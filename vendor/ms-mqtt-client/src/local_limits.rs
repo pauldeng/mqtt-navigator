@@ -17,8 +17,10 @@ static QUEUED: AtomicUsize = AtomicUsize::new(0);
 static QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Fixed cost added to each queued publish, for the topic and the bookkeeping.
+/// Fixed cost added to each queued publish, for the bookkeeping.
 pub(crate) const PUBLISH_OVERHEAD: usize = 128;
+/// Fixed cost added to each user property, for its two string headers.
+pub(crate) const USER_PROPERTY_OVERHEAD: usize = 48;
 
 /// Sets the limits. `max_packet` is the largest incoming packet in bytes (fixed header included).
 /// `max_queued` and `max_queued_bytes` bound the incoming-publish queue.
@@ -43,12 +45,22 @@ pub(crate) fn max_packet() -> usize {
     MAX_PACKET.load(Ordering::Relaxed)
 }
 
+/// Largest WebSocket frame or message that we accept. `None` means "no limit set": the
+/// WebSocket library then keeps its own defaults.
+pub(crate) fn ws_limit() -> Option<usize> {
+    match max_packet() {
+        usize::MAX => None,
+        n => Some(n),
+    }
+}
+
 /// Reserves queue space for one publish of `cost` bytes. Returns false (and counts a drop) if the
 /// queue is full.
 pub(crate) fn try_admit(cost: usize) -> bool {
     let count = QUEUED.fetch_add(1, Ordering::AcqRel) + 1;
     let bytes = QUEUED_BYTES.fetch_add(cost, Ordering::AcqRel) + cost;
-    if count > MAX_QUEUED.load(Ordering::Relaxed) || bytes > MAX_QUEUED_BYTES.load(Ordering::Relaxed)
+    if count > MAX_QUEUED.load(Ordering::Relaxed)
+        || bytes > MAX_QUEUED_BYTES.load(Ordering::Relaxed)
     {
         release(cost);
         DROPPED.fetch_add(1, Ordering::Relaxed);

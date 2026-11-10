@@ -11,7 +11,10 @@ use std::{
 use async_tungstenite::{
     WebSocketStream as TungsteniteWebSocketStream,
     tokio::TokioAdapter,
-    tungstenite::{self, Bytes, Message, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{
+        self, Bytes, Message, client::IntoClientRequest, http::HeaderValue,
+        protocol::WebSocketConfig,
+    },
 };
 use either::Either;
 use futures_util::{Sink, Stream};
@@ -20,6 +23,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, Rea
 use crate::buffer_pool::{BufferPool, EitherAccumulator};
 use crate::io::{ReadableStream, Reader, WritableStream, Writer};
 use crate::transport::{Proxy, TlsConfig};
+
+// LOCAL PATCH (mqtt-navigator): bound WebSocket frames and messages before they are buffered.
+// Tungstenite defaults are 16 MiB for a frame and 64 MiB for a message. An MQTT packet is at
+// most `local_limits::max_packet()` bytes, so one frame or message cannot be larger.
+fn ws_config() -> Option<WebSocketConfig> {
+    ws_config_for(crate::local_limits::ws_limit())
+}
+
+fn ws_config_for(limit: Option<usize>) -> Option<WebSocketConfig> {
+    limit.map(|n| {
+        WebSocketConfig::default()
+            .max_frame_size(Some(n))
+            .max_message_size(Some(n))
+    })
+}
 
 /// Establish a WebSocket connection using the given request parameters,
 /// and use the given buffer pools to initialize the buffers for the stream reader and writer.
@@ -83,9 +101,10 @@ where
 
     match stream {
         Either::Left(stream) => {
-            let (stream, _response) = async_tungstenite::tokio::client_async(request, stream)
-                .await
-                .map_err(tungstenite_err_to_io_err)?;
+            let (stream, _response) =
+                async_tungstenite::tokio::client_async_with_config(request, stream, ws_config())
+                    .await
+                    .map_err(tungstenite_err_to_io_err)?;
             let stream = WebSocketStream {
                 inner: stream,
                 next_read: Default::default(),
@@ -100,9 +119,10 @@ where
         }
 
         Either::Right(stream) => {
-            let (stream, _response) = async_tungstenite::tokio::client_async(request, stream)
-                .await
-                .map_err(tungstenite_err_to_io_err)?;
+            let (stream, _response) =
+                async_tungstenite::tokio::client_async_with_config(request, stream, ws_config())
+                    .await
+                    .map_err(tungstenite_err_to_io_err)?;
             let stream = WebSocketStream {
                 inner: stream,
                 next_read: Default::default(),
@@ -332,6 +352,33 @@ mod tests {
             .await
             .unwrap();
         (reader, server)
+    }
+
+    #[test]
+    fn config_is_built_from_the_limit() {
+        assert!(super::ws_config_for(None).is_none());
+        let c = super::ws_config_for(Some(1234)).unwrap();
+        assert_eq!(
+            (c.max_frame_size, c.max_message_size),
+            (Some(1234), Some(1234))
+        );
+    }
+
+    // Tests that touch the global limit must not run in parallel with each other.
+    static LIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn oversized_frame_is_rejected() {
+        let _guard = LIMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::local_limits::set_limits(1024, usize::MAX, usize::MAX);
+        let (mut reader, server) =
+            websocket_reader(vec![Message::Binary(vec![0x30; 4096].into())]).await;
+        let result = reader.read().await;
+        crate::local_limits::set_limits(usize::MAX, usize::MAX, usize::MAX);
+        // The WebSocket layer rejects the frame (kind `Other`). The MQTT reader check would
+        // give `InvalidData` instead, and here it never gets to run.
+        assert_matches!(result, Err(err) if err.kind() == std::io::ErrorKind::Other);
+        let _ = server.await;
     }
 
     #[tokio::test]

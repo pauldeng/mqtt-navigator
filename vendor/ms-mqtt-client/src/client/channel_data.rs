@@ -119,6 +119,21 @@ where
 {
     pub(crate) fn queue_cost(&self) -> usize {
         let (Self::QoS0(p) | Self::QoS1(p, _) | Self::QoS2(p, _)) = self;
-        p.payload.as_ref().len() + crate::local_limits::PUBLISH_OVERHEAD
+        // Payload, topic and all variable-size properties. A publish with an empty payload and
+        // many user properties must not be free.
+        let o = &p.other_properties;
+        let user: usize = o
+            .user_properties
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + crate::local_limits::USER_PROPERTY_OVERHEAD)
+            .sum();
+        p.payload.as_ref().len()
+            + p.topic_name.as_str().len()
+            + user
+            + o.correlation_data.as_ref().map_or(0, |d| d.len())
+            + o.content_type.as_ref().map_or(0, |c| c.len())
+            + o.response_topic.as_ref().map_or(0, |t| t.as_str().len())
+            + o.subscription_identifiers.len() * 4
+            + crate::local_limits::PUBLISH_OVERHEAD
     }
 }

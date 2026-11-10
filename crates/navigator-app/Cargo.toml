@@ -12,7 +12,11 @@ name = "mqtt-navigator"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+gpui-kit = "0.9.1"
 navigator-core = { path = "../navigator-core" }
+tokio = { version = "1.54.1", features = ["sync"] }
 
 [lints]
 workspace = true

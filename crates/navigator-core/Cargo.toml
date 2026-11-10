@@ -9,3 +9,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+ms-mqtt-client = { version = "0.1.0", features = ["websockets"] }
+openssl = { version = "0.10.82", features = ["vendored"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
