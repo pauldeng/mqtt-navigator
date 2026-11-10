@@ -1,0 +1,10 @@
+# Ports 18830 to 18837 on 127.0.0.1. See mosquitto.conf for the list.
+name: navigator-broker
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.1.2-alpine@sha256:75d6662dee52c947dc9dd9c29f1d8d7ffef78ddaf38001caa09755681e8bbc98
+    ports:
+      - "127.0.0.1:18830-18837:18830-18837"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./certs:/certs:ro

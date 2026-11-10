@@ -227,19 +227,23 @@ async fn reconnect_increments_generation() {
     assert_eq!(connect(&mut net, profile(&[])).await, 3);
 }
 
+/// A refused connection is a temporary error: the net thread retries until the user stops it.
 #[tokio::test(flavor = "current_thread")]
-async fn connection_refused_is_failed() {
+async fn connection_refused_is_retried_until_disconnect() {
     let _limits = limits_lock();
     let mut net = Net::start(NetLimits::default());
     let mut p = profile(&[]);
     p.port = 1; // nothing listens here
     net.send(Command::Connect(Box::new(p))).expect("send");
-    wait_state(&mut net, |s| matches!(s, ConnState::Failed(_))).await;
+    wait_state(&mut net, |s| matches!(s, ConnState::Reconnecting { .. })).await;
     let s = net.status.borrow().clone();
     assert!(
-        matches!(&s.state, ConnState::Failed(t) if t.contains("refused")),
+        matches!(&s.state, ConnState::Reconnecting { attempt: 1, reason } if reason.contains("refused")),
         "{s:?}"
     );
+    net.disconnect();
+    let generation = wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    assert_eq!(generation, s.generation);
 }
 
 /// A second client that publishes without Net.
@@ -627,9 +631,16 @@ async fn unsuback_reason_is_checked() {
         })
         .expect("send");
         match (next_event(&mut net).await, expect_ok) {
-            (Event::Unsubscribed { filter, .. }, true) => assert_eq!(filter, "a/b"),
-            (Event::Error { message, .. }, false) => {
-                assert_eq!(message, "Unsubscribe rejected: NotAuthorized");
+            (Event::Unsubscribed { filter, result, .. }, true) => {
+                assert_eq!(filter, "a/b");
+                assert_eq!(result, Ok(()));
+            }
+            (Event::Unsubscribed { filter, result, .. }, false) => {
+                assert_eq!(filter, "a/b");
+                assert_eq!(
+                    result,
+                    Err("Unsubscribe rejected: NotAuthorized".to_string())
+                );
             }
             (other, _) => panic!("reason {reason:#x}: unexpected {other:?}"),
         }

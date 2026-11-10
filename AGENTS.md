@@ -41,6 +41,7 @@ cargo run --release            # start the app
 - Never block the net thread on the UI. Every queue has a bound.
 - Be event-driven. Do not write polling loops or periodic timers that run when the app is idle. A timer must start from an event and stop when its work is done.
 - Do no blocking I/O on the UI thread (files, keyring, DNS, certificates, network). Run it in the background and send the result back as an event.
+  - One exception: the panic hook writes the crash file synchronously. A panic on the UI thread ends the app, and a background write would often be lost before the process exits. A contained panic (for example in the net thread) also runs the hook; that write is small, rare and not on the UI thread.
 - Keep every UI-thread task within the frame budget (≤ 4 ms of merge work in each frame). Time-slice long work or move it off the UI thread.
 - Never log payloads, passwords or keys.
 

@@ -1,6 +1,7 @@
 //! MQTT Navigator desktop app. P1 tracer bullet: connect, subscribe, topic tree, latest value,
 //! publish, disconnect.
 
+mod logging;
 mod ui;
 
 use gpui_kit::*;
@@ -14,6 +15,7 @@ pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLoc
 
 fn main() {
     STARTED.get_or_init(std::time::Instant::now);
+    logging::init();
     let profile = match parse_args(std::env::args().skip(1)) {
         Ok(p) => p,
         Err(msg) => {

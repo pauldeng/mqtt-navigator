@@ -4,14 +4,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::{ActiveTheme, Disableable, Sizable, Theme, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable, IconName, Sizable, Theme, TitleBar, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use navigator_core::Qos;
 use navigator_core::net::{
-    Command, ConnState, Event, Net, NetLimits, Outgoing, Profile, PublishResult, Status,
+    Command, ConnState, Event, Net, NetLimits, Outgoing, Profile, PublishResult, SendError, Status,
 };
 use navigator_core::store::{Limits, NodeId, TopicStore};
 
@@ -24,11 +26,134 @@ const FRAME_BUDGET: Duration = Duration::from_millis(4);
 const COALESCE: Duration = Duration::from_millis(33);
 const ROW_HEIGHT: f32 = 24.;
 
+/// Where one subscription row is in its life.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SubState {
+    /// SUBSCRIBE is queued or sent. The SUBACK has not come.
+    Pending,
+    Active(Qos),
+    Failed(String),
+    /// The UNSUBSCRIBE could not be queued. The subscription is still wanted.
+    NotRemoved(String),
+    /// The net thread took the UNSUBSCRIBE: the filter is out of its desired list. The row
+    /// waits for the broker answer.
+    Removing,
+    /// The broker rejected the UNSUBSCRIBE. The filter is out of the desired list, so it is not
+    /// sent again after a reconnect, but the broker can still send its messages until then.
+    RemoveFailed(String),
+}
+
+impl SubState {
+    /// The user removed this filter, and the net thread took the request.
+    fn removal_accepted(&self) -> bool {
+        matches!(self, Self::Removing | Self::RemoveFailed(_))
+    }
+}
+
 struct Sub {
     filter: String,
     qos: Qos,
-    /// `None` while subscribing.
-    result: Option<Result<Qos, String>>,
+    state: SubState,
+}
+
+/// The subscription rows. Free of gpui types, so that tests can run it.
+#[derive(Default)]
+struct Subs {
+    rows: Vec<Sub>,
+}
+
+impl Subs {
+    fn row(&mut self, filter: &str) -> Option<&mut Sub> {
+        self.rows.iter_mut().find(|s| s.filter == filter)
+    }
+
+    /// Filters that the next Connect must subscribe. An accepted removal is not one of them.
+    fn wanted(&self) -> Vec<(String, Qos)> {
+        self.rows
+            .iter()
+            .filter(|s| !s.state.removal_accepted())
+            .map(|s| (s.filter.clone(), s.qos))
+            .collect()
+    }
+
+    /// The connection changed. The broker forgot its subscriptions (clean start), so SUBACKs
+    /// come again. A row whose removal the net thread accepted is gone: the filter is not in the
+    /// desired list, and the new session does not have it.
+    fn connection_reset(&mut self) {
+        self.rows.retain(|s| !s.state.removal_accepted());
+        for s in &mut self.rows {
+            s.state = SubState::Pending;
+        }
+    }
+
+    fn on_subscribed(&mut self, filter: &str, result: Result<Qos, String>) {
+        if let Some(s) = self.row(filter)
+            && !s.state.removal_accepted()
+        {
+            s.state = result.map_or_else(SubState::Failed, SubState::Active);
+        }
+    }
+
+    /// The net thread took the UNSUBSCRIBE.
+    fn begin_remove(&mut self, filter: &str) {
+        if let Some(s) = self.row(filter) {
+            s.state = SubState::Removing;
+        }
+    }
+
+    /// The UNSUBSCRIBE could not be queued.
+    fn remove_not_sent(&mut self, filter: &str, why: String) {
+        if let Some(s) = self.row(filter) {
+            s.state = SubState::NotRemoved(why);
+        }
+    }
+
+    /// The UNSUBSCRIBE result for `filter`.
+    fn on_unsubscribed(&mut self, filter: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => self
+                .rows
+                .retain(|s| s.filter != filter || !s.state.removal_accepted()),
+            Err(why) => {
+                if let Some(s) = self.row(filter)
+                    && s.state.removal_accepted()
+                {
+                    s.state = SubState::RemoveFailed(why);
+                }
+            }
+        }
+    }
+}
+
+/// Text for a command that the net queue did not accept.
+fn send_error_text(e: SendError) -> &'static str {
+    match e {
+        SendError::Full => "Too many requests are waiting. Try again.",
+        SendError::Closed => "The connection task stopped.",
+    }
+}
+
+/// Checks a topic filter before it is sent. `Err` is the text for the user.
+fn validate_filter(filter: &str) -> Result<(), &'static str> {
+    if filter.is_empty() {
+        return Err("Type a topic filter.");
+    }
+    if filter.len() > 65_535 {
+        return Err("The filter is longer than 65535 bytes.");
+    }
+    if filter.contains('\0') {
+        return Err("The filter must not contain a NUL character.");
+    }
+    let levels: Vec<&str> = filter.split('/').collect();
+    for (i, level) in levels.iter().enumerate() {
+        if level.contains('#') && (*level != "#" || i + 1 != levels.len()) {
+            return Err("Use # alone as the last level, for example a/#.");
+        }
+        if level.contains('+') && *level != "+" {
+            return Err("Use + alone as a whole level, for example a/+/b.");
+        }
+    }
+    Ok(())
 }
 
 pub struct Navigator {
@@ -36,7 +161,7 @@ pub struct Navigator {
     net: Net,
     store: TopicStore,
     status: Status,
-    subs: Vec<Sub>,
+    subs: Subs,
     selected: Option<NodeId>,
     /// Connection generation of the shown data. Newer data from the net thread replaces it.
     generation: u64,
@@ -44,8 +169,14 @@ pub struct Navigator {
     detail_cache: Option<(DetailKey, SharedString)>,
     scroll: UniformListScrollHandle,
     topic_input: Entity<InputState>,
+    sub_input: Entity<InputState>,
+    /// Error text under the subscribe input.
+    sub_error: Option<String>,
+    /// Set when the connection came back by itself. Cleared when the connection ends again.
+    reconnected_at: Option<std::time::SystemTime>,
     payload_input: Entity<InputState>,
     qos: Qos,
+    sub_qos: Qos,
     next_op: u64,
     last_result: Option<(u64, String)>,
     rate: Rate,
@@ -71,6 +202,16 @@ impl Navigator {
 
         let topic_input = cx.new(|cx| InputState::new(window, cx).placeholder("Topic"));
         let payload_input = cx.new(|cx| InputState::new(window, cx).placeholder("Payload"));
+        let sub_input = cx.new(|cx| InputState::new(window, cx).placeholder("Topic filter"));
+        let sub_events = cx.subscribe_in(
+            &sub_input,
+            window,
+            |v, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => v.add_sub(window, cx),
+                InputEvent::Change if v.sub_error.take().is_some() => cx.notify(),
+                _ => {}
+            },
+        );
 
         // Theme follows the system (event-driven).
         Theme::sync_system_appearance(Some(window), cx);
@@ -82,15 +223,17 @@ impl Navigator {
         Self::spawn_events(events, cx);
         Self::spawn_status(status_rx, cx);
 
-        let subs = profile
-            .subscriptions
-            .iter()
-            .map(|(filter, qos)| Sub {
-                filter: filter.clone(),
-                qos: *qos,
-                result: None,
-            })
-            .collect();
+        let subs = Subs {
+            rows: profile
+                .subscriptions
+                .iter()
+                .map(|(filter, qos)| Sub {
+                    filter: filter.clone(),
+                    qos: *qos,
+                    state: SubState::Pending,
+                })
+                .collect(),
+        };
         let this = Self {
             profile,
             net,
@@ -102,8 +245,12 @@ impl Navigator {
             detail_cache: None,
             scroll: UniformListScrollHandle::new(),
             topic_input,
+            sub_input,
+            sub_error: None,
+            reconnected_at: None,
             payload_input,
             qos: Qos::AtMostOnce,
+            sub_qos: Qos::AtMostOnce,
             next_op: 1,
             last_result: None,
             rate: Rate::default(),
@@ -111,6 +258,7 @@ impl Navigator {
             // On quit, disconnect cleanly. gpui waits for quit handlers for at most 200 ms.
             _subscriptions: vec![
                 appearance,
+                sub_events,
                 cx.on_app_quit(|v: &mut Self, _| v.net.shutdown()),
             ],
         };
@@ -119,27 +267,100 @@ impl Navigator {
     }
 
     /// Accepts data of generation `g`. Data of an older generation is dropped. A newer generation
-    /// clears the data, because data belongs to one connection. Messages, events and status can
-    /// arrive in any order, so each of them calls this first.
+    /// (a manual connect) keeps the data, because data belongs to one profile and there is one
+    /// profile. Only the SUBACK results restart. Messages, events and status can arrive in any
+    /// order, so each of them calls this first.
     fn accept(&mut self, g: u64) -> bool {
         if g < self.generation {
             return false;
         }
         if g > self.generation {
             self.generation = g;
-            self.store.clear();
-            self.selected = None;
-            self.detail_cache = None;
-            self.subs.iter_mut().for_each(|s| s.result = None);
+            self.subs.connection_reset();
         }
         true
     }
 
     fn connect(&self) {
-        let cmd = Command::Connect(Box::new(self.profile.clone()));
-        if self.net.send(cmd).is_err() {
+        // The subscription list is what the user sees now, not what the command line gave.
+        let mut profile = self.profile.clone();
+        profile.subscriptions = self.subs.wanted();
+        tracing::info!(url = %self.url(), "Connect");
+        if self.net.send(Command::Connect(Box::new(profile))).is_err() {
             // ponytail: the command queue (64) is full only under extreme UI spam.
         }
+    }
+
+    fn add_sub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let filter = self.sub_input.read(cx).value().to_string();
+        let error = match validate_filter(&filter) {
+            Err(text) => Some(text.to_string()),
+            Ok(()) if self.subs.rows.iter().any(|s| s.filter == filter) => {
+                Some(format!("You are already subscribed to {filter}."))
+            }
+            Ok(()) => None,
+        };
+        if error.is_some() {
+            self.sub_error = error;
+            cx.notify();
+            return;
+        }
+        let qos = self.sub_qos;
+        // No row and no input reset if the queue refuses the command.
+        if let Err(e) = self.send_subscribe(&filter, qos) {
+            self.sub_error = Some(send_error_text(e).into());
+            cx.notify();
+            return;
+        }
+        self.sub_error = None;
+        self.sub_input
+            .update(cx, |i, cx| i.set_value("", window, cx));
+        self.subs.rows.push(Sub {
+            filter,
+            qos,
+            state: SubState::Pending,
+        });
+        cx.notify();
+    }
+
+    fn send_subscribe(&mut self, filter: &str, qos: Qos) -> Result<(), SendError> {
+        self.net.send(Command::Subscribe {
+            filter: filter.to_string(),
+            qos,
+        })
+    }
+
+    fn retry_sub(&mut self, filter: &str, cx: &mut Context<Self>) {
+        let Some(qos) = self.subs.row(filter).map(|s| s.qos) else {
+            return;
+        };
+        let state = match self.send_subscribe(filter, qos) {
+            Ok(()) => SubState::Pending,
+            Err(e) => SubState::Failed(send_error_text(e).into()),
+        };
+        if let Some(s) = self.subs.row(filter) {
+            s.state = state;
+        }
+        cx.notify();
+    }
+
+    /// Starts the removal. The row stays until the UNSUBACK (or the offline answer) arrives.
+    fn remove_sub(&mut self, filter: &str, cx: &mut Context<Self>) {
+        if self
+            .subs
+            .row(filter)
+            .is_none_or(|s| s.state == SubState::Removing)
+        {
+            return;
+        }
+        let cmd = Command::Unsubscribe {
+            filter: filter.to_string(),
+        };
+        match self.net.send(cmd) {
+            Ok(()) => self.subs.begin_remove(filter),
+            Err(e) => self.subs.remove_not_sent(filter, send_error_text(e).into()),
+        }
+        cx.notify();
     }
 
     /// Waits for the first message, merges a batch within the frame budget, then coalesces.
@@ -256,7 +477,8 @@ impl Navigator {
 
     fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
         let g = match &ev {
-            Event::Subscribed { generation, .. }
+            Event::Reconnected { generation, .. }
+            | Event::Subscribed { generation, .. }
             | Event::Unsubscribed { generation, .. }
             | Event::Published { generation, .. }
             | Event::Error { generation, .. } => *generation,
@@ -265,10 +487,15 @@ impl Navigator {
             return;
         }
         match ev {
+            Event::Reconnected { at, .. } => {
+                tracing::info!("Reconnected");
+                self.reconnected_at = Some(at);
+            }
             Event::Subscribed { filter, result, .. } => {
-                if let Some(s) = self.subs.iter_mut().find(|s| s.filter == filter) {
-                    s.result = Some(result);
+                if let Err(why) = &result {
+                    tracing::warn!(%why, "Subscribe failed");
                 }
+                self.subs.on_subscribed(&filter, result);
             }
             Event::Published { op_id, result, .. } => {
                 let text = match result {
@@ -289,10 +516,11 @@ impl Navigator {
                     self.last_result = Some((op_id, text));
                 }
             }
-            Event::Error { message, .. } => {
-                self.last_result = Some((0, message));
+            Event::Error { message, .. } => self.last_result = Some((0, message)),
+            // An UNSUBSCRIBE result shows on its row, not in the publish line.
+            Event::Unsubscribed { filter, result, .. } => {
+                self.subs.on_unsubscribed(&filter, result)
             }
-            _ => return,
         }
         cx.notify();
     }
@@ -303,6 +531,14 @@ impl Navigator {
                 let status = rx.borrow_and_update().clone();
                 let alive = this.update(cx, |v, cx| {
                     if v.accept(status.generation) {
+                        if status.state != v.status.state {
+                            tracing::info!(state = ?status.state, "Connection state");
+                        }
+                        if status.state != ConnState::Connected {
+                            v.reconnected_at = None;
+                            // The broker forgets the subscriptions. Results come again.
+                            v.subs.connection_reset();
+                        }
                         v.status = status;
                         cx.notify();
                     }
@@ -317,7 +553,9 @@ impl Navigator {
 
     fn toggle_connection(&mut self, cx: &mut Context<Self>) {
         match self.status.state {
-            ConnState::Connected | ConnState::Connecting => self.net.disconnect(),
+            ConnState::Connected | ConnState::Connecting | ConnState::Reconnecting { .. } => {
+                self.net.disconnect()
+            }
             ConnState::Disconnecting => {}
             ConnState::Disconnected | ConnState::Failed(_) => self.connect(),
         }
@@ -375,6 +613,7 @@ impl Navigator {
         match &self.status.state {
             ConnState::Disconnected => "Disconnected".into(),
             ConnState::Connecting => "Connecting…".into(),
+            ConnState::Reconnecting { attempt, .. } => format!("Reconnecting ({attempt})…"),
             ConnState::Connected => "Connected".into(),
             ConnState::Disconnecting => "Disconnecting…".into(),
             ConnState::Failed(why) => format!("Disconnected: {why}"),
@@ -396,13 +635,19 @@ impl Navigator {
         let theme = cx.theme();
         let dot = match self.status.state {
             ConnState::Connected => theme.success,
-            ConnState::Connecting | ConnState::Disconnecting => theme.warning,
+            ConnState::Connecting | ConnState::Reconnecting { .. } | ConnState::Disconnecting => {
+                theme.warning
+            }
             ConnState::Failed(_) => theme.danger,
             ConnState::Disconnected => theme.muted_foreground,
         };
+        let reason = match &self.status.state {
+            ConnState::Reconnecting { reason, .. } => Some(reason.clone()),
+            _ => None,
+        };
         let label = match self.status.state {
             ConnState::Connected => "Disconnect",
-            ConnState::Connecting => "Cancel",
+            ConnState::Connecting | ConnState::Reconnecting { .. } => "Cancel",
             _ => "Connect",
         };
         TitleBar::new().child(
@@ -415,7 +660,19 @@ impl Navigator {
                     h_flex()
                         .gap_1()
                         .child(div().size_2().rounded_full().bg(dot))
-                        .child(div().text_sm().child(self.state_text())),
+                        .child(div().text_sm().child(self.state_text()))
+                        .when_some(reason, |d, why| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .max_w(px(360.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(why),
+                            )
+                        }),
                 )
                 .child(div().flex_1())
                 .child(
@@ -431,6 +688,102 @@ impl Navigator {
 
     fn render_subs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let qos_button = |q: Qos| {
+            let b = Button::new(("sub-qos", q.as_u8() as usize))
+                .small()
+                .label(format!("Q{}", q.as_u8()));
+            let b = if self.sub_qos == q {
+                b.primary()
+            } else {
+                b.ghost()
+            };
+            b.on_click(cx.listener(move |v, _, _, cx| {
+                v.sub_qos = q;
+                cx.notify();
+            }))
+        };
+        let has_hash = self.subs.rows.iter().any(|s| s.filter == "#");
+        let rows = self.subs.rows.iter().map(|s| {
+            let state: SharedString = match &s.state {
+                SubState::Pending if self.connected() => "Subscribing…".into(),
+                SubState::Pending => "Waiting for connection".into(),
+                SubState::Active(q) => format!("granted {}", q.as_u8()).into(),
+                SubState::Failed(e) | SubState::RemoveFailed(e) | SubState::NotRemoved(e) => {
+                    e.clone().into()
+                }
+                SubState::Removing => "Removing…".into(),
+            };
+            let failed = matches!(
+                s.state,
+                SubState::Failed(_) | SubState::RemoveFailed(_) | SubState::NotRemoved(_)
+            );
+            // The button of a failed row repeats the action that failed.
+            let retry_label =
+                if matches!(s.state, SubState::RemoveFailed(_) | SubState::NotRemoved(_)) {
+                    "Retry remove"
+                } else {
+                    "Retry"
+                };
+            let retry_remove =
+                matches!(s.state, SubState::RemoveFailed(_) | SubState::NotRemoved(_));
+            let (retry, remove) = (s.filter.clone(), s.filter.clone());
+            let (id_retry, id_remove) = (
+                SharedString::from(format!("retry:{}", s.filter)),
+                SharedString::from(format!("remove:{}", s.filter)),
+            );
+            v_flex()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_sm()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(s.filter.clone()),
+                        )
+                        .child(div().text_xs().child(format!("Q{}", s.qos.as_u8())))
+                        .child(
+                            Button::new(id_remove)
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip(format!("Remove subscription {}", s.filter))
+                                .disabled(s.state == SubState::Removing)
+                                .on_click(
+                                    cx.listener(move |v, _, _, cx| v.remove_sub(&remove, cx)),
+                                ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(if failed {
+                                    theme.danger
+                                } else {
+                                    theme.muted_foreground
+                                })
+                                .child(state),
+                        )
+                        .when(failed, |d| {
+                            d.child(Button::new(id_retry).xsmall().label(retry_label).on_click(
+                                cx.listener(move |v, _, _, cx| {
+                                    if retry_remove {
+                                        v.remove_sub(&retry, cx)
+                                    } else {
+                                        v.retry_sub(&retry, cx)
+                                    }
+                                }),
+                            ))
+                        }),
+                )
+        });
         v_flex()
             .w(px(260.))
             .h_full()
@@ -444,38 +797,44 @@ impl Navigator {
                     .text_color(theme.muted_foreground)
                     .child("SUBSCRIPTIONS"),
             )
-            .children(self.subs.iter().map(|s| {
-                let state: SharedString = match &s.result {
-                    None if self.connected() => "Subscribing…".into(),
-                    None => "".into(),
-                    Some(Ok(q)) => format!("granted {}", q.as_u8()).into(),
-                    Some(Err(e)) => e.clone().into(),
-                };
-                let failed = matches!(s.result, Some(Err(_)));
-                v_flex()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_sm()
-                                    .child(s.filter.clone()),
-                            )
-                            .child(div().text_xs().child(format!("Q{}", s.qos.as_u8()))),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(if failed {
-                                theme.danger
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .child(state),
-                    )
-            }))
+            // The rows scroll. The add input stays pinned below them.
+            .child(
+                div()
+                    .id("subs")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(v_flex().gap_1().children(rows)),
+            )
+            .when(has_hash && self.subs.rows.len() > 1, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("Remove # to receive only your filters?"),
+                        )
+                        .child(
+                            Button::new("remove-hash")
+                                .xsmall()
+                                .label("Remove #")
+                                .on_click(cx.listener(|v, _, _, cx| v.remove_sub("#", cx))),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(div().flex_1().child(Input::new(&self.sub_input).small()))
+                    .child(qos_button(Qos::AtMostOnce))
+                    .child(qos_button(Qos::AtLeastOnce)),
+            )
+            .when_some(self.sub_error.clone(), |d, e| {
+                d.child(div().text_xs().text_color(theme.danger).child(e))
+            })
     }
 
     fn render_tree(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -742,6 +1101,9 @@ impl Navigator {
         } else if !self.profile.verify_tls {
             left = left.child(div().text_color(theme.warning).child("Insecure TLS"));
         }
+        if self.reconnected_at.is_some() {
+            left = left.child("Reconnected");
+        }
         StatusBar::new().left(left).right(
             h_flex()
                 .gap_3()
@@ -951,7 +1313,23 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
-    use super::preview;
+    use super::{Sub, SubState, Subs, preview, send_error_text, validate_filter};
+    use navigator_core::Qos;
+    use navigator_core::net::SendError;
+
+    #[test]
+    fn filter_validation() {
+        for ok in ["a", "a/b", "#", "a/#", "+", "a/+/b", "+/#", "/", "a//b"] {
+            assert!(validate_filter(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", "a/#/b", "a#", "#a", "a/b#", "a+", "+a/b", "a/b+/c", "a\0b",
+        ] {
+            assert!(validate_filter(bad).is_err(), "{bad}");
+        }
+        assert!(validate_filter(&"a".repeat(65_535)).is_ok());
+        assert!(validate_filter(&"a".repeat(65_536)).is_err());
+    }
 
     #[test]
     fn preview_collapses_whitespace_and_marks_binary() {
@@ -961,5 +1339,88 @@ mod tests {
         // A cut inside a multi-byte character is not binary.
         let long = "é".repeat(400);
         assert!(!preview(long.as_bytes(), 80).starts_with("bin"));
+    }
+
+    fn subs(filters: &[&str]) -> Subs {
+        Subs {
+            rows: filters
+                .iter()
+                .map(|f| Sub {
+                    filter: f.to_string(),
+                    qos: Qos::AtMostOnce,
+                    state: SubState::Active(Qos::AtMostOnce),
+                })
+                .collect(),
+        }
+    }
+
+    fn state(s: &mut Subs, f: &str) -> Option<SubState> {
+        s.row(f).map(|r| r.state.clone())
+    }
+
+    #[test]
+    fn remove_keeps_row_until_unsubscribed() {
+        let mut s = subs(&["a", "b"]);
+        s.begin_remove("a");
+        assert_eq!(state(&mut s, "a"), Some(SubState::Removing));
+        s.on_unsubscribed("a", Ok(()));
+        assert_eq!(state(&mut s, "a"), None);
+        assert!(s.row("b").is_some());
+    }
+
+    #[test]
+    fn send_failure_keeps_the_subscription_wanted() {
+        let mut s = subs(&["a"]);
+        s.remove_not_sent("a", send_error_text(SendError::Full).into());
+        assert!(matches!(state(&mut s, "a"), Some(SubState::NotRemoved(_))));
+        assert_eq!(s.wanted().len(), 1);
+        // Retry works and then the row goes.
+        s.begin_remove("a");
+        s.on_unsubscribed("a", Ok(()));
+        assert!(s.rows.is_empty());
+    }
+
+    #[test]
+    fn results_match_their_own_rows_in_any_order() {
+        let mut s = subs(&["a", "b"]);
+        s.begin_remove("a");
+        s.begin_remove("b");
+        // "b" answers first, with a rejection.
+        s.on_unsubscribed("b", Err("Unsubscribe rejected: NotAuthorized".into()));
+        assert_eq!(
+            state(&mut s, "b"),
+            Some(SubState::RemoveFailed(
+                "Unsubscribe rejected: NotAuthorized".into()
+            ))
+        );
+        assert_eq!(state(&mut s, "a"), Some(SubState::Removing));
+        s.on_unsubscribed("a", Ok(()));
+        assert_eq!(state(&mut s, "a"), None);
+    }
+
+    #[test]
+    fn suback_does_not_revive_a_removed_row() {
+        let mut s = subs(&["a"]);
+        s.begin_remove("a");
+        s.on_subscribed("a", Ok(Qos::AtLeastOnce));
+        assert_eq!(state(&mut s, "a"), Some(SubState::Removing));
+        let mut s = subs(&["a"]);
+        s.on_subscribed("a", Err("no".into()));
+        assert_eq!(state(&mut s, "a"), Some(SubState::Failed("no".into())));
+    }
+
+    #[test]
+    fn accepted_removal_does_not_come_back_on_connect() {
+        // Remove, then the connection drops before the UNSUBACK, then a manual Connect.
+        let mut s = subs(&["a", "b", "c"]);
+        s.begin_remove("a");
+        s.begin_remove("c");
+        s.on_unsubscribed("c", Err("Unsubscribe rejected: NotAuthorized".into()));
+        assert_eq!(s.wanted(), vec![("b".to_string(), Qos::AtMostOnce)]);
+        s.connection_reset();
+        assert_eq!(state(&mut s, "a"), None);
+        assert_eq!(state(&mut s, "c"), None);
+        assert_eq!(state(&mut s, "b"), Some(SubState::Pending));
+        assert_eq!(s.wanted(), vec![("b".to_string(), Qos::AtMostOnce)]);
     }
 }

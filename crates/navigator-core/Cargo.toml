@@ -16,3 +16,8 @@ ms-mqtt-client = { version = "0.1.0", features = ["websockets"] }
 openssl = { version = "0.10.82", features = ["vendored"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1.44"
+
+[features]
+# Tests against the Docker brokers in tests/broker (see tests/broker/README.md).
+broker-tests = []
