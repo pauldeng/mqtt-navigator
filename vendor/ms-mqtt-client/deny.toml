@@ -1,0 +1,60 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# Configuration for `cargo deny check`.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Only check the dependency graph for the platforms we actually build/ship on.
+all-features = true
+
+[advisories]
+version = 2
+# Unhandled advisories fail the standalone Dependency advisories workflow, not Nightly.
+# A finding requires applicability triage, not an automatic dependency-floor bump.
+# Reviewed non-applicability exceptions must include a specific reason.
+# This evaluates resolved versions, not every version a consumer might select.
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0386", reason = "This crate and its integrations do not call the affected Tokio AsyncFd constructors; the finding is a version match, not reachable API usage." },
+]
+
+[licenses]
+version = 2
+# Curated set of permissive, MIT-compatible licenses. These impose no copyleft and
+# may be included in this MIT-licensed library. The list is intentionally broader
+# than the current dependency tree so routine dependency updates don't break CI;
+# `unused-allowed-license` is relaxed to silence warnings for entries not yet in use.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-2-Clause-Patent",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# Don't warn about allowed licenses that no current dependency uses; the allow list
+# is a stable policy statement, not a mirror of today's tree.
+unused-allowed-license = "allow"
+
+[bans]
+# Duplicate versions bloat the dependency tree; warn so they stay visible without
+# blocking CI on transitive churn we don't directly control.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only allow dependencies from crates.io; reject unknown registries and git sources.
+unknown-registry = "deny"
+unknown-git = "deny"

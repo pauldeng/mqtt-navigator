@@ -12,3 +12,7 @@ dependencies = [
 [[package]]
 name = "navigator-core"
 version = "0.1.0"
+
+[[patch.unused]]
+name = "ms-mqtt-client"
+version = "0.1.0"

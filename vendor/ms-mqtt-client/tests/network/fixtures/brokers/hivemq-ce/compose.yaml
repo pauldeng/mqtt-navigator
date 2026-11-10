@@ -1,0 +1,35 @@
+# One of the brokers the live network suite can run against.
+# Brought up and torn down by `make network-test BROKER=hivemq-ce`.
+services:
+  hivemq:
+    image: hivemq/hivemq-ce:2026.5
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_TLS_PORT:-8883}:8883"
+      - "${MQTT_WS_PORT:-8083}:8083"
+      - "${MQTT_WSS_PORT:-8084}:8084"
+    environment:
+      # The image defaults to this, but the suite depends on it, so make it explicit.
+      HIVEMQ_ALLOW_ALL_CLIENTS: "true"
+    volumes:
+      - ./config.xml:/opt/hivemq/conf/config.xml:ro
+      - ../certs:/opt/hivemq/conf/certs:ro
+      - custom-counter-extension:/opt/hivemq/extensions/custom-counter-extension:ro
+
+  extension-builder:
+    image: maven:3.9-eclipse-temurin-26
+    profiles: ["build"]
+    entrypoint: ["sh", "-euc"]
+    command:
+      - >-
+        rm -rf /extension/* &&
+        mvn --batch-mode --quiet -f /src/pom.xml
+        -Dextension.build.directory=/build package &&
+        cp /build/custom-counter-extension-1.0.0.jar /extension/ &&
+        cp /src/hivemq-extension.xml /extension/
+    volumes:
+      - ./extensions/custom-counter:/src:ro
+      - custom-counter-extension:/extension
+
+volumes:
+  custom-counter-extension:

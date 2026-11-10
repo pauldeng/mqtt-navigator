@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/navigator-core", "crates/navigator-app"]
+exclude = ["vendor"]
 default-members = ["crates/navigator-app"]
 
 [workspace.package]
@@ -25,3 +26,7 @@ strip = true
 debug = "line-tables-only"
 split-debuginfo = "packed"  # symbols go to a separate file for crash analysis
 # panic stays "unwind": a library panic must stop one session, not the app.
+
+# Vendored fork with a local patch (see vendor/README.md). Remove when upstream fixes the issues.
+[patch.crates-io]
+ms-mqtt-client = { path = "vendor/ms-mqtt-client" }
