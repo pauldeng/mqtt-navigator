@@ -161,7 +161,7 @@ pub enum PublishResult {
     LostOnDisconnect,
 }
 
-/// Results and errors. Bounded log: when full, new events are dropped (P1).
+/// Results and errors. The log is bounded, and results are never lost: see [`EVENTS_CAP`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The connection is up again after `Reconnecting`. The subscriptions are sent again.
@@ -196,6 +196,9 @@ pub enum Event {
 pub struct NetStats {
     /// Messages dropped because a queue was full (both the client queue and ours).
     pub drops: AtomicU64,
+    /// Events dropped because the event log was full. This stays 0 while the UI drains the log
+    /// (see [`EVENTS_CAP`]). It can grow only if the UI stops draining during many reconnects.
+    pub event_drops: AtomicU64,
 }
 
 /// Queue limits of the net thread.
@@ -250,6 +253,27 @@ const STABLE_AFTER: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time that the open operations get to report "lost" after the connection ended.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Capacity of the event log.
+///
+/// A result must never be lost, or the UI waits for it for ever. The net thread cannot wait for
+/// the UI, so every producer of results asks first. Each one starts new work only while the log
+/// has [`EVENTS_RESERVE`] free places. That is more than the results of all the work that can be
+/// in flight at one time, so the log is never full when a result must go in:
+///
+/// - [`Net::send`] accepts a publish, subscribe or unsubscribe (each gives at most one result).
+///   When the UI drains too slowly, `send` returns [`SendError::Full`] and the UI shows its
+///   normal "try again" text. `Connect` gives no result, so it does not ask.
+/// - The automatic re-subscribe after a connect asks before it starts each filter. It also
+///   asks before it sends `Reconnected`. If the log has no room, it waits and tries again
+///   (see [`FEED_RETRY`]). So a profile with thousands of filters needs a UI that drains.
+const EVENTS_CAP: usize = 2048;
+/// Free room in the event log that a producer needs. Work in flight: the command queue (64),
+/// the session queue (256), the operations (`MAX_PENDING_OPS`), one in the supervisor and
+/// `Reconnected`. The rest is slack.
+const EVENTS_RESERVE: usize = 64 + 256 + MAX_PENDING_OPS + 1 + 64;
+/// Wait before the re-subscribe asks again for room in the full event log. The timer runs only
+/// while the re-subscribe is blocked.
+const FEED_RETRY: Duration = Duration::from_millis(50);
 /// Largest number of publish, subscribe and unsubscribe operations in flight at one time.
 const MAX_PENDING_OPS: usize = 256;
 const TOO_MANY_OPS_TEXT: &str = "Too many messages are waiting. Try again.";
@@ -284,6 +308,8 @@ pub struct Net {
     pub events: mpsc::Receiver<Event>,
     pub stats: Arc<NetStats>,
     commands: mpsc::Sender<(u64, Command)>,
+    /// Weak, so the event log still closes when the net thread ends. Used to read the free room.
+    events_tx: mpsc::WeakSender<Event>,
     /// Cancel epoch: counts disconnect requests. `SHUTDOWN` stops the thread. Each command
     /// carries the epoch at the time of [`Net::send`]. A cancel makes all older commands void.
     cancel: watch::Sender<u64>,
@@ -298,13 +324,14 @@ impl Net {
     pub fn start(limits: NetLimits) -> Self {
         let (commands, cmd_rx) = mpsc::channel(64);
         let (incoming_tx, incoming) = mpsc::channel(limits.queue_len.max(1));
-        let (events_tx, events) = mpsc::channel(256);
+        let (events_tx, events) = mpsc::channel(EVENTS_CAP);
         let (status_tx, status) = watch::channel(Status::default());
         let (cancel, cancel_rx) = watch::channel(0u64);
         let stats = Arc::new(NetStats::default());
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let (done_tx, done) = watch::channel(false);
 
+        let events_weak = events_tx.downgrade();
         let parts = (
             incoming_tx,
             events_tx,
@@ -351,6 +378,7 @@ impl Net {
         }
         Self {
             commands,
+            events_tx: events_weak,
             incoming,
             status,
             events,
@@ -361,11 +389,19 @@ impl Net {
         }
     }
 
-    /// Queues a command. Never blocks. Returns [`SendError::Full`] if 64 commands are waiting.
+    /// Queues a command. Never blocks. Returns [`SendError::Full`] if 64 commands are waiting,
+    /// or if the UI has not read enough events (see [`EVENTS_CAP`]).
     ///
     /// A [`Net::disconnect`] voids every command that was sent before it, even if the net
     /// thread has not read the command yet. A rejected command is answered with an event.
     pub fn send(&self, cmd: Command) -> Result<(), SendError> {
+        if !matches!(cmd, Command::Connect(_)) {
+            match self.events_tx.upgrade() {
+                Some(tx) if tx.capacity() < EVENTS_RESERVE => return Err(SendError::Full),
+                Some(_) => {}
+                None => return Err(SendError::Closed),
+            }
+        }
         let epoch = *self.cancel.borrow();
         self.commands.try_send((epoch, cmd)).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => SendError::Full,
@@ -466,9 +502,17 @@ impl Shared {
         })
     }
 
-    /// The event log is bounded. A full log drops the new event.
+    /// True if the log has room for the results of all work that can be in flight.
+    fn has_room(&self) -> bool {
+        self.events.capacity() >= EVENTS_RESERVE
+    }
+
+    /// Every producer asks for room first (see [`EVENTS_CAP`]), so this does not fail. If it fails
+    /// anyway (a UI that stops reading), the event is dropped and counted.
     fn event(&self, event: Event) {
-        let _ = self.events.try_send(event);
+        if self.events.try_send(event).is_err() {
+            self.stats.event_drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -971,28 +1015,29 @@ async fn session(
     // `desired` as one step.
     ctx.up.set(true);
     let filters = ctx.desired.borrow().clone();
+    let mut resub = Resub {
+        announce: false,
+        pending: filters.into(),
+        blocked: false,
+    };
     if shared.set_connected(generation, ctx.token) {
         tracing::info!(generation, reconnect = ctx.reconnect, "connected");
-        if ctx.reconnect {
-            shared.event(Event::Reconnected {
-                generation,
-                at: SystemTime::now(),
-            });
-        }
+        resub.announce = ctx.reconnect;
     }
 
     let mut ops = JoinSet::new();
     // An operation that times out reports it here. The session then ends.
     let expired = Rc::new(Notify::new());
     // Subscribe in batches: `dispatch` rejects more than `MAX_PENDING_OPS` operations.
-    let mut pending: VecDeque<(String, Qos)> = filters.into();
-    resubscribe(
-        &mut pending,
+    let retry = tokio::time::sleep(FEED_RETRY);
+    tokio::pin!(retry);
+    resub.feed(
         &client,
         generation,
         shared,
         &expired,
         &mut ops,
+        retry.as_mut(),
     );
 
     let mut ingest = Ingest {
@@ -1018,7 +1063,7 @@ async fn session(
                     // A newer command for a filter replaces its queued re-subscribe.
                     match &command {
                         Command::Subscribe { filter, .. } | Command::Unsubscribe { filter } => {
-                            pending.retain(|(f, _)| f != filter);
+                            resub.pending.retain(|(f, _)| f != filter);
                         }
                         _ => {}
                     }
@@ -1035,7 +1080,10 @@ async fn session(
                 if joined.is_err_and(|e| e.is_panic()) {
                     break Ended::OpPanic;
                 }
-                resubscribe(&mut pending, &client, generation, shared, &expired, &mut ops);
+                resub.feed(&client, generation, shared, &expired, &mut ops, retry.as_mut());
+            },
+            () = &mut retry, if resub.blocked => {
+                resub.feed(&client, generation, shared, &expired, &mut ops, retry.as_mut());
             },
         }
     };
@@ -1071,22 +1119,53 @@ async fn session(
     }
 }
 
-/// Starts queued re-subscribes while the batch limit allows. Half of the operation slots stay
-/// free for commands from the UI.
-fn resubscribe(
-    pending: &mut VecDeque<(String, Qos)>,
-    client: &Client,
-    generation: u64,
-    shared: &Rc<Shared>,
-    expired: &Rc<Notify>,
-    ops: &mut JoinSet<()>,
-) {
-    while ops.len() < MAX_PENDING_OPS / 2 {
-        let Some((filter, qos)) = pending.pop_front() else {
-            return;
-        };
-        let subscribe = Command::Subscribe { filter, qos };
-        dispatch(client, subscribe, generation, shared, expired, ops);
+/// What the session still has to send after the CONNACK: the `Reconnected` event and the
+/// subscribe of every desired filter.
+struct Resub {
+    announce: bool,
+    pending: VecDeque<(String, Qos)>,
+    /// The last `feed` stopped because the event log has no room. The retry timer runs.
+    blocked: bool,
+}
+
+impl Resub {
+    /// Sends `Reconnected` and starts queued re-subscribes while the batch limit and the room in
+    /// the event log allow. Half of the operation slots stay free for commands from the UI.
+    /// With no room, it starts the retry timer.
+    fn feed(
+        &mut self,
+        client: &Client,
+        generation: u64,
+        shared: &Rc<Shared>,
+        expired: &Rc<Notify>,
+        ops: &mut JoinSet<()>,
+        retry: std::pin::Pin<&mut tokio::time::Sleep>,
+    ) {
+        self.blocked = false;
+        if self.announce {
+            if !shared.has_room() {
+                return self.block(retry);
+            }
+            shared.event(Event::Reconnected {
+                generation,
+                at: SystemTime::now(),
+            });
+            self.announce = false;
+        }
+        while ops.len() < MAX_PENDING_OPS / 2 && !self.pending.is_empty() {
+            if !shared.has_room() {
+                return self.block(retry);
+            }
+            if let Some((filter, qos)) = self.pending.pop_front() {
+                let subscribe = Command::Subscribe { filter, qos };
+                dispatch(client, subscribe, generation, shared, expired, ops);
+            }
+        }
+    }
+
+    fn block(&mut self, retry: std::pin::Pin<&mut tokio::time::Sleep>) {
+        self.blocked = true;
+        retry.reset(tokio::time::Instant::now() + FEED_RETRY);
     }
 }
 

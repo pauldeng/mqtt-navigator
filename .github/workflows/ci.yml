@@ -60,6 +60,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: tests/broker/up.sh
       - run: cargo test -p navigator-core --features broker-tests --test broker_matrix -- --test-threads=1
+      - name: Load test (10 000 msg/s)
+        env:
+          LOAD_WARMUP_SECS: 30
+          LOAD_SECS: 120
+        run: cargo test --release -p navigator-core --features broker-tests --test load_ci -- --nocapture
       - name: Stop the broker
         if: always()
         run: tests/broker/down.sh

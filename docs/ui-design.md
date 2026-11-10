@@ -43,7 +43,7 @@ None of the three has a direct "edit and publish" or "reply" action for a receiv
 │ [Q0│Q1] [Subscribe]│ [{"cmd":"stop"}       ] Q[0│1] ☐R │ ───────                │
 │                   │ ▸ Properties          [Send ⌃⏎]    │ [Clear retained]       │
 ├───────────────────┴─────────────────────────────────────┴────────────────────────┤
-│ mqtts://broker:8883 · 1 240 msg/s · 105 topics · 34 / 256 MiB · 0 dropped         │ StatusBar
+│ mqtts://broker:8883 · 1 240 msg/s · 105 topics · 34 / 128 MiB · 0 dropped         │ StatusBar
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 

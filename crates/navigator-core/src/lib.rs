@@ -5,5 +5,6 @@ pub mod model;
 pub mod net;
 pub mod store;
 pub mod tls;
+pub mod topic;
 
 pub use model::{Incoming, MsgProps, Qos};

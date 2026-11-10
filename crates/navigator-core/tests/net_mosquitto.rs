@@ -541,6 +541,140 @@ async fn pending_operations_are_capped() {
     server.join().expect("server");
 }
 
+/// The UI does not read events while it sends 1000 QoS 0 publishes. Each publish must still get
+/// exactly one `Published` result (sent, or rejected by the cap). The old log held 256 events and dropped the rest.
+#[tokio::test(flavor = "current_thread")]
+async fn slow_ui_still_gets_every_publish_result() {
+    if !broker_up() {
+        return;
+    }
+    let _limits = limits_lock();
+    let mut net = Net::start(NetLimits::default());
+    connect(&mut net, profile(&[])).await;
+
+    const N: u64 = 1000;
+    let topic = format!("{}/slow", prefix());
+    let mut seen = vec![0u8; N as usize];
+    let mut got = 0u64;
+    let take = |seen: &mut Vec<u8>, got: &mut u64, event: Event| match event {
+        // The cap of 256 open operations can reject a publish. That is a result too.
+        Event::Published {
+            op_id,
+            result: PublishResult::Sent,
+            ..
+        }
+        | Event::Published {
+            op_id,
+            result: PublishResult::Rejected(_),
+            ..
+        } => {
+            seen[op_id as usize] += 1;
+            *got += 1;
+        }
+        other => panic!("unexpected {other:?}"),
+    };
+    for i in 0..N {
+        loop {
+            match net.send(out(i, &topic, b"x", Qos::AtMostOnce)) {
+                Ok(()) => break,
+                // The command queue is full, or the log has no spare room. Read a little.
+                Err(navigator_core::net::SendError::Full) => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    while let Ok(e) = net.events.try_recv() {
+                        take(&mut seen, &mut got, e);
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+    while got < N {
+        take(&mut seen, &mut got, next_event(&mut net).await);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(net.events.try_recv().is_err(), "an extra event");
+    assert!(seen.iter().all(|&n| n == 1), "a result is missing or twice");
+    assert_eq!(net.stats.event_drops.load(Ordering::Relaxed), 0);
+
+    net.shutdown().await;
+}
+
+/// 3000 desired filters and a UI that drains slowly. The automatic subscribe must wait for room
+/// in the event log. Every `Subscribed` result and every `Published` result must arrive once,
+/// and nothing may be dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn many_filters_and_a_slow_ui_lose_no_result() {
+    if !broker_up() {
+        return;
+    }
+    let _limits = limits_lock();
+    let mut net = Net::start(NetLimits::default());
+    let p = prefix();
+    const FILTERS: usize = 3000;
+    const PUBS: u64 = 300;
+    let filters: Vec<String> = (0..FILTERS).map(|i| format!("{p}/f/{i}")).collect();
+    let refs: Vec<&str> = filters.iter().map(String::as_str).collect();
+    connect(&mut net, profile(&refs)).await;
+
+    let mut subs = std::collections::HashSet::new();
+    let mut pubs = vec![0u8; PUBS as usize];
+    let mut take = |event: Event| match event {
+        Event::Subscribed {
+            filter,
+            result: Ok(_),
+            ..
+        } => assert!(subs.insert(filter), "a Subscribed result came twice"),
+        Event::Published {
+            op_id,
+            result: PublishResult::Acknowledged,
+            ..
+        } => pubs[op_id as usize] += 1,
+        other => panic!("unexpected {other:?}"),
+    };
+    let topic = format!("{p}/f/0");
+    // The UI reads a few events at each tick. The publishes must wait for room.
+    for i in 0..PUBS {
+        loop {
+            match net.send(out(i, &topic, b"x", Qos::AtLeastOnce)) {
+                Ok(()) => break,
+                Err(navigator_core::net::SendError::Full) => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    for _ in 0..3 {
+                        if let Ok(e) = net.events.try_recv() {
+                            take(e);
+                        }
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let event = tokio::time::timeout_at(deadline, net.events.recv())
+            .await
+            .expect("a result is missing")
+            .expect("events closed");
+        take(event);
+        tokio::time::sleep(Duration::from_micros(500)).await;
+        // `take` holds the sets, so count through the log: stop when the log is quiet.
+        if net.events.is_empty() && net.stats.event_drops.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if net.events.is_empty() {
+                break;
+            }
+        }
+    }
+    drop(take);
+    assert_eq!(subs.len(), FILTERS, "every Subscribed result arrives");
+    assert!(
+        pubs.iter().all(|&n| n == 1),
+        "every publish result arrives once"
+    );
+    assert_eq!(net.stats.event_drops.load(Ordering::Relaxed), 0);
+    net.shutdown().await;
+}
+
 /// `shutdown` resolves after the clean disconnect. `drop` does not wait.
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_resolves_and_drop_does_not_wait() {

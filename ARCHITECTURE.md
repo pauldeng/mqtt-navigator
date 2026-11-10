@@ -67,7 +67,7 @@ Rules:
 
 ## Memory
 
-One budget (default 256 MiB) covers all stored data. There are also limits for each topic and for the topic count. The message list (up to 10 000 entries) is inside the same budget. When the store is full, it evicts in this order: the oldest message-list entries, then the oldest history, then the oldest latest-value payloads. See the TopicStore section of the plan.
+One budget (default 128 MiB) covers all stored data. There are also limits for each topic and for the topic count. The message list (up to 10 000 entries) is inside the same budget. When the store is full, it evicts in this order: the oldest message-list entries, then the oldest history, then the oldest latest-value payloads. See the TopicStore section of the plan.
 
 ## Persistence
 

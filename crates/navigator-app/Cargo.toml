@@ -14,10 +14,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }  # local UTC offset, read once in the background
 dirs = "7.0.0"
 gpui-kit = "0.9.1"
 navigator-core = { path = "../navigator-core" }
-tokio = { version = "1.54.1", features = ["sync"] }
+tokio = { version = "1.54.1", features = ["sync", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "std"] }
 
