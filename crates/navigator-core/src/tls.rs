@@ -94,20 +94,27 @@ pub fn verify_text(f: &VerifyFailure) -> String {
 pub fn build(
     ca_file: Option<&Path>,
     client_cert: Option<(&Path, &Path)>,
+    key_passphrase: Option<&str>,
     verify: bool,
 ) -> Result<(TlsConfig, TlsDiag), String> {
-    let (builder, diag) = connector(ca_file, client_cert, verify)?;
+    let (builder, diag) = connector(ca_file, client_cert, key_passphrase, verify)?;
     Ok((TlsConfig::from(builder), diag))
 }
 
 const ENCRYPTED_KEY_TEXT: &str =
-    "The client key is encrypted. Use a key without a passphrase (passphrase support comes later).";
+    "The client key is encrypted. Enter the key passphrase, or use a key without a passphrase.";
+const WRONG_PASSPHRASE_TEXT: &str = "The client key passphrase is wrong, or the key is not valid.";
 
-/// Reads a private key. An encrypted key fails at once: OpenSSL must never ask for a passphrase
-/// on the terminal, because that would block the net thread.
-fn private_key_from_pem(pem: &[u8]) -> Result<openssl::pkey::PKey<openssl::pkey::Private>, String> {
+/// Reads a private key. An encrypted key with no passphrase fails at once: OpenSSL must never
+/// ask for a passphrase on the terminal, because that would block the net thread.
+fn private_key_from_pem(
+    pem: &[u8],
+    passphrase: Option<&str>,
+) -> Result<openssl::pkey::PKey<openssl::pkey::Private>, String> {
     if pem.windows(9).any(|w| w == b"ENCRYPTED") {
-        return Err(ENCRYPTED_KEY_TEXT.to_owned());
+        let pass = passphrase.ok_or_else(|| ENCRYPTED_KEY_TEXT.to_owned())?;
+        return openssl::pkey::PKey::private_key_from_pem_passphrase(pem, pass.as_bytes())
+            .map_err(|_| WRONG_PASSPHRASE_TEXT.to_owned());
     }
     // Second line of defence: a callback that fails, so OpenSSL never prompts.
     openssl::pkey::PKey::private_key_from_pem_callback(pem, |_| Err(ErrorStack::get()))
@@ -117,6 +124,7 @@ fn private_key_from_pem(pem: &[u8]) -> Result<openssl::pkey::PKey<openssl::pkey:
 fn connector(
     ca_file: Option<&Path>,
     client_cert: Option<(&Path, &Path)>,
+    key_passphrase: Option<&str>,
     verify: bool,
 ) -> Result<(SslConnectorBuilder, TlsDiag), String> {
     fn read(path: &Path, what: &str) -> Result<Vec<u8>, String> {
@@ -149,7 +157,7 @@ fn connector(
         let cert = chain
             .next()
             .ok_or("The client certificate file has no certificate.")?;
-        let key = private_key_from_pem(&read(key_path, "client key")?)?;
+        let key = private_key_from_pem(&read(key_path, "client key")?, key_passphrase)?;
         builder.set_certificate(&cert).map_err(tls)?;
         // OpenSSL 3 can already refuse a wrong key in `set_private_key`.
         let mismatch = |_| "The client certificate and key do not match.".to_owned();
@@ -308,14 +316,20 @@ mod tests {
             .expect("encrypted pem");
         assert!(String::from_utf8_lossy(&pem).contains("ENCRYPTED"));
         assert_eq!(
-            private_key_from_pem(&pem).expect_err("must fail"),
+            private_key_from_pem(&pem, None).expect_err("must fail"),
             ENCRYPTED_KEY_TEXT
+        );
+        // The passphrase decrypts it. A wrong one fails with text.
+        assert!(private_key_from_pem(&pem, Some("secret")).is_ok());
+        assert_eq!(
+            private_key_from_pem(&pem, Some("wrong")).expect_err("must fail"),
+            WRONG_PASSPHRASE_TEXT
         );
         // The plain key still loads. Garbage is not valid PEM and never prompts.
         let plain = key.private_key_to_pem_pkcs8().expect("pem");
-        assert!(private_key_from_pem(&plain).is_ok());
+        assert!(private_key_from_pem(&plain, None).is_ok());
         assert!(
-            private_key_from_pem(b"nonsense")
+            private_key_from_pem(b"nonsense", None)
                 .expect_err("must fail")
                 .contains("not valid PEM")
         );
@@ -357,24 +371,24 @@ mod tests {
         let cert = cert("client", &key_a, None, false, -1, 1);
         let cert_path = dir.write("c.pem", &cert.to_pem().expect("pem"));
         let key_path = dir.write("k.pem", &key_b.private_key_to_pem_pkcs8().expect("pem"));
-        let err = build(None, Some((&cert_path, &key_path)), true)
+        let err = build(None, Some((&cert_path, &key_path)), None, true)
             .err()
             .expect("error");
         assert_eq!(err, "The client certificate and key do not match.");
         // The matching key is accepted.
         let key_path = dir.write("k2.pem", &key_a.private_key_to_pem_pkcs8().expect("pem"));
-        assert!(build(None, Some((&cert_path, &key_path)), true).is_ok());
+        assert!(build(None, Some((&cert_path, &key_path)), None, true).is_ok());
     }
 
     #[test]
     fn unreadable_and_empty_files_give_text() {
         let dir = TempDir::new();
-        let err = build(Some(&dir.path().join("none.pem")), None, true)
+        let err = build(Some(&dir.path().join("none.pem")), None, None, true)
             .err()
             .expect("error");
         assert!(err.starts_with("Cannot read the CA file"), "{err}");
         let empty = dir.write("e.pem", b"");
-        let err = build(Some(&empty), None, true).err().expect("error");
+        let err = build(Some(&empty), None, None, true).err().expect("error");
         assert!(err.contains("no certificate"), "{err}");
     }
 
@@ -405,7 +419,7 @@ mod tests {
 
         let dir = TempDir::new();
         let ca_path = ca.map(|c| dir.write("ca.pem", &c.to_pem().expect("pem")));
-        let (builder, diag) = connector(ca_path.as_deref(), None, verify).expect("build");
+        let (builder, diag) = connector(ca_path.as_deref(), None, None, verify).expect("build");
         // Same steps as the vendored `tls_handshake`.
         let ssl = builder
             .build()

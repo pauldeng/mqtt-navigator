@@ -20,7 +20,9 @@ use ms_mqtt_client::packet::{ConnectProperties, PublishProperties};
 use ms_mqtt_client::topic::TopicName;
 use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::Qos;
-use navigator_core::net::{Command, ConnState, Event, Net, NetLimits, Profile, Transport};
+use navigator_core::net::{
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Transport,
+};
 use navigator_core::store::{Limits, TopicStore};
 
 const PORT: u16 = 18830;
@@ -159,13 +161,13 @@ fn ten_thousand_messages_per_second_through_net_and_store() {
         .expect("runtime");
     rt.block_on(async {
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(Profile {
+        net.send(Command::Connect(Box::new(ConnectConfig::from(Profile {
             host: "127.0.0.1".into(),
             port: PORT,
             transport: Transport::Tcp,
             subscriptions: vec![("load/#".into(), Qos::AtMostOnce)],
             ..Profile::default()
-        })))
+        }))))
         .expect("send");
         let generation = tokio::time::timeout(
             Duration::from_secs(10),

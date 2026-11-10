@@ -15,8 +15,8 @@ use ms_mqtt_client::topic::TopicName;
 use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
-    Command, ConnState, Event, Net, NetLimits, Outgoing, Profile, PublishResult, Transport,
-    queue_cost,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, PublishResult,
+    Transport, queue_cost,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -62,9 +62,10 @@ fn profile(subs: &[&str]) -> Profile {
     }
 }
 
-async fn connect(net: &mut Net, p: Profile) -> u64 {
+async fn connect(net: &mut Net, p: impl Into<ConnectConfig>) -> u64 {
     let previous = net.status.borrow().generation;
-    net.send(Command::Connect(Box::new(p))).expect("send");
+    net.send(Command::Connect(Box::new(p.into())))
+        .expect("send");
     let s = tokio::time::timeout(
         WAIT,
         net.status
@@ -85,11 +86,32 @@ async fn wait_state(net: &mut Net, f: impl Fn(&ConnState) -> bool) -> u64 {
     s.generation
 }
 
+/// The next event, without the reports of the session filters (see `next_session_filters`).
 async fn next_event(net: &mut Net) -> Event {
+    loop {
+        match next_event_raw(net).await {
+            Event::SessionFilters { .. } => {}
+            other => return other,
+        }
+    }
+}
+
+async fn next_event_raw(net: &mut Net) -> Event {
     tokio::time::timeout(WAIT, net.events.recv())
         .await
         .expect("event timeout")
         .expect("events closed")
+}
+
+/// Waits for a report of the session filters that satisfies `f`. Returns the set.
+async fn next_session_filters(net: &mut Net, f: impl Fn(&[String]) -> bool) -> Vec<String> {
+    loop {
+        if let Event::SessionFilters { filters, .. } = next_event_raw(net).await
+            && f(&filters)
+        {
+            return filters;
+        }
+    }
 }
 
 async fn next_incoming(net: &mut Net) -> Incoming {
@@ -234,7 +256,8 @@ async fn connection_refused_is_retried_until_disconnect() {
     let mut net = Net::start(NetLimits::default());
     let mut p = profile(&[]);
     p.port = 1; // nothing listens here
-    net.send(Command::Connect(Box::new(p))).expect("send");
+    net.send(Command::Connect(Box::new(p.into())))
+        .expect("send");
     wait_state(&mut net, |s| matches!(s, ConnState::Reconnecting { .. })).await;
     let s = net.status.borrow().clone();
     assert!(
@@ -392,7 +415,8 @@ async fn hostile_broker_oversized_packet_fails_session() {
     });
     let mut p = profile(&[]);
     p.port = port;
-    net.send(Command::Connect(Box::new(p))).expect("send");
+    net.send(Command::Connect(Box::new(p.into())))
+        .expect("send");
     wait_state(&mut net, |s| matches!(s, ConnState::Failed(_))).await;
     let state = net.status.borrow().state.clone();
     assert!(
@@ -624,11 +648,18 @@ async fn many_filters_and_a_slow_ui_lose_no_result() {
             result: Ok(_),
             ..
         } => assert!(subs.insert(filter), "a Subscribed result came twice"),
+        // While the 3000 re-subscribes use the operation slots, a publish can get the documented
+        // "Too many messages are waiting" answer. It is that publish's single result.
         Event::Published {
             op_id,
             result: PublishResult::Acknowledged,
             ..
         } => pubs[op_id as usize] += 1,
+        Event::Published {
+            op_id,
+            result: PublishResult::Rejected(why),
+            ..
+        } if why.contains("Too many") => pubs[op_id as usize] += 1,
         other => panic!("unexpected {other:?}"),
     };
     let topic = format!("{p}/f/0");
@@ -706,7 +737,7 @@ async fn disconnect_then_connect_keeps_the_new_session() {
     let mut generation = connect(&mut net, p.clone()).await;
     for _ in 0..ROUNDS {
         net.disconnect();
-        net.send(Command::Connect(Box::new(p.clone())))
+        net.send(Command::Connect(Box::new(p.clone().into())))
             .expect("send");
         let s = tokio::time::timeout(
             WAIT,
@@ -781,4 +812,460 @@ async fn unsuback_reason_is_checked() {
         net.shutdown().await;
         server.join().expect("server");
     }
+}
+
+/// A TCP forwarder to the broker that a test can cut, like a cable pull.
+struct CuttableProxy {
+    port: u16,
+    streams: std::sync::Arc<Mutex<Vec<std::net::TcpStream>>>,
+    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CuttableProxy {
+    fn start() -> Self {
+        Self::start_on(0)
+    }
+
+    /// Like `start`, on a given port (0: any). A port of an older proxy can need a moment to
+    /// become free.
+    fn start_on(port: u16) -> Self {
+        let listener = (0..50)
+            .find_map(|_| {
+                std::net::TcpListener::bind(("127.0.0.1", port))
+                    .map_err(|_| std::thread::sleep(Duration::from_millis(100)))
+                    .ok()
+            })
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let streams = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s, c) = (streams.clone(), cut.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                if c.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(upstream) = std::net::TcpStream::connect("127.0.0.1:1883") else {
+                    continue;
+                };
+                for (mut from, mut to) in [
+                    (client.try_clone(), upstream.try_clone()),
+                    (upstream.try_clone(), client.try_clone()),
+                ]
+                .into_iter()
+                .filter_map(|(a, b)| Some((a.ok()?, b.ok()?)))
+                {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+                s.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend([client, upstream]);
+            }
+        });
+        Self { port, streams, cut }
+    }
+
+    /// Closes every connection without an MQTT DISCONNECT, and refuses new ones.
+    fn cut(&self) {
+        self.cut.store(true, Ordering::SeqCst);
+        for s in self
+            .streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port)); // wakes the accept loop
+    }
+}
+
+/// The CONNECT carries the Will: when the connection drops without DISCONNECT, the broker
+/// publishes it to a second client.
+#[tokio::test(flavor = "current_thread")]
+async fn will_is_published_when_the_connection_drops() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let p = prefix();
+    let will_topic = format!("{p}/will");
+    let mut observer = Net::start(NetLimits::default());
+    let mut watcher = profile(&[&will_topic]);
+    watcher.client_id = format!("obs-{}", watcher.client_id);
+    connect(&mut observer, watcher).await;
+    assert!(matches!(
+        next_event(&mut observer).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+
+    let proxy = CuttableProxy::start();
+    let mut victim = Net::start(NetLimits::default());
+    let mut v = profile(&[]);
+    v.port = proxy.port;
+    v.will = Some(navigator_core::net::Will {
+        topic: will_topic.clone(),
+        payload: vec![0, b'g', b'o', b'n', b'e', 0xff],
+        qos: Qos::AtLeastOnce,
+        retain: false,
+        delay_secs: 0,
+    });
+    connect(&mut victim, v).await;
+    proxy.cut();
+
+    let m = next_incoming(&mut observer).await;
+    assert_eq!(*m.topic, *will_topic);
+    assert_eq!(&m.payload[..], &[0, b'g', b'o', b'n', b'e', 0xff]);
+    assert_eq!(m.qos, Qos::AtLeastOnce);
+    victim.shutdown().await;
+    observer.shutdown().await;
+}
+
+/// A Connect that the user replaced before it answered. The generation is chosen when the
+/// Connect is sent, so the UI knows which generation is the new one. The old Connect (and the
+/// Subscribe that followed it) must not show up under the new generation.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replaced_connect_never_uses_the_new_generation() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let mut net = Net::start(NetLimits::default());
+    let mut a = profile(&[]);
+    a.port = 1; // nothing listens here: the Connect A never gets a CONNACK
+    let ga = net.connect(a.into()).expect("connect A");
+    net.send(Command::Subscribe {
+        filter: "a/only".into(),
+        qos: Qos::AtMostOnce,
+    })
+    .expect("subscribe for A");
+    // The user switches to B before A has published anything.
+    net.disconnect();
+    let p = prefix();
+    let gb = net
+        .connect(profile(&[&format!("{p}/b")]).into())
+        .expect("connect B");
+    assert!(gb > ga, "generations grow: {ga} then {gb}");
+    tokio::time::timeout(
+        WAIT,
+        net.status
+            .wait_for(|s| s.generation == gb && s.state == ConnState::Connected),
+    )
+    .await
+    .expect("B connects")
+    .expect("status");
+    // B works: its own SUBACK carries its generation. Events of A have another one.
+    let mut b_events = 0;
+    loop {
+        let event = next_event(&mut net).await;
+        let g = match &event {
+            Event::Reconnected { generation, .. }
+            | Event::Subscribed { generation, .. }
+            | Event::Unsubscribed { generation, .. }
+            | Event::Published { generation, .. }
+            | Event::SessionFilters { generation, .. }
+            | Event::Error { generation, .. } => *generation,
+        };
+        if g != gb {
+            assert!(g < gb, "{event:?}");
+            continue;
+        }
+        assert!(
+            matches!(&event, Event::Subscribed { result: Ok(_), .. }),
+            "{event:?}"
+        );
+        b_events += 1;
+        break;
+    }
+    assert_eq!(b_events, 1);
+    publish_plain(&format!("{p}/b"), b"hi".to_vec()).await;
+    let m = next_incoming(&mut net).await;
+    assert_eq!(m.generation, gb);
+    net.shutdown().await;
+}
+
+/// A filter that the user removes while the connection is down. The broker keeps the session
+/// (clean start off, session expiry on), so it still has the subscription. The net thread must
+/// remove it after the CONNACK, or the broker keeps sending its messages.
+#[tokio::test(flavor = "current_thread")]
+async fn a_removal_while_offline_reaches_a_resumed_session() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let p = prefix();
+    let topic = format!("{p}/kept");
+    let proxy = CuttableProxy::start();
+    let port = proxy.port;
+    let mut net = Net::start(NetLimits::default());
+    let mut v = profile(&[&topic]);
+    v.port = port;
+    v.clean_start = false;
+    v.session_expiry_secs = 60;
+    let generation = connect(&mut net, v).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+
+    // Cable pull. The net thread waits in the backoff, and nothing listens on the port.
+    proxy.cut();
+    wait_state(&mut net, |s| matches!(s, ConnState::Reconnecting { .. })).await;
+    net.send(Command::Unsubscribe {
+        filter: topic.clone(),
+    })
+    .expect("unsubscribe");
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Unsubscribed { result: Ok(()), .. }
+    ));
+
+    // The way to the broker is back. The broker resumes the session.
+    let _proxy2 = CuttableProxy::start_on(port);
+    tokio::time::timeout(
+        WAIT * 2,
+        net.status
+            .wait_for(|s| s.generation == generation && s.state == ConnState::Connected),
+    )
+    .await
+    .expect("reconnects")
+    .expect("status");
+    // Let the UNSUBSCRIBE reach the broker, then publish.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    publish_plain(&topic, b"must not arrive".to_vec()).await;
+    let got = tokio::time::timeout(Duration::from_secs(2), net.incoming.recv()).await;
+    assert!(got.is_err(), "the removed filter still delivers: {got:?}");
+    net.shutdown().await;
+}
+
+/// A persistent-session profile. The same value gives the same broker session.
+fn persistent(subs: &[&str], port: u16) -> Profile {
+    Profile {
+        port,
+        clean_start: false,
+        session_expiry_secs: 60,
+        ..profile(subs)
+    }
+}
+
+/// Waits until nothing arrives for a short time. `Err` shows the message that arrived.
+async fn expect_silence(net: &mut Net) {
+    let got = tokio::time::timeout(Duration::from_secs(2), net.incoming.recv()).await;
+    assert!(got.is_err(), "the removed filter still delivers: {got:?}");
+}
+
+/// The user removes a filter after a manual Disconnect. The next Connect resumes the broker
+/// session, which still holds the filter. The net thread must remove it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_removal_after_a_manual_disconnect_reaches_the_next_session() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let p = prefix();
+    let topic = format!("{p}/x");
+    let mut net = Net::start(NetLimits::default());
+    let first = persistent(&[&topic], 1883);
+    connect(&mut net, first.clone()).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    // Nothing is connected: the net thread answers with an error, and the UI keeps the removal.
+    net.send(Command::Unsubscribe {
+        filter: topic.clone(),
+    })
+    .expect("unsubscribe");
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Unsubscribed { result: Err(_), .. }
+    ));
+    // The same session (host, port, client ID), now without the filter.
+    connect(
+        &mut net,
+        Profile {
+            subscriptions: vec![],
+            ..first
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    publish_plain(&topic, b"must not arrive".to_vec()).await;
+    expect_silence(&mut net).await;
+    net.shutdown().await;
+}
+
+/// A live UNSUBSCRIBE that never reaches the broker (the connection is cut first). The next
+/// connection resumes the session, and the net thread removes the filter then.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_unsubscribe_is_retried_on_the_resumed_session() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let p = prefix();
+    let topic = format!("{p}/lost");
+    let proxy = CuttableProxy::start();
+    let port = proxy.port;
+    let mut net = Net::start(NetLimits::default());
+    let generation = connect(&mut net, persistent(&[&topic], port)).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    // Cut the cable, and send the UNSUBSCRIBE at once: the broker cannot get it.
+    proxy.cut();
+    net.send(Command::Unsubscribe {
+        filter: topic.clone(),
+    })
+    .expect("unsubscribe");
+    let _ = next_event(&mut net).await; // Ok (offline) or the error of the lost request
+    let _proxy2 = CuttableProxy::start_on(port);
+    tokio::time::timeout(
+        WAIT * 2,
+        net.status
+            .wait_for(|s| s.generation == generation && s.state == ConnState::Connected),
+    )
+    .await
+    .expect("reconnects")
+    .expect("status");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    publish_plain(&topic, b"must not arrive".to_vec()).await;
+    expect_silence(&mut net).await;
+    net.shutdown().await;
+}
+
+/// A clean session holds nothing, so the same steps need no removal and still work.
+#[tokio::test(flavor = "current_thread")]
+async fn a_clean_session_forgets_the_filters() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let p = prefix();
+    let topic = format!("{p}/clean");
+    let mut net = Net::start(NetLimits::default());
+    let first = profile(&[&topic]);
+    connect(&mut net, first.clone()).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    connect(
+        &mut net,
+        Profile {
+            subscriptions: vec![],
+            ..first
+        },
+    )
+    .await;
+    publish_plain(&topic, b"nobody listens".to_vec()).await;
+    expect_silence(&mut net).await;
+    // Subscribing again still works.
+    net.send(Command::Subscribe {
+        filter: topic.clone(),
+        qos: Qos::AtLeastOnce,
+    })
+    .expect("subscribe");
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    publish_plain(&topic, b"now".to_vec()).await;
+    assert_eq!(&next_incoming(&mut net).await.payload[..], b"now");
+    net.shutdown().await;
+}
+
+/// The app starts again between the removal and the reconnect: a NEW `Net` has no memory. The
+/// saved set (from `Event::SessionFilters`) seeds it, so it still removes the filter from the
+/// resumed session.
+#[tokio::test(flavor = "current_thread")]
+async fn a_removal_survives_a_restart_with_the_saved_session_filters() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let p = prefix();
+    let topic = format!("{p}/restart");
+    let first = persistent(&[&topic], 1883);
+    let mut net = Net::start(NetLimits::default());
+    connect(&mut net, first.clone()).await;
+    // The report comes after the SUBSCRIBE was sent. The app would save this set.
+    let saved = next_session_filters(&mut net, |f| f.contains(&topic)).await;
+    net.shutdown().await;
+
+    // The user removed the filter (the new profile has no subscriptions), and the app restarts.
+    let mut fresh = Net::start(NetLimits::default());
+    let config = ConnectConfig {
+        session_filters: saved,
+        ..ConnectConfig::from(Profile {
+            subscriptions: vec![],
+            ..first
+        })
+    };
+    fresh
+        .send(Command::Connect(Box::new(config)))
+        .expect("connect");
+    wait_state(&mut fresh, |s| s == &ConnState::Connected).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    publish_plain(&topic, b"must not arrive".to_vec()).await;
+    expect_silence(&mut fresh).await;
+    // The set is empty now: the UNSUBACK was reported.
+    next_session_filters(&mut fresh, |f| f.is_empty()).await;
+    fresh.shutdown().await;
+}
+
+/// A new profile shares the broker session of an older one (an imported copy with the same
+/// client ID). The net thread has the set in its cache and nothing changes, but the new profile
+/// must still get the set to save it. Without it, a restart after a removal forgets the filter.
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_profile_on_a_shared_session_gets_the_cached_set() {
+    let _limits = limits_lock();
+    if !broker_up() {
+        return;
+    }
+    let p = prefix();
+    let topic = format!("{p}/shared");
+    let original = persistent(&[&topic], 1883);
+    let mut net = Net::start(NetLimits::default());
+    connect(&mut net, original.clone()).await;
+    next_session_filters(&mut net, |f| f.contains(&topic)).await;
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+
+    // The imported copy: a new ID, the same broker and client ID, no saved set.
+    let copy = Profile {
+        id: uuid::Uuid::new_v4(),
+        session_filters: vec![],
+        ..original
+    };
+    connect(&mut net, copy.clone()).await;
+    // Nothing changed in the cached set, and it is reported anyway.
+    let saved = next_session_filters(&mut net, |f| f.contains(&topic)).await;
+    net.shutdown().await;
+
+    // The user removes the filter from the copy, and the app restarts with the saved set.
+    let mut fresh = Net::start(NetLimits::default());
+    let config = ConnectConfig {
+        session_filters: saved,
+        ..ConnectConfig::from(Profile {
+            subscriptions: vec![],
+            ..copy
+        })
+    };
+    fresh
+        .send(Command::Connect(Box::new(config)))
+        .expect("connect");
+    wait_state(&mut fresh, |s| s == &ConnState::Connected).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    publish_plain(&topic, b"must not arrive".to_vec()).await;
+    expect_silence(&mut fresh).await;
+    fresh.shutdown().await;
 }

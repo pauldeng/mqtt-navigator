@@ -1,12 +1,16 @@
 //! Main window. P3: title bar with filter, subscriptions, message list and topic tree, details,
 //! composer, status bar.
 
+mod profiles;
+
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::TabBar;
 use gpui_kit::component::{
@@ -15,17 +19,22 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use navigator_core::net::{
-    Command, ConnState, Event, Net, NetLimits, Outgoing, Profile, SendError, Status,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, SendError, Status,
 };
+use navigator_core::settings::{RowHeight, Settings, ThemeMode, ViewMode};
 use navigator_core::store::{
     Direction, DirectionFilter, Limits, ListFilter, Msg, NodeId, RowId, RowView, SendStatus,
     TopicStore, TreeFilter,
 };
 use navigator_core::{MsgProps, Qos};
+use uuid::Uuid;
 
+use crate::connections::{Choice, ConnectionSheet, ProfileItem, SheetEvent};
 use crate::messages::{
     colour_slot, format_time, group_digits, status_failed, status_from_result, status_text,
 };
+use crate::persist::Writer;
+use crate::secrets::{Cached, Secrets};
 
 actions!(
     navigator_ui,
@@ -137,6 +146,10 @@ enum RowData {
 const FRAME_BUDGET: Duration = Duration::from_millis(4);
 /// Wait between merges, so that many messages make one render.
 const COALESCE: Duration = Duration::from_millis(33);
+/// After the first frame, a window resize in this time comes from the window system.
+// ponytail: a window manager resize later than this is saved as the user's size. Add a check
+// for user input (a mouse press on the window border) if that shows up.
+const RESIZE_SETTLE: Duration = Duration::from_secs(1);
 /// Wait before a filter text change applies.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 /// Row heights of the message list and the tree.
@@ -243,6 +256,56 @@ impl Subs {
     }
 }
 
+/// Decides which connection generation the UI shows. It is free of gpui types, so that tests can
+/// run it.
+///
+/// The UI chooses the generation of a connection: `Net::connect` returns it when the Connect is
+/// queued, and the net thread uses it for every status, event and message of that connection.
+/// The UI accepts data of its current generation only. A switch, a delete or a cancel clears
+/// the current generation. Until the next Connect, nothing of an older connection can pass,
+/// even if its status has not reached the UI yet.
+#[derive(Default)]
+struct GenGate {
+    current: Option<u64>,
+}
+
+impl GenGate {
+    /// A Connect with generation `g` was queued. It replaces the older one.
+    fn begin(&mut self, g: u64) {
+        self.current = Some(g);
+    }
+
+    /// The profile changed or the connection was cancelled.
+    fn clear(&mut self) {
+        self.current = None;
+    }
+
+    /// Generation 0 is not a connection. The net thread uses it for a start error and for the
+    /// answers to commands that came before any Connect.
+    fn accept(&self, g: u64) -> bool {
+        g == 0 || self.current == Some(g)
+    }
+
+    /// The generation of the shown data. 0: no connection.
+    fn generation(&self) -> u64 {
+        self.current.unwrap_or(0)
+    }
+
+    /// A Connect was queued, and no status of it has arrived (`status_generation` is another).
+    fn outstanding(&self, status_generation: u64) -> bool {
+        self.current.is_some_and(|c| c != status_generation)
+    }
+}
+
+/// True while a connection is up or on its way: a live state, or a Connect that has no status
+/// yet. A save of the active profile must not replace the runtime profile in this time.
+fn connection_live(state: &ConnState, gate: &GenGate, status_generation: u64) -> bool {
+    matches!(
+        state,
+        ConnState::Connected | ConnState::Connecting | ConnState::Reconnecting { .. }
+    ) || gate.outstanding(status_generation)
+}
+
 /// Text for a command that the net queue did not accept.
 fn send_error_text(e: SendError) -> &'static str {
     match e {
@@ -275,7 +338,37 @@ fn validate_filter(filter: &str) -> Result<(), &'static str> {
 }
 
 pub struct Navigator {
-    profile: Profile,
+    /// The active profile. `None`: the user has not chosen one (or deleted it).
+    profile: Option<Profile>,
+    /// The unsaved "Command line" profile. It is never written to the settings file.
+    session: Option<Profile>,
+    /// The settings in memory. The writer thread saves them (see `persist`).
+    settings: Settings,
+    /// The settings file has arrived. Until then the sheet and saves are off.
+    settings_loaded: bool,
+    /// The file could not be read, so the app must never replace it.
+    read_only: bool,
+    writer: Option<Writer>,
+    secrets: Secrets,
+    /// Secrets that this session knows (loaded, entered or from the command line).
+    secret_cache: HashMap<Uuid, Cached>,
+    /// The keyring read that a Connect waits for: its token and the profile. A switch, a delete,
+    /// an edit or a cancel clears it. A reply with another token never connects.
+    secret_req: Option<(u64, Uuid)>,
+    next_secret_token: u64,
+    /// The active profile was edited while the connection was live. The connection still uses
+    /// the old settings.
+    reconnect_pending: bool,
+    /// The profile of each recent Connect, by generation. A report of the session filters can
+    /// come after a switch, and it belongs to the old profile.
+    connect_owners: Vec<(u64, Uuid)>,
+    profile_select: Entity<SelectState<Vec<ProfileItem>>>,
+    sheet: Option<WeakEntity<ConnectionSheet>>,
+    /// The window system can resize a new window soon after the first frame. A resize before
+    /// this time is not the user's. `None`: no frame yet.
+    resize_settled_at: Option<Instant>,
+    user_resized: bool,
+    last_size: (f32, f32),
     net: Net,
     store: TopicStore,
     status: Status,
@@ -308,7 +401,7 @@ pub struct Navigator {
     root_focus: FocusHandle,
     list_focus: FocusHandle,
     /// Connection generation of the shown data. Newer data from the net thread replaces it.
-    generation: u64,
+    gate: GenGate,
     /// Formatted payload of the selected message, with the key it was built for.
     detail_cache: Option<(DetailKey, SharedString)>,
     list_scroll: UniformListScrollHandle,
@@ -339,7 +432,23 @@ struct Rate {
 }
 
 impl Navigator {
-    pub fn new(profile: Profile, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `cli` is the session profile from the command line. The window opens first. The settings
+    /// arrive later, as an event.
+    pub fn new(cli: Option<ConnectConfig>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut secret_cache = HashMap::new();
+        let profile = cli.map(|c| {
+            // The command line password stays in memory. It is never saved.
+            secret_cache.insert(
+                c.profile.id,
+                Cached {
+                    password: c.password,
+                    passphrase: c.key_passphrase,
+                    loaded: true,
+                    ..Cached::default()
+                },
+            );
+            c.profile
+        });
         let mut net = Net::start(NetLimits::default());
         let incoming = std::mem::replace(&mut net.incoming, tokio_channel_placeholder());
         let events = std::mem::replace(&mut net.events, tokio_channel_placeholder());
@@ -369,11 +478,32 @@ impl Navigator {
             },
         );
 
-        // Theme follows the system (event-driven).
+        // Theme follows the system (event-driven), until the settings say Light or Dark.
         Theme::sync_system_appearance(Some(window), cx);
-        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
-            Theme::sync_system_appearance(Some(window), cx);
+        let appearance = cx.observe_window_appearance(window, |v, window, cx| {
+            if v.settings.ui.theme_mode == ThemeMode::System {
+                Theme::sync_system_appearance(Some(window), cx);
+            }
         });
+        let bounds = cx.observe_window_bounds(window, |v, window, cx| v.on_resize(window, cx));
+        let profile_select =
+            cx.new(|cx| SelectState::new(Vec::<ProfileItem>::new(), None, window, cx));
+        let select_events = cx.subscribe_in(
+            &profile_select,
+            window,
+            |v, _, ev: &SelectEvent<Vec<ProfileItem>>, window, cx| {
+                let SelectEvent::Confirm(choice) = ev;
+                match choice {
+                    Some(Choice::Profile(id)) => v.request_switch(*id, false, window, cx),
+                    Some(Choice::Manage) => {
+                        // The select shows the active profile again, not "Manage connections…".
+                        v.sync_select(window, cx);
+                        v.open_sheet(None, false, window, cx);
+                    }
+                    None => {}
+                }
+            },
+        );
 
         let (kick, kick_rx) = tokio::sync::mpsc::channel(1);
         Self::spawn_ingest(incoming, kick_rx, cx);
@@ -397,8 +527,8 @@ impl Navigator {
 
         let subs = Subs {
             rows: profile
-                .subscriptions
                 .iter()
+                .flat_map(|p| p.subscriptions.iter())
                 .map(|(filter, qos)| Sub {
                     filter: filter.clone(),
                     qos: *qos,
@@ -406,8 +536,30 @@ impl Navigator {
                 })
                 .collect(),
         };
+        let path = crate::persist::settings_path();
+        let (writer_errors, writer_errors_rx) = tokio::sync::mpsc::channel(4);
+        let writer = path.clone().map(|p| Writer::start(p, writer_errors));
         let mut this = Self {
+            session: profile.clone(),
             profile,
+            settings: Settings::default(),
+            settings_loaded: false,
+            read_only: false,
+            writer,
+            secrets: Secrets::start(),
+            secret_cache,
+            secret_req: None,
+            next_secret_token: 1,
+            reconnect_pending: false,
+            connect_owners: Vec::new(),
+            profile_select,
+            sheet: None,
+            resize_settled_at: None,
+            user_resized: false,
+            last_size: {
+                let s = window.viewport_size();
+                (f32::from(s.width), f32::from(s.height))
+            },
             net,
             store: TopicStore::new(Limits::default()),
             status: Status::default(),
@@ -428,7 +580,7 @@ impl Navigator {
             utc_offset: 0,
             root_focus,
             list_focus: cx.focus_handle(),
-            generation: 0,
+            gate: GenGate::default(),
             detail_cache: None,
             list_scroll: UniformListScrollHandle::new(),
             tree_scroll: UniformListScrollHandle::new(),
@@ -446,39 +598,92 @@ impl Navigator {
             // On quit, disconnect cleanly. gpui waits for quit handlers for at most 200 ms.
             _subscriptions: vec![
                 appearance,
+                bounds,
+                select_events,
                 sub_events,
                 filter_events,
-                cx.on_app_quit(|v: &mut Self, _| v.net.shutdown()),
+                // On quit, the settings writer saves a pending change at once.
+                cx.on_app_quit(|v: &mut Self, _| {
+                    let net = v.net.shutdown();
+                    let flush = v.writer.as_ref().map(Writer::flush);
+                    async move {
+                        if let Some(flush) = flush {
+                            let _ = flush.await;
+                        }
+                        net.await
+                    }
+                }),
             ],
         };
         this.sync_subs();
-        this.connect();
+        this.sync_select(window, cx);
+        // The command line gives a session profile: connect at once, as before.
+        if this.profile.is_some()
+            && let Err(why) = this.send_connect()
+        {
+            tracing::warn!(%why, "The command line connection is not valid");
+        }
+        this.spawn_settings(path, writer_errors_rx, window, cx);
         this
     }
 
-    /// Accepts data of generation `g`. Data of an older generation is dropped. A newer generation
-    /// (a manual connect) keeps the data, because data belongs to one profile and there is one
-    /// profile. Only the SUBACK results restart. Messages, events and status can arrive in any
-    /// order, so each of them calls this first.
-    fn accept(&mut self, g: u64) -> bool {
-        if g < self.generation {
-            return false;
-        }
-        if g > self.generation {
-            self.generation = g;
-            self.subs.connection_reset();
-            self.sync_subs();
-        }
-        true
+    /// Accepts data of generation `g` (see [`GenGate`]). Messages, events and status can arrive
+    /// in any order, so each of them calls this first.
+    fn accept(&self, g: u64) -> bool {
+        self.gate.accept(g)
     }
 
-    fn connect(&self) {
-        // The subscription list is what the user sees now, not what the command line gave.
-        let mut profile = self.profile.clone();
+    /// A Connect is on its way and no status of it has arrived.
+    fn connecting(&self) -> bool {
+        self.secret_req.is_some() || self.gate.outstanding(self.status.generation)
+    }
+
+    /// Cancels the connection. From now on no data of it is accepted (see [`GenGate`]).
+    fn cancel_connection(&mut self) {
+        self.net.disconnect();
+        self.gate.clear();
+        self.secret_req = None;
+        self.reconnect_pending = false;
+    }
+
+    /// Sends the connect command for the active profile. The secrets must be in the cache (see
+    /// `connect` in `profiles.rs`): this does no keyring call. `Err` is the text for the user:
+    /// the profile or a secret is not valid, and nothing was sent.
+    fn send_connect(&mut self) -> Result<(), String> {
+        let Some(mut profile) = self.profile.clone() else {
+            return Ok(());
+        };
+        // The subscription list is what the user sees now, not what the profile has saved.
         profile.subscriptions = self.subs.wanted();
+        let secrets = self
+            .secret_cache
+            .get(&profile.id)
+            .cloned()
+            .unwrap_or_default();
+        let owner = profile.id;
+        let config = ConnectConfig {
+            session_filters: profile.session_filters.clone(),
+            password: secrets.password,
+            key_passphrase: secrets.passphrase,
+            ..ConnectConfig::from(profile)
+        };
+        // A settings file or an old version can hold a value that panics the MQTT library.
+        config.validate()?;
+        self.reconnect_pending = false;
         tracing::info!(url = %self.url(), "Connect");
-        if self.net.send(Command::Connect(Box::new(profile))).is_err() {
+        match self.net.connect(config) {
+            Ok(generation) => {
+                self.gate.begin(generation);
+                self.connect_owners.push((generation, owner));
+                let extra = self.connect_owners.len().saturating_sub(16);
+                self.connect_owners.drain(..extra);
+                // The broker forgets the subscriptions of the old connection.
+                self.subs.connection_reset();
+                self.sync_subs();
+                Ok(())
+            }
             // ponytail: the command queue (64) is full only under extreme UI spam.
+            Err(e) => Err(send_error_text(e).into()),
         }
     }
 
@@ -512,6 +717,7 @@ impl Navigator {
             state: SubState::Pending,
         });
         self.sync_subs();
+        self.persist_subs();
         cx.notify();
     }
 
@@ -562,7 +768,10 @@ impl Navigator {
             filter: filter.to_string(),
         };
         match self.net.send(cmd) {
-            Ok(()) => self.subs.begin_remove(filter),
+            Ok(()) => {
+                self.subs.begin_remove(filter);
+                self.persist_subs();
+            }
             Err(e) => self.subs.remove_not_sent(filter, send_error_text(e).into()),
         }
         cx.notify();
@@ -850,8 +1059,14 @@ impl Navigator {
             | Event::Subscribed { generation, .. }
             | Event::Unsubscribed { generation, .. }
             | Event::Published { generation, .. }
+            | Event::SessionFilters { generation, .. }
             | Event::Error { generation, .. } => *generation,
         };
+        // The filters belong to the profile of the connection, also after a switch.
+        if let Event::SessionFilters { filters, .. } = &ev {
+            self.save_session_filters(g, filters);
+            return;
+        }
         // The op id is unique for the whole run. A result of an older generation still ends the
         // "Sending" state of its row, so it is applied before the generation check.
         if let Event::Published { op_id, result, .. } = &ev {
@@ -881,7 +1096,7 @@ impl Navigator {
                 }
                 self.subs.on_subscribed(&filter, result);
             }
-            Event::Published { .. } => {}
+            Event::Published { .. } | Event::SessionFilters { .. } => {}
             Event::Error { message, .. } => self.last_result = Some((0, message)),
             // An UNSUBSCRIBE result shows on its row, not in the publish line.
             Event::Unsubscribed { filter, result, .. } => {
@@ -919,13 +1134,26 @@ impl Navigator {
         .detach();
     }
 
-    fn toggle_connection(&mut self, cx: &mut Context<Self>) {
+    fn toggle_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // "Cancel" while the keyring read runs: the reply must not connect.
+        if self.secret_req.take().is_some() {
+            cx.notify();
+            return;
+        }
+        // "Cancel" while a Connect has no status yet: the net thread may not have read it.
+        if self.gate.outstanding(self.status.generation) {
+            self.net.disconnect();
+            self.gate.clear();
+            self.status = Status::default();
+            cx.notify();
+            return;
+        }
         match self.status.state {
             ConnState::Connected | ConnState::Connecting | ConnState::Reconnecting { .. } => {
                 self.net.disconnect()
             }
             ConnState::Disconnecting => {}
-            ConnState::Disconnected | ConnState::Failed(_) => self.connect(),
+            ConnState::Disconnected | ConnState::Failed(_) => self.connect(window, cx),
         }
         cx.notify();
     }
@@ -976,7 +1204,7 @@ impl Navigator {
     /// rendered. A click on a row of an older generation does nothing, because its `NodeId` may
     /// now name another topic.
     fn select(&mut self, id: NodeId, generation: u64, cx: &mut Context<Self>) {
-        if generation != self.generation {
+        if generation != self.gate.generation() {
             return;
         }
         let Some(node) = self.store.get(id) else {
@@ -1087,6 +1315,11 @@ impl Navigator {
             return;
         }
         self.view = view;
+        self.settings.ui.view = match view {
+            View::Messages => ViewMode::Messages,
+            View::Tree => ViewMode::Tree,
+        };
+        self.persist();
         match view {
             View::Tree => {
                 let node = self
@@ -1127,6 +1360,7 @@ impl Navigator {
 
     fn state_text(&self) -> String {
         match &self.status.state {
+            _ if self.connecting() => "Connecting…".into(),
             ConnState::Disconnected => "Disconnected".into(),
             ConnState::Connecting => "Connecting…".into(),
             ConnState::Reconnecting { attempt, .. } => format!("Reconnecting ({attempt})…"),
@@ -1137,7 +1371,9 @@ impl Navigator {
     }
 
     fn url(&self) -> String {
-        let p = &self.profile;
+        let Some(p) = &self.profile else {
+            return "No connection".into();
+        };
         let scheme = match p.transport {
             navigator_core::net::Transport::Tls => "mqtts",
             navigator_core::net::Transport::Tcp => "mqtt",
@@ -1150,6 +1386,7 @@ impl Navigator {
     fn render_title(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let dot = match self.status.state {
+            _ if self.connecting() => theme.warning,
             ConnState::Connected => theme.success,
             ConnState::Connecting | ConnState::Reconnecting { .. } | ConnState::Disconnecting => {
                 theme.warning
@@ -1162,6 +1399,7 @@ impl Navigator {
             _ => None,
         };
         let label = match self.status.state {
+            _ if self.connecting() => "Cancel",
             ConnState::Connected => "Disconnect",
             ConnState::Connecting | ConnState::Reconnecting { .. } => "Cancel",
             _ => "Connect",
@@ -1171,7 +1409,14 @@ impl Navigator {
                 .w_full()
                 .pr_2()
                 .gap_3()
-                .child(div().text_sm().child(self.profile.host.clone()))
+                .child(
+                    div().w(px(180.)).child(
+                        Select::new(&self.profile_select)
+                            .small()
+                            .placeholder("No connections")
+                            .menu_width(px(260.)),
+                    ),
+                )
                 .child(
                     h_flex()
                         .gap_1()
@@ -1199,12 +1444,26 @@ impl Navigator {
                     ),
                 )
                 .child(
+                    Button::new("theme")
+                        .small()
+                        .ghost()
+                        .label(match self.settings.ui.theme_mode {
+                            ThemeMode::System => "Theme: System",
+                            ThemeMode::Light => "Theme: Light",
+                            ThemeMode::Dark => "Theme: Dark",
+                        })
+                        .tooltip("Change the theme")
+                        .on_click(cx.listener(|v, _, window, cx| v.cycle_theme(window, cx))),
+                )
+                .child(
                     Button::new("connect")
                         .small()
                         .primary()
                         .label(label)
-                        .disabled(self.status.state == ConnState::Disconnecting)
-                        .on_click(cx.listener(|v, _, _, cx| v.toggle_connection(cx))),
+                        .disabled(
+                            self.status.state == ConnState::Disconnecting || self.profile.is_none(),
+                        )
+                        .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx))),
                 ),
         )
     }
@@ -1483,6 +1742,12 @@ impl Navigator {
                         .tooltip("Row height")
                         .on_click(cx.listener(|v, _, _, cx| {
                             v.two_lines = !v.two_lines;
+                            v.settings.ui.row_height = if v.two_lines {
+                                RowHeight::TwoLines
+                            } else {
+                                RowHeight::OneLine
+                            };
+                            v.persist();
                             cx.notify();
                         })),
                 )
@@ -1544,6 +1809,9 @@ impl Navigator {
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.profile.is_none() {
+            return self.render_no_profile(cx);
+        }
         let filtered = self.filters_active();
         let text = if filtered {
             match self.view {
@@ -1848,7 +2116,7 @@ impl Navigator {
             count,
             cx.processor(|v, range: std::ops::Range<usize>, _window, cx| {
                 let theme = cx.theme().clone();
-                let generation = v.generation;
+                let generation = v.gate.generation();
                 let ids: Vec<NodeId> = v.store.rows()[range].to_vec();
                 ids.into_iter()
                     .map(|id| {
@@ -2111,13 +2379,37 @@ impl Navigator {
                 .load(std::sync::atomic::Ordering::Relaxed);
         let theme = cx.theme();
         let mut left = h_flex().gap_3().text_xs().child(self.url());
-        if !self.profile.transport.is_encrypted() {
-            left = left.child(div().text_color(theme.warning).child("Not encrypted"));
-        } else if !self.profile.verify_tls {
-            left = left.child(div().text_color(theme.warning).child("Insecure TLS"));
+        if let Some(p) = &self.profile {
+            if !p.transport.is_encrypted() {
+                left = left.child(div().text_color(theme.warning).child("Not encrypted"));
+            } else if !p.verify_tls {
+                left = left.child(div().text_color(theme.warning).child("Insecure TLS"));
+            }
         }
         if self.reconnected_at.is_some() {
             left = left.child("Reconnected");
+        }
+        if self.reconnect_pending && self.is_live() {
+            let id = self.profile.as_ref().map(|p| p.id);
+            left = left.child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(theme.warning)
+                            .child("Reconnect to apply your changes."),
+                    )
+                    .child(
+                        Button::new("reconnect")
+                            .xsmall()
+                            .label("Reconnect")
+                            .on_click(cx.listener(move |v, _, window, cx| {
+                                if let Some(id) = id {
+                                    v.request_switch(id, true, window, cx);
+                                }
+                            })),
+                    ),
+            );
         }
         StatusBar::new().left(left).right(
             h_flex()
@@ -2147,6 +2439,11 @@ impl Navigator {
 impl Render for Navigator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.metrics.frame_start(window);
+        if self.resize_settled_at.is_none() {
+            self.resize_settled_at = Some(Instant::now() + RESIZE_SETTLE);
+            let s = window.viewport_size();
+            self.last_size = (f32::from(s.width), f32::from(s.height));
+        }
         let chips = self.render_chips(cx);
         let theme = cx.theme();
         v_flex()
@@ -2363,10 +2660,54 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
-        Sub, SubState, Subs, preview, scroll_top_of, send_error_text, top_row, validate_filter,
+        GenGate, Sub, SubState, Subs, connection_live, preview, scroll_top_of, send_error_text,
+        top_row, validate_filter,
     };
     use navigator_core::Qos;
     use navigator_core::net::SendError;
+
+    #[test]
+    fn a_connect_replaced_before_it_answers_is_never_accepted() {
+        let mut g = GenGate::default();
+        // Connect A (generation 1) and a Subscribe for A are queued. Nothing has come back.
+        g.begin(1);
+        // The user switches to B before A published anything.
+        g.clear();
+        // Anything of A is dropped, before and after B starts.
+        assert!(!g.accept(1));
+        g.begin(2);
+        assert!(!g.accept(1), "status, event or message of A");
+        // B works.
+        assert!(g.accept(2));
+        // Another switch and a manual connect of B: the older generation stays out.
+        g.clear();
+        assert!(!g.accept(2));
+        g.begin(3);
+        assert!(g.accept(3) && !g.accept(2) && !g.accept(1));
+        // A start error or a reject before any Connect has generation 0.
+        assert!(g.accept(0));
+    }
+
+    #[test]
+    fn a_connect_without_status_counts_as_live() {
+        use navigator_core::net::ConnState;
+        let mut g = GenGate::default();
+        let idle = ConnState::Disconnected;
+        assert!(!connection_live(&idle, &g, 0));
+        // Connect A is queued. The UI has no status of it yet: a save of the active profile
+        // must not replace the runtime profile.
+        g.begin(1);
+        assert!(connection_live(&idle, &g, 0));
+        // Its status arrives: the state decides.
+        assert!(connection_live(&ConnState::Connecting, &g, 1));
+        assert!(!connection_live(&idle, &g, 1));
+        // A second Connect (a Reconnect) while the first one is Connected.
+        g.begin(2);
+        assert!(connection_live(&ConnState::Connected, &g, 1));
+        // A cancel ends it.
+        g.clear();
+        assert!(!connection_live(&idle, &g, 0));
+    }
 
     #[test]
     fn anchor_keeps_its_pixel_offset() {

@@ -13,7 +13,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
-    Command, ConnState, Event, Net, NetLimits, Outgoing, Profile, PublishResult, Transport,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, PublishResult,
+    Transport,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -68,7 +69,8 @@ fn with_ca(mut p: Profile) -> Profile {
 }
 
 fn with_client_cert(mut p: Profile, key: &str) -> Profile {
-    p.client_cert = Some((cert("client.crt"), cert(key)));
+    p.client_cert = Some(cert("client.crt"));
+    p.client_key = Some(cert(key));
     p
 }
 
@@ -84,15 +86,17 @@ async fn wait_connected(net: &mut Net, previous: u64) -> u64 {
     s.generation
 }
 
-async fn connect(net: &mut Net, p: Profile) -> u64 {
+async fn connect(net: &mut Net, p: impl Into<ConnectConfig>) -> u64 {
     let previous = net.status.borrow().generation;
-    net.send(Command::Connect(Box::new(p))).expect("send");
+    net.send(Command::Connect(Box::new(p.into())))
+        .expect("send");
     wait_connected(net, previous).await
 }
 
 /// Connects and expects `Failed`. Returns the text. A retry must not start.
-async fn connect_failed(net: &mut Net, p: Profile) -> String {
-    net.send(Command::Connect(Box::new(p))).expect("send");
+async fn connect_failed(net: &mut Net, p: impl Into<ConnectConfig>) -> String {
+    net.send(Command::Connect(Box::new(p.into())))
+        .expect("send");
     tokio::time::timeout(
         WAIT,
         net.status
@@ -179,7 +183,11 @@ async fn publish_round_trip(net: &mut Net, prefix: &str, generation: u64) {
 }
 
 /// Connect, subscribe, publish QoS 0 and QoS 1, receive, disconnect.
-async fn round_trip(port: u16, transport: Transport, tweak: impl FnOnce(Profile) -> Profile) {
+async fn round_trip<C: Into<ConnectConfig>>(
+    port: u16,
+    transport: Transport,
+    tweak: impl FnOnce(Profile) -> C,
+) {
     let _limits = limits_lock();
     let mut net = Net::start(NetLimits::default());
     let prefix = prefix();
@@ -196,10 +204,11 @@ async fn anonymous_tcp() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn password_tcp() {
-    round_trip(AUTH, Transport::Tcp, |mut p| {
-        p.username = Some("test".into());
-        p.password = Some("test-pass".into());
-        p
+    round_trip(AUTH, Transport::Tcp, |p| {
+        let mut c = ConnectConfig::from(p);
+        c.profile.username = Some("test".into());
+        c.password = Some("test-pass".into());
+        c
     })
     .await;
 }
@@ -210,8 +219,9 @@ async fn wrong_password_fails_without_retry() {
     let mut net = Net::start(NetLimits::default());
     let mut p = profile(AUTH, Transport::Tcp, &prefix());
     p.username = Some("test".into());
-    p.password = Some("wrong".into());
-    let text = connect_failed(&mut net, p).await;
+    let mut c = ConnectConfig::from(p);
+    c.password = Some("wrong".into());
+    let text = connect_failed(&mut net, c).await;
     assert_text(&text, &["not authorized", "credentials", "password"]);
     // No credentials at all fail too.
     let text = connect_failed(&mut net, profile(AUTH, Transport::Tcp, &prefix())).await;

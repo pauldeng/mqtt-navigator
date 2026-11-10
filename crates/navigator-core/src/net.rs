@@ -4,10 +4,9 @@
 //! "Threads and data flow" section of the plan, ADR 0002 and ARCHITECTURE.md.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU32};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -34,70 +33,50 @@ use tokio::task::{JoinSet, LocalSet};
 use crate::model::{Incoming, MsgProps, Qos};
 use crate::tls::{self, TlsDiag};
 
-/// Transport. TLS is the default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Transport {
-    #[default]
-    Tls,
-    Tcp,
-    Wss,
-    Ws,
-}
+pub use crate::profile::{Profile, Transport, Will};
 
-impl Transport {
-    pub fn default_port(self) -> u16 {
-        match self {
-            Self::Tls => 8883,
-            Self::Tcp => 1883,
-            Self::Wss => 443,
-            Self::Ws => 80,
-        }
-    }
-
-    pub fn is_encrypted(self) -> bool {
-        matches!(self, Self::Tls | Self::Wss)
-    }
-}
-
-/// Connection settings for one connect. Secrets are in memory only.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Profile {
-    pub host: String,
-    pub port: u16,
-    pub transport: Transport,
-    /// WebSocket path, for example `/mqtt`.
-    pub ws_path: String,
-    /// `None`: the broker assigns a client ID.
-    pub client_id: Option<String>,
-    pub username: Option<String>,
+/// One connect: the saved profile plus the secrets. The secrets live in memory only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectConfig {
+    pub profile: Profile,
     pub password: Option<String>,
-    /// Extra CA certificates (PEM), added to the system roots.
-    pub ca_file: Option<PathBuf>,
-    /// Client certificate chain and key (PEM), for mTLS.
-    pub client_cert: Option<(PathBuf, PathBuf)>,
-    /// Verify the server certificate and host name. Default true.
-    pub verify_tls: bool,
-    pub keepalive_secs: u16,
-    /// Filters to subscribe after each connect.
-    pub subscriptions: Vec<(String, Qos)>,
+    /// Decrypts an encrypted client key. Never prompted for.
+    pub key_passphrase: Option<String>,
+    /// The generation of this connection. [`Net::connect`] and [`Net::send`] set it. The UI
+    /// chooses it, not the net thread: the UI knows the generation of a connect at the moment
+    /// it sends the command, so it can ignore everything that has another generation.
+    pub generation: u64,
+    /// Filters that the broker may still hold for this profile's persistent session (from the
+    /// last [`Event::SessionFilters`]). They seed the session set when the net thread has no
+    /// newer one for the same host, port and client ID.
+    pub session_filters: Vec<String>,
 }
 
-impl Default for Profile {
-    fn default() -> Self {
+impl From<Profile> for ConnectConfig {
+    fn from(profile: Profile) -> Self {
         Self {
-            host: "localhost".into(),
-            port: Transport::Tls.default_port(),
-            transport: Transport::Tls,
-            ws_path: "/mqtt".into(),
-            client_id: None,
-            username: None,
+            profile,
             password: None,
-            ca_file: None,
-            client_cert: None,
-            verify_tls: true,
-            keepalive_secs: 60,
-            subscriptions: vec![("#".into(), Qos::AtMostOnce)],
+            key_passphrase: None,
+            generation: 0,
+            session_filters: Vec::new(),
         }
+    }
+}
+
+/// Hides the secrets, so a log line never shows them.
+impl std::fmt::Debug for ConnectConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectConfig")
+            .field("profile", &self.profile)
+            .field("generation", &self.generation)
+            .field("session_filters", &self.session_filters)
+            .field("password", &self.password.as_ref().map(|_| "<hidden>"))
+            .field(
+                "key_passphrase",
+                &self.key_passphrase.as_ref().map(|_| "<hidden>"),
+            )
+            .finish()
     }
 }
 
@@ -117,7 +96,7 @@ pub struct Outgoing {
 /// [`Net::disconnect`].
 #[derive(Clone, Debug)]
 pub enum Command {
-    Connect(Box<Profile>),
+    Connect(Box<ConnectConfig>),
     Subscribe { filter: String, qos: Qos },
     Unsubscribe { filter: String },
     Publish(Box<Outgoing>),
@@ -186,6 +165,14 @@ pub enum Event {
         generation: u64,
         op_id: u64,
         result: PublishResult,
+    },
+    /// The filters that the broker may hold for the persistent session of the connection
+    /// changed. The list is the whole set (it replaces the older one). It comes at most every
+    /// 500 ms, and only for a profile with a session expiry. Save it with the profile and give
+    /// it back in [`ConnectConfig::session_filters`].
+    SessionFilters {
+        generation: u64,
+        filters: Vec<String>,
     },
     /// An error the user must see, for example an invalid filter.
     Error { generation: u64, message: String },
@@ -310,6 +297,8 @@ pub struct Net {
     commands: mpsc::Sender<(u64, Command)>,
     /// Weak, so the event log still closes when the net thread ends. Used to read the free room.
     events_tx: mpsc::WeakSender<Event>,
+    /// The last generation that [`Net::connect`] gave out. It only grows.
+    last_generation: AtomicU64,
     /// Cancel epoch: counts disconnect requests. `SHUTDOWN` stops the thread. Each command
     /// carries the epoch at the time of [`Net::send`]. A cancel makes all older commands void.
     cancel: watch::Sender<u64>,
@@ -383,10 +372,28 @@ impl Net {
             status,
             events,
             stats,
+            last_generation: AtomicU64::new(0),
             cancel,
             queued_bytes,
             done,
         }
+    }
+
+    /// Queues a Connect and returns its generation. The numbers grow with each call, and the
+    /// net thread uses the number as the generation of the connection. Every status, event and
+    /// message of this connection carries it, so the UI can tell it from an older connection
+    /// before the net thread has answered anything.
+    pub fn connect(&self, mut config: ConnectConfig) -> Result<u64, SendError> {
+        let generation = self.last_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        config.generation = generation;
+        let epoch = *self.cancel.borrow();
+        self.commands
+            .try_send((epoch, Command::Connect(Box::new(config))))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => SendError::Full,
+                mpsc::error::TrySendError::Closed(_) => SendError::Closed,
+            })?;
+        Ok(generation)
     }
 
     /// Queues a command. Never blocks. Returns [`SendError::Full`] if 64 commands are waiting,
@@ -395,12 +402,13 @@ impl Net {
     /// A [`Net::disconnect`] voids every command that was sent before it, even if the net
     /// thread has not read the command yet. A rejected command is answered with an event.
     pub fn send(&self, cmd: Command) -> Result<(), SendError> {
-        if !matches!(cmd, Command::Connect(_)) {
-            match self.events_tx.upgrade() {
-                Some(tx) if tx.capacity() < EVENTS_RESERVE => return Err(SendError::Full),
-                Some(_) => {}
-                None => return Err(SendError::Closed),
-            }
+        if let Command::Connect(config) = cmd {
+            return self.connect(*config).map(|_| ());
+        }
+        match self.events_tx.upgrade() {
+            Some(tx) if tx.capacity() < EVENTS_RESERVE => return Err(SendError::Full),
+            Some(_) => {}
+            None => return Err(SendError::Closed),
         }
         let epoch = *self.cancel.borrow();
         self.commands.try_send((epoch, cmd)).map_err(|e| match e {
@@ -555,7 +563,73 @@ struct AttemptCtx {
     /// The attempt sets this at the CONNACK. From then on, the supervisor sends it every
     /// subscribe and unsubscribe. Before, the attempt takes them from `desired`.
     up: Rc<Cell<bool>>,
+    /// Filters that the broker may hold for this session (see [`SessionSubs`]).
+    maybe: SessionSubs,
+    /// The profile has a session expiry, so the set is reported (see [`report_filters`]).
+    report: bool,
+    /// The set was reported once for this connection (after its first CONNACK).
+    announced: Rc<Cell<bool>>,
 }
+
+/// The filters that a broker session may still hold. A filter comes in when its SUBSCRIBE is
+/// sent. It goes out only after a successful UNSUBACK, or when a CONNACK says that the session
+/// is new (session present is false). So a removal that never reached the broker (the user was
+/// offline, or the connection died first) is not forgotten: after a CONNACK that resumes the
+/// session, the attempt sends an UNSUBSCRIBE for every filter here that is not desired.
+type SessionSubs = Rc<RefCell<SessionSet>>;
+
+/// The set, and whether it changed since the last [`Event::SessionFilters`].
+#[derive(Default)]
+struct SessionSet {
+    filters: BTreeSet<String>,
+    dirty: bool,
+}
+
+impl SessionSet {
+    fn insert(&mut self, filter: &str) {
+        if self.filters.insert(filter.to_owned()) {
+            self.dirty = true;
+        }
+    }
+
+    fn remove(&mut self, filter: &str) {
+        if self.filters.remove(filter) {
+            self.dirty = true;
+        }
+    }
+
+    fn clear(&mut self) {
+        if !self.filters.is_empty() {
+            self.filters.clear();
+            self.dirty = true;
+        }
+    }
+}
+
+/// Wait before a change of the set is reported. Changes in this time make one event.
+const REPORT_DELAY: Duration = Duration::from_millis(500);
+
+/// Reports the set if it changed and the event log has room. Does nothing for a profile
+/// without a session expiry: its session ends with the connection.
+fn report_filters(shared: &Shared, ctx: &AttemptCtx) {
+    if !ctx.report {
+        return;
+    }
+    let mut set = ctx.maybe.borrow_mut();
+    if set.dirty && shared.has_room() {
+        set.dirty = false;
+        shared.event(Event::SessionFilters {
+            generation: ctx.generation,
+            filters: set.filters.iter().cloned().collect(),
+        });
+    }
+}
+
+/// Identity of a broker session: host, port and client ID.
+type SessionKey = (String, u16, String);
+
+/// How many sessions the supervisor remembers. The oldest goes first.
+const MAX_SESSIONS: usize = 8;
 
 /// One running attempt: the connect, and the session after it.
 struct Attempt {
@@ -570,10 +644,14 @@ struct Current {
     generation: u64,
     /// Cancel epoch under which the connect started. A cancel stops only older connects.
     epoch: u64,
-    profile: Rc<Profile>,
+    config: Rc<ConnectConfig>,
     /// Filters that the broker must have: the profile's, plus live subscribes, minus live
     /// unsubscribes. Changes while we are not connected count too.
     desired: Rc<RefCell<Vec<(String, Qos)>>>,
+    /// The filters of the broker session of this connect. It outlives the connect.
+    maybe: SessionSubs,
+    /// See [`AttemptCtx::announced`].
+    announced: Rc<Cell<bool>>,
     /// Number of retries since the last stable connection.
     retries: u32,
     attempt: Option<Attempt>,
@@ -607,6 +685,8 @@ fn backoff_delay(attempt: u32, random: u64) -> Duration {
 /// Owns the state machine. Starts, stops and joins attempts.
 struct Sup {
     shared: Rc<Shared>,
+    /// The filter sets of the last broker sessions, newest first.
+    sessions: Vec<(SessionKey, SessionSubs)>,
     generation: u64,
     next_token: u64,
     /// State of the jitter generator (xorshift64). Time seeds it. No `rand` crate needed.
@@ -623,17 +703,47 @@ impl Sup {
         x
     }
 
+    /// The filter set of the broker session that `profile` connects to. The set survives a
+    /// disconnect and the next Connect to the same session.
+    fn session_subs(&mut self, config: &ConnectConfig) -> SessionSubs {
+        let profile = &config.profile;
+        let key = (
+            profile.host.clone(),
+            profile.port,
+            profile.client_id.clone(),
+        );
+        let at = self.sessions.iter().position(|(k, _)| *k == key);
+        let entry = match at {
+            Some(i) => self.sessions.remove(i),
+            // A session that the supervisor has not seen (the app started again) begins with
+            // what the UI saved. A cached set is newer.
+            None => {
+                let set = SessionSet {
+                    filters: config.session_filters.iter().cloned().collect(),
+                    dirty: false,
+                };
+                (key, Rc::new(RefCell::new(set)))
+            }
+        };
+        let set = entry.1.clone();
+        self.sessions.insert(0, entry);
+        self.sessions.truncate(MAX_SESSIONS);
+        set
+    }
+
     /// A user Connect.
-    fn begin(&mut self, profile: Profile, epoch: u64) -> Current {
-        self.generation += 1;
-        let generation = self.generation;
+    fn begin(&mut self, config: ConnectConfig, epoch: u64) -> Current {
+        let generation = config.generation;
+        self.generation = generation;
         self.shared.set_status(generation, ConnState::Connecting);
-        tracing::info!(generation, transport = ?profile.transport, "connect requested");
+        tracing::info!(generation, transport = ?config.profile.transport, "connect requested");
         let mut current = Current {
             generation,
             epoch,
-            desired: Rc::new(RefCell::new(profile.subscriptions.clone())),
-            profile: Rc::new(profile),
+            desired: Rc::new(RefCell::new(config.profile.subscriptions.clone())),
+            maybe: self.session_subs(&config),
+            announced: Rc::default(),
+            config: Rc::new(config),
             retries: 0,
             attempt: None,
             wake: None,
@@ -656,10 +766,13 @@ impl Sup {
             reconnect: c.retries > 0,
             desired: c.desired.clone(),
             up: up.clone(),
+            maybe: c.maybe.clone(),
+            report: c.config.profile.session_expiry_secs > 0,
+            announced: c.announced.clone(),
         };
         tracing::info!(generation = c.generation, retry = c.retries, "connecting");
         let handle = tokio::task::spawn_local(run_session(
-            c.profile.clone(),
+            c.config.clone(),
             ctx,
             self.shared.clone(),
             rx,
@@ -776,6 +889,7 @@ impl Sup {
                     None => desired.push((filter.clone(), qos)),
                 }
                 drop(desired);
+
                 // Not up yet: the attempt reads `desired` at the CONNACK. After a loss the
                 // next attempt does the same.
                 if let Some(a) = up {
@@ -786,7 +900,9 @@ impl Sup {
                 c.desired.borrow_mut().retain(|(f, _)| *f != filter);
                 match up {
                     Some(a) => self.forward(a, Command::Unsubscribe { filter }),
-                    // The broker has no subscription now. Nothing to send.
+                    // The connection is down, so there is nothing to send now. The filter stays
+                    // in the session set: after a CONNACK that resumes the session, the attempt
+                    // removes it from the broker.
                     None => self.shared.event(Event::Unsubscribed {
                         generation,
                         filter,
@@ -828,6 +944,7 @@ async fn supervisor(
 ) {
     let mut sup = Sup {
         shared,
+        sessions: Vec::new(),
         generation: 0,
         next_token: 1,
         rng: rng_seed(),
@@ -842,7 +959,13 @@ async fn supervisor(
                 Some((epoch, command)) if epoch < *cancel.borrow() => {
                     reject(&sup.shared, sup.generation, command, "Not connected.");
                 }
-                Some((epoch, Command::Connect(profile))) => {
+                Some((epoch, Command::Connect(config))) => {
+                    // The generation of a Connect must grow. This also stops a Connect that
+                    // did not come from `Net::connect`.
+                    if config.generation <= sup.generation {
+                        tracing::warn!(generation = config.generation, "connect ignored: old generation");
+                        continue;
+                    }
                     if let Some(old) = current.take() {
                         sup.stop(old).await;
                         // A disconnect can come while we stop the old connect.
@@ -850,7 +973,7 @@ async fn supervisor(
                             continue;
                         }
                     }
-                    current = Some(sup.begin(*profile, epoch));
+                    current = Some(sup.begin(*config, epoch));
                 }
                 Some((_, other)) => sup.route(&current, other),
             },
@@ -922,14 +1045,16 @@ fn reject(shared: &Shared, generation: u64, command: Command, why: &str) {
 /// One attempt, from connect to disconnect. Runs in a task, so a panic in the MQTT library
 /// ends only this attempt.
 async fn run_session(
-    profile: Rc<Profile>,
+    config: Rc<ConnectConfig>,
     ctx: AttemptCtx,
     shared: Rc<Shared>,
     mut commands: mpsc::Receiver<Command>,
     stop: Rc<Notify>,
 ) -> AttemptEnd {
     let generation = ctx.generation;
-    let end = session(&profile, &ctx, &shared, &mut commands, &stop).await;
+    let end = session(&config, &ctx, &shared, &mut commands, &stop).await;
+    // The last changes of the connection (a lost UNSUBACK, for example) are reported too.
+    report_filters(&shared, &ctx);
     commands.close();
     while let Ok(command) = commands.try_recv() {
         reject(&shared, generation, command, "Not connected.");
@@ -947,24 +1072,32 @@ enum Ended {
 }
 
 async fn session(
-    profile: &Profile,
+    config: &ConnectConfig,
     ctx: &AttemptCtx,
     shared: &Rc<Shared>,
     commands: &mut mpsc::Receiver<Command>,
     stop: &Notify,
 ) -> AttemptEnd {
+    let profile = &config.profile;
     let generation = ctx.generation;
     local_limits::set_limits(
         shared.limits.max_packet,
         shared.limits.queue_len,
         shared.limits.queue_bytes,
     );
-    let (transport, diag) = match transport(profile) {
+    let (transport, diag) = match transport(config) {
         Ok(t) => t,
         Err(text) => return AttemptEnd::never_up(Outcome::Failed(text)),
     };
+    let will = match profile.will.as_ref().map(wire_will) {
+        Some(None) => {
+            return AttemptEnd::never_up(Outcome::Failed("The Will topic is not valid.".into()));
+        }
+        Some(Some(w)) => Some(w),
+        None => None,
+    };
     let (client, connect_handle, mut receiver) = new_client(ClientOptions {
-        client_id: profile.client_id.clone(),
+        client_id: Some(profile.client_id.clone()).filter(|id| !id.is_empty()),
         ..Default::default()
     });
     let keep_alive = match NonZeroU16::new(profile.keepalive_secs) {
@@ -982,16 +1115,17 @@ async fn session(
             proxy: None,
             tcp_nodelay: true,
         },
-        true,
+        profile.clean_start,
         keep_alive,
-        None,
+        will,
         profile.username.clone(),
-        profile
+        config
             .password
             .as_ref()
             .map(|p| Bytes::copy_from_slice(p.as_bytes())),
         ConnectProperties {
             maximum_packet_size: NonZeroU32::new(max_packet).unwrap_or(NonZeroU32::MAX),
+            session_expiry_interval: profile.session_expiry_secs.into(),
             ..Default::default()
         },
         Some(CONNECT_TIMEOUT),
@@ -1000,8 +1134,10 @@ async fn session(
         result = connect => result,
         () = stop.notified() => return AttemptEnd::never_up(Outcome::Disconnected),
     };
-    let (connection, disconnect_handle) = match result {
-        ConnectResult::Success(connection, _, handle) => (connection, handle),
+    let (connection, disconnect_handle, session_present) = match result {
+        ConnectResult::Success(connection, connack, handle) => {
+            (connection, handle, connack.session_present)
+        }
         ConnectResult::Failure(_, error) => {
             return AttemptEnd::never_up(connect_outcome(
                 &error,
@@ -1015,9 +1151,33 @@ async fn session(
     // `desired` as one step.
     ctx.up.set(true);
     let filters = ctx.desired.borrow().clone();
+    // A new session holds nothing. A resumed one can hold filters that are not desired any
+    // more (removed offline, or the UNSUBACK was lost): they are removed below.
+    let removed: VecDeque<String> = {
+        let mut maybe = ctx.maybe.borrow_mut();
+        let removed: VecDeque<String> = if session_present {
+            maybe
+                .filters
+                .iter()
+                .filter(|f| !filters.iter().any(|(d, _)| d == *f))
+                .cloned()
+                .collect()
+        } else {
+            maybe.clear();
+            VecDeque::new()
+        };
+        // Report the whole set once for each connection, even if it did not change. A new
+        // profile can share the session (an imported copy with the same client ID) and has not
+        // saved the set yet.
+        if !ctx.announced.replace(true) {
+            maybe.dirty = true;
+        }
+        removed
+    };
     let mut resub = Resub {
         announce: false,
         pending: filters.into(),
+        unsubs: removed,
         blocked: false,
     };
     if shared.set_connected(generation, ctx.token) {
@@ -1031,14 +1191,7 @@ async fn session(
     // Subscribe in batches: `dispatch` rejects more than `MAX_PENDING_OPS` operations.
     let retry = tokio::time::sleep(FEED_RETRY);
     tokio::pin!(retry);
-    resub.feed(
-        &client,
-        generation,
-        shared,
-        &expired,
-        &mut ops,
-        retry.as_mut(),
-    );
+    resub.feed(&client, ctx, shared, &expired, &mut ops, retry.as_mut());
 
     let mut ingest = Ingest {
         shared: shared.clone(),
@@ -1049,8 +1202,22 @@ async fn session(
     let mut driver = Box::pin(connection.run_until_disconnect());
     let mut disconnect_handle = Some(disconnect_handle);
     let (mut receiver_open, mut commands_open) = (true, true);
+    // The timer runs only after a change of the session set. It makes one report for many.
+    let report = tokio::time::sleep(REPORT_DELAY);
+    tokio::pin!(report);
+    let mut report_armed = false;
     let ended = loop {
+        if !report_armed && ctx.report && ctx.maybe.borrow().dirty {
+            report
+                .as_mut()
+                .reset(tokio::time::Instant::now() + REPORT_DELAY);
+            report_armed = true;
+        }
         tokio::select! {
+            () = &mut report, if report_armed => {
+                report_armed = false;
+                report_filters(shared, ctx);
+            },
             (_handle, event) = &mut driver => break Ended::Driver(event),
             () = expired.notified() => break Ended::Expired,
             message = receiver.recv(), if receiver_open => match message {
@@ -1064,10 +1231,11 @@ async fn session(
                     match &command {
                         Command::Subscribe { filter, .. } | Command::Unsubscribe { filter } => {
                             resub.pending.retain(|(f, _)| f != filter);
+                            resub.unsubs.retain(|f| f != filter);
                         }
                         _ => {}
                     }
-                    dispatch(&client, command, generation, shared, &expired, &mut ops);
+                    dispatch(&client, command, ctx, shared, &expired, &mut ops);
                 }
                 None => commands_open = false,
             },
@@ -1080,10 +1248,10 @@ async fn session(
                 if joined.is_err_and(|e| e.is_panic()) {
                     break Ended::OpPanic;
                 }
-                resub.feed(&client, generation, shared, &expired, &mut ops, retry.as_mut());
+                resub.feed(&client, ctx, shared, &expired, &mut ops, retry.as_mut());
             },
             () = &mut retry, if resub.blocked => {
-                resub.feed(&client, generation, shared, &expired, &mut ops, retry.as_mut());
+                resub.feed(&client, ctx, shared, &expired, &mut ops, retry.as_mut());
             },
         }
     };
@@ -1124,6 +1292,8 @@ async fn session(
 struct Resub {
     announce: bool,
     pending: VecDeque<(String, Qos)>,
+    /// Filters to remove from a resumed session (see [`SessionSubs`]).
+    unsubs: VecDeque<String>,
     /// The last `feed` stopped because the event log has no room. The retry timer runs.
     blocked: bool,
 }
@@ -1135,12 +1305,13 @@ impl Resub {
     fn feed(
         &mut self,
         client: &Client,
-        generation: u64,
+        ctx: &AttemptCtx,
         shared: &Rc<Shared>,
         expired: &Rc<Notify>,
         ops: &mut JoinSet<()>,
         retry: std::pin::Pin<&mut tokio::time::Sleep>,
     ) {
+        let generation = ctx.generation;
         self.blocked = false;
         if self.announce {
             if !shared.has_room() {
@@ -1152,13 +1323,25 @@ impl Resub {
             });
             self.announce = false;
         }
+        // These removals make no event, so they need no room in the log.
+        while ops.len() < MAX_PENDING_OPS / 2
+            && let Some(filter) = self.unsubs.pop_front()
+        {
+            ops.spawn_local(stale_unsubscribe_op(
+                client.clone(),
+                filter,
+                ctx.maybe.clone(),
+                ctx.desired.clone(),
+                expired.clone(),
+            ));
+        }
         while ops.len() < MAX_PENDING_OPS / 2 && !self.pending.is_empty() {
             if !shared.has_room() {
                 return self.block(retry);
             }
             if let Some((filter, qos)) = self.pending.pop_front() {
                 let subscribe = Command::Subscribe { filter, qos };
-                dispatch(client, subscribe, generation, shared, expired, ops);
+                dispatch(client, subscribe, ctx, shared, expired, ops);
             }
         }
     }
@@ -1253,11 +1436,13 @@ impl Ingest {
 fn dispatch(
     client: &Client,
     command: Command,
-    generation: u64,
+    ctx: &AttemptCtx,
     shared: &Rc<Shared>,
     expired: &Rc<Notify>,
     ops: &mut JoinSet<()>,
 ) {
+    let generation = ctx.generation;
+    let (maybe, desired) = (ctx.maybe.clone(), ctx.desired.clone());
     if ops.len() >= MAX_PENDING_OPS {
         reject(shared, generation, command, TOO_MANY_OPS_TEXT);
         return;
@@ -1266,17 +1451,38 @@ fn dispatch(
     match command {
         Command::Subscribe { filter, qos } => {
             ops.spawn_local(subscribe_op(
-                client, filter, qos, generation, shared, expired,
+                client, filter, qos, generation, maybe, shared, expired,
             ));
         }
         Command::Unsubscribe { filter } => {
-            ops.spawn_local(unsubscribe_op(client, filter, generation, shared, expired));
+            ops.spawn_local(unsubscribe_op(
+                client, filter, generation, maybe, desired, shared, expired,
+            ));
         }
         Command::Publish(outgoing) => {
             ops.spawn_local(publish_op(client, *outgoing, generation, shared, expired));
         }
         Command::Connect(_) => {}
     }
+}
+
+/// The Will of a profile as the MQTT library wants it. `None`: the topic is not valid.
+fn wire_will(w: &Will) -> Option<ms_mqtt_client::packet::Will> {
+    Some(ms_mqtt_client::packet::Will {
+        topic_name: TopicName::try_from(w.topic.as_str()).ok()?,
+        qos: wire_qos(w.qos),
+        retain: w.retain,
+        payload: Bytes::copy_from_slice(&w.payload),
+        properties: ms_mqtt_client::packet::WillProperties {
+            delay_interval: w.delay_secs,
+            payload_format_indicator: PayloadFormatIndicator::Unspecified,
+            message_expiry_interval: None,
+            content_type: None,
+            response_topic: None,
+            correlation_data: None,
+            user_properties: Vec::new(),
+        },
+    })
 }
 
 fn wire_qos(qos: Qos) -> WireQos {
@@ -1291,12 +1497,15 @@ async fn subscribe_op(
     filter: String,
     qos: Qos,
     generation: u64,
+    maybe: SessionSubs,
     shared: Rc<Shared>,
     expired: Rc<Notify>,
 ) {
     let result = tokio::time::timeout(OP_TIMEOUT, async {
         let topic_filter =
             TopicFilter::new(&filter).map_err(|e| format!("Invalid topic filter: {e}"))?;
+        // From the moment of the send, the broker may hold the filter.
+        maybe.borrow_mut().insert(&filter);
         let token = client
             .subscribe(
                 topic_filter,
@@ -1336,6 +1545,8 @@ async fn unsubscribe_op(
     client: Client,
     filter: String,
     generation: u64,
+    maybe: SessionSubs,
+    desired: Rc<RefCell<Vec<(String, Qos)>>>,
     shared: Rc<Shared>,
     expired: Rc<Notify>,
 ) {
@@ -1356,6 +1567,9 @@ async fn unsubscribe_op(
         expired.notify_one();
         Err(fail(NO_ANSWER_TEXT))
     });
+    if result.is_ok() {
+        forget(&maybe, &desired, &filter);
+    }
     shared.event(match result {
         Ok(()) => Event::Unsubscribed {
             generation,
@@ -1368,6 +1582,43 @@ async fn unsubscribe_op(
             result: Err(message),
         },
     });
+}
+
+/// The broker no longer holds `filter`: drop it from the session set. A filter that is desired
+/// again stays (the user subscribed to it after the UNSUBSCRIBE was sent).
+fn forget(maybe: &SessionSubs, desired: &Rc<RefCell<Vec<(String, Qos)>>>, filter: &str) {
+    if !desired.borrow().iter().any(|(f, _)| f == filter) {
+        maybe.borrow_mut().remove(filter);
+    }
+}
+
+/// Removes a filter that is not desired from a resumed session (see [`SessionSubs`]). It makes
+/// no event: the user got the result when he removed the filter. A failure keeps the filter in
+/// the set, so the next CONNACK that resumes the session tries again.
+async fn stale_unsubscribe_op(
+    client: Client,
+    filter: String,
+    maybe: SessionSubs,
+    desired: Rc<RefCell<Vec<(String, Qos)>>>,
+    expired: Rc<Notify>,
+) {
+    let sent = tokio::time::timeout(OP_TIMEOUT, async {
+        let topic_filter = TopicFilter::new(&filter).map_err(|_| ())?;
+        let token = client
+            .unsubscribe(topic_filter, UnsubscribeProperties::default())
+            .await
+            .map_err(|_| ())?;
+        token.await.map_err(|_| ())?.as_result().map_err(|_| ())
+    })
+    .await;
+    match sent {
+        Ok(Ok(())) => {
+            forget(&maybe, &desired, &filter);
+            tracing::info!("removed a subscription from the resumed session");
+        }
+        Ok(Err(())) => {}
+        Err(_) => expired.notify_one(),
+    }
 }
 
 async fn publish_op(
@@ -1460,7 +1711,8 @@ async fn publish(client: &Client, o: &Outgoing) -> PublishResult {
 // ---------------------------------------------------------------------------------------------
 
 /// The transport for one attempt. The [`TlsDiag`] (TLS only) tells why a handshake failed.
-fn transport(p: &Profile) -> Result<(ConnectionTransportType, Option<TlsDiag>), String> {
+fn transport(c: &ConnectConfig) -> Result<(ConnectionTransportType, Option<TlsDiag>), String> {
+    let p = &c.profile;
     let host = p.host.clone();
     match p.transport {
         Transport::Tcp => Ok((
@@ -1471,7 +1723,7 @@ fn transport(p: &Profile) -> Result<(ConnectionTransportType, Option<TlsDiag>), 
             None,
         )),
         Transport::Tls => {
-            let (tls_config, diag) = tls_config(p)?;
+            let (tls_config, diag) = tls_config(c)?;
             Ok((
                 ConnectionTransportType::Tls {
                     hostname: host,
@@ -1502,7 +1754,7 @@ fn transport(p: &Profile) -> Result<(ConnectionTransportType, Option<TlsDiag>), 
                 .into_client_request()
                 .map_err(|e| format!("Invalid WebSocket address: {e}"))?;
             let (tls_config, diag) = if secure {
-                let (config, diag) = tls_config(p)?;
+                let (config, diag) = tls_config(c)?;
                 (Some(config), Some(diag))
             } else {
                 (None, None)
@@ -1519,12 +1771,19 @@ fn transport(p: &Profile) -> Result<(ConnectionTransportType, Option<TlsDiag>), 
 }
 
 /// Reads the PEM files here. This runs on the net thread, never on the UI thread.
-fn tls_config(p: &Profile) -> Result<(ms_mqtt_client::transport::TlsConfig, TlsDiag), String> {
+fn tls_config(
+    c: &ConnectConfig,
+) -> Result<(ms_mqtt_client::transport::TlsConfig, TlsDiag), String> {
+    let p = &c.profile;
+    let pair = match (&p.client_cert, &p.client_key) {
+        (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+        (None, None) => None,
+        _ => return Err("Set both the client certificate and the client key, or neither.".into()),
+    };
     tls::build(
         p.ca_file.as_deref(),
-        p.client_cert
-            .as_ref()
-            .map(|(c, k)| (c.as_path(), k.as_path())),
+        pair,
+        c.key_passphrase.as_deref(),
         p.verify_tls,
     )
 }
@@ -1724,7 +1983,13 @@ mod tests {
             ..Profile::default()
         };
         cmd_tx
-            .try_send((0, Command::Connect(Box::new(profile))))
+            .try_send((
+                0,
+                Command::Connect(Box::new(ConnectConfig {
+                    generation: 1,
+                    ..ConnectConfig::from(profile)
+                })),
+            ))
             .expect("queue connect");
         let subscribe = Command::Subscribe {
             filter: "a/b".into(),
@@ -1783,7 +2048,8 @@ mod tests {
             subscriptions: vec![],
             ..Profile::default()
         };
-        net.send(Command::Connect(Box::new(profile))).expect("send");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
+            .expect("send");
         tokio::time::timeout(
             Duration::from_secs(5),
             net.status
@@ -2028,9 +2294,8 @@ mod tests {
             }
         });
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(tcp_profile(
-            broker.port,
-            &["base/#"],
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &["base/#"]),
         ))))
         .expect("send");
         let first = wait_status(&mut net, |s| s.state == ConnState::Connected).await;
@@ -2116,9 +2381,8 @@ mod tests {
             }
         });
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(tcp_profile(
-            broker.port,
-            &["a", "b"],
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &["a", "b"]),
         ))))
         .expect("send");
         wait_status(&mut net, |s| {
@@ -2155,8 +2419,10 @@ mod tests {
             l.local_addr().expect("addr").port()
         }; // closed: connections are refused
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(tcp_profile(port, &[]))))
-            .expect("send");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(port, &[]),
+        ))))
+        .expect("send");
         let waiting = wait_status(&mut net, |s| {
             matches!(s.state, ConnState::Reconnecting { .. })
         })
@@ -2182,8 +2448,10 @@ mod tests {
             let _ = accept_connect(&mut sock, 0x87);
         });
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(tcp_profile(broker.port, &[]))))
-            .expect("send");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
         let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
         assert!(
             matches!(&s.state, ConnState::Failed(t) if t.contains("not authorized")),
@@ -2202,8 +2470,10 @@ mod tests {
             let _ = accept_connect(&mut sock, 0x88);
         });
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(tcp_profile(broker.port, &[]))))
-            .expect("send");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
         let s = wait_status(&mut net, |s| {
             matches!(s.state, ConnState::Reconnecting { .. })
         })
@@ -2242,8 +2512,10 @@ mod tests {
             }
         });
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(tcp_profile(broker.port, &["t"]))))
-            .expect("send");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &["t"]),
+        ))))
+        .expect("send");
         let first = tokio::time::timeout(Duration::from_secs(5), net.incoming.recv())
             .await
             .expect("timeout")
@@ -2316,7 +2588,8 @@ mod tests {
             subscriptions: vec![],
             ..Profile::default()
         };
-        net.send(Command::Connect(Box::new(profile))).expect("send");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
+            .expect("send");
         let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
         assert!(
             matches!(&s.state, ConnState::Failed(t) if t.contains("not trusted")),
@@ -2553,8 +2826,10 @@ mod tests {
         let names: Vec<String> = (0..TOTAL).map(|i| format!("f/{i}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(tcp_profile(broker.port, &refs))))
-            .expect("send");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &refs),
+        ))))
+        .expect("send");
         let mut subscribed = std::collections::HashSet::new();
         while subscribed.len() < TOTAL {
             match next_event(&mut net).await {

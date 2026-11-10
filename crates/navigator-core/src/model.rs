@@ -22,6 +22,21 @@ impl Qos {
     }
 }
 
+/// Stored as the number 0 or 1. The number 2 is an error.
+impl serde::Serialize for Qos {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u8(self.as_u8())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Qos {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let n = u8::deserialize(d)?;
+        Self::try_from(n)
+            .map_err(|n| serde::de::Error::custom(format!("QoS {n} is not supported (use 0 or 1)")))
+    }
+}
+
 impl TryFrom<u8> for Qos {
     type Error = u8;
 

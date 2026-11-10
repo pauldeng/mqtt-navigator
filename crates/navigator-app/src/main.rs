@@ -1,13 +1,16 @@
 //! MQTT Navigator desktop app. P1 tracer bullet: connect, subscribe, topic tree, latest value,
 //! publish, disconnect.
 
+mod connections;
 mod logging;
 mod messages;
+mod persist;
+mod secrets;
 mod ui;
 
 use gpui_kit::*;
 use navigator_core::Qos;
-use navigator_core::net::{Profile, Transport};
+use navigator_core::net::{ConnectConfig, Transport};
 
 actions!(navigator, [Quit]);
 
@@ -17,8 +20,8 @@ pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLoc
 fn main() {
     STARTED.get_or_init(std::time::Instant::now);
     logging::init();
-    let profile = match parse_args(std::env::args().skip(1)) {
-        Ok(p) => p,
+    let cli = match cli_session(std::env::args().skip(1)) {
+        Ok(c) => c,
         Err(msg) => {
             eprintln!("{msg}\n\n{USAGE}");
             std::process::exit(2);
@@ -40,7 +43,7 @@ fn main() {
                 ..gpui_kit::component::TitleBar::window_options()
             };
             if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| ui::Navigator::new(profile, window, cx))
+                cx.new(|cx| ui::Navigator::new(cli, window, cx))
             }) {
                 eprintln!("Cannot open the window: {err:#}");
                 cx.quit();
@@ -53,8 +56,27 @@ const USAGE: &str = "Usage: mqtt-navigator [--host HOST] [--port PORT] [--tcp | 
 
 TLS on port 8883 is the default. --tcp connects without encryption.";
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<Profile, String> {
-    let mut p = Profile::default();
+/// The name of the session profile that the command line makes.
+const SESSION_NAME: &str = "Command line";
+
+/// With arguments, the command line makes an unsaved session profile "Command line". Its
+/// password stays in memory (`ConnectConfig`). The app never writes the profile or the password
+/// to the settings file or the keyring. Without arguments there is no session profile.
+fn cli_session(args: impl Iterator<Item = String>) -> Result<Option<ConnectConfig>, String> {
+    let args: Vec<String> = args.collect();
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let mut config = parse_args(args.into_iter())?;
+    config.profile.name = SESSION_NAME.into();
+    // A value that is too long makes the MQTT library panic at the connect.
+    config.validate()?;
+    Ok(Some(config))
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<ConnectConfig, String> {
+    let mut c = ConnectConfig::from(navigator_core::net::Profile::default());
+    let p = &mut c.profile;
     let mut port = None;
     let mut subs = Vec::new();
     let mut args = args.peekable();
@@ -77,7 +99,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Profile, String> {
             "--insecure" => p.verify_tls = false,
             "--ca" => p.ca_file = Some(value("--ca")?.into()),
             "--user" => p.username = Some(value("--user")?),
-            "--password" => p.password = Some(value("--password")?),
+            "--password" => c.password = Some(value("--password")?),
             "--sub" => {
                 let v = value("--sub")?;
                 let (filter, qos) = match v.rsplit_once(':') {
@@ -95,16 +117,16 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Profile, String> {
     if !subs.is_empty() {
         p.subscriptions = subs;
     }
-    Ok(p)
+    Ok(c)
 }
 
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
-    use super::{Profile, Qos, Transport, parse_args};
+    use super::{ConnectConfig, Qos, Transport, cli_session, parse_args};
 
-    fn parse(s: &str) -> Result<Profile, String> {
-        parse_args(s.split_whitespace().map(String::from))
+    fn parse(s: &str) -> Result<navigator_core::net::Profile, String> {
+        parse_args(s.split_whitespace().map(String::from)).map(|c: ConnectConfig| c.profile)
     }
 
     #[test]
@@ -127,6 +149,50 @@ mod tests {
                 ("b".into(), Qos::AtMostOnce)
             ]
         );
+    }
+
+    fn session(s: &str) -> Result<Option<ConnectConfig>, String> {
+        cli_session(s.split_whitespace().map(String::from))
+    }
+
+    #[test]
+    fn no_arguments_make_no_session_profile() {
+        assert!(session("").expect("valid").is_none());
+    }
+
+    #[test]
+    fn arguments_make_an_unsaved_command_line_profile() {
+        let c = session("--host b.example --tcp --user u --password secret")
+            .expect("valid")
+            .expect("a session");
+        let p = &c.profile;
+        assert_eq!(p.name, "Command line");
+        assert_eq!((p.host.as_str(), p.port), ("b.example", 1883));
+        assert_eq!(p.transport, Transport::Tcp);
+        assert_eq!(p.username.as_deref(), Some("u"));
+        // The password is in the connect config only. It is not in the profile, so it cannot
+        // reach the settings file.
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        assert!(!format!("{p:?}").contains("secret"));
+    }
+
+    #[test]
+    fn too_long_values_are_rejected_with_a_plain_message() {
+        let long = "a".repeat(65_536);
+        let user = session(&format!("--user {long}")).expect_err("user");
+        let pass = session(&format!("--password {long}")).expect_err("password");
+        assert!(user.contains("user name"), "{user}");
+        assert!(
+            pass.contains("password") && !pass.contains("aaaa"),
+            "{pass}"
+        );
+        assert!(session(&format!("--user {}", "a".repeat(65_535))).is_ok());
+    }
+
+    #[test]
+    fn a_bad_argument_is_an_error() {
+        assert!(session("--port 0").is_err());
+        assert!(session("--nope").is_err());
     }
 
     #[test]

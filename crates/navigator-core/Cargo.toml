@@ -14,10 +14,16 @@ workspace = true
 bytes = "1.12.1"
 ms-mqtt-client = { version = "0.1.0", features = ["websockets"] }
 openssl = { version = "0.10.82", features = ["vendored"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1.44"
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
 
 [features]
 # Tests against the Docker brokers in tests/broker (see tests/broker/README.md).
 broker-tests = []
+
+[dev-dependencies]
+tempfile = "3.27.0"
