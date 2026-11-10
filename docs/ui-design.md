@@ -88,18 +88,21 @@ The window has one place for each job:
   - "Properties" opens the MQTT 5 fields: content type, response topic, correlation data, message expiry, user properties.
   - The **History ▾** button has two groups: **Drafts** (the last 5 replaced drafts) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. Nothing is saved to disk.
   - **Every** replacement of the composer content first saves the current draft to Drafts, if it has content and was not sent. This includes History recall, Edit and publish, Reply, and Publish to this topic.
+  - The topic and the property texts are single-line inputs. A text with a line break shows escaped (`\n`) with the note "This topic has line breaks; they are kept.". The composer keeps the exact text until you edit that field.
+  - Content type, correlation data and each user property have **Send empty**: a property that is present but empty stays present in Edit and publish and in the sent message.
+  - **Format** works up to 1 MiB of payload and 2 MiB of result, and it saves the old draft first. The Text/Hex switch saves the old draft, too.
   - The composer can collapse to one line. Then it shows the topic, the payload and Send.
   - While disconnected, Send is disabled and the composer shows "Connect to a broker first."
 - **Right pane, details of the selected message or topic:**
   - Tabs: Value and History.
   - Actions fill the composer. **They never send.** The old composer content goes to Drafts, so you can get it back. After the action, focus moves to the composer payload. In a narrow window, the details sheet closes first.
-    - **Publish to this topic** sets the topic only and keeps the payload. It is available for a topic and for a message.
+    - **Publish to this topic** sets the topic only and keeps the payload. It is available for a topic and for a message. It does not need a stored payload: a branch of the tree and a topic with an evicted value work too.
     - **Edit and publish** fills topic, payload bytes, QoS, retain and properties from the message.
       - A payload that is not valid UTF-8 opens in Hex mode with the exact bytes.
       - The action is disabled when the full payload is not stored (truncated or evicted). The reason shows next to it: "The full payload is not stored."
       - The composer never takes a formatted view (pretty JSON, Hex dump, Base64) as the payload text.
     - **Reply** shows only when the message has an MQTT 5 Response Topic. It sets the topic to the response topic and copies the correlation data. The payload is empty, Retain is off, and the other properties are empty.
-  - **Clear retained** shows only for a topic that has a retained message. It sits apart from the other actions and asks for confirmation.
+  - **Clear retained** shows only for a topic that has a retained message. It sits apart from the other actions and asks for confirmation. The store tracks the broker state for each topic: a retained message with a payload sets it, a retained message with an empty payload or our own acknowledged Clear ends it, and the Message Expiry Interval of the retained message ends it. A message without the Retain flag changes nothing.
   - The pane header has a close button. The pane stays closed until you open it again (button in the centre header, or the command palette).
   - When the window is narrower than 1 100 px, the details open as a right-side sheet.
 - **Status bar:** URL, msg/s, topics, memory used against the budget, and drops (red with text when above 0). A warning tag shows "Not encrypted" for TCP and WS, and "Insecure TLS" when TLS verification is off.
@@ -141,6 +144,8 @@ Payloads are often long (400 characters or more, often JSON). Some are a single 
   - The full payload. JSON is pretty-printed. Lines wrap by default, and the **Wrap** toggle turns wrapping off. Long topics and tokens wrap and do not overflow.
   - **Expand** widens the details pane over the message list. **Restore** returns it to its size.
   - A payload larger than 256 KiB shows its first 256 KiB and **Show all (1.2 MiB)**. Formatting runs in the background (see ARCHITECTURE.md, "Responsive UI").
+  - The editor takes a bounded chunk of the formatted text in one step, because setting and laying out text runs on the UI thread. Longer text shows its first chunk and **Show more (+N KiB)**. Each click adds the next chunk. **Copy** copies all of the formatted text, but only when the finished render belongs to the selection. While the render runs, Copy is off.
+  - The command palette has the same actions: Decoder (also Number), Number type, Number byte order, Wrap, Show all, Show more. Each one shows only when it can work.
 - **Tooltip:** hovering a row shows the first 20 lines of the payload. This is only a shortcut. Selecting the row gives the same content in the details pane.
 
 ## 4. Component map
@@ -233,6 +238,7 @@ Other rules:
 | `F6` / `Shift+F6` | Next / previous pane |
 | `Tab` / `Shift+Tab` | Next / previous control |
 | Arrows, `Left`, `Right`, `Enter` | Move, collapse, expand, select in the tree and the list |
+| `Up`, `Down`, `Enter` (in History) | Move the cursor in the rows of the History tab, show the row in the Value tab |
 
 - Pause, Edit and publish, Reply, Publish to this topic and the details pane have buttons and command palette entries. They have no shortcut, so that they cannot conflict with system or editor keys.
 - Pane widths change with the mouse. The command palette has "Reset layout".

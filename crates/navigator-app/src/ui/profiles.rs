@@ -43,7 +43,7 @@ fn same_connection(a: &Profile, b: &Profile) -> bool {
     strip(a) == strip(b)
 }
 
-fn display_name(p: &Profile) -> String {
+pub(super) fn display_name(p: &Profile) -> String {
     if p.name.trim().is_empty() {
         p.host.clone()
     } else {
@@ -135,6 +135,10 @@ impl Navigator {
                 .cloned();
             if pick.is_some() {
                 self.set_active(pick);
+                // Metrics only (see `autoselect`): connect without a click.
+                if self.autoselect.is_some() {
+                    self.connect(window, cx);
+                }
             }
         }
         self.sync_select(window, cx);
@@ -170,7 +174,7 @@ impl Navigator {
         }
     }
 
-    fn apply_theme(&self, mode: ThemeMode, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn apply_theme(&self, mode: ThemeMode, window: &mut Window, cx: &mut Context<Self>) {
         match mode {
             ThemeMode::System => Theme::sync_system_appearance(Some(window), cx),
             ThemeMode::Light => Theme::change(ComponentTheme::Light, Some(window), cx),
@@ -302,16 +306,17 @@ impl Navigator {
         self.sel_msg = None;
         self.sel_topic = None;
         self.detail_of = DetailOf::Nothing;
-        self.detail_cache = None;
         self.anchor = None;
         self.reconnected_at = None;
         self.last_result = None;
         self.sub_error = None;
         self.rate = Rate::default();
         self.status = Status::default();
-        for input in [&self.topic_input, &self.payload_input, &self.sub_input] {
-            input.update(cx, |i, cx| i.set_value("", window, cx));
-        }
+        // The composer and History belong to the profile too.
+        self.insp.reset();
+        self.comp.reset(window, cx);
+        self.sub_input
+            .update(cx, |i, cx| i.set_value("", window, cx));
     }
 
     /// The user chose another profile. While a connection is live, the app asks first.

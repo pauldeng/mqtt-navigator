@@ -1,14 +1,18 @@
 //! Main window. P3: title bar with filter, subscriptions, message list and topic tree, details,
 //! composer, status bar.
 
+mod commands;
+mod compose;
+mod details;
 mod profiles;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use bytes::Bytes;
+use gpui_kit::component::WindowExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::command::{Command as PaletteList, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::status_bar::StatusBar;
@@ -18,21 +22,23 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use navigator_core::Qos;
+use navigator_core::decode::preview;
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, SendError, Status,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, SendError, Status,
 };
 use navigator_core::settings::{RowHeight, Settings, ThemeMode, ViewMode};
 use navigator_core::store::{
-    Direction, DirectionFilter, Limits, ListFilter, Msg, NodeId, RowId, RowView, SendStatus,
-    TopicStore, TreeFilter,
+    Direction, DirectionFilter, Insert, Limits, ListFilter, Msg, NodeId, RowId, RowView,
+    SendStatus, TopicStore, TreeFilter,
 };
-use navigator_core::{MsgProps, Qos};
 use uuid::Uuid;
 
 use crate::connections::{Choice, ConnectionSheet, ProfileItem, SheetEvent};
 use crate::messages::{
     colour_slot, format_time, group_digits, status_failed, status_from_result, status_text,
 };
+use crate::palette::Cmd;
 use crate::persist::Writer;
 use crate::secrets::{Cached, Secrets};
 
@@ -42,8 +48,14 @@ actions!(
         ShowMessages,
         ShowTree,
         FocusFilter,
+        OpenPalette,
+        NewConnection,
+        SendMessage,
+        FocusNextField,
+        FocusPrevField,
         SelectPrev,
         SelectNext,
+        ConfirmRow,
         ExpandNode,
         CollapseNode
     ]
@@ -51,6 +63,7 @@ actions!(
 
 const CONTEXT: &str = "Navigator";
 const LIST_CONTEXT: &str = "NavigatorList";
+const HIST_CONTEXT: &str = "NavigatorHistory";
 
 /// Registers the key bindings of this window. Call once at start.
 pub fn init(cx: &mut App) {
@@ -61,10 +74,23 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-2", ShowTree, Some(CONTEXT)),
         KeyBinding::new("ctrl-f", FocusFilter, Some(CONTEXT)),
         KeyBinding::new("cmd-f", FocusFilter, Some(CONTEXT)),
+        KeyBinding::new("ctrl-k", OpenPalette, Some(CONTEXT)),
+        KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
+        KeyBinding::new("ctrl-n", NewConnection, Some(CONTEXT)),
+        KeyBinding::new("cmd-n", NewConnection, Some(CONTEXT)),
+        // The payload editor inserts a newline for Ctrl+Enter and a tab for Tab. In the
+        // composer, these keys send and move the focus.
+        KeyBinding::new("ctrl-enter", SendMessage, Some("Composer > Input")),
+        KeyBinding::new("cmd-enter", SendMessage, Some("Composer > Input")),
+        KeyBinding::new("tab", FocusNextField, Some("Composer > Input")),
+        KeyBinding::new("shift-tab", FocusPrevField, Some("Composer > Input")),
         KeyBinding::new("up", SelectPrev, Some(LIST_CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(LIST_CONTEXT)),
         KeyBinding::new("right", ExpandNode, Some(LIST_CONTEXT)),
         KeyBinding::new("left", CollapseNode, Some(LIST_CONTEXT)),
+        KeyBinding::new("up", SelectPrev, Some(HIST_CONTEXT)),
+        KeyBinding::new("down", SelectNext, Some(HIST_CONTEXT)),
+        KeyBinding::new("enter", ConfirmRow, Some(HIST_CONTEXT)),
     ]);
 }
 
@@ -121,6 +147,8 @@ enum DetailKey {
     /// Latest value of a node: node, receive time, stored length, truncated.
     Node(NodeId, SystemTime, usize, bool),
     Row(RowId),
+    /// A History entry of a node: node, receive time, stored length, truncated.
+    Hist(NodeId, SystemTime, usize, bool),
 }
 
 /// One visible row of the message list, copied out of the store for rendering.
@@ -402,23 +430,30 @@ pub struct Navigator {
     list_focus: FocusHandle,
     /// Connection generation of the shown data. Newer data from the net thread replaces it.
     gate: GenGate,
-    /// Formatted payload of the selected message, with the key it was built for.
-    detail_cache: Option<(DetailKey, SharedString)>,
+    /// The details pane (Value and History tabs, decoder, background render job).
+    insp: details::Inspector,
+    /// The details pane is open. It stays closed until the user opens it again.
+    details_open: bool,
+    /// The window is narrower than `details::NARROW`: the details open as a sheet.
+    narrow: bool,
+    comp: compose::Composer,
     list_scroll: UniformListScrollHandle,
     tree_scroll: UniformListScrollHandle,
-    topic_input: Entity<InputState>,
     sub_input: Entity<InputState>,
     /// Error text under the subscribe input.
     sub_error: Option<String>,
     /// Set when the connection came back by itself. Cleared when the connection ends again.
     reconnected_at: Option<std::time::SystemTime>,
-    payload_input: Entity<InputState>,
-    qos: Qos,
     sub_qos: Qos,
     next_op: u64,
     last_result: Option<(u64, String)>,
     rate: Rate,
     metrics: Metrics,
+    /// Metrics only: `MQTT_NAVIGATOR_AUTOSELECT=<topic>` (ignored without
+    /// `MQTT_NAVIGATOR_METRICS`). When this topic arrives, the app selects it and applies Show
+    /// all, as a click would, and the app connects to the saved profile at start. It exists to
+    /// measure the frame time of a large payload without UI automation.
+    autoselect: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -454,8 +489,6 @@ impl Navigator {
         let events = std::mem::replace(&mut net.events, tokio_channel_placeholder());
         let status_rx = net.status.clone();
 
-        let topic_input = cx.new(|cx| InputState::new(window, cx).placeholder("Topic"));
-        let payload_input = cx.new(|cx| InputState::new(window, cx).placeholder("Payload"));
         let sub_input = cx.new(|cx| InputState::new(window, cx).placeholder("Topic filter"));
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -581,20 +614,23 @@ impl Navigator {
             root_focus,
             list_focus: cx.focus_handle(),
             gate: GenGate::default(),
-            detail_cache: None,
+            insp: details::Inspector::new(window, cx),
+            details_open: true,
+            narrow: false,
+            comp: compose::Composer::new(window, cx),
             list_scroll: UniformListScrollHandle::new(),
             tree_scroll: UniformListScrollHandle::new(),
-            topic_input,
             sub_input,
             sub_error: None,
             reconnected_at: None,
-            payload_input,
-            qos: Qos::AtMostOnce,
             sub_qos: Qos::AtMostOnce,
             next_op: 1,
             last_result: None,
             rate: Rate::default(),
             metrics: Metrics::from_env(),
+            autoselect: std::env::var("MQTT_NAVIGATOR_AUTOSELECT")
+                .ok()
+                .filter(|_| std::env::var_os("MQTT_NAVIGATOR_METRICS").is_some()),
             // On quit, disconnect cleanly. gpui waits for quit handlers for at most 200 ms.
             _subscriptions: vec![
                 appearance,
@@ -911,7 +947,17 @@ impl Navigator {
         while let Some(msg) = next.take() {
             self.net.release(&msg);
             if self.accept(msg.generation) {
-                self.store.insert(msg);
+                let pick = self.autoselect.as_deref() == Some(&*msg.topic);
+                if let Insert::Stored(id) = self.store.insert(msg)
+                    && pick
+                {
+                    self.sel_topic = Some(id);
+                    self.sel_msg = None;
+                    self.detail_of = DetailOf::Topic;
+                    self.details_open = true;
+                    self.insp.hist_pick = None;
+                    self.insp.set_auto_all();
+                }
                 n += 1;
             }
             if Instant::now() < deadline {
@@ -1158,48 +1204,6 @@ impl Navigator {
         cx.notify();
     }
 
-    fn send(&mut self, cx: &mut Context<Self>) {
-        // Spaces are part of an MQTT topic name, so the topic is not trimmed.
-        let topic = self.topic_input.read(cx).value().to_string();
-        if topic.is_empty() {
-            self.last_result = Some((0, "Type a topic.".into()));
-            cx.notify();
-            return;
-        }
-        let payload = self.payload_input.read(cx).value().to_string();
-        let op_id = self.next_op;
-        self.next_op += 1;
-        let payload = Bytes::from(payload);
-        let out = Outgoing {
-            op_id,
-            topic: topic.clone(),
-            payload: payload.clone(),
-            qos: self.qos,
-            retain: false,
-            props: MsgProps::default(),
-        };
-        self.last_result = match self.net.send(Command::Publish(Box::new(out))) {
-            Ok(()) => {
-                // The list row shows the progress. The broker sends the message back as a
-                // normal received message if a subscription matches.
-                self.capture_anchor();
-                self.store.record_sent(
-                    op_id,
-                    &topic,
-                    payload,
-                    self.qos,
-                    false,
-                    MsgProps::default(),
-                    SystemTime::now(),
-                );
-                self.restore_anchor();
-                Some((op_id, status_text(&SendStatus::Sending)))
-            }
-            Err(_) => Some((op_id, "Too many messages are waiting. Try again.".into())),
-        };
-        cx.notify();
-    }
-
     /// Selects a topic of the tree. `generation` is the data generation when the row was
     /// rendered. A click on a row of an older generation does nothing, because its `NodeId` may
     /// now name another topic.
@@ -1214,6 +1218,7 @@ impl Navigator {
         self.sel_topic = Some(id);
         self.sel_msg = None;
         self.detail_of = DetailOf::Topic;
+        self.insp.hist_pick = None;
         if has_children {
             self.store.set_expanded(id, !expanded);
             // A paused tree takes a new snapshot: wake the frame loop for the work.
@@ -1244,6 +1249,7 @@ impl Navigator {
                 direction,
             });
             self.detail_of = DetailOf::Message;
+            self.insp.hist_pick = None;
             self.follow = false;
             self.list_scroll.scroll_to_item(i, ScrollStrategy::Nearest);
             cx.notify();
@@ -1285,6 +1291,7 @@ impl Navigator {
                     self.sel_topic = Some(id);
                     self.sel_msg = None;
                     self.detail_of = DetailOf::Topic;
+                    self.insp.hist_pick = None;
                     if let Some(n) = next {
                         self.tree_scroll.scroll_to_item(n, ScrollStrategy::Nearest);
                     }
@@ -1442,6 +1449,14 @@ impl Navigator {
                             .small()
                             .prefix(IconName::Search),
                     ),
+                )
+                .child(
+                    Button::new("palette")
+                        .small()
+                        .ghost()
+                        .label("Commands")
+                        .tooltip(format!("Command palette ({}+K)", crate::palette::MOD))
+                        .on_click(cx.listener(|v, _, window, cx| v.open_palette(window, cx))),
                 )
                 .child(
                     Button::new("theme")
@@ -1703,6 +1718,15 @@ impl Navigator {
                 )
             })
             .child(div().flex_1())
+            .child(
+                Button::new("toggle-details")
+                    .small()
+                    .ghost()
+                    .icon(IconName::PanelRight)
+                    .label("Details")
+                    .tooltip("Show or hide the details")
+                    .on_click(cx.listener(|v, _, window, cx| v.toggle_details(window, cx))),
+            )
             .when(paused, |d| {
                 d.child(div().text_xs().text_color(theme.warning).child(format!(
                     "Paused · {} new",
@@ -2067,6 +2091,8 @@ impl Navigator {
                     .on_click(cx.listener(move |v, _, window, cx| {
                         v.list_focus.focus(window, cx);
                         v.select_row(id, cx);
+                        // A click opens the sheet. The keys (Up, Down) must keep the list focus.
+                        v.insp.want_sheet = v.narrow && v.details_open;
                     }))
                     .into_any_element()
             }
@@ -2179,7 +2205,8 @@ impl Navigator {
                             )
                             .on_click(cx.listener(move |v, _, window, cx| {
                                 v.list_focus.focus(window, cx);
-                                v.select(id, generation, cx)
+                                v.select(id, generation, cx);
+                                v.insp.want_sheet = v.narrow && v.details_open;
                             }))
                     })
                     .collect()
@@ -2188,184 +2215,6 @@ impl Navigator {
         .track_scroll(&self.tree_scroll)
         .flex_1()
         .into_any_element()
-    }
-
-    /// Formatted payload, built once for each message and capped in size.
-    fn detail_text(&mut self, key: DetailKey, payload: &Bytes) -> SharedString {
-        match &self.detail_cache {
-            Some((k, text)) if *k == key => text.clone(),
-            _ => {
-                let text: SharedString = text_or_hex(payload, DETAIL_MAX).into();
-                self.detail_cache = Some((key, text.clone()));
-                text
-            }
-        }
-    }
-
-    fn meta_text(&self, m: &Msg, direction: Direction) -> String {
-        format!(
-            "{} · {}QoS {} · {}{} B{}",
-            format_time(m.received_at, self.utc_offset, true),
-            if direction == Direction::Sent {
-                "↑ Sent · "
-            } else {
-                ""
-            },
-            m.qos.as_u8(),
-            if m.retain { "Retained · " } else { "" },
-            m.original_size,
-            if m.truncated { " · truncated" } else { "" },
-        )
-    }
-
-    fn render_details(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // What to show: topic, meta line and payload. The Messages view shows the selected
-        // message. The Tree view shows the latest value of the selected topic.
-        let mut evicted = false;
-        let shown: Option<(String, Option<(String, SharedString)>)> = match self.detail_of {
-            DetailOf::Nothing => None,
-            DetailOf::Message => self.sel_msg.take().map(|s| {
-                evicted = self.store.row_evicted(s.id);
-                let text = self.detail_text(DetailKey::Row(s.id), &s.msg.payload);
-                let shown = (
-                    s.topic.to_string(),
-                    Some((self.meta_text(&s.msg, s.direction), text)),
-                );
-                self.sel_msg = Some(s);
-                shown
-            }),
-            DetailOf::Topic => self.sel_topic.and_then(|id| {
-                let n = self.store.get(id)?;
-                let path = self.store.path(id);
-                let Some(m) = n.latest.cloned() else {
-                    return Some((path, None));
-                };
-                let key = DetailKey::Node(id, m.received_at, m.payload.len(), m.truncated);
-                let text = self.detail_text(key, &m.payload);
-                Some((path, Some((self.meta_text(&m, Direction::Received), text))))
-            }),
-        };
-        let theme = cx.theme();
-        let hint = |t: &'static str| div().text_color(theme.muted_foreground).child(t);
-        let body = match shown {
-            None => hint("Select a topic with a message.").into_any_element(),
-            Some((path, value)) => {
-                let head = div()
-                    .font_family(theme.mono_font_family.clone())
-                    .child(path);
-                match value {
-                    None => v_flex()
-                        .gap_2()
-                        .child(head)
-                        .child(hint("Select a topic with a message."))
-                        .into_any_element(),
-                    Some((meta, text)) => v_flex()
-                        .gap_2()
-                        .child(head)
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(meta),
-                        )
-                        .when(evicted, |d| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.warning)
-                                    .child("Removed from the message list (memory limit)."),
-                            )
-                        })
-                        .child(
-                            div()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_sm()
-                                .child(text),
-                        )
-                        .into_any_element(),
-                }
-            }
-        };
-        v_flex()
-            .w(px(360.))
-            .h_full()
-            .border_l_1()
-            .border_color(theme.border)
-            .p_3()
-            .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("MESSAGE"),
-            )
-            .child(body)
-    }
-
-    fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let qos_button = |q: Qos| {
-            let label = format!("QoS {}", q.as_u8());
-            let b = Button::new(("qos", q.as_u8() as usize))
-                .small()
-                .label(label);
-            let b = if self.qos == q {
-                b.primary()
-            } else {
-                b.ghost()
-            };
-            b.on_click(cx.listener(move |v, _, _, cx| {
-                v.qos = q;
-                cx.notify();
-            }))
-        };
-        let result = self
-            .last_result
-            .as_ref()
-            .map(|(_, t)| t.clone())
-            .unwrap_or_default();
-        v_flex()
-            .border_t_1()
-            .border_color(theme.border)
-            .p_2()
-            .gap_2()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("PUBLISH"),
-                    )
-                    .child(div().flex_1().child(Input::new(&self.topic_input).small())),
-            )
-            .child(Input::new(&self.payload_input).small())
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(qos_button(Qos::AtMostOnce))
-                    .child(qos_button(Qos::AtLeastOnce))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(if self.connected() {
-                                result
-                            } else {
-                                "Connect to a broker first.".into()
-                            }),
-                    )
-                    .child(
-                        Button::new("send")
-                            .small()
-                            .primary()
-                            .label("Send")
-                            .disabled(!self.connected())
-                            .on_click(cx.listener(|v, _, _, cx| v.send(cx))),
-                    ),
-            )
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2444,7 +2293,21 @@ impl Render for Navigator {
             let s = window.viewport_size();
             self.last_size = (f32::from(s.width), f32::from(s.height));
         }
+        // Below NARROW px the details open as a sheet. A wide window shows them in the pane.
+        self.narrow = f32::from(window.viewport_size().width) < details::NARROW;
+        if self.narrow && self.insp.want_sheet {
+            self.insp.want_sheet = false;
+            cx.defer_in(window, |v, window, cx| v.open_details_sheet(window, cx));
+        } else if !self.narrow && self.insp.sheet_open {
+            self.insp.sheet_open = false;
+            cx.defer_in(window, |_, window, cx| window.close_sheet(cx));
+        }
         let chips = self.render_chips(cx);
+        let details = if self.details_open && !self.narrow {
+            Some(self.render_details(window, false, cx))
+        } else {
+            None
+        };
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -2452,11 +2315,18 @@ impl Render for Navigator {
             .text_color(theme.foreground)
             .key_context(CONTEXT)
             .track_focus(&self.root_focus)
-            .on_action(cx.listener(|v, _: &ShowMessages, _, cx| v.set_view(View::Messages, cx)))
-            .on_action(cx.listener(|v, _: &ShowTree, _, cx| v.set_view(View::Tree, cx)))
-            .on_action(cx.listener(|v, _: &FocusFilter, window, cx| {
-                v.filter_input.update(cx, |i, cx| i.focus(window, cx));
-            }))
+            .on_action(
+                cx.listener(|v, _: &ShowMessages, w, cx| v.run_cmd(Cmd::ViewMessages, w, cx)),
+            )
+            .on_action(cx.listener(|v, _: &ShowTree, w, cx| v.run_cmd(Cmd::ViewTree, w, cx)))
+            .on_action(cx.listener(|v, _: &FocusFilter, w, cx| v.run_cmd(Cmd::FocusFilter, w, cx)))
+            .on_action(cx.listener(|v, _: &OpenPalette, w, cx| v.open_palette(w, cx)))
+            .on_action(
+                cx.listener(|v, _: &NewConnection, w, cx| v.run_cmd(Cmd::NewConnection, w, cx)),
+            )
+            .on_action(cx.listener(|v, _: &SendMessage, w, cx| v.run_cmd(Cmd::Send, w, cx)))
+            .on_action(cx.listener(|_, _: &FocusNextField, window, cx| window.focus_next(cx)))
+            .on_action(cx.listener(|_, _: &FocusPrevField, window, cx| window.focus_prev(cx)))
             .child(self.render_title(cx))
             .child(
                 h_flex()
@@ -2473,7 +2343,7 @@ impl Render for Navigator {
                             .child(self.render_list_area(cx))
                             .child(self.render_composer(cx)),
                     )
-                    .child(self.render_details(cx)),
+                    .children(details),
             )
             .child(self.render_status(cx))
     }
@@ -2520,6 +2390,16 @@ impl Metrics {
     fn merge(&mut self, d: Duration) {
         if self.on {
             self.merge_ms.push(d.as_secs_f32() * 1000.);
+        }
+    }
+
+    /// One UI-thread step that the frame timer does not see (setting text into the editor).
+    fn ui_step(&self, what: &str, bytes: usize, d: Duration) {
+        if self.on {
+            eprintln!(
+                "metrics ui_step={what} bytes={bytes} took={:.2}ms",
+                d.as_secs_f32() * 1000.
+            );
         }
     }
 
@@ -2586,71 +2466,6 @@ async fn write_metrics(line: String) {
     eprintln!("{line} rss={rss_mib}MiB");
 }
 
-/// One-line preview: whitespace collapsed, control characters as `·`, invalid UTF-8 as hex.
-fn preview(payload: &[u8], max_chars: usize) -> String {
-    let head = &payload[..payload.len().min(512)];
-    let Some(text) = utf8_prefix(head) else {
-        let hex: Vec<String> = head.iter().take(16).map(|b| format!("{b:02x}")).collect();
-        return format!("bin {}", hex.join(" "));
-    };
-    let mut out = String::with_capacity(max_chars + 1);
-    let mut last_space = false;
-    for (i, c) in text.chars().enumerate() {
-        if i >= max_chars {
-            out.push('…');
-            return out;
-        }
-        if c.is_whitespace() {
-            if !last_space {
-                out.push(' ');
-            }
-            last_space = true;
-        } else {
-            out.push(if c.is_control() { '·' } else { c });
-            last_space = false;
-        }
-    }
-    if payload.len() > head.len() {
-        out.push('…');
-    }
-    out
-}
-
-/// Valid UTF-8 prefix of a slice that may end inside a character. `None` if the data is not text.
-fn utf8_prefix(b: &[u8]) -> Option<&str> {
-    match std::str::from_utf8(b) {
-        Ok(s) => Some(s),
-        Err(e) if e.error_len().is_none() => std::str::from_utf8(&b[..e.valid_up_to()]).ok(),
-        Err(_) => None,
-    }
-}
-
-/// Most payload bytes the details pane formats. P5 adds "Show all" and background formatting.
-// ponytail: fixed cap on the UI thread; P5 moves large payloads to a cancellable background job.
-const DETAIL_MAX: usize = 64 * 1024;
-
-/// Payload as text, or as a hex dump when it is not UTF-8. At most `max` bytes are formatted.
-fn text_or_hex(payload: &[u8], max: usize) -> String {
-    use std::fmt::Write as _;
-    let head = &payload[..payload.len().min(max)];
-    let more = payload.len() > head.len();
-    let mut out = match utf8_prefix(head) {
-        Some(text) => text.to_string(),
-        None => {
-            let mut hex = String::with_capacity(head.len() * 3);
-            for (i, b) in head.iter().enumerate() {
-                let sep = if i == 0 { "" } else { " " };
-                let _ = write!(hex, "{sep}{b:02x}");
-            }
-            hex
-        }
-    };
-    if more {
-        let _ = write!(out, "\n… {} more bytes", payload.len() - head.len());
-    }
-    out
-}
-
 /// A closed receiver, used to take the real receivers out of `Net`.
 fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
     tokio::sync::mpsc::channel(1).1
@@ -2660,8 +2475,8 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
-        GenGate, Sub, SubState, Subs, connection_live, preview, scroll_top_of, send_error_text,
-        top_row, validate_filter,
+        GenGate, Sub, SubState, Subs, connection_live, scroll_top_of, send_error_text, top_row,
+        validate_filter,
     };
     use navigator_core::Qos;
     use navigator_core::net::SendError;
@@ -2731,16 +2546,6 @@ mod tests {
         }
         assert!(validate_filter(&"a".repeat(65_535)).is_ok());
         assert!(validate_filter(&"a".repeat(65_536)).is_err());
-    }
-
-    #[test]
-    fn preview_collapses_whitespace_and_marks_binary() {
-        assert_eq!(preview(b"{\n  \"v\": 1\n}", 80), "{ \"v\": 1 }");
-        assert_eq!(preview(&[0xff, 0x00, 0x10], 80), "bin ff 00 10");
-        assert_eq!(preview("abcdef".as_bytes(), 3), "abc…");
-        // A cut inside a multi-byte character is not binary.
-        let long = "é".repeat(400);
-        assert!(!preview(long.as_bytes(), 80).starts_with("bin"));
     }
 
     fn subs(filters: &[&str]) -> Subs {

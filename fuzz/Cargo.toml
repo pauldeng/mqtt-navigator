@@ -1,0 +1,46 @@
+[package]
+name = "navigator-core-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+navigator-core = { path = "../crates/navigator-core" }
+
+# This crate is its own workspace, so it repeats the root patch (see vendor/README.md).
+[patch.crates-io]
+ms-mqtt-client = { path = "../vendor/ms-mqtt-client" }
+
+[workspace]
+
+[[bin]]
+name = "decode_render"
+path = "fuzz_targets/decode_render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_hex"
+path = "fuzz_targets/parse_hex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topic_matches"
+path = "fuzz_targets/topic_matches.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_import"
+path = "fuzz_targets/profile_import.rs"
+test = false
+doc = false
+bench = false

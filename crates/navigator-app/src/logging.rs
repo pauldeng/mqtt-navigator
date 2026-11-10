@@ -110,7 +110,8 @@ fn drain(rx: Receiver<Vec<u8>>, dropped: Arc<AtomicU64>, mut file: RotatingFile)
     }
 }
 
-fn log_dir() -> Option<PathBuf> {
+/// The folder of the log and crash files.
+pub fn log_dir() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("mqtt-navigator").join("logs"))
 }
 

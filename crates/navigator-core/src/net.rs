@@ -9,7 +9,7 @@ use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -304,6 +304,8 @@ pub struct Net {
     cancel: watch::Sender<u64>,
     /// Bytes ([`queue_cost`]) that are in `incoming` and not yet released.
     queued_bytes: Arc<AtomicUsize>,
+    /// See [`Shared::broker_max_packet`].
+    broker_max_packet: Arc<AtomicU32>,
     /// Becomes true when the net thread has ended.
     done: watch::Receiver<bool>,
 }
@@ -318,6 +320,7 @@ impl Net {
         let (cancel, cancel_rx) = watch::channel(0u64);
         let stats = Arc::new(NetStats::default());
         let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let broker_max_packet = Arc::new(AtomicU32::new(0));
         let (done_tx, done) = watch::channel(false);
 
         let events_weak = events_tx.downgrade();
@@ -327,19 +330,21 @@ impl Net {
             status_tx.clone(),
             stats.clone(),
             queued_bytes.clone(),
+            broker_max_packet.clone(),
         );
         // The thread is detached. `done_tx` is dropped if the thread cannot start or dies, and
         // that also ends `shutdown`.
         let thread = std::thread::Builder::new()
             .name("mqtt-net".into())
             .spawn(move || {
-                let (incoming, events, status, stats, queued_bytes) = parts;
+                let (incoming, events, status, stats, queued_bytes, broker_max_packet) = parts;
                 let shared = Rc::new(Shared {
                     incoming,
                     events,
                     status,
                     stats,
                     queued_bytes,
+                    broker_max_packet,
                     limits,
                     active: Cell::new(0),
                 });
@@ -375,6 +380,7 @@ impl Net {
             last_generation: AtomicU64::new(0),
             cancel,
             queued_bytes,
+            broker_max_packet,
             done,
         }
     }
@@ -401,20 +407,47 @@ impl Net {
     ///
     /// A [`Net::disconnect`] voids every command that was sent before it, even if the net
     /// thread has not read the command yet. A rejected command is answered with an event.
+    ///
+    /// A publish is checked first with [`crate::publish::validate_outgoing`] (and the broker's
+    /// Maximum Packet Size, see [`Net::broker_max_packet`]). If the check fails, `send` returns
+    /// `Ok(())`, does not queue the command, and gives [`Event::Published`] with
+    /// [`PublishResult::Rejected`] and the reason. The generation is the latest one that
+    /// [`Net::connect`] gave out.
     pub fn send(&self, cmd: Command) -> Result<(), SendError> {
         if let Command::Connect(config) = cmd {
             return self.connect(*config).map(|_| ());
         }
-        match self.events_tx.upgrade() {
+        let events = match self.events_tx.upgrade() {
             Some(tx) if tx.capacity() < EVENTS_RESERVE => return Err(SendError::Full),
-            Some(_) => {}
+            Some(tx) => tx,
             None => return Err(SendError::Closed),
+        };
+        if let Command::Publish(o) = &cmd
+            && let Err(why) = crate::publish::validate_outgoing(o, self.broker_max_packet())
+        {
+            // The reserve above makes room for this result (see `EVENTS_CAP`).
+            return events
+                .try_send(Event::Published {
+                    generation: self.last_generation.load(Ordering::Relaxed),
+                    op_id: o.op_id,
+                    result: PublishResult::Rejected(why),
+                })
+                .map_err(|_| SendError::Full);
         }
         let epoch = *self.cancel.borrow();
         self.commands.try_send((epoch, cmd)).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => SendError::Full,
             mpsc::error::TrySendError::Closed(_) => SendError::Closed,
         })
+    }
+
+    /// The broker's Maximum Packet Size from its CONNACK, in bytes. `None` while the session is
+    /// not connected, or when the broker sets no limit.
+    pub fn broker_max_packet(&self) -> Option<u32> {
+        if self.status.borrow().state != ConnState::Connected {
+            return None;
+        }
+        Some(self.broker_max_packet.load(Ordering::Relaxed)).filter(|&n| n != 0 && n != u32::MAX)
     }
 
     /// Asks for a clean disconnect. Never blocks. Works even if the command queue is full.
@@ -479,6 +512,8 @@ struct Shared {
     status: watch::Sender<Status>,
     stats: Arc<NetStats>,
     queued_bytes: Arc<AtomicUsize>,
+    /// Maximum Packet Size of the broker from the last CONNACK. 0: not known.
+    broker_max_packet: Arc<AtomicU32>,
     limits: NetLimits,
     /// Token of the one attempt that may change the status and queue messages. 0: none. The
     /// supervisor sets it when it starts an attempt, and clears it when it cancels or ends the
@@ -1136,6 +1171,10 @@ async fn session(
     };
     let (connection, disconnect_handle, session_present) = match result {
         ConnectResult::Success(connection, connack, handle) => {
+            shared.broker_max_packet.store(
+                connack.properties.maximum_packet_size.get(),
+                Ordering::Relaxed,
+            );
             (connection, handle, connack.session_present)
         }
         ConnectResult::Failure(_, error) => {
@@ -1971,6 +2010,7 @@ mod tests {
             status,
             stats: Arc::default(),
             queued_bytes: Arc::default(),
+            broker_max_packet: Arc::default(),
             limits: NetLimits::default(),
             active: Cell::new(0),
         });
@@ -2019,6 +2059,44 @@ mod tests {
         assert!(matches!(
             events_rx.try_recv(),
             Ok(Event::Subscribed { result: Err(_), .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_publish_is_answered_with_an_event_and_not_queued() {
+        let mut net = Net::start(NetLimits::default());
+        assert_eq!(net.broker_max_packet(), None);
+        let publish = |op_id, topic: &str| {
+            Command::Publish(Box::new(Outgoing {
+                op_id,
+                topic: topic.into(),
+                payload: Bytes::from_static(b"x"),
+                qos: Qos::AtMostOnce,
+                retain: false,
+                props: MsgProps::default(),
+            }))
+        };
+        net.send(publish(7, "a/+")).expect("rejected with an event");
+        match net.events.try_recv() {
+            Ok(Event::Published {
+                op_id: 7,
+                result: PublishResult::Rejected(why),
+                ..
+            }) => assert!(why.contains("wildcard"), "{why}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // A valid topic is queued: the net thread answers (it is not connected).
+        net.send(publish(8, "a/b")).expect("queued");
+        let event = tokio::time::timeout(Duration::from_secs(5), net.events.recv())
+            .await
+            .expect("answer");
+        assert!(matches!(
+            event,
+            Some(Event::Published {
+                op_id: 8,
+                result: PublishResult::Rejected(_),
+                ..
+            })
         ));
     }
 
@@ -2612,6 +2690,7 @@ mod tests {
             status,
             stats: Arc::default(),
             queued_bytes: Arc::default(),
+            broker_max_packet: Arc::default(),
             limits: NetLimits::default(),
             active: Cell::new(0),
         });

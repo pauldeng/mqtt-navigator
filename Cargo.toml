@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/navigator-core", "crates/navigator-app"]
-exclude = ["vendor"]
+exclude = ["vendor", "fuzz"]
 default-members = ["crates/navigator-app"]
 
 [workspace.package]
@@ -18,9 +18,14 @@ unsafe_code = "deny"
 all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 
+# Dev builds: full debug info for our crates only. gpui's debug info is several GB.
+[profile.dev.package."*"]
+debug = false
+
+# Chosen in P5 by measurement (ADR 0004): the smallest build that passes the budgets.
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level = "s"
+lto = "fat"
 codegen-units = 1
 strip = true
 debug = "line-tables-only"

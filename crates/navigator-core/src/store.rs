@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 
@@ -280,6 +280,15 @@ struct Node {
     /// Colour cache: the subscription revision, and the index (`NO_COLOUR` for none).
     colour_rev: u32,
     colour_idx: u32,
+    /// The broker keeps a retained message for this topic (see [`TopicStore::has_retained`]).
+    retained: Option<Retained>,
+}
+
+/// A retained message that the broker is known to keep.
+#[derive(Clone, Copy)]
+struct Retained {
+    /// The Message Expiry Interval of the retained message ends here. `None`: it has none.
+    until: Option<SystemTime>,
 }
 
 const NO_COLOUR: u32 = u32::MAX;
@@ -302,6 +311,20 @@ fn msg_cost(msg: &Msg) -> usize {
 /// Fixed part of the charge of a history entry. The `VecDeque` can have spare room, so the
 /// struct counts twice. The extra bytes are the entry in `hist_order`.
 const HIST_OVERHEAD: usize = 2 * size_of::<HistEntry>() + 48;
+
+/// Most retained publishes that wait for their end (see `TopicStore::pending_retained`).
+const MAX_PENDING_RETAINED: usize = 64;
+/// Most topics in `TopicStore::sent_retained`.
+const MAX_SENT_RETAINED: usize = 1024;
+
+struct PendingRetained {
+    op_id: u64,
+    topic: Arc<str>,
+    qos: Qos,
+    /// An empty payload: the publish deletes the retained message.
+    delete: bool,
+    until: Option<SystemTime>,
+}
 
 /// Fixed part of the charge of a list row. The extra bytes are the entry in the filter index.
 const ROW_OVERHEAD: usize = size_of::<Row>() + 16;
@@ -510,6 +533,13 @@ pub struct TopicStore {
     next_row: u64,
     /// `op_id` to the row of a sent message.
     ops: HashMap<u64, RowId>,
+    /// Our own retained publishes that wait for the end of the send. They do not depend on a
+    /// list row, which the store can evict. Oldest first.
+    pending_retained: VecDeque<PendingRetained>,
+    /// Topics where our own retained publish succeeded, also topics without a node (we do not
+    /// subscribe to them). Oldest first.
+    // ponytail: a linear search, because the cap is small. Use a map if the cap grows.
+    sent_retained: VecDeque<(Arc<str>, Retained)>,
     lf: ListFilterState,
     /// With an active filter: the ids of the matching rows, ascending.
     matched: VecDeque<RowId>,
@@ -576,6 +606,8 @@ impl TopicStore {
             snap_bytes: 0,
             messages: 0,
             topic_drops: 0,
+            pending_retained: VecDeque::new(),
+            sent_retained: VecDeque::new(),
             drops: 0,
             list_drops: 0,
             list: VecDeque::new(),
@@ -667,6 +699,7 @@ impl TopicStore {
         let original_size = payload.len();
         let stored_len = original_size.min(self.limits.latest_payload_max);
         let props_cost = props.heap_bytes();
+        let expiry = props.message_expiry;
         let latest_cost = stored_len + props_cost;
         let hist_len = stored_len.min(self.limits.history_payload_max);
         let hist_cost = HIST_OVERHEAD + hist_len + props_cost;
@@ -730,6 +763,7 @@ impl TopicStore {
                 history: VecDeque::new(),
                 colour_rev: 0,
                 colour_idx: NO_COLOUR,
+                retained: None,
             });
             self.node_bytes += node_cost(name.len(), end);
             match leaf {
@@ -785,9 +819,22 @@ impl TopicStore {
         let row_msg = latest.clone();
 
         // Store the latest value.
+        // Any retained message from the broker is the newest record for its topic: the node keeps
+        // it, and our own earlier retained publish no longer counts.
+        if retain {
+            self.sent_retained.retain(|(t, _)| **t != *topic);
+        }
         let node = &mut self.nodes[id.0 as usize];
         let first = node.msg_count == 0;
         node.msg_count += 1;
+        // A retained message with a payload sets the broker state. A retained message with an
+        // empty payload deletes it. A message without the flag changes nothing.
+        if retain {
+            node.retained = (original_size > 0).then(|| Retained {
+                until: expiry
+                    .and_then(|s| received_at.checked_add(Duration::from_secs(u64::from(s)))),
+            });
+        }
         node.latest = Some(latest);
         let node_topic = Arc::clone(&node.topic);
         if latest_cost > 0 {
@@ -867,6 +914,7 @@ impl TopicStore {
             topic.len() + ARC_OVERHEAD
         };
         let original_size = payload.len();
+        let expiry = props.message_expiry;
         let stored_len = original_size.min(self.limits.latest_payload_max);
         let cost = ROW_OVERHEAD + SENT_EXTRA + topic_cost + stored_len + props.heap_bytes();
         if self.fixed() + cost > self.limits.budget || !self.make_room(cost, 0, None) {
@@ -901,12 +949,25 @@ impl TopicStore {
         );
         // A repeated `op_id` points to the newest row.
         self.ops.insert(op_id, id);
+        if retain {
+            if self.pending_retained.len() >= MAX_PENDING_RETAINED {
+                self.pending_retained.pop_front();
+            }
+            self.pending_retained.push_back(PendingRetained {
+                op_id,
+                topic: Arc::from(topic),
+                qos,
+                delete: original_size == 0,
+                until: expiry.and_then(|s| at.checked_add(Duration::from_secs(u64::from(s)))),
+            });
+        }
         Insert::Recorded(id)
     }
 
     /// Changes the status of the sent message with this `op_id`. Returns false if the row is
     /// not in the list any more (or never was).
     pub fn set_send_status(&mut self, op_id: u64, status: SendStatus) -> bool {
+        self.finish_retained(op_id, &status);
         let Some(&id) = self.ops.get(&op_id) else {
             return false;
         };
@@ -932,13 +993,81 @@ impl TopicStore {
         else {
             return false;
         };
-        match &mut row.kind {
-            RowKind::Message(m) => {
-                m.status = Some(status);
-                true
-            }
-            RowKind::Reconnected(_) => false,
+        let RowKind::Message(m) = &mut row.kind else {
+            return false;
+        };
+        m.status = Some(status);
+        true
+    }
+
+    /// Our own retained publish succeeds when the broker acknowledges it (QoS 1) or when it is
+    /// written (QoS 0). A retained message with a payload is then held by the broker. An empty
+    /// one deletes it. Any other end only forgets the publish. This needs no list row and no
+    /// node.
+    fn finish_retained(&mut self, op_id: u64, status: &SendStatus) {
+        if matches!(status, SendStatus::Sending) {
+            return;
         }
+        let Some(i) = self.pending_retained.iter().position(|p| p.op_id == op_id) else {
+            return;
+        };
+        let done = matches!(
+            (status, self.pending_retained[i].qos),
+            (SendStatus::Acknowledged, _) | (SendStatus::Sent, Qos::AtMostOnce)
+        );
+        // A QoS 1 publish is still open after "Sent": the acknowledgement comes later.
+        if !done && matches!(status, SendStatus::Sent) {
+            return;
+        }
+        let Some(p) = self.pending_retained.remove(i) else {
+            return;
+        };
+        if !done {
+            return;
+        }
+        let state = (!p.delete).then_some(Retained { until: p.until });
+        if let Some(id) = self.find(&p.topic) {
+            self.nodes[id.0 as usize].retained = state;
+        }
+        self.sent_retained.retain(|(t, _)| *t != p.topic);
+        if let Some(r) = state {
+            if self.sent_retained.len() >= MAX_SENT_RETAINED {
+                self.sent_retained.pop_front();
+            }
+            self.sent_retained.push_back((p.topic, r));
+        }
+    }
+
+    /// [`has_retained`](Self::has_retained) for a topic path: the node state, or our own
+    /// acknowledged retained publish to a topic that has no node.
+    pub fn has_retained_topic(&self, topic: &str) -> bool {
+        self.has_retained_topic_at(topic, SystemTime::now())
+    }
+
+    pub fn has_retained_topic_at(&self, topic: &str, now: SystemTime) -> bool {
+        self.find(topic)
+            .is_some_and(|id| self.has_retained_at(id, now))
+            || self
+                .sent_retained
+                .iter()
+                .any(|(t, r)| **t == *topic && r.until.is_none_or(|u| now < u))
+    }
+
+    /// True if the broker keeps a retained message for this topic, as far as this client knows:
+    /// a retained message with a payload arrived, and no retained delete (an empty retained
+    /// message, or our own acknowledged "clear") came after it. A message without the retain flag
+    /// does not change this. The Message Expiry Interval of the retained message ends it.
+    pub fn has_retained(&self, id: NodeId) -> bool {
+        self.has_retained_at(id, SystemTime::now())
+    }
+
+    /// [`has_retained`](Self::has_retained) at a given time. The expiry is computed on read:
+    /// there is no timer.
+    pub fn has_retained_at(&self, id: NodeId, now: SystemTime) -> bool {
+        self.nodes
+            .get(id.0 as usize)
+            .and_then(|n| n.retained)
+            .is_some_and(|r| r.until.is_none_or(|t| now < t))
     }
 
     /// Adds a "Reconnected" marker row to the list. The marker has a small fixed charge and it
@@ -3590,5 +3719,225 @@ mod tests {
              worst {worst3:?}, total {total3:?}, rows() {rows_time:?} ({rows} rows); site3 rows() \
              {rows3_time:?}; pause {pause_time:?} (10k rows), {pause_max_time:?} (cap)"
         );
+    }
+
+    fn retained_msg(topic: &str, payload: &[u8], retain: bool, expiry: Option<u32>) -> Incoming {
+        Incoming {
+            retain,
+            props: MsgProps {
+                message_expiry: expiry,
+                ..MsgProps::default()
+            },
+            ..msg(topic, payload)
+        }
+    }
+
+    #[test]
+    fn retained_state_follows_the_broker() {
+        let mut s = TopicStore::new(big());
+        let id = stored(s.insert(retained_msg("t", b"v", true, None)));
+        assert!(s.has_retained(id));
+        // A live (not retained) update does not change it. The latest message has no flag.
+        s.insert(msg("t", b"live"));
+        assert!(!s.node(id).latest.expect("latest").retain);
+        assert!(s.has_retained(id));
+        // A retained message with an empty payload is a delete.
+        s.insert(retained_msg("t", b"", true, None));
+        assert!(!s.has_retained(id));
+        // An empty payload without the flag is not a delete, and it does not set the state.
+        s.insert(retained_msg("t", b"x", true, None));
+        s.insert(msg("t", b""));
+        assert!(s.has_retained(id));
+        assert!(!s.has_retained(NodeId(999)));
+        let other = stored(s.insert(msg("u", b"v")));
+        assert!(!s.has_retained(other));
+        s.clear();
+        assert!(!s.has_retained(id));
+    }
+
+    #[test]
+    fn retained_state_expires_on_read() {
+        let mut s = TopicStore::new(big());
+        let t0 = SystemTime::UNIX_EPOCH;
+        let id = stored(s.insert(retained_msg("t", b"v", true, Some(10))));
+        assert!(s.has_retained_at(id, t0 + Duration::from_secs(9)));
+        assert!(!s.has_retained_at(id, t0 + Duration::from_secs(10)));
+        // The interval belongs to the retained message: a live update does not renew it.
+        s.insert(msg("t", b"live"));
+        assert!(!s.has_retained_at(id, t0 + Duration::from_secs(11)));
+        // A new retained message without an interval does not expire.
+        s.insert(retained_msg("t", b"v2", true, None));
+        assert!(s.has_retained_at(id, t0 + Duration::from_secs(1_000_000)));
+    }
+
+    #[test]
+    fn our_acknowledged_clear_ends_the_retained_state() {
+        let mut s = TopicStore::new(big());
+        let id = stored(s.insert(retained_msg("t", b"v", true, None)));
+        let clear = |s: &mut TopicStore, op, qos, retain, payload: &'static [u8]| {
+            s.record_sent(
+                op,
+                "t",
+                Bytes::from_static(payload),
+                qos,
+                retain,
+                MsgProps::default(),
+                SystemTime::UNIX_EPOCH,
+            );
+        };
+        // Sending is not enough. A normal publish and a non-retained empty one do not clear.
+        clear(&mut s, 1, Qos::AtLeastOnce, true, b"");
+        assert!(s.has_retained(id));
+        clear(&mut s, 2, Qos::AtLeastOnce, true, b"x");
+        s.set_send_status(2, SendStatus::Acknowledged);
+        clear(&mut s, 3, Qos::AtLeastOnce, false, b"");
+        s.set_send_status(3, SendStatus::Acknowledged);
+        s.set_send_status(1, SendStatus::Rejected("no".into()));
+        assert!(s.has_retained(id));
+        // A rejected delete is over: a late "acknowledged" for it changes nothing.
+        s.set_send_status(1, SendStatus::Acknowledged);
+        assert!(s.has_retained(id));
+        // The acknowledgement of our own retained delete clears it.
+        clear(&mut s, 5, Qos::AtLeastOnce, true, b"");
+        s.set_send_status(5, SendStatus::Acknowledged);
+        assert!(!s.has_retained(id));
+        // QoS 0 has no acknowledgement: "Sent" is the end.
+        s.insert(retained_msg("t", b"v", true, None));
+        clear(&mut s, 4, Qos::AtMostOnce, true, b"");
+        s.set_send_status(4, SendStatus::Sent);
+        assert!(!s.has_retained(id));
+    }
+
+    #[test]
+    fn the_clear_completes_after_its_list_row_was_evicted() {
+        let mut s = TopicStore::new(Limits {
+            list_len: 3,
+            ..big()
+        });
+        let id = stored(s.insert(retained_msg("t", b"v", true, None)));
+        s.record_sent(
+            1,
+            "t",
+            Bytes::new(),
+            Qos::AtLeastOnce,
+            true,
+            MsgProps::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        // "Sent" is not the end of a QoS 1 delete.
+        s.set_send_status(1, SendStatus::Sent);
+        assert!(s.has_retained(id));
+        // New rows push the sent row out of the list. Its op id is gone.
+        for i in 0..10 {
+            s.insert(msg(&format!("x/{i}"), b"1"));
+        }
+        assert!(!s.set_send_status(1, SendStatus::Acknowledged), "no row");
+        assert!(!s.has_retained(id), "the late acknowledgement still clears");
+        // The pending list is bounded: the oldest delete is forgotten.
+        let id = stored(s.insert(retained_msg("t", b"v", true, None)));
+        for op in 100..100 + MAX_PENDING_RETAINED as u64 + 1 {
+            s.record_sent(
+                op,
+                "t",
+                Bytes::new(),
+                Qos::AtLeastOnce,
+                true,
+                MsgProps::default(),
+                SystemTime::UNIX_EPOCH,
+            );
+        }
+        assert_eq!(s.pending_retained.len(), MAX_PENDING_RETAINED);
+        s.set_send_status(100, SendStatus::Acknowledged);
+        assert!(s.has_retained(id), "the oldest delete was dropped");
+        s.set_send_status(101, SendStatus::Acknowledged);
+        assert!(!s.has_retained(id));
+    }
+
+    #[test]
+    fn a_broker_retained_message_replaces_our_own_record() {
+        let mut s = TopicStore::new(big());
+        let t0 = SystemTime::UNIX_EPOCH;
+        // We publish a retained message without expiry, and the broker acknowledges it.
+        s.record_sent(
+            1,
+            "r/t",
+            Bytes::from_static(b"ours"),
+            Qos::AtLeastOnce,
+            true,
+            MsgProps::default(),
+            t0,
+        );
+        s.set_send_status(1, SendStatus::Acknowledged);
+        assert!(s.has_retained_topic("r/t"));
+        // Then the broker sends a newer retained value that expires after 5 s.
+        let m = retained_msg("r/t", b"theirs", true, Some(5));
+        let at = m.received_at;
+        s.insert(m);
+        assert!(s.has_retained_topic_at("r/t", at + Duration::from_secs(4)));
+        // When that value expires, the broker holds nothing; our older record must not count.
+        assert!(!s.has_retained_topic_at("r/t", at + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn our_own_retained_publish_is_known_without_a_node() {
+        let mut s = TopicStore::new(big());
+        let t0 = SystemTime::UNIX_EPOCH;
+        let send = |s: &mut TopicStore, op, qos, payload: &'static [u8], expiry: Option<u32>| {
+            s.record_sent(
+                op,
+                "out/t",
+                Bytes::from_static(payload),
+                qos,
+                true,
+                MsgProps {
+                    message_expiry: expiry,
+                    ..MsgProps::default()
+                },
+                t0,
+            );
+        };
+        assert!(s.find("out/t").is_none() && !s.has_retained_topic("out/t"));
+        // Not yet: the publish is only sent.
+        send(&mut s, 1, Qos::AtLeastOnce, b"v", Some(10));
+        s.set_send_status(1, SendStatus::Sent);
+        assert!(!s.has_retained_topic_at("out/t", t0));
+        s.set_send_status(1, SendStatus::Acknowledged);
+        assert!(s.has_retained_topic_at("out/t", t0 + Duration::from_secs(9)));
+        assert!(!s.has_retained_topic_at("out/t", t0 + Duration::from_secs(10)));
+        // A rejected publish changes nothing.
+        send(&mut s, 2, Qos::AtLeastOnce, b"w", None);
+        s.set_send_status(2, SendStatus::Rejected("no".into()));
+        assert!(!s.has_retained_topic_at("out/t", t0 + Duration::from_secs(11)));
+        // QoS 0 counts at "Sent". An empty retained publish ends it.
+        send(&mut s, 3, Qos::AtMostOnce, b"x", None);
+        s.set_send_status(3, SendStatus::Sent);
+        assert!(s.has_retained_topic("out/t"));
+        send(&mut s, 4, Qos::AtLeastOnce, b"", None);
+        s.set_send_status(4, SendStatus::Acknowledged);
+        assert!(!s.has_retained_topic("out/t"));
+        // An incoming retained delete ends it, too.
+        send(&mut s, 5, Qos::AtMostOnce, b"y", None);
+        s.set_send_status(5, SendStatus::Sent);
+        s.insert(retained_msg("out/t", b"", true, None));
+        assert!(!s.has_retained_topic("out/t"));
+        // With a node, the node state counts.
+        let id = stored(s.insert(retained_msg("in/t", b"v", true, None)));
+        assert!(s.has_retained_topic("in/t") && s.has_retained(id));
+        // The map is bounded.
+        for i in 0..MAX_SENT_RETAINED + 5 {
+            let op = 1000 + i as u64;
+            s.record_sent(
+                op,
+                &format!("many/{i}"),
+                Bytes::from_static(b"v"),
+                Qos::AtMostOnce,
+                true,
+                MsgProps::default(),
+                t0,
+            );
+            s.set_send_status(op, SendStatus::Sent);
+        }
+        assert_eq!(s.sent_retained.len(), MAX_SENT_RETAINED);
+        assert!(!s.has_retained_topic("many/0") && s.has_retained_topic("many/1028"));
     }
 }

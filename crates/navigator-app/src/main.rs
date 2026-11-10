@@ -1,9 +1,13 @@
 //! MQTT Navigator desktop app. P1 tracer bullet: connect, subscribe, topic tree, latest value,
 //! publish, disconnect.
 
+mod composer;
 mod connections;
+mod diagnostics;
+mod inspector;
 mod logging;
 mod messages;
+mod palette;
 mod persist;
 mod secrets;
 mod ui;
