@@ -612,7 +612,12 @@ where
         // Ignore error from sending to incoming PUBLISH receiver.
         // If there is an error, it's because the application dropped the incoming PUBLISH receiver,
         // in which case `incoming` will be dropped here and will auto-ack it via dropping the ack token.
-        _ = self.ch.i_pub_tx.send(incoming);
+        // LOCAL PATCH (mqtt-navigator): bound the incoming queue. A dropped QoS 1 publish is
+        // acknowledged when its token drops, so the broker does not send it again.
+        let cost = incoming.queue_cost();
+        if crate::local_limits::try_admit(cost) && self.ch.i_pub_tx.send(incoming).is_err() {
+            crate::local_limits::release(cost);
+        }
     }
 
     /// An incoming AUTH packet has been received from the server as part of a reauthentication process

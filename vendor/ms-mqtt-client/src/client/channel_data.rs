@@ -111,3 +111,14 @@ where
     QoS1(Publish<S>, PubAckToken<S>),
     QoS2(Publish<S>, PubRecToken<S>),
 }
+
+// LOCAL PATCH (mqtt-navigator): queue cost of an incoming publish, for `local_limits`.
+impl<S> IncomingPublishAndToken<S>
+where
+    S: Shared,
+{
+    pub(crate) fn queue_cost(&self) -> usize {
+        let (Self::QoS0(p) | Self::QoS1(p, _) | Self::QoS2(p, _)) = self;
+        p.payload.as_ref().len() + crate::local_limits::PUBLISH_OVERHEAD
+    }
+}

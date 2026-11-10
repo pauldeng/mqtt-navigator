@@ -62,6 +62,14 @@ where
             }
         };
 
+        // LOCAL PATCH (mqtt-navigator): reject an oversized packet before memory is reserved for it.
+        if fixed_header_len.saturating_add(remaining_length) > crate::local_limits::max_packet() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incoming packet is larger than the maximum packet size",
+            ));
+        }
+
         if let Some(remaining) =
             (fixed_header_len + remaining_length).checked_sub(self.buf.filled_len())
         {

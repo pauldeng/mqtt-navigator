@@ -89,6 +89,8 @@ pub fn new_client(options: ClientOptions) -> (Client, ConnectHandle, Receiver) {
     // NOTE: We use an unbounded channel for incoming publishes, as messages read off the network must go
     // somewhere.
     let (i_pub_tx, i_pub_rx) = tokio::sync::mpsc::unbounded_channel();
+    // LOCAL PATCH (mqtt-navigator): a new client starts with an empty incoming queue.
+    crate::local_limits::reset_queue();
     let client = Client {
         pub_qos0_tx: o_pub_q0_tx,
         pub_qos12_tx: o_pub_q12_tx,
@@ -422,7 +424,11 @@ impl Receiver {
     /// ```
     #[doc(alias = "receive")]
     pub async fn recv(&mut self) -> Option<(Publish, ManualAcknowledgement)> {
-        self.rx.recv().await.map(Into::into)
+        // LOCAL PATCH (mqtt-navigator): free the queue space of the received publish.
+        self.rx.recv().await.map(|incoming| {
+            crate::local_limits::release(incoming.queue_cost());
+            incoming.into()
+        })
     }
 }
 
