@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/navigator-core", "crates/navigator-app"]
+default-members = ["crates/navigator-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pauldeng/mqtt-navigator"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+debug = "line-tables-only"
+split-debuginfo = "packed"  # symbols go to a separate file for crash analysis
+# panic stays "unwind": a library panic must stop one session, not the app.

@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQTT Navigator - Connection editor</title>
+<style>
+:root{
+  --page:#f5f5f5; --bg:#ffffff; --bar:#fafafa; --fg:#0a0a0a; --muted:#f5f5f5; --muted-fg:#6e6e6e;
+  --border:#e5e5e5; --input:#d4d4d4; --accent:#f5f5f5; --sel:#e5e5e5; --primary:#171717; --primary-fg:#ffffff; --ring:#737373;
+  --success:#15803d; --warning:#a16207; --danger:#b91c1c; --info:#1d4ed8; --off:#a3a3a3; --scrim:rgba(0,0,0,.5);
+  --c-key:#1d4ed8; --c-str:#15803d; --c-num:#a16207;
+  --danger-bg:color-mix(in srgb,var(--danger) 10%,var(--bg)); --warning-bg:color-mix(in srgb,var(--warning) 12%,var(--bg));
+  --mono:ui-monospace,"SF Mono","Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme]){
+    --page:#000000; --bg:#0a0a0a; --bar:#111111; --fg:#fafafa; --muted:#262626; --muted-fg:#a3a3a3;
+    --border:#2e2e2e; --input:#404040; --accent:#262626; --sel:#333333; --primary:#fafafa; --primary-fg:#171717; --ring:#a3a3a3;
+    --success:#4ade80; --warning:#fbbf24; --danger:#f87171; --info:#60a5fa; --off:#525252; --scrim:rgba(0,0,0,.6);
+    --c-key:#60a5fa; --c-str:#4ade80; --c-num:#fbbf24; color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --page:#000000; --bg:#0a0a0a; --bar:#111111; --fg:#fafafa; --muted:#262626; --muted-fg:#a3a3a3;
+  --border:#2e2e2e; --input:#404040; --accent:#262626; --sel:#333333; --primary:#fafafa; --primary-fg:#171717; --ring:#a3a3a3;
+  --success:#4ade80; --warning:#fbbf24; --danger:#f87171; --info:#60a5fa; --off:#525252; --scrim:rgba(0,0,0,.6);
+  --c-key:#60a5fa; --c-str:#4ade80; --c-num:#fbbf24; color-scheme:dark;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--page);color:var(--fg);font:13px/1.4 var(--sans);padding:12px 16px 16px}
+.mono{font-family:var(--mono)}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin{animation:none}}
+button{display:inline-flex;align-items:center;justify-content:center;gap:6px;background:var(--muted);border:1px solid transparent;border-radius:6px;padding:0 12px;cursor:pointer;height:28px;font-weight:500;white-space:nowrap}
+button:hover{background:var(--sel)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.primary{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+button.primary:hover{opacity:.9}
+button.outline{background:var(--bg);border-color:var(--input)}
+button.ghost{background:transparent;padding:0 8px}
+button.ghost:hover{background:var(--sel)}
+input[type=text],input[type=password],input[type=number],select,textarea{background:var(--bg);border:1px solid var(--input);border-radius:6px;padding:3px 8px;height:28px;min-width:0;width:100%}
+textarea{height:auto;font-family:var(--mono);font-size:12px;resize:vertical}
+input::placeholder,textarea::placeholder{color:var(--muted-fg)}
+input[aria-invalid=true],textarea[aria-invalid=true]{border-color:var(--danger);background:var(--danger-bg)}
+input:disabled{opacity:.5;cursor:not-allowed}
+.top{max-width:1280px;margin:0 auto 12px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.lnk{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border:1px solid var(--input);border-radius:6px;background:var(--bg);color:var(--fg);font-weight:500;text-decoration:none}
+.lnk:hover{background:var(--accent)}
+/* dimmed main window (decoration only) */
+.win{width:100%;max-width:1280px;height:800px;max-height:calc(100vh - 72px);min-height:560px;margin:0 auto;background:var(--bg);border:1px solid var(--border);border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.18);display:flex;flex-direction:column;overflow:hidden;position:relative}
+.tb{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--border);background:var(--muted);font-weight:500}
+.logo{width:16px;height:16px;border-radius:50%;border:4px solid var(--primary)}
+.ghostbody{flex:1;display:grid;grid-template-columns:240px 1fr 320px}
+.ghostbody>div{border-right:1px solid var(--border);padding:10px}
+.ghostbody p{margin:0 0 8px;height:10px;border-radius:3px;background:var(--sel)}
+.scrim{position:absolute;inset:0;background:var(--scrim);display:flex;align-items:stretch;justify-content:flex-end}
+/* sheet: right side, full window height */
+.sheet{width:560px;max-width:100%;height:100%;background:var(--bg);border-left:1px solid var(--border);box-shadow:-16px 0 48px rgba(0,0,0,.35);display:flex;flex-direction:column;overflow:hidden}
+.sh-head{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.sh-head h1{font-size:14px;font-weight:500;margin:0;flex:1}
+.sh-body{flex:1;overflow:auto;padding:14px 18px;min-height:0}
+.sh-body h2{margin:18px 0 10px;font-size:12px;font-weight:500;letter-spacing:.04em;text-transform:uppercase;color:var(--muted-fg);padding-top:14px;border-top:1px solid var(--border)}
+.sh-body h2:first-child{margin-top:0;padding-top:0;border-top:0}
+.f{display:grid;gap:4px;margin-bottom:12px}
+.f>label,.lbl{font-size:12px;font-weight:500}
+.row{display:flex;gap:8px;align-items:center}
+.row>input{flex:1}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) 120px;gap:12px}
+.cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.hint{font-size:12px;color:var(--muted-fg)}
+.fe{font-size:12px;color:var(--danger);display:flex;gap:6px;align-items:center}
+.note{display:flex;gap:8px;border:1px solid var(--border);background:var(--muted);border-radius:6px;padding:7px 10px;font-size:12px;margin-bottom:10px}
+.note.warn{border-color:var(--warning);background:var(--warning-bg)}
+.note.danger{border-color:var(--danger);background:var(--danger-bg);color:var(--danger);font-weight:500}
+.seg{display:inline-flex;gap:2px;padding:2px;background:var(--muted);border-radius:6px;width:max-content}
+.seg button{height:24px;min-width:44px;border-radius:4px;background:transparent;color:var(--muted-fg)}
+.seg button[aria-checked=true]{background:var(--bg);color:var(--fg);box-shadow:0 0 0 1px var(--border),0 1px 2px rgba(0,0,0,.1)}
+.sw{display:inline-flex;gap:8px;align-items:center;cursor:pointer;font-weight:500;font-size:12px}
+.sw input{appearance:none;width:32px;height:18px;border-radius:99px;background:var(--off);position:relative;margin:0;cursor:pointer;flex:none}
+.sw input::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff}
+.sw input:checked{background:var(--primary)}
+.sw input:checked::after{left:16px;background:var(--primary-fg)}
+.chip{display:inline-flex;align-items:center;height:26px;padding:0 10px;border:1px solid var(--border);border-radius:5px;background:var(--muted);font-family:var(--mono)}
+.file{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center}
+.file .name{font-family:var(--mono);font-size:12px;border:1px solid var(--border);border-radius:5px;height:28px;display:flex;align-items:center;padding:0 8px;background:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file .name.none{color:var(--muted-fg);font-family:var(--sans)}
+details{border:1px solid var(--border);border-radius:6px;padding:0 12px;margin-top:6px}
+summary{cursor:pointer;padding:8px 0;font-weight:500}
+details[open]{padding-bottom:8px}
+details[open]>summary{margin-bottom:6px}
+.sh-foot{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-top:1px solid var(--border);background:var(--muted)}
+.msg{flex:1 1 100%;order:-1;min-width:0;font-size:12px;display:flex;gap:6px;align-items:flex-start;color:var(--st,var(--muted-fg))}
+.msg:empty{display:none}
+.msg.danger{--st:var(--danger)} .msg.success{--st:var(--success)}
+.foot-sp{flex:1}
+@media (max-width:640px){
+  .ghostbody{grid-template-columns:1fr}
+  .ghostbody>div:not(:nth-child(2)){display:none}
+  .cols,.cols2{grid-template-columns:1fr}
+  .sh-foot{flex-wrap:wrap}
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol><symbol id="i-lock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol><symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-rotate" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></symbol><symbol id="i-circle-x" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></symbol><symbol id="i-circle-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></symbol><symbol id="i-loader" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol><symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol><symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></symbol>
+</svg>
+<div class="top">
+  <a class="lnk" href="main-window.html">Back to main window</a>
+  <div class="seg" id="theme" role="radiogroup" aria-label="Theme">
+    <button type="button" role="radio" aria-checked="true" data-th="system" title="Follow the system theme"><svg class="ic" aria-hidden="true"><use href="#i-monitor"/></svg> System</button>
+    <button type="button" role="radio" aria-checked="false" data-th="light" title="Light theme"><svg class="ic" aria-hidden="true"><use href="#i-sun"/></svg> Light</button>
+    <button type="button" role="radio" aria-checked="false" data-th="dark" title="Dark theme"><svg class="ic" aria-hidden="true"><use href="#i-moon"/></svg> Dark</button>
+  </div>
+</div>
+
+<div class="win">
+  <div class="tb" aria-hidden="true"><span class="logo"></span>MQTT Navigator</div>
+  <div class="ghostbody" aria-hidden="true">
+    <div><p style="width:70%"></p><p style="width:55%"></p><p style="width:60%"></p></div>
+    <div><p style="width:40%"></p><p style="width:62%"></p><p style="width:50%"></p><p style="width:70%"></p><p style="width:45%"></p><p style="width:58%"></p></div>
+    <div><p style="width:80%"></p><p style="width:50%"></p><p style="width:65%"></p></div>
+  </div>
+
+  <div class="scrim">
+    <form class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetT" novalidate>
+      <div class="sh-head">
+        <h1 id="sheetT">New connection</h1>
+        <button type="button" class="ghost" id="close" aria-label="Close" title="Close"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </div>
+
+      <div class="sh-body">
+        <h2>Basic</h2>
+        <div class="f"><label for="name">Name</label><input type="text" id="name" value="prod" placeholder="prod" autocomplete="off" aria-describedby="e-name"><div class="fe" id="e-name" hidden></div></div>
+        <div class="cols">
+          <div class="f"><label for="host">Host</label><input type="text" id="host" class="mono" value="broker.example.com" placeholder="broker.example.com" autocomplete="off" aria-describedby="e-host"><div class="fe" id="e-host" hidden></div></div>
+          <div class="f"><label for="port">Port</label><input type="text" id="port" class="mono" inputmode="numeric" value="8883" autocomplete="off" aria-describedby="e-port"><div class="fe" id="e-port" hidden></div></div>
+        </div>
+        <div class="f">
+          <span class="lbl" id="trl">Transport</span>
+          <div class="seg" role="radiogroup" aria-labelledby="trl" id="transport">
+            <button type="button" role="radio" aria-checked="true" data-t="tls">TLS</button>
+            <button type="button" role="radio" aria-checked="false" data-t="wss">WSS</button>
+            <button type="button" role="radio" aria-checked="false" data-t="tcp">TCP</button>
+            <button type="button" role="radio" aria-checked="false" data-t="ws">WS</button>
+          </div>
+        </div>
+        <div class="note warn" id="plain" role="alert" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span>Not encrypted. Passwords and messages are sent in clear text.</span></div>
+        <div class="cols2">
+          <div class="f"><label for="user">Username</label><input type="text" id="user" value="navigator" autocomplete="off"></div>
+          <div class="f"><label for="pw">Password</label>
+            <div class="row"><input type="password" id="pw" value="hunter2-example" autocomplete="off"><button type="button" class="outline" id="showpw" aria-label="Show password" aria-pressed="false">Show</button></div></div>
+        </div>
+        <div class="note" id="kr-ok"><svg class="ic" aria-hidden="true"><use href="#i-lock"/></svg><span>Saved in the system keyring.</span></div>
+        <div class="note warn" id="kr-none" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span>No keyring found. The password is kept for this session only.</span></div>
+        <div class="hint" style="margin:-4px 0 12px"><label><input type="checkbox" id="kr-demo"> Demo: system has no keyring</label></div>
+        <div class="f">
+          <label for="cid">Client ID</label>
+          <div class="row"><input type="text" id="cid" class="mono" value="navigator-7f3a9c21" autocomplete="off" aria-describedby="e-cid"><button type="button" class="outline" id="regen" aria-label="Make a new client ID" title="Make a new client ID"><svg class="ic" aria-hidden="true"><use href="#i-rotate"/></svg></button></div>
+          <div class="fe" id="e-cid" hidden></div>
+          <span class="hint">The app makes this ID. You can edit it. Each client needs a different ID.</span>
+        </div>
+
+        <div id="tlsSec">
+          <h2>TLS</h2>
+          <div class="f"><label class="sw"><input type="checkbox" role="switch" id="verify" checked> Verify server certificate</label></div>
+          <div class="note danger" id="verifyWarn" role="alert" hidden><svg class="ic" aria-hidden="true"><use href="#i-alert"/></svg><span>Insecure. The app does not check the server certificate. An attacker can read and change your data.</span></div>
+          <div class="f"><span class="lbl">CA file</span>
+            <div class="file" data-sample="/etc/ssl/factory/ca.pem"><span class="name" title="/etc/ssl/factory/ca.pem">/etc/ssl/factory/ca.pem</span><button type="button" class="outline" data-browse>Browse</button><button type="button" class="ghost" data-clear aria-label="Clear CA file" title="Clear CA file"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button></div></div>
+          <div class="f"><span class="lbl">Client certificate</span>
+            <div class="file" data-sample="navigator-client.crt"><span class="name none">No file selected</span><button type="button" class="outline" data-browse>Browse</button><button type="button" class="ghost" data-clear aria-label="Clear client certificate" title="Clear client certificate" disabled><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button></div></div>
+          <div class="f"><span class="lbl">Client key file</span>
+            <div class="file" data-sample="navigator-client.key"><span class="name none">No file selected</span><button type="button" class="outline" data-browse>Browse</button><button type="button" class="ghost" data-clear aria-label="Clear client key file" title="Clear client key file" disabled><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+            <span class="hint">The app never logs or copies the key.</span></div>
+        </div>
+
+        <details id="adv">
+          <summary>Advanced</summary>
+          <div class="f"><label for="path">WebSocket path</label><input type="text" id="path" class="mono" value="/mqtt" disabled aria-describedby="e-path pathHint"><div class="fe" id="e-path" hidden></div><span class="hint" id="pathHint">Only WS and WSS use the path.</span></div>
+          <div class="f"><label class="sw"><input type="checkbox" role="switch" id="clean" checked> Clean start</label>
+            <span class="hint">On: the broker drops the old session when the app connects.</span></div>
+          <div class="cols2">
+            <div class="f"><label for="sexp">Session expiry (s)</label><input type="text" id="sexp" class="mono" inputmode="numeric" value="0" autocomplete="off" aria-describedby="e-sexp"><div class="fe" id="e-sexp" hidden></div></div>
+            <div class="f"><label for="ka">Keepalive (s)</label><input type="text" id="ka" class="mono" inputmode="numeric" value="30" autocomplete="off" aria-describedby="e-ka"><div class="fe" id="e-ka" hidden></div></div>
+          </div>
+          <div class="f"><label class="sw"><input type="checkbox" role="switch" id="willOn"> Send a will message</label>
+            <span class="hint">The broker sends the will when the app drops without a clean close.</span></div>
+          <div id="willFields" hidden>
+            <div class="f"><label for="wt">Will topic</label><input type="text" id="wt" class="mono" value="status/navigator" autocomplete="off" aria-describedby="e-wt"><div class="fe" id="e-wt" hidden></div></div>
+            <div class="f"><label for="wp">Will payload</label><textarea id="wp" rows="2" spellcheck="false">offline</textarea></div>
+            <div class="row" style="margin-bottom:12px">
+              <div class="seg" id="wq" role="radiogroup" aria-label="Will QoS"><button type="button" role="radio" aria-checked="false" data-q="0">QoS 0</button><button type="button" role="radio" aria-checked="true" data-q="1">QoS 1</button></div>
+              <label class="sw"><input type="checkbox" role="switch"> Retain</label>
+            </div>
+          </div>
+          <div class="hint">MQTT 5.0 only. QoS 2 is not supported.</div>
+        </details>
+      </div>
+
+      <div class="sh-foot">
+        <p class="msg" id="msg" role="status"></p>
+        <span class="foot-sp"></span>
+        <button type="button" id="cancel">Cancel</button>
+        <button type="button" class="outline" id="save">Save</button>
+        <button type="button" class="primary" id="saveGo">Save and connect</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const ic=n=>`<svg class="ic${n==='loader'?' spin':''}" aria-hidden="true"><use href="#i-${n}"/></svg>`;
+// radio groups: roving tabindex, arrow keys
+function group(el,cb){
+  const it=[...el.querySelectorAll('[role=radio]')];
+  const set=(b,run=true)=>{it.forEach(x=>{x.setAttribute('aria-checked',x===b);x.tabIndex=x===b?0:-1});run&&cb&&cb(b)};
+  set(it.find(x=>x.getAttribute('aria-checked')==='true')||it[0],false);
+  it.forEach((b,i)=>{b.onclick=()=>set(b);b.onkeydown=e=>{const d={ArrowRight:1,ArrowLeft:-1}[e.key];if(d){e.preventDefault();const t=it[(i+d+it.length)%it.length];set(t);t.focus()}}});
+  return set;
+}
+// theme: System follows prefers-color-scheme (no data-theme attribute). The choice is shared with main-window.html.
+const root=document.documentElement, th=$$('#theme button');
+function setTheme(v){
+  v==='system'?root.removeAttribute('data-theme'):root.dataset.theme=v;
+  th.forEach(b=>{b.setAttribute('aria-checked',b.dataset.th===v);b.tabIndex=b.dataset.th===v?0:-1});
+  try{localStorage.setItem('mqtt-theme',v)}catch(e){}
+}
+th.forEach((b,i)=>{b.onclick=()=>setTheme(b.dataset.th);b.onkeydown=e=>{const d={ArrowRight:1,ArrowLeft:-1}[e.key];if(d){e.preventDefault();const t=th[(i+d+th.length)%th.length];setTheme(t.dataset.th);t.focus()}}});
+try{setTheme(localStorage.getItem('mqtt-theme')||'system')}catch(e){setTheme('system')}
+
+// Transport. TLS is the default. The port follows the transport only while it is still the default of the old transport.
+const DEF={tls:8883,wss:443,tcp:1883,ws:80};
+let tr='tls';
+group($('#transport'),b=>{
+  const t=b.dataset.t,secure=t==='tls'||t==='wss',ws=t==='ws'||t==='wss';
+  if($('#port').value.trim()===String(DEF[tr]))$('#port').value=DEF[t];
+  tr=t;
+  $('#tlsSec').hidden=!secure;$('#plain').hidden=secure;
+  $('#path').disabled=!ws;$('#pathHint').hidden=ws;
+});
+$('#verify').onchange=e=>$('#verifyWarn').hidden=e.target.checked;
+$('#willOn').onchange=e=>$('#willFields').hidden=!e.target.checked;
+group($('#wq'));
+$('#regen').onclick=()=>$('#cid').value='navigator-'+Math.random().toString(16).slice(2,10);
+$('#showpw').onclick=e=>{const b=e.currentTarget,show=b.getAttribute('aria-pressed')!=='true';b.setAttribute('aria-pressed',show);b.textContent=show?'Hide':'Show';b.setAttribute('aria-label',show?'Hide password':'Show password');$('#pw').type=show?'text':'password'};
+$('#kr-demo').onchange=e=>{$('#kr-ok').hidden=e.target.checked;$('#kr-none').hidden=!e.target.checked};
+// certificate files (demo: the native file dialog picks a sample name)
+$$('.file').forEach(f=>{
+  const n=f.querySelector('.name'),c=f.querySelector('[data-clear]');
+  const put=v=>{n.textContent=v||'No file selected';n.classList.toggle('none',!v);c.disabled=!v};
+  f.querySelector('[data-browse]').onclick=()=>put(f.dataset.sample);c.onclick=()=>put('');
+});
+
+// Validation runs only when you press Save or Save and connect. Focus moves to the first wrong field, in page order.
+const int=(v,lo,hi)=>/^\d+$/.test(v)&&+v>=lo&&+v<=hi;
+function validate(){
+  const v=id=>$('#'+id).value.trim(),ws=tr==='ws'||tr==='wss';
+  const rules=[
+    ['name',!v('name'),'Enter a name.'],
+    ['host',!v('host'),'Enter a host.'],['host',/\s/.test(v('host')),'The host must not contain spaces.'],
+    ['port',!int(v('port'),1,65535),'Use a port from 1 to 65535.'],
+    ['cid',!v('cid'),'Enter a client ID.'],
+    ['path',ws&&!v('path').startsWith('/'),'The path must start with /.'],
+    ['sexp',!int(v('sexp'),0,4294967295),'Use a number of seconds, 0 or more.'],
+    ['ka',!int(v('ka'),0,65535),'Use 0 to 65535 seconds.'],
+    ['wt',$('#willOn').checked&&!v('wt'),'Enter a will topic.']];
+  $$('.fe').forEach(e=>e.hidden=true);$$('[aria-invalid]').forEach(e=>e.removeAttribute('aria-invalid'));
+  const bad=[];
+  rules.forEach(([id,fail,m])=>{if(fail&&!bad.some(b=>b[0]===id))bad.push([id,m])});
+  bad.forEach(([id,m])=>{const e=$('#e-'+id);e.innerHTML=ic('circle-x')+m;e.hidden=false;$('#'+id).setAttribute('aria-invalid','true')});
+  if(bad.length){const f=$('#'+bad[0][0]);if($('#adv').contains(f))$('#adv').open=true;f.focus()}
+  return bad.length===0;
+}
+const msg=(t,k='')=>{$('#msg').className='msg '+k;$('#msg').innerHTML=t};
+let busy=0;
+$('#save').onclick=()=>{
+  if(busy)return;
+  validate()?msg(ic('circle-check')+`Saved ${$('#name').value.trim()}.`,'success'):msg(ic('circle-x')+'Check the marked fields.','danger');
+};
+// "Save and connect" is the test. A failure shows its cause here. Demo: a verified TLS connection fails with an expired certificate.
+$('#saveGo').onclick=()=>{
+  if(busy)return;
+  if(!validate()){msg(ic('circle-x')+'Check the marked fields.','danger');return}
+  const secure=tr==='tls'||tr==='wss',fail=secure&&$('#verify').checked;
+  busy=1;$$('.sh-foot button').forEach(b=>b.disabled=true);
+  msg(ic('loader')+`Connecting to ${$('#host').value.trim()}:${$('#port').value.trim()}…`);
+  setTimeout(()=>{
+    busy=0;$$('.sh-foot button').forEach(b=>b.disabled=false);
+    fail?msg(ic('circle-x')+'Certificate expired on 2026-03-01. Renew the server certificate, or turn off verification.','danger')
+        :msg(ic('circle-check')+`Connected to ${$('#host').value.trim()}. The app saved ${$('#name').value.trim()}.`,'success');
+  },900);
+};
+$('#cancel').onclick=$('#close').onclick=()=>location.href='main-window.html';
+$('#sheet').onsubmit=e=>e.preventDefault();
+$('#sheet').onkeydown=e=>{if(e.key==='Escape')location.href='main-window.html'};
+</script>
+</body>
+</html>

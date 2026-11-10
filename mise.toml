@@ -1,0 +1,3 @@
+[tools]
+cargo-deny = "latest"
+rust = "latest"

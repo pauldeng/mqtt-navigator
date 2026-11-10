@@ -1,0 +1,18 @@
+[package]
+name = "navigator-app"
+description = "MQTT Navigator desktop app."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mqtt-navigator"
+path = "src/main.rs"
+
+[dependencies]
+navigator-core = { path = "../navigator-core" }
+
+[lints]
+workspace = true
