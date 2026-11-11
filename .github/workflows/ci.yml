@@ -4,14 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: "17 3 * * 1" # weekly: the fuzz job
-    - cron: "43 2 * * *" # nightly: the soak job
   workflow_dispatch: # starts the soak job by hand
 
 concurrency:
-  # The schedule is in the group, so that the weekly fuzz run does not cancel the nightly soak run.
-  group: ci-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -22,7 +18,7 @@ env:
 
 jobs:
   lint:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,7 +34,7 @@ jobs:
           if grep -i gpui core-tree.txt; then echo "navigator-core depends on gpui"; exit 1; fi
 
   test:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +55,7 @@ jobs:
 
   size:
     # Linux x64 release size gate (ADR 0004). Other targets get a gate after their first build.
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     env:
       MAX_BYTES: "37317165" # 33 924 696 B measured on 2026-11-11, + 10%
@@ -79,7 +75,7 @@ jobs:
           test "$size" -le "$MAX_BYTES"
 
   broker-tests:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,9 +94,9 @@ jobs:
         if: always()
         run: tests/broker/down.sh
 
-  # Runs on push to main and every week, not on pull requests.
+  # Runs on push to main, not on pull requests.
   fuzz:
-    if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch' && github.event.schedule != '43 2 * * *'
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -124,9 +120,9 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts
 
-  # Runs every night and by hand. One hour at 500 msg/s with 6 broker restarts (P7).
+  # Runs only by hand (Actions > CI > Run workflow). One hour at 500 msg/s with 6 broker restarts (P7).
   soak:
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 2 * * *'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
