@@ -266,6 +266,10 @@ fn ten_thousand_messages_per_second_through_net_and_store() {
                     None
                 };
             }
+            // The UI scheduler gives the store 1 ms of work in a frame. This is the eviction.
+            if store.has_work() {
+                store.work(Instant::now() + Duration::from_millis(1));
+            }
             slices.push(slice.elapsed());
             tokio::time::sleep(FRAME).await;
         }
@@ -307,7 +311,7 @@ fn ten_thousand_messages_per_second_through_net_and_store() {
         assert_eq!(net_drops, 0, "net drops");
         assert_eq!(event_drops, 0, "event drops");
         assert_eq!((stats.drops, stats.topic_drops), (0, 0), "store drops");
-        assert!(stats.used_bytes <= limits().budget, "over budget");
+        assert!(stats.used_bytes <= store.hard_limit(), "over the hard ceiling");
         if cfg!(not(debug_assertions)) {
             assert!(p99 <= SLICE_P99, "merge slice p99 {p99:?}");
             assert!(slice_max <= SLICE_MAX, "longest merge slice {slice_max:?}");

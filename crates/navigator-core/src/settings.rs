@@ -40,7 +40,7 @@ pub enum RowHeight {
     TwoLines,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiState {
     pub theme_mode: ThemeMode,
@@ -48,6 +48,48 @@ pub struct UiState {
     pub row_height: RowHeight,
     pub pane_widths: Vec<f32>,
     pub window_size: Option<(f32, f32)>,
+    /// Memory budget of the topic store, in MiB. The default is 128. The file value is clamped to
+    /// [`STORE_BUDGET_MIB_MIN`]..=[`STORE_BUDGET_MIB_MAX`] when it loads.
+    #[serde(deserialize_with = "clamped_mib")]
+    pub store_budget_mib: u32,
+}
+
+/// Any number in the file is accepted and clamped. A wrong value must not make the whole file
+/// unreadable.
+fn clamped_mib<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = f64::deserialize(d)?;
+    Ok(v.clamp(
+        f64::from(STORE_BUDGET_MIB_MIN),
+        f64::from(STORE_BUDGET_MIB_MAX),
+    ) as u32)
+}
+
+/// Limits of [`UiState::store_budget_mib`] (the same as the store budget limits).
+pub const STORE_BUDGET_MIB_MIN: u32 = (crate::store::BUDGET_MIN >> 20) as u32;
+pub const STORE_BUDGET_MIB_MAX: u32 = (crate::store::BUDGET_MAX >> 20) as u32;
+const STORE_BUDGET_MIB_DEFAULT: u32 = (crate::store::BUDGET_DEFAULT >> 20) as u32;
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            theme_mode: ThemeMode::default(),
+            view: ViewMode::default(),
+            row_height: RowHeight::default(),
+            pane_widths: Vec::new(),
+            window_size: None,
+            store_budget_mib: STORE_BUDGET_MIB_DEFAULT,
+        }
+    }
+}
+
+impl UiState {
+    /// The store budget in bytes, for [`crate::store::Limits::with_budget`].
+    pub fn store_budget_bytes(&self) -> usize {
+        (self
+            .store_budget_mib
+            .clamp(STORE_BUDGET_MIB_MIN, STORE_BUDGET_MIB_MAX) as usize)
+            << 20
+    }
 }
 
 /// Missing fields take their defaults, so an older file loads.
@@ -274,6 +316,7 @@ mod tests {
             row_height: RowHeight::OneLine,
             pane_widths: vec![200.0, 300.5],
             window_size: Some((1200.0, 800.0)),
+            store_budget_mib: 512,
         };
         save_atomic(&path, &s).expect("save");
         let l = load(&path);
@@ -289,7 +332,29 @@ mod tests {
         let l = load(&path);
         assert_eq!(l.settings.schema_version, 1);
         assert_eq!(l.settings.ui, UiState::default());
+        assert_eq!(l.settings.ui.store_budget_mib, 128);
         assert_eq!(l.settings.profiles[0].port, 8883);
+    }
+
+    #[test]
+    fn store_budget_is_clamped_on_load() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        for (text, want) in [
+            (r#"{"ui":{"store_budget_mib":1}}"#, 32),
+            (r#"{"ui":{"store_budget_mib":0}}"#, 32),
+            (r#"{"ui":{"store_budget_mib":100000}}"#, 2048),
+            (r#"{"ui":{"store_budget_mib":777}}"#, 777),
+            (r#"{"ui":{"store_budget_mib":-5}}"#, 32),
+            (r#"{"ui":{"store_budget_mib":300.7}}"#, 300),
+            (r#"{"ui":{}}"#, 128),
+        ] {
+            fs::write(&path, text).expect("write");
+            let ui = load(&path).settings.ui;
+            assert_eq!(ui.store_budget_mib, want, "{text}");
+            assert_eq!(ui.store_budget_bytes(), (want as usize) << 20);
+        }
+        assert_eq!(UiState::default().store_budget_mib, 128);
     }
 
     #[test]

@@ -40,7 +40,7 @@ See ADR 0004. Selected `opt-level = "s"`, `lto = "fat"`: 33 924 696 B (−29% ag
 
 - The editor takes a 4 KiB first window. The text then grows in timed steps (6 ms target, step size from the last step) to 32 KiB. "Show more" adds 64 KiB in the same way. Copy copies all of the formatted text, and only when the render is the one of the selection. The composer Format refuses a payload above 1 MiB or a result above 2 MiB.
 - Measured, release, 360 px pane, trickle of 20 msg/s (`MQTT_NAVIGATOR_METRICS=1`, `MQTT_NAVIGATOR_AUTOSELECT=<topic>`, which also connects and applies Show all; for measurement only). 1.0 MB JSON: worst frame at selection 23.8 ms, steps 2 to 5 ms, later frames at most 17.6 ms. 2 MB hex (stored 1 MiB, 5 MB of text): worst frame at selection 58 ms (cold glyph cache in the first window), steps 5 to 7 ms, later frames at most 18.7 ms. Before the change, one `set_value` of the whole text put 614 ms into one frame (1.9 MB JSON). The editor wraps a hex dump at 3 to 4 ms for each KiB, so hex is the limit.
-- A broker message above 2 MiB (`NetLimits::max_packet`) is not received, so a 2 MB payload was published as 2 000 000 bytes.
+- A broker message above the packet cap (`NetLimits::max_packet`, 2 MiB at that time; the default is now 1 MiB) is not received, so a 2 MB payload was published as 2 000 000 bytes.
 - Retained state is tracked for each topic in the store (see `TopicStore::has_retained`).
 - Not checked: no UI interaction (History keys, "Send empty", escaped line breaks, palette entries) in a real window.
 

@@ -248,7 +248,7 @@ mod tests {
         let mut big = msg("a");
         big.payload = Bytes::from(vec![0; 3_000_000]);
         assert_eq!(encoded_size(&big), 1 + 4 + 2 + 1 + 1 + 3_000_000);
-        assert!(validate_outgoing(&big, Some(2 * 1024 * 1024)).is_err());
+        assert!(validate_outgoing(&big, Some(1024 * 1024)).is_err());
         assert!(validate_outgoing(&big, None).is_ok());
     }
 

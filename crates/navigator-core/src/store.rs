@@ -19,8 +19,16 @@
 //! The store never looks at reference counts. `Bytes` buffers are shared between holders, so the
 //! budget is an upper bound of the real memory.
 //!
-//! The eviction order is: oldest history entries, oldest list rows, oldest latest payloads.
-//! The Messages view has priority over history, because history grows with the topic count.
+//! The budget is a soft target. An insert never evicts: it only checks the hard ceiling
+//! ([`TopicStore::hard_limit`], the budget plus a quarter) and drops the message above it.
+//! [`TopicStore::work`] evicts in batches: when the used bytes are above the budget, it evicts
+//! down to 90 % of the budget. The eviction order is: oldest history entries, oldest list rows,
+//! oldest latest payloads. The Messages view has priority over history, because history grows
+//! with the topic count.
+//!
+//! Node metadata has its own caps (`topic_cap`, `node_budget`). When a cap is 95 % full, `work`
+//! removes idle leaf topics (least recently updated first) down to 90 %. A removed node frees
+//! its slot. A [`NodeId`] has a generation, so an old id is never wrong: it gives `None`.
 //!
 //! # Views and work
 //!
@@ -30,6 +38,7 @@
 //! - [`TopicStore::set_paused`] freezes both views. Ingest continues inside the budget. The
 //!   snapshot of the tree is built in slices by `work`.
 
+use std::collections::btree_map::Values;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -40,8 +49,9 @@ use bytes::Bytes;
 use crate::model::{Incoming, MsgProps, Qos};
 use crate::topic;
 
-/// Most old values one insert may evict. If more space is needed, the message is dropped.
-pub const MAX_EVICTIONS_PER_INSERT: usize = 1024;
+/// Items one step of node eviction handles. A node can hold a whole history ring, so this is
+/// smaller than `WORK_CHUNK`.
+const NODE_CHUNK: usize = 16;
 
 /// Most topic levels. A deeper topic is dropped (counted as a topic drop).
 pub const MAX_TOPIC_LEVELS: usize = 64;
@@ -67,13 +77,39 @@ const MAX_TRIM_PER_INSERT: usize = 8;
 /// Longest text of `SendStatus::Rejected` that the store keeps. A sent row reserves this.
 const STATUS_MAX: usize = 256;
 
-/// Index of a node in the arena. Stable until `clear`.
+/// Identity of a node: a slot in the arena and the generation of the slot. The store reuses the
+/// slot of a removed node, but with a new generation. So an old `NodeId` never points to another
+/// topic: [`TopicStore::get`] and the other lookups give `None` (or an empty result) for it, after
+/// the node was removed (memory pressure, see [`TopicStore::work`]) or after `clear`.
+/// [`TopicStore::node`] panics for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeId(pub u32);
+pub struct NodeId {
+    idx: u32,
+    generation: u32,
+}
+
+impl NodeId {
+    fn ix(self) -> usize {
+        self.idx as usize
+    }
+
+    /// An id that no store has issued yet, for tests of stale ids.
+    #[cfg(test)]
+    fn raw(idx: u32) -> Self {
+        Self { idx, generation: 0 }
+    }
+}
 
 /// Identity of one row of the message list. Never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RowId(pub u64);
+
+/// Default memory budget of the store: 128 MiB.
+pub const BUDGET_DEFAULT: usize = 128 * 1024 * 1024;
+/// Smallest budget that [`Limits::with_budget`] and [`TopicStore::set_budget`] accept: 32 MiB.
+pub const BUDGET_MIN: usize = 32 * 1024 * 1024;
+/// Largest budget that [`Limits::with_budget`] and [`TopicStore::set_budget`] accept: 2 GiB.
+pub const BUDGET_MAX: usize = 2 * 1024 * 1024 * 1024;
 
 /// Store limits. All values are in bytes except `topic_cap`, `history_len` and `list_len`.
 /// A zero value becomes the default value.
@@ -95,17 +131,26 @@ pub struct Limits {
     pub list_len: usize,
 }
 
-impl Default for Limits {
-    fn default() -> Self {
+impl Limits {
+    /// The default limits with another budget. The budget is clamped to
+    /// [`BUDGET_MIN`]..=[`BUDGET_MAX`]. The node budget is a quarter of it.
+    pub fn with_budget(bytes: usize) -> Self {
+        let budget = bytes.clamp(BUDGET_MIN, BUDGET_MAX);
         Self {
             latest_payload_max: 1024 * 1024,
             topic_cap: 200_000,
-            budget: 128 * 1024 * 1024,
-            node_budget: 32 * 1024 * 1024,
+            budget,
+            node_budget: budget / 4,
             history_len: 100,
             history_payload_max: 64 * 1024,
             list_len: 10_000,
         }
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::with_budget(BUDGET_DEFAULT)
     }
 }
 
@@ -282,6 +327,13 @@ struct Node {
     colour_idx: u32,
     /// The broker keeps a retained message for this topic (see [`TopicStore::has_retained`]).
     retained: Option<Retained>,
+    /// Generation of the slot. Rises each time the slot is freed.
+    generation: u32,
+    /// False for a free slot.
+    live: bool,
+    /// Receive sequence of the last message. It is the key in `TopicStore::touch` while the node
+    /// is a leaf. 0: no message yet.
+    touch: u64,
 }
 
 /// A retained message that the broker is known to keep.
@@ -316,6 +368,40 @@ const HIST_OVERHEAD: usize = 2 * size_of::<HistEntry>() + 48;
 const MAX_PENDING_RETAINED: usize = 64;
 /// Most topics in `TopicStore::sent_retained`.
 const MAX_SENT_RETAINED: usize = 1024;
+
+/// Topics with our own acknowledged retained publish. A map for the lookup, and a second map for
+/// the order, so the oldest topic goes first when the cap is full.
+#[derive(Default)]
+struct SentRetained {
+    by_topic: HashMap<Arc<str>, (u64, Retained)>,
+    /// Insert counter to topic. The first entry is the oldest.
+    order: BTreeMap<u64, Arc<str>>,
+    counter: u64,
+}
+
+impl SentRetained {
+    fn remove(&mut self, topic: &str) {
+        if let Some((n, _)) = self.by_topic.remove(topic) {
+            self.order.remove(&n);
+        }
+    }
+
+    fn insert(&mut self, topic: Arc<str>, r: Retained) {
+        self.remove(&topic);
+        if self.by_topic.len() >= MAX_SENT_RETAINED
+            && let Some((_, old)) = self.order.pop_first()
+        {
+            self.by_topic.remove(&old);
+        }
+        self.counter += 1;
+        self.order.insert(self.counter, Arc::clone(&topic));
+        self.by_topic.insert(topic, (self.counter, r));
+    }
+
+    fn get(&self, topic: &str) -> Option<Retained> {
+        self.by_topic.get(topic).map(|&(_, r)| r)
+    }
+}
 
 struct PendingRetained {
     op_id: u64,
@@ -378,6 +464,65 @@ impl Row {
     }
 }
 
+/// The subscription filters, parsed once and indexed by their first level.
+///
+/// A lookup collects the filters whose first level is the first level of the topic, and the
+/// filters that start with a wildcard. The first filter in list order that matches wins. The cost
+/// is O(topic depth + candidates), not O(all filters).
+#[derive(Default)]
+struct SubIndex {
+    /// The list as the caller gave it. It is used to see that a new list is the same.
+    raw: Vec<String>,
+    /// Parsed filters. `None`: not valid, so it matches nothing.
+    parsed: Vec<Option<topic::Filter>>,
+    /// First literal level to the indexes (ascending) of the filters that start with it.
+    by_first: HashMap<Box<str>, Vec<u32>>,
+    /// Indexes (ascending) of the filters that start with `+` or `#`.
+    wild: Vec<u32>,
+}
+
+impl SubIndex {
+    fn new(raw: Vec<String>) -> Self {
+        let mut by_first: HashMap<Box<str>, Vec<u32>> = HashMap::new();
+        let mut wild = Vec::new();
+        let parsed = raw
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let f = topic::Filter::new(s)?;
+                let i = u32::try_from(i).ok()?;
+                if f.starts_with_wildcard() {
+                    wild.push(i);
+                } else {
+                    by_first.entry(f.first_level().into()).or_default().push(i);
+                }
+                Some(f)
+            })
+            .collect();
+        Self {
+            raw,
+            parsed,
+            by_first,
+            wild,
+        }
+    }
+
+    /// Index of the first filter that matches `topic`.
+    fn first_match(&self, topic: &str) -> Option<usize> {
+        let first = topic.split('/').next().unwrap_or_default();
+        let hit = |list: &[u32]| {
+            list.iter().copied().find(|&i| {
+                self.parsed[i as usize]
+                    .as_ref()
+                    .is_some_and(|f| f.matches(topic))
+            })
+        };
+        let lit = self.by_first.get(first).and_then(|l| hit(l));
+        let wild = hit(&self.wild);
+        lit.into_iter().chain(wild).min().map(|i| i as usize)
+    }
+}
+
 /// A case-insensitive text to look for.
 #[derive(Default)]
 struct Needle {
@@ -423,12 +568,15 @@ struct ListFilterState {
     needle: Needle,
     /// False for the default filter. Then the list itself is the view and there is no index.
     active: bool,
+    /// `filter.show_only`, parsed once. `None` for a filter that is not valid.
+    show: Option<topic::Filter>,
 }
 
 impl ListFilterState {
     fn new(filter: ListFilter) -> Self {
         Self {
             needle: Needle::new(&filter.text),
+            show: filter.show_only.as_deref().and_then(topic::Filter::new),
             active: !filter.text.is_empty()
                 || filter.direction != DirectionFilter::All
                 || filter.show_only.is_some(),
@@ -448,9 +596,7 @@ fn row_matches(row: &Row, f: &ListFilterState) -> bool {
         DirectionFilter::Sent if m.direction == Direction::Sent => {}
         _ => return false,
     }
-    if let Some(sub) = &f.filter.show_only
-        && !topic::matches(sub, &m.topic)
-    {
+    if f.filter.show_only.is_some() && !f.show.as_ref().is_some_and(|s| s.matches(&m.topic)) {
         return false;
     }
     f.needle.found_in(&m.topic) || {
@@ -465,6 +611,8 @@ struct TreeFilterState {
     filter: TreeFilter,
     needle: Needle,
     active: bool,
+    /// `filter.show_only`, parsed once. `None` for a filter that is not valid.
+    show: Option<topic::Filter>,
 }
 
 /// Tree flags of a node, with a tree filter.
@@ -501,8 +649,24 @@ struct SnapFrame {
 
 pub struct TopicStore {
     limits: Limits,
-    /// Arena. A `NodeId` is an index. Parents have a lower index than their children.
+    /// Arena of slots. A `NodeId` is a slot and its generation. A free slot has `live == false`.
     nodes: Vec<Node>,
+    /// Free slots (indexes). Not used while paused (see `alloc`).
+    free: Vec<u32>,
+    /// Nodes that are not free.
+    live_nodes: usize,
+    /// The leaves (nodes without children), oldest message first. Key is `Node::touch`.
+    /// These are the nodes that memory pressure can remove.
+    touch: BTreeMap<u64, NodeId>,
+    /// Shared empty topic for the free slots.
+    empty: Arc<str>,
+    /// A batch eviction of data runs (from above the budget to the low watermark).
+    evicting: bool,
+    /// A batch eviction of nodes runs.
+    evicting_nodes: bool,
+    /// The last batch found nothing to evict. Cleared by the next insert.
+    stuck_mem: bool,
+    stuck_nodes: bool,
     /// Children of the virtual root. Topics start at depth 0.
     roots: BTreeMap<Box<str>, NodeId>,
     /// Visible nodes in display order. Valid only when `rows_dirty` is false.
@@ -538,8 +702,7 @@ pub struct TopicStore {
     pending_retained: VecDeque<PendingRetained>,
     /// Topics where our own retained publish succeeded, also topics without a node (we do not
     /// subscribe to them). Oldest first.
-    // ponytail: a linear search, because the cap is small. Use a map if the cap grows.
-    sent_retained: VecDeque<(Arc<str>, Retained)>,
+    sent_retained: SentRetained,
     lf: ListFilterState,
     /// With an active filter: the ids of the matching rows, ascending.
     matched: VecDeque<RowId>,
@@ -568,7 +731,7 @@ pub struct TopicStore {
     snap_job: Option<SnapJob>,
 
     // Subscription colours.
-    subs: Vec<String>,
+    subs: SubIndex,
     sub_rev: u32,
 }
 
@@ -593,6 +756,14 @@ impl TopicStore {
         Self {
             limits,
             nodes: Vec::new(),
+            free: Vec::new(),
+            live_nodes: 0,
+            touch: BTreeMap::new(),
+            empty: Arc::from(""),
+            evicting: false,
+            evicting_nodes: false,
+            stuck_mem: false,
+            stuck_nodes: false,
             roots: BTreeMap::new(),
             rows: Vec::new(),
             rows_dirty: false,
@@ -607,7 +778,7 @@ impl TopicStore {
             messages: 0,
             topic_drops: 0,
             pending_retained: VecDeque::new(),
-            sent_retained: VecDeque::new(),
+            sent_retained: SentRetained::default(),
             drops: 0,
             list_drops: 0,
             list: VecDeque::new(),
@@ -628,7 +799,7 @@ impl TopicStore {
             snap_rows: Vec::new(),
             snap: HashMap::new(),
             snap_job: None,
-            subs: Vec::new(),
+            subs: SubIndex::default(),
             sub_rev: 1,
         }
     }
@@ -638,6 +809,14 @@ impl TopicStore {
     /// These stay: the limits, the filters, the subscriptions and the next `RowId` (an old
     /// `RowId` never points to a new row). Pause ends.
     pub fn clear(&mut self) {
+        drop(self.take());
+    }
+
+    /// Like [`clear`](Self::clear), but returns the old store. Dropping a big store takes a long
+    /// time, so the caller can drop the returned store on a background thread. The returned
+    /// store keeps the data and the counters. Its filters and subscriptions are moved to the new
+    /// store, so it is only good for reading or for a drop.
+    pub fn take(&mut self) -> TopicStore {
         let mut fresh = Self::new(self.limits);
         fresh.next_row = self.next_row;
         fresh.scan_below = self.next_row;
@@ -646,7 +825,7 @@ impl TopicStore {
         fresh.tf = std::mem::take(&mut self.tf);
         fresh.subs = std::mem::take(&mut self.subs);
         fresh.sub_rev = self.sub_rev.wrapping_add(1).max(1);
-        *self = fresh;
+        std::mem::replace(self, fresh)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -655,11 +834,12 @@ impl TopicStore {
 
     /// Inserts one received message. Creates missing nodes. Updates counts on the path. Adds the
     /// message to the latest value, the history of the topic and the message list.
-    /// Never exceeds the budgets. `msg.generation` is not checked here.
+    /// Never goes above the hard ceiling and the node caps. `msg.generation` is not checked here.
     ///
-    /// The store checks the whole cost first. If the message does not fit, the store evicts
-    /// (see the module docs). A drop can happen after some evictions (the evictions stay).
-    /// The topic keeps its old latest value until the new message is admitted.
+    /// The store checks the whole cost first. It never evicts here: it only drops the message if
+    /// the memory would go above the hard ceiling (`hard_limit`). [`TopicStore::work`] evicts in
+    /// batches, so the memory can be a little above the budget for a short time.
+    /// The topic keeps its old latest value if the message is dropped.
     pub fn insert(&mut self, msg: Incoming) -> Insert {
         let Incoming {
             topic,
@@ -706,49 +886,39 @@ impl TopicStore {
         let row_cost = ROW_OVERHEAD + stored_len + props_cost;
         let cost = latest_cost + hist_cost + row_cost;
         if new_nodes > 0
-            && (self.nodes.len() + new_nodes > self.limits.topic_cap
+            && (self.live_nodes + new_nodes > self.limits.topic_cap
                 || self.node_bytes + new_node_bytes > self.limits.node_budget)
         {
             self.topic_drops += 1;
             return Insert::TopicDropped;
         }
-        if self.fixed() + new_node_bytes + cost > self.limits.budget {
-            // Does not fit even if everything that can be evicted is evicted.
-            self.drops += 1;
-            return Insert::Dropped;
-        }
-
-        // Make room. The old latest value of this topic counts as free space, but it is released
-        // only when the message is stored.
+        // The old latest value of this topic is replaced at once, so it counts as free space.
         let existing = if new_nodes == 0 { parent } else { None };
         let own = existing.map_or(0, |id| {
-            self.nodes[id.0 as usize]
-                .latest
-                .as_ref()
-                .map_or(0, msg_cost)
+            self.nodes[id.ix()].latest.as_ref().map_or(0, msg_cost)
         });
-        if !self.make_room(new_node_bytes + cost, own, existing) {
+        if self.used() + new_node_bytes + cost > self.hard_limit() + own {
             self.drops += 1;
             return Insert::Dropped;
         }
+        self.stuck_mem = false;
+        self.stuck_nodes = false;
         if let Some(id) = existing {
             self.release(id);
         }
-        debug_assert!(self.used() + new_node_bytes + cost <= self.limits.budget);
+        debug_assert!(self.used() + new_node_bytes + cost <= self.hard_limit());
 
         // Create the missing nodes.
-        let parent_visible = parent.is_none_or(|p| self.nodes[p.0 as usize].expanded);
         let mut leaf = parent;
         for (i, name) in missing.enumerate() {
-            let id = NodeId(self.nodes.len() as u32); // topic_cap <= u32::MAX is checked above
-            let depth = leaf.map_or(0, |p| self.nodes[p.0 as usize].depth.saturating_add(1));
+            let depth = leaf.map_or(0, |p| self.nodes[p.ix()].depth.saturating_add(1));
             let end = prefix_end(&topic, name);
             let node_topic = if end == topic.len() {
                 Arc::clone(&topic)
             } else {
                 Arc::from(&topic[..end])
             };
-            self.nodes.push(Node {
+            let id = self.alloc(Node {
                 name: name.into(),
                 topic: node_topic,
                 parent: leaf,
@@ -764,23 +934,39 @@ impl TopicStore {
                 colour_rev: 0,
                 colour_idx: NO_COLOUR,
                 retained: None,
+                generation: 0,
+                live: true,
+                touch: 0,
             });
             self.node_bytes += node_cost(name.len(), end);
             match leaf {
                 None => self.roots.insert(name.into(), id),
-                Some(p) => self.nodes[p.0 as usize].children.insert(name.into(), id),
+                Some(p) => {
+                    // The parent gets its first child: it is not a leaf any more.
+                    let pn = &mut self.nodes[p.ix()];
+                    if pn.children.is_empty() {
+                        self.touch.remove(&pn.touch);
+                    }
+                    pn.children.insert(name.into(), id)
+                }
             };
             // Only the first new node can show up in the rows: the others are below a new
-            // (collapsed) node.
-            if i == 0 && parent_visible {
-                self.rows_dirty = true;
+            // (collapsed) node. With a tree filter, `tree_test` decides.
+            if i == 0 && !self.tf.active && !self.rows_dirty && self.children_shown(parent) {
+                self.splice_new_row(id);
             }
             if self.tf.active {
-                self.tree_flags.push(0);
-                // A node below the cursor is tested by the rebuild, a node at it is tested now.
-                if self.tree_cursor == id.0 as usize {
+                match self.tree_flags.get_mut(id.ix()) {
+                    Some(f) => *f = 0, // a reused slot
+                    None => self.tree_flags.push(0),
+                }
+                // A node above the cursor is tested by the rebuild. A node at the cursor or below
+                // it (a reused slot) is tested now.
+                if id.ix() <= self.tree_cursor {
                     self.tree_test(id);
-                    self.tree_cursor += 1;
+                    if self.tree_cursor == id.ix() {
+                        self.tree_cursor += 1;
+                    }
                 }
             }
             leaf = Some(id);
@@ -821,10 +1007,10 @@ impl TopicStore {
         // Store the latest value.
         // Any retained message from the broker is the newest record for its topic: the node keeps
         // it, and our own earlier retained publish no longer counts.
-        if retain {
-            self.sent_retained.retain(|(t, _)| **t != *topic);
+        if retain && !self.sent_retained.by_topic.is_empty() {
+            self.sent_retained.remove(&topic);
         }
-        let node = &mut self.nodes[id.0 as usize];
+        let node = &mut self.nodes[id.ix()];
         let first = node.msg_count == 0;
         node.msg_count += 1;
         // A retained message with a payload sets the broker state. A retained message with an
@@ -854,6 +1040,12 @@ impl TopicStore {
         });
         self.hist_order.insert(self.seq, id);
         self.hist_bytes += hist_cost;
+        // A leaf is indexed by its last message, for the removal of idle topics.
+        if node.children.is_empty() {
+            self.touch.remove(&node.touch);
+            self.touch.insert(self.seq, id);
+        }
+        node.touch = self.seq;
         while node.history.len() > self.limits.history_len {
             if let Some(old) = node.history.pop_front() {
                 self.hist_order.remove(&old.seq);
@@ -862,10 +1054,10 @@ impl TopicStore {
         }
 
         // Counts: this node and all ancestors.
-        self.nodes[id.0 as usize].subtree_msgs += 1;
-        let mut up = self.nodes[id.0 as usize].parent;
+        self.nodes[id.ix()].subtree_msgs += 1;
+        let mut up = self.nodes[id.ix()].parent;
         while let Some(p) = up {
-            let n = &mut self.nodes[p.0 as usize];
+            let n = &mut self.nodes[p.ix()];
             n.subtree_msgs += 1;
             if first {
                 n.subtree_topics += 1;
@@ -907,7 +1099,7 @@ impl TopicStore {
         at: SystemTime,
     ) -> Insert {
         let node = self.find(topic);
-        let shared = node.map(|n| Arc::clone(&self.nodes[n.0 as usize].topic));
+        let shared = node.map(|n| Arc::clone(&self.nodes[n.ix()].topic));
         let topic_cost = if shared.is_some() {
             0
         } else {
@@ -917,7 +1109,7 @@ impl TopicStore {
         let expiry = props.message_expiry;
         let stored_len = original_size.min(self.limits.latest_payload_max);
         let cost = ROW_OVERHEAD + SENT_EXTRA + topic_cost + stored_len + props.heap_bytes();
-        if self.fixed() + cost > self.limits.budget || !self.make_room(cost, 0, None) {
+        if self.used() + cost > self.hard_limit() {
             self.drops += 1;
             return Insert::Dropped;
         }
@@ -1027,14 +1219,11 @@ impl TopicStore {
         }
         let state = (!p.delete).then_some(Retained { until: p.until });
         if let Some(id) = self.find(&p.topic) {
-            self.nodes[id.0 as usize].retained = state;
+            self.nodes[id.ix()].retained = state;
         }
-        self.sent_retained.retain(|(t, _)| *t != p.topic);
+        self.sent_retained.remove(&p.topic);
         if let Some(r) = state {
-            if self.sent_retained.len() >= MAX_SENT_RETAINED {
-                self.sent_retained.pop_front();
-            }
-            self.sent_retained.push_back((p.topic, r));
+            self.sent_retained.insert(p.topic, r);
         }
     }
 
@@ -1049,8 +1238,8 @@ impl TopicStore {
             .is_some_and(|id| self.has_retained_at(id, now))
             || self
                 .sent_retained
-                .iter()
-                .any(|(t, r)| **t == *topic && r.until.is_none_or(|u| now < u))
+                .get(topic)
+                .is_some_and(|r| r.until.is_none_or(|u| now < u))
     }
 
     /// True if the broker keeps a retained message for this topic, as far as this client knows:
@@ -1064,8 +1253,7 @@ impl TopicStore {
     /// [`has_retained`](Self::has_retained) at a given time. The expiry is computed on read:
     /// there is no timer.
     pub fn has_retained_at(&self, id: NodeId, now: SystemTime) -> bool {
-        self.nodes
-            .get(id.0 as usize)
+        self.live(id)
             .and_then(|n| n.retained)
             .is_some_and(|r| r.until.is_none_or(|t| now < t))
     }
@@ -1073,9 +1261,7 @@ impl TopicStore {
     /// Adds a "Reconnected" marker row to the list. The marker has a small fixed charge and it
     /// is not counted in `paused_new`. Returns `None` if even a marker does not fit.
     pub fn mark_reconnected(&mut self, at: SystemTime) -> Option<RowId> {
-        if self.fixed() + ROW_OVERHEAD > self.limits.budget
-            || !self.make_room(ROW_OVERHEAD, 0, None)
-        {
+        if self.used() + ROW_OVERHEAD > self.hard_limit() {
             return None;
         }
         Some(self.admit_row(RowKind::Reconnected(at), ROW_OVERHEAD, false))
@@ -1103,40 +1289,108 @@ impl TopicStore {
 
     fn live_rows(&mut self) -> &[NodeId] {
         if self.rows_dirty {
-            // ponytail: full rebuild, O(visible rows). Each new visible node costs one rebuild,
-            // and a filter that opens 100k nodes makes each rebuild long. Make it an incremental
-            // splice if a measurement shows a problem.
-            let mut rows = std::mem::take(&mut self.rows);
-            rows.clear();
-            let filtered = self.tf.active;
-            let flag = |id: NodeId| self.tree_flags.get(id.0 as usize).copied().unwrap_or(0);
-            let mut stack = vec![self.roots.values()];
-            while let Some(it) = stack.last_mut() {
-                match it.next() {
-                    Some(&id) => {
-                        if filtered && flag(id) & T_VISIBLE == 0 {
-                            continue;
-                        }
-                        rows.push(id);
-                        let n = &self.nodes[id.0 as usize];
-                        let open = if filtered {
-                            flag(id) & T_OPEN != 0
-                        } else {
-                            n.expanded
-                        };
-                        if open {
-                            stack.push(n.children.values());
-                        }
-                    }
-                    None => {
-                        stack.pop();
-                    }
-                }
-            }
-            self.rows = rows;
+            // Only a tree filter (or a structure change that the splice cannot handle) gets
+            // here. This is one walk for any number of changes since the last call.
+            self.rows = self.rebuild_rows();
             self.rows_dirty = false;
         }
         &self.rows
+    }
+
+    /// The visible rows, built from the tree: O(visible rows).
+    fn rebuild_rows(&self) -> Vec<NodeId> {
+        let mut rows = Vec::with_capacity(self.rows.len());
+        self.walk_rows(self.roots.values(), &mut rows);
+        rows
+    }
+
+    /// Adds the visible rows below one list of siblings, depth first.
+    fn walk_rows(&self, first: Values<'_, Box<str>, NodeId>, rows: &mut Vec<NodeId>) {
+        let filtered = self.tf.active;
+        let flag = |id: NodeId| self.tree_flags.get(id.ix()).copied().unwrap_or(0);
+        let mut stack = vec![first];
+        while let Some(it) = stack.last_mut() {
+            match it.next() {
+                Some(&id) => {
+                    if filtered && flag(id) & T_VISIBLE == 0 {
+                        continue;
+                    }
+                    rows.push(id);
+                    let n = &self.nodes[id.ix()];
+                    let open = if filtered {
+                        flag(id) & T_OPEN != 0
+                    } else {
+                        n.expanded
+                    };
+                    if open {
+                        stack.push(n.children.values());
+                    }
+                }
+                None => {
+                    stack.pop();
+                }
+            }
+        }
+    }
+
+    /// True if the children of `parent` (`None`: the root) are on screen when `parent` is
+    /// expanded: `parent` and all its ancestors are expanded. Without a tree filter only.
+    fn children_shown(&self, parent: Option<NodeId>) -> bool {
+        let mut cur = parent;
+        while let Some(id) = cur {
+            let n = &self.nodes[id.ix()];
+            if !n.expanded {
+                return false;
+            }
+            cur = n.parent;
+        }
+        true
+    }
+
+    /// Place of a node in `rows`, or the place where it would go. The rows are sorted by path,
+    /// level by level (depth first, children a-z), so this is a binary search.
+    fn row_place(&self, id: NodeId) -> Result<usize, usize> {
+        let topic = &*self.nodes[id.ix()].topic;
+        self.rows.binary_search_by(|r| {
+            let t = &*self.nodes[r.ix()].topic;
+            t.split('/').cmp(topic.split('/'))
+        })
+    }
+
+    /// Puts a new node into `rows` (no tree filter, `rows` is not dirty, its parent shows its
+    /// children). O(log V) to find the place, and one memmove.
+    fn splice_new_row(&mut self, id: NodeId) {
+        match self.row_place(id) {
+            Err(at) => self.rows.insert(at, id),
+            Ok(_) => self.rows_dirty = true, // cannot happen: the node is new
+        }
+    }
+
+    /// Changes `rows` for an expand or a collapse (no tree filter, `rows` is not dirty).
+    /// Costs the size of the changed part, and one memmove.
+    fn splice_toggle(&mut self, id: NodeId) {
+        let n = &self.nodes[id.ix()];
+        if !self.children_shown(n.parent) {
+            return; // the node is not on screen, so its rows do not change
+        }
+        let Ok(at) = self.row_place(id) else {
+            self.rows_dirty = true; // cannot happen: a shown node has a row
+            return;
+        };
+        if n.expanded {
+            let mut below = Vec::new();
+            self.walk_rows(n.children.values(), &mut below);
+            self.rows.splice(at + 1..at + 1, below);
+        } else {
+            let depth = n.depth;
+            let end = at
+                + 1
+                + self.rows[at + 1..]
+                    .iter()
+                    .take_while(|r| self.nodes[r.ix()].depth > depth)
+                    .count();
+            self.rows.drain(at + 1..end);
+        }
     }
 
     /// View of one node. `id` must come from this store since the last `clear`, or this panics.
@@ -1149,14 +1403,14 @@ impl TopicStore {
     /// While paused and with a complete snapshot, the counts and the preview come from the
     /// snapshot (if the node is in it).
     pub fn get(&self, id: NodeId) -> Option<NodeView<'_>> {
-        let n = self.nodes.get(id.0 as usize)?;
+        let n = self.live(id)?;
         let snap = if self.paused && self.snap_job.is_none() {
             self.snap.get(&id)
         } else {
             None
         };
         let (has_children, expanded) = if self.tf.active {
-            let open = self.tree_flags.get(id.0 as usize).copied().unwrap_or(0) & T_OPEN != 0;
+            let open = self.tree_flags.get(id.ix()).copied().unwrap_or(0) & T_OPEN != 0;
             (open, open)
         } else {
             (!n.children.is_empty(), n.expanded)
@@ -1179,8 +1433,7 @@ impl TopicStore {
     /// Full topic path of a node, for example `factory/line1/temp`.
     /// An unknown id gives an empty string.
     pub fn path(&self, id: NodeId) -> String {
-        self.nodes
-            .get(id.0 as usize)
+        self.live(id)
             .map_or_else(String::new, |n| n.topic.to_string())
     }
 
@@ -1194,18 +1447,21 @@ impl TopicStore {
     }
 
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes.get(id.0 as usize)?.parent
+        self.live(id)?.parent
     }
 
     /// Expands or collapses a node. An unknown id is ignored.
     /// A tree filter ignores the flag until the filter is cleared. While paused, this starts a
     /// new snapshot (built by `work`), so the counts of the tree refresh once.
     pub fn set_expanded(&mut self, id: NodeId, expanded: bool) {
-        if let Some(n) = self.nodes.get_mut(id.0 as usize)
+        if let Some(n) = self.live_mut(id)
             && n.expanded != expanded
         {
             n.expanded = expanded;
-            self.rows_dirty = true;
+            // A tree filter shows its own set of rows, so the flag does not change them.
+            if !self.tf.active && !self.rows_dirty {
+                self.splice_toggle(id);
+            }
             if self.paused {
                 self.start_snapshot();
             }
@@ -1218,8 +1474,7 @@ impl TopicStore {
     /// at most `history_payload_max` bytes, so it can be shorter than `NodeView::latest`.
     /// An unknown id gives an empty iterator.
     pub fn history(&self, id: NodeId) -> impl DoubleEndedIterator<Item = &Msg> + '_ {
-        self.nodes
-            .get(id.0 as usize)
+        self.live(id)
             .into_iter()
             .flat_map(|n| n.history.iter().rev().map(|h| &h.msg))
     }
@@ -1245,7 +1500,7 @@ impl TopicStore {
     pub fn list_row(&self, i: usize) -> Option<RowView<'_>> {
         let present = self.view_present();
         if i < present {
-            return self.row(self.view_id(i, present)).map(Row::view);
+            return self.row(self.view_id(i, present)).map(|r| self.view_of(r));
         }
         if !self.paused || self.removed.is_empty() {
             return None;
@@ -1258,6 +1513,15 @@ impl TopicStore {
         Some(RowView::Removed {
             id: self.removed[k],
         })
+    }
+
+    /// The view of a row. A node that the store removed shows as `None`.
+    fn view_of<'a>(&self, row: &'a Row) -> RowView<'a> {
+        let mut view = row.view();
+        if let RowView::Message { node, .. } = &mut view {
+            *node = node.filter(|&n| self.live(n).is_some());
+        }
+        view
     }
 
     /// True if the store removed the row (memory budget, list cap or `clear`): its id is older
@@ -1319,6 +1583,7 @@ impl TopicStore {
         }
         self.tf = TreeFilterState {
             needle: Needle::new(&filter.text),
+            show: filter.show_only.as_deref().and_then(topic::Filter::new),
             active: !filter.text.is_empty() || filter.show_only.is_some(),
             filter,
         };
@@ -1349,7 +1614,9 @@ impl TopicStore {
     /// True while `work` has something to do (a filter rebuild, a snapshot, or the list is above
     /// its cap).
     pub fn has_work(&self) -> bool {
-        self.scanning
+        self.mem_pending()
+            || self.nodes_pending()
+            || self.scanning
             || self.snap_job.is_some()
             || (self.tf.active && self.tree_cursor < self.nodes.len())
             || self.list.len() > self.list_cap()
@@ -1365,7 +1632,11 @@ impl TopicStore {
     /// calls always make progress. The UI should not call it after its frame budget is used.
     pub fn work(&mut self, deadline: Instant) -> bool {
         loop {
-            if self.tf.active && self.tree_cursor < self.nodes.len() {
+            if self.mem_pending() {
+                self.evict_step(WORK_CHUNK);
+            } else if self.nodes_pending() {
+                self.evict_nodes_step(NODE_CHUNK);
+            } else if self.tf.active && self.tree_cursor < self.nodes.len() {
                 self.tree_step(WORK_CHUNK);
             } else if self.snap_job.is_some() {
                 self.snap_step(WORK_CHUNK);
@@ -1432,9 +1703,13 @@ impl TopicStore {
     // ---------------------------------------------------------------------------------------
 
     /// Sets the subscription filters, in the order of the subscription list. This clears the
-    /// colours. Invalid filters match nothing.
+    /// colours (not when the list is the same). Invalid filters match nothing. The filters are
+    /// checked and indexed once here, so a lookup does not depend on their number.
     pub fn set_subscriptions(&mut self, filters: Vec<String>) {
-        self.subs = filters;
+        if filters == self.subs.raw {
+            return;
+        }
+        self.subs = SubIndex::new(filters);
         self.sub_rev = self.sub_rev.wrapping_add(1).max(1);
     }
 
@@ -1443,13 +1718,15 @@ impl TopicStore {
     /// An unknown node gives `None`.
     pub fn colour_of(&mut self, node: NodeId) -> Option<usize> {
         let rev = self.sub_rev;
-        let n = self.nodes.get_mut(node.0 as usize)?;
+        let subs = &self.subs;
+        let n = self
+            .nodes
+            .get_mut(node.ix())
+            .filter(|n| n.live && n.generation == node.generation)?;
         if n.colour_rev != rev {
             n.colour_rev = rev;
-            n.colour_idx = self
-                .subs
-                .iter()
-                .position(|s| topic::matches(s, &n.topic))
+            n.colour_idx = subs
+                .first_match(&n.topic)
                 .map_or(NO_COLOUR, |i| u32::try_from(i).unwrap_or(NO_COLOUR));
         }
         (n.colour_idx != NO_COLOUR).then_some(n.colour_idx as usize)
@@ -1457,14 +1734,14 @@ impl TopicStore {
 
     /// Like `colour_of`, for a topic without a node (a sent message). It is not cached.
     pub fn colour_of_topic(&self, topic: &str) -> Option<usize> {
-        self.subs.iter().position(|s| topic::matches(s, topic))
+        self.subs.first_match(topic)
     }
 
     // ---------------------------------------------------------------------------------------
 
     pub fn stats(&self) -> StoreStats {
         StoreStats {
-            topics: self.nodes.len(),
+            topics: self.live_nodes,
             messages: self.messages,
             used_bytes: self.used(),
             topic_drops: self.topic_drops,
@@ -1476,11 +1753,55 @@ impl TopicStore {
         }
     }
 
+    /// Puts a node into a free slot, or into a new one. The generation of a reused slot was
+    /// raised when it was freed. While paused, free slots stay unused: the frozen tree knows the
+    /// nodes by their slot.
+    fn alloc(&mut self, mut node: Node) -> NodeId {
+        self.live_nodes += 1;
+        if !self.paused
+            && let Some(idx) = self.free.pop()
+        {
+            node.generation = self.nodes[idx as usize].generation;
+            let id = NodeId {
+                idx,
+                generation: node.generation,
+            };
+            self.nodes[idx as usize] = node;
+            return id;
+        }
+        // `topic_cap` is at most `u32::MAX`, and a slot is never freed without a node before it.
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(node);
+        NodeId { idx, generation: 0 }
+    }
+
+    /// The node with this id, if it is still in the store.
+    fn live(&self, id: NodeId) -> Option<&Node> {
+        self.nodes
+            .get(id.ix())
+            .filter(|n| n.live && n.generation == id.generation)
+    }
+
+    fn live_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.nodes
+            .get_mut(id.ix())
+            .filter(|n| n.live && n.generation == id.generation)
+    }
+
+    /// The id of the node in slot `i`, if the slot is in use.
+    fn id_at(&self, i: usize) -> Option<NodeId> {
+        let n = self.nodes.get(i)?;
+        n.live.then_some(NodeId {
+            idx: i as u32,
+            generation: n.generation,
+        })
+    }
+
     /// `None` is the virtual root.
     fn children_of(&self, id: Option<NodeId>) -> &BTreeMap<Box<str>, NodeId> {
         match id {
             None => &self.roots,
-            Some(id) => &self.nodes[id.0 as usize].children,
+            Some(id) => &self.nodes[id.ix()].children,
         }
     }
 
@@ -1494,23 +1815,206 @@ impl TopicStore {
         self.node_bytes + self.snap_bytes + self.removed.len() * size_of::<RowId>()
     }
 
-    /// Evicts until `need` more bytes fit. `own_free` bytes (the old latest value of the topic
-    /// that is replaced) count as free space. `keep` is that topic. Returns false if the work cap
-    /// is reached or nothing is left to evict.
-    fn make_room(&mut self, need: usize, own_free: usize, keep: Option<NodeId>) -> bool {
-        let mut evicted = 0;
-        while self.used() + need > self.limits.budget + own_free {
-            if evicted == MAX_EVICTIONS_PER_INSERT || !self.evict_one(keep) {
-                return false;
+    /// Sets a new memory budget at once (clamped to [`BUDGET_MIN`]..=[`BUDGET_MAX`]) and returns
+    /// the value that is in use. The node budget becomes a quarter of it.
+    ///
+    /// A lower budget evicts nothing here. It changes the targets: `has_work` becomes true, and
+    /// [`TopicStore::work`] brings the memory down in time slices. Until then the memory can be
+    /// above the budget (the insert drops a message only above the hard ceiling, which also
+    /// moves). A higher budget needs no work.
+    pub fn set_budget(&mut self, bytes: usize) -> usize {
+        let budget = bytes.clamp(BUDGET_MIN, BUDGET_MAX);
+        self.limits.budget = budget;
+        self.limits.node_budget = budget / 4;
+        self.stuck_mem = false;
+        self.stuck_nodes = false;
+        budget
+    }
+
+    /// The memory budget in use.
+    pub fn budget(&self) -> usize {
+        self.limits.budget
+    }
+
+    /// The hard ceiling of the memory: the budget plus a quarter. An insert above it is dropped.
+    /// The budget itself is the target of the batch eviction in [`TopicStore::work`].
+    pub fn hard_limit(&self) -> usize {
+        self.limits.budget + self.limits.budget / 4
+    }
+
+    /// Low watermark of the batch eviction: it stops here, so the next evictions come later.
+    fn low_mark(&self) -> usize {
+        self.limits.budget - self.limits.budget / 10
+    }
+
+    /// Data eviction is needed: used bytes are above the budget, or a batch is running.
+    fn mem_pending(&self) -> bool {
+        !self.stuck_mem && (self.evicting || self.used() > self.limits.budget)
+    }
+
+    /// One step of the data eviction: at most `n` items, oldest first, down to the low
+    /// watermark. It goes on in the next call while `mem_pending`.
+    fn evict_step(&mut self, n: usize) {
+        self.evicting = true;
+        let low = self.low_mark();
+        for _ in 0..n {
+            if self.used() <= low {
+                self.evicting = false;
+                return;
             }
-            evicted += 1;
+            if !self.evict_one() {
+                // Nothing left that can go (the rest is fixed).
+                self.evicting = false;
+                self.stuck_mem = self.used() > self.limits.budget;
+                return;
+            }
         }
-        true
+    }
+
+    /// Node eviction is needed: nodes or node bytes reached the high mark (95 % of their cap),
+    /// or a batch is running. Not while paused: the frozen views hold node ids.
+    fn nodes_pending(&self) -> bool {
+        if self.paused || self.stuck_nodes {
+            return false;
+        }
+        let (count_high, _) = marks(self.limits.topic_cap);
+        let (bytes_high, _) = marks(self.limits.node_budget);
+        self.evicting_nodes || self.live_nodes >= count_high || self.node_bytes >= bytes_high
+    }
+
+    /// One step of the node eviction: removes at most `n` idle leaves (and the empty parents
+    /// above them), least recently updated first, down to 90 % of the caps.
+    fn evict_nodes_step(&mut self, n: usize) {
+        self.evicting_nodes = true;
+        let (_, count_low) = marks(self.limits.topic_cap);
+        let (_, bytes_low) = marks(self.limits.node_budget);
+        for _ in 0..n {
+            if self.live_nodes <= count_low && self.node_bytes <= bytes_low {
+                self.evicting_nodes = false;
+                return;
+            }
+            let victim = self.touch.values().copied().find(|&id| {
+                let n = &self.nodes[id.ix()];
+                // A node that is open, or that waits for the end of our own retained publish.
+                !n.expanded && !self.pending_retained.iter().any(|p| p.topic == n.topic)
+            });
+            let Some(id) = victim else {
+                self.evicting_nodes = false;
+                self.stuck_nodes = true;
+                return;
+            };
+            self.remove_leaf(id);
+        }
+    }
+
+    // ponytail: list rows keep the topic `Arc` of a removed node, and nothing charges for it
+    // (at most one topic of up to 64 KiB for each row). The budget is an estimate, not a strict
+    // bound. Charge the row for its topic if this ever matters.
+    /// Removes a leaf node, and then each parent that has no child and no message. The list rows
+    /// keep their topic text but lose the node (`RowView::Message::node` is `None`). Counts of
+    /// the ancestors drop by the counts of the node. `messages` (the total) does not change.
+    fn remove_leaf(&mut self, mut id: NodeId) {
+        loop {
+            let parent = self.nodes[id.ix()].parent;
+            // The rows first: the place of the node is found by its path.
+            let mut was_visible = false;
+            if self.tf.active {
+                was_visible = self.tree_flags[id.ix()] & T_VISIBLE != 0;
+                self.rows_dirty |= was_visible;
+                self.tree_flags[id.ix()] = 0;
+            } else if !self.rows_dirty && self.children_shown(parent) {
+                match self.row_place(id) {
+                    Ok(at) => {
+                        self.rows.remove(at);
+                    }
+                    Err(_) => self.rows_dirty = true,
+                }
+            }
+            let n = &mut self.nodes[id.ix()];
+            let name = std::mem::take(&mut n.name);
+            let topic = std::mem::replace(&mut n.topic, Arc::clone(&self.empty));
+            let (msgs, had_msg) = (n.subtree_msgs, n.msg_count > 0);
+            let cost = n.latest.take().as_ref().map_or(0, msg_cost);
+            if cost > 0 {
+                self.order.remove(&n.seq);
+                self.latest_bytes -= cost;
+            }
+            for e in n.history.drain(..) {
+                self.hist_order.remove(&e.seq);
+                self.hist_bytes -= e.charge;
+            }
+            self.touch.remove(&n.touch);
+            *n = Node {
+                name: Box::default(),
+                topic: Arc::clone(&self.empty),
+                parent: None,
+                depth: 0,
+                children: BTreeMap::new(),
+                expanded: false,
+                msg_count: 0,
+                subtree_msgs: 0,
+                subtree_topics: 0,
+                latest: None,
+                seq: 0,
+                history: VecDeque::new(),
+                colour_rev: 0,
+                colour_idx: NO_COLOUR,
+                retained: None,
+                generation: n.generation.wrapping_add(1),
+                live: false,
+                touch: 0,
+            };
+            self.node_bytes -= node_cost(name.len(), topic.len());
+            self.free.push(id.idx);
+            self.live_nodes -= 1;
+            let mut up = parent;
+            match parent {
+                None => self.roots.remove(&*name),
+                Some(p) => self.nodes[p.ix()].children.remove(&*name),
+            };
+            while let Some(a) = up {
+                let n = &mut self.nodes[a.ix()];
+                n.subtree_msgs -= msgs;
+                if had_msg {
+                    n.subtree_topics -= 1;
+                }
+                up = n.parent;
+            }
+            // With a tree filter, an ancestor that was open only for this node closes again. The
+            // walk stops at the first ancestor that stays open.
+            // ponytail: the check scans the children of such an ancestor (it stops at the first
+            // visible one). A very wide parent with no visible child is one long scan.
+            let mut up = parent;
+            while was_visible && let Some(a) = up {
+                let flags = self.tree_flags[a.ix()];
+                let n = &self.nodes[a.ix()];
+                let open = flags & T_MATCH != 0
+                    || n.children
+                        .values()
+                        .any(|c| self.tree_flags[c.ix()] & T_VISIBLE != 0);
+                if open {
+                    break;
+                }
+                self.tree_flags[a.ix()] = 0;
+                up = n.parent;
+            }
+            let Some(p) = parent else { return };
+            let pn = &self.nodes[p.ix()];
+            if !pn.children.is_empty() {
+                return;
+            }
+            if pn.msg_count > 0 {
+                // The parent has a message of its own and is a leaf now.
+                self.touch.insert(pn.touch, p);
+                return;
+            }
+            id = p; // an empty structure node: it goes too
+        }
     }
 
     /// Evicts one item. The order: oldest history entry, oldest list row, oldest latest payload.
-    fn evict_one(&mut self, keep: Option<NodeId>) -> bool {
-        self.evict_history() || self.pop_row(true) || self.evict_latest(keep)
+    fn evict_one(&mut self) -> bool {
+        self.evict_history() || self.pop_row(true) || self.evict_latest()
     }
 
     /// Removes the oldest history entry of all topics. It is the front of one ring.
@@ -1518,7 +2022,7 @@ impl TopicStore {
         let Some((seq, id)) = self.hist_order.pop_first() else {
             return false;
         };
-        if let Some(e) = self.nodes[id.0 as usize].history.pop_front() {
+        if let Some(e) = self.nodes[id.ix()].history.pop_front() {
             debug_assert_eq!(e.seq, seq);
             self.hist_bytes -= e.charge;
         }
@@ -1528,7 +2032,7 @@ impl TopicStore {
     /// Takes the bytes of the latest value of a node out of the accounting.
     /// The caller replaces the value right after.
     fn release(&mut self, id: NodeId) {
-        let n = &self.nodes[id.0 as usize];
+        let n = &self.nodes[id.ix()];
         let cost = n.latest.as_ref().map_or(0, msg_cost);
         if cost > 0 {
             self.order.remove(&n.seq);
@@ -1536,15 +2040,12 @@ impl TopicStore {
         }
     }
 
-    /// Empties the oldest non-empty latest value, except the value of `keep` (the topic that is
-    /// being replaced: it is released only when its new value is stored). Returns false if there
-    /// is nothing to evict.
-    fn evict_latest(&mut self, keep: Option<NodeId>) -> bool {
-        let Some((&seq, &id)) = self.order.iter().find(|(_, id)| Some(**id) != keep) else {
+    /// Empties the oldest non-empty latest value. Returns false if there is nothing to evict.
+    fn evict_latest(&mut self) -> bool {
+        let Some((_, id)) = self.order.pop_first() else {
             return false;
         };
-        self.order.remove(&seq);
-        if let Some(m) = self.nodes[id.0 as usize].latest.as_mut() {
+        if let Some(m) = self.nodes[id.ix()].latest.as_mut() {
             self.latest_bytes -= msg_cost(m);
             m.payload = Bytes::new();
             m.props = MsgProps::default(); // ponytail: props go too, so the cost is exactly 0
@@ -1553,7 +2054,7 @@ impl TopicStore {
         true
     }
 
-    /// Adds a row to the list. The charge is already admitted (`make_room`). Updates the filter
+    /// Adds a row to the list. The charge is already admitted. Updates the filter
     /// index and `paused_new`. Removes the rows above the cap (a few at a time).
     fn admit_row(&mut self, kind: RowKind, charge: usize, counts_new: bool) -> RowId {
         let id = RowId(self.next_row);
@@ -1689,7 +2190,9 @@ impl TopicStore {
         let start = self.tree_cursor;
         let end = (start + n).min(self.nodes.len());
         for i in start..end {
-            self.tree_test(NodeId(i as u32));
+            if let Some(id) = self.id_at(i) {
+                self.tree_test(id);
+            }
         }
         self.tree_cursor = end;
         if self.paused && end == self.nodes.len() && end > start {
@@ -1705,27 +2208,23 @@ impl TopicStore {
 
     /// Tests one node against the tree filter. A match and its ancestors become visible.
     fn tree_test(&mut self, id: NodeId) {
-        let n = &self.nodes[id.0 as usize];
+        let n = &self.nodes[id.ix()];
         let hit = self.tf.needle.found_in(&n.topic)
-            && self
-                .tf
-                .filter
-                .show_only
-                .as_ref()
-                .is_none_or(|s| topic::matches(s, &n.topic));
+            && (self.tf.filter.show_only.is_none()
+                || self.tf.show.as_ref().is_some_and(|s| s.matches(&n.topic)));
         if !hit {
             return;
         }
-        self.tree_flags[id.0 as usize] |= T_MATCH | T_VISIBLE;
+        self.tree_flags[id.ix()] |= T_MATCH | T_VISIBLE;
         // An ancestor that is open has open ancestors, so the walk stops there.
         let mut up = n.parent;
         while let Some(p) = up {
-            let f = &mut self.tree_flags[p.0 as usize];
+            let f = &mut self.tree_flags[p.ix()];
             if *f & T_OPEN != 0 {
                 break;
             }
             *f |= T_OPEN | T_VISIBLE;
-            up = self.nodes[p.0 as usize].parent;
+            up = self.nodes[p.ix()].parent;
         }
         self.rows_dirty = true;
     }
@@ -1750,10 +2249,7 @@ impl TopicStore {
         let id = match last {
             None => children.values().next(),
             Some(l) => children
-                .range::<str, _>((
-                    Bound::Excluded(&*self.nodes[l.0 as usize].name),
-                    Bound::Unbounded,
-                ))
+                .range::<str, _>((Bound::Excluded(&*self.nodes[l.ix()].name), Bound::Unbounded))
                 .next()
                 .map(|(_, id)| id),
         };
@@ -1782,15 +2278,15 @@ impl TopicStore {
                 job.stack.pop();
                 continue;
             };
-            let flags = self.tree_flags.get(id.0 as usize).copied().unwrap_or(0);
-            let skip = id.0 as usize >= job.node_limit || (filtered && flags & T_VISIBLE == 0);
+            let flags = self.tree_flags.get(id.ix()).copied().unwrap_or(0);
+            let skip = id.ix() >= job.node_limit || (filtered && flags & T_VISIBLE == 0);
             let mut open = false;
             if !skip {
                 if self.snap_rows.len() >= SNAPSHOT_MAX_ROWS {
                     done = true;
                     break;
                 }
-                let node = &self.nodes[id.0 as usize];
+                let node = &self.nodes[id.ix()];
                 open = if filtered {
                     flags & T_OPEN != 0
                 } else {
@@ -1812,7 +2308,7 @@ impl TopicStore {
                         break 'walk; // the node is not handled yet: the next step starts here
                     }
                     left -= 1;
-                    if !self.evict_one(None) {
+                    if !self.evict_one() {
                         done = true;
                         break 'walk;
                     }
@@ -1839,6 +2335,12 @@ impl TopicStore {
     }
 }
 
+/// The 95 % and the 90 % mark of a cap (see `TopicStore::nodes_pending`). The low mark is below
+/// the high mark, also for a tiny cap.
+fn marks(cap: usize) -> (usize, usize) {
+    (cap - cap / 20, cap - (cap / 10).max(1))
+}
+
 /// Byte offset of the end of `part` in `topic`. `part` must be a slice of `topic`.
 fn prefix_end(topic: &str, part: &str) -> usize {
     part.as_ptr() as usize - topic.as_ptr() as usize + part.len()
@@ -1846,6 +2348,7 @@ fn prefix_end(topic: &str, part: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use super::*;
@@ -1981,13 +2484,52 @@ mod tests {
     fn audit(s: &TopicStore) {
         let lim = s.limits;
         let (mut nodes, mut latest, mut hist, mut hist_n) = (0, 0, 0, 0);
+        let free: HashSet<u32> = s.free.iter().copied().collect();
+        assert_eq!(free.len(), s.free.len(), "no slot is free twice");
+        let mut live_count = 0;
         for (i, n) in s.nodes.iter().enumerate() {
+            let id = NodeId {
+                idx: i as u32,
+                generation: n.generation,
+            };
+            if !n.live {
+                assert!(
+                    free.contains(&(i as u32)),
+                    "a dead slot is in the free list"
+                );
+                assert!(n.latest.is_none() && n.history.is_empty() && n.children.is_empty());
+                assert!(s.live(id).is_none());
+                continue;
+            }
+            assert!(!free.contains(&(i as u32)));
+            live_count += 1;
             nodes += node_cost(n.name.len(), n.topic.len());
+            // Counts of the subtree, from the children.
+            let (mut msgs, mut topics) = (n.msg_count, 0u32);
+            let mut stack: Vec<NodeId> = n.children.values().copied().collect();
+            while let Some(c) = stack.pop() {
+                let cn = s.live(c).expect("a child is live");
+                msgs += cn.msg_count;
+                topics += u32::from(cn.msg_count > 0);
+                stack.extend(cn.children.values().copied());
+            }
+            assert_eq!(n.subtree_msgs, msgs, "subtree_msgs of {}", n.topic);
+            assert_eq!(n.subtree_topics, topics, "subtree_topics of {}", n.topic);
+            for c in n.children.values() {
+                assert_eq!(s.live(*c).expect("a child is live").parent, Some(id));
+            }
+            // A leaf has a message and is in the touch index. Nothing else is.
+            if n.children.is_empty() {
+                assert!(n.msg_count > 0, "an empty leaf must not exist: {}", n.topic);
+                assert_eq!(s.touch.get(&n.touch), Some(&id));
+            } else {
+                assert!(!s.touch.contains_key(&n.touch) || n.touch == 0);
+            }
             let mut names = vec![&*n.name];
             let mut p = n.parent;
             while let Some(q) = p {
-                names.push(&s.nodes[q.0 as usize].name);
-                p = s.nodes[q.0 as usize].parent;
+                names.push(&s.nodes[q.ix()].name);
+                p = s.nodes[q.ix()].parent;
             }
             names.reverse();
             assert_eq!(names.join("/"), *n.topic, "topic is the path");
@@ -2000,11 +2542,26 @@ mod tests {
                 assert!(e.msg.payload.len() <= lim.history_payload_max);
                 assert!(e.seq > last);
                 last = e.seq;
-                assert_eq!(s.hist_order.get(&e.seq), Some(&NodeId(i as u32)));
+                assert_eq!(s.hist_order.get(&e.seq), Some(&id));
                 hist += e.charge;
                 hist_n += 1;
             }
         }
+        if !s.rows_dirty {
+            assert_eq!(
+                s.rows,
+                s.rebuild_rows(),
+                "spliced rows equal a full rebuild"
+            );
+        }
+        assert_eq!(s.live_nodes, live_count);
+        assert_eq!(
+            s.touch.len(),
+            s.nodes
+                .iter()
+                .filter(|n| n.live && n.children.is_empty())
+                .count()
+        );
         assert_eq!(s.node_bytes, nodes);
         assert_eq!(s.latest_bytes, latest);
         assert_eq!(s.hist_bytes, hist);
@@ -2012,10 +2569,10 @@ mod tests {
         let live = s
             .nodes
             .iter()
-            .filter(|n| n.latest.as_ref().is_some_and(|m| msg_cost(m) > 0));
+            .filter(|n| n.live && n.latest.as_ref().is_some_and(|m| msg_cost(m) > 0));
         assert_eq!(s.order.len(), live.count());
         for (seq, id) in &s.order {
-            assert_eq!(s.nodes[id.0 as usize].seq, *seq);
+            assert_eq!(s.nodes[id.ix()].seq, *seq);
         }
 
         // List.
@@ -2030,12 +2587,17 @@ mod tests {
                     match m.direction {
                         Direction::Received => base,
                         Direction::Sent => {
-                            base + SENT_EXTRA
-                                + if m.node.is_none() {
-                                    m.topic.len() + ARC_OVERHEAD
-                                } else {
-                                    0
-                                }
+                            let own_topic = m.topic.len() + ARC_OVERHEAD;
+                            if m.node.is_some_and(|n| s.live(n).is_none()) {
+                                // The node went away after the row was recorded: either charge.
+                                assert!(
+                                    r.charge == base + SENT_EXTRA
+                                        || r.charge == base + SENT_EXTRA + own_topic
+                                );
+                                r.charge
+                            } else {
+                                base + SENT_EXTRA + if m.node.is_none() { own_topic } else { 0 }
+                            }
                         }
                     }
                 }
@@ -2080,12 +2642,12 @@ mod tests {
             let mut want = vec![0u8; c];
             for i in 0..c {
                 let n = &s.nodes[i];
-                if naive_tree(&s.tf.filter, &n.topic) {
+                if n.live && naive_tree(&s.tf.filter, &n.topic) {
                     want[i] |= T_MATCH | T_VISIBLE;
                     let mut up = n.parent;
                     while let Some(p) = up {
-                        want[p.0 as usize] |= T_OPEN | T_VISIBLE;
-                        up = s.nodes[p.0 as usize].parent;
+                        want[p.ix()] |= T_OPEN | T_VISIBLE;
+                        up = s.nodes[p.ix()].parent;
                     }
                 }
             }
@@ -2109,7 +2671,7 @@ mod tests {
 
         let total = nodes + latest + hist + list + snap + s.removed.len() * size_of::<RowId>();
         assert_eq!(s.stats().used_bytes, total);
-        assert!(total <= lim.budget, "over budget");
+        assert!(total <= s.hard_limit(), "over the hard ceiling");
         assert!(s.node_bytes <= lim.node_budget);
     }
 
@@ -2199,9 +2761,9 @@ mod tests {
         assert_eq!(row_paths(&mut s)[4], "a/b/q");
         s.set_expanded(a, false);
         assert_eq!(row_paths(&mut s), ["0", "a", "b", "c"]);
-        s.set_expanded(NodeId(9999), true); // unknown id is ignored
-        assert_eq!(s.path(NodeId(9999)), "");
-        assert_eq!(s.parent(NodeId(9999)), None);
+        s.set_expanded(NodeId::raw(9999), true); // unknown id is ignored
+        assert_eq!(s.path(NodeId::raw(9999)), "");
+        assert_eq!(s.parent(NodeId::raw(9999)), None);
     }
 
     #[test]
@@ -2342,9 +2904,13 @@ mod tests {
                 Insert::Recorded(_) => panic!("insert never records"),
             }
             assert!(
-                s.stats().used_bytes <= limits.budget,
-                "over budget at insert {i}"
+                s.stats().used_bytes <= s.hard_limit(),
+                "over the hard ceiling at insert {i}"
             );
+            if i % 50 == 0 {
+                settle(&mut s);
+                assert!(s.stats().used_bytes <= limits.budget, "over budget at {i}");
+            }
             if i % 97 == 0 {
                 audit(&s);
             }
@@ -2360,28 +2926,27 @@ mod tests {
     fn eviction_keeps_metadata() {
         let n = root_cost("a"); // "b" costs the same
         let limits = Limits {
-            budget: 2 * n + per_msg(600) + 100,
-            node_budget: 2 * n,
+            budget: 2 * n + 2 * per_msg(600) - 50,
+            node_budget: 6 * n,
             ..big()
         };
         let mut s = TopicStore::new(limits);
         let a = stored(s.insert(msg("a", &[1; 600])));
-        let b = stored(s.insert(msg("b", &[2; 600]))); // evicts the row, the history, then a
-        let ma = s.node(a).latest.expect("a keeps its message record");
-        assert!(ma.payload.is_empty() && ma.truncated);
-        assert_eq!(ma.original_size, 600);
-        assert_eq!(s.node(a).msg_count, 1);
+        let b = stored(s.insert(msg("b", &[2; 600])));
+        // Both fit below the hard ceiling. The batch then removes the oldest history entry.
+        assert!(s.has_work());
+        settle(&mut s);
+        assert!(s.stats().used_bytes <= limits.budget);
         assert_eq!(s.find("a"), Some(a));
+        assert_eq!(s.node(a).msg_count, 1);
         assert_eq!(s.history(a).count(), 0);
         assert_eq!(s.history(b).count(), 1);
-        assert_eq!(s.node(b).latest.expect("b").payload.len(), 600);
-        assert_eq!(s.stats().used_bytes, 2 * n + per_msg(600));
-        assert_eq!(s.stats().list_drops, 1);
+        assert_eq!(s.node(a).latest.expect("a").payload.len(), 600);
+        assert_eq!(s.stats().list_drops, 0);
         audit(&s);
 
-        // A bigger value for b does not fit, even when b's row and history go. The old value
-        // stays: it is released only when the new value is admitted.
-        assert_eq!(s.insert(msg("b", &[3; 900])), Insert::Dropped);
+        // Past the hard ceiling the message is dropped. The old value stays.
+        assert_eq!(s.insert(msg("b", &[3; 5000])), Insert::Dropped);
         assert_eq!(s.node(b).latest.expect("b").payload.len(), 600);
         assert_eq!(s.stats().drops, 1);
         audit(&s);
@@ -2390,13 +2955,18 @@ mod tests {
         assert_eq!(s.node(b).latest.expect("b").payload.len(), 500);
         audit(&s);
 
-        // Too big for the budget even alone: dropped, nothing is evicted.
-        let before = s.stats();
-        assert_eq!(s.insert(msg("a", &[5; 700])), Insert::Dropped);
-        assert_eq!(s.stats().used_bytes, before.used_bytes);
-        assert_eq!(s.stats().list_rows, before.list_rows);
-        assert_eq!(s.stats().drops, before.drops + 1);
-        audit(&s);
+        // Eviction of the payloads keeps the message record (and the node).
+        let mut t = TopicStore::new(limits);
+        let a = stored(t.insert(msg("a", &[1; 600])));
+        stored(t.insert(msg("b", &[2; 600])));
+        t.limits.budget = 2 * n + 10; // memory pressure: everything must go
+        settle(&mut t);
+        let ma = t.node(a).latest.expect("a keeps its message record");
+        assert!(ma.payload.is_empty() && ma.truncated);
+        assert_eq!(ma.original_size, 600);
+        assert_eq!(t.node(a).msg_count, 1);
+        assert_eq!(t.history(a).count(), 0);
+        audit(&t);
     }
 
     #[test]
@@ -2422,13 +2992,15 @@ mod tests {
             let before = emptied(&s);
             let had = (s.hist_order.len(), s.list.len());
             s.insert(msg(&format!("t/{}", i % 150), &[1u8; 3000]));
+            settle(&mut s);
+            assert!(s.stats().used_bytes <= limits.budget);
             if emptied(&s) > before {
-                // A latest value was evicted: nothing older than the new message was left.
-                assert_eq!((s.hist_order.len(), s.list.len()), (1, 1), "at {i}");
+                // A latest value was evicted: the batch had removed all history and rows first.
+                assert_eq!((s.hist_order.len(), s.list.len()), (0, 0), "at {i}");
                 latest_gone = true;
             } else if s.list.len() < had.1 + 1 {
-                // A list row was evicted: the history holds only the new entry.
-                assert_eq!(s.hist_order.len(), 1, "at {i}");
+                // A list row was evicted: the batch had removed all history first.
+                assert_eq!(s.hist_order.len(), 0, "at {i}");
                 list_gone = true;
             } else if s.hist_order.len() < had.0 + 1 {
                 // Only history was evicted: no row left the list.
@@ -2461,6 +3033,8 @@ mod tests {
             + TOPICS * 100
             + list_len * (ROW_OVERHEAD + 100)
             + 20 * (HIST_OVERHEAD + 100);
+        // The batch frees a tenth of the budget, so the budget has room for that, too.
+        let budget = budget + budget / 8;
         let mut s = TopicStore::new(Limits {
             budget,
             list_len,
@@ -2469,6 +3043,7 @@ mod tests {
         let total = TOPICS * 20;
         for i in 0..total {
             stored(s.insert(msg(&topic(i), &payload(i as u64))));
+            settle(&mut s);
             assert!(s.stats().used_bytes <= budget, "over budget at {i}");
             if i % 97 == 0 {
                 audit(&s);
@@ -2482,10 +3057,10 @@ mod tests {
             "no row left because of memory"
         );
         assert!(
-            st.history_bytes <= 20 * (HIST_OVERHEAD + 100),
+            st.history_bytes <= 40 * (HIST_OVERHEAD + 100),
             "history was evicted"
         );
-        assert!(s.hist_order.len() <= 20 && s.hist_order.len() < total / 10);
+        assert!(s.hist_order.len() <= 40 && s.hist_order.len() < total / 10);
         // The list is full, newest first.
         assert_eq!(s.list_len(), list_len);
         for i in 0..list_len {
@@ -2505,27 +3080,31 @@ mod tests {
         let n = root_cost("a");
         let mut s = TopicStore::new(Limits {
             budget: 2 * n + 4 * per_msg(1),
-            node_budget: 2 * n,
+            node_budget: 4 * n,
             ..big()
         });
         for i in 0..300 {
             let p: &[u8] = if i % 3 == 0 { b"" } else { b"x" };
             stored(s.insert(msg("a", p)));
+            settle(&mut s);
             stored(s.insert(msg("b", p)));
+            settle(&mut s);
             audit(&s);
         }
         assert_eq!(s.stats().drops, 0);
 
-        // Exactly one empty message fits. One byte less does not.
+        // Exactly one empty message fits under the hard ceiling. One byte less does not.
+        let hard = n + per_msg(0);
+        let budget = (0..).find(|&b: &usize| b + b / 4 >= hard).expect("budget");
         let mut t = TopicStore::new(Limits {
-            budget: n + per_msg(0) - 1,
+            budget: budget - 1,
             node_budget: n,
             ..big()
         });
         assert_eq!(t.insert(msg("a", b"")), Insert::Dropped);
         assert_eq!(t.stats().topics, 0, "a dropped message creates no node");
         let mut t = TopicStore::new(Limits {
-            budget: n + per_msg(0),
+            budget,
             node_budget: n,
             ..big()
         });
@@ -2581,7 +3160,7 @@ mod tests {
         assert!(!s.is_paused());
         assert_eq!(s.list_len(), 0);
         assert!(!s.set_send_status(7, SendStatus::Sent));
-        assert_eq!(stored(s.insert(msg("z", b"1"))), NodeId(0));
+        assert_eq!(stored(s.insert(msg("z", b"1"))), NodeId::raw(0));
         assert_eq!(
             s.insert(msg("q", b"1")),
             Insert::TopicDropped,
@@ -2651,7 +3230,7 @@ mod tests {
         assert_eq!(st.stats().topic_drops, 1);
         let ok = vec!["a"; MAX_TOPIC_LEVELS].join("/");
         assert!(matches!(st.insert(msg(&ok, b"x")), Insert::Stored(_)));
-        assert!(st.get(NodeId(u32::MAX)).is_none());
+        assert!(st.get(NodeId::raw(u32::MAX)).is_none());
         audit(&st);
     }
 
@@ -2664,27 +3243,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn eviction_work_per_insert_is_capped() {
-        let limits = mid_limits();
-        let mut st = TopicStore::new(limits);
-        // Fill the budget with many small values.
+    /// Adds small values (no eviction runs) until the used bytes reach `target`.
+    fn fill_tiny(st: &mut TopicStore, target: usize) {
         let mut i = 0;
-        while st.stats().used_bytes < limits.budget - 64 * 1024 && i < 9_000 {
+        while st.stats().used_bytes < target && i < 20_000 {
             st.insert(msg(&format!("t/{i}"), &[0u8; 600]));
             i += 1;
         }
-        let before = st.stats();
-        // A big value needs more than MAX_EVICTIONS_PER_INSERT evictions: it is dropped.
-        let big = vec![1u8; 1024 * 1024];
-        assert_eq!(st.insert(msg("big", &big)), Insert::Dropped);
-        assert_eq!(st.stats().drops, before.drops + 1);
+    }
+
+    /// Runs `work` until it has nothing to do.
+    fn settle(s: &mut TopicStore) {
+        while s.work(Instant::now() + Duration::from_secs(5)) {}
+    }
+
+    #[test]
+    fn a_big_message_is_stored_at_once_and_work_evicts_in_a_batch() {
+        let limits = mid_limits();
+        let mut st = TopicStore::new(limits);
+        fill_tiny(&mut st, limits.budget - 64 * 1024);
+        assert!(!st.has_work());
+        let big = vec![1u8; 400 * 1024];
+        let drops = st.stats().drops;
+        // The insert does no eviction. The message fits below the hard ceiling.
+        assert!(matches!(st.insert(msg("big", &big)), Insert::Stored(_)));
+        assert_eq!(st.stats().drops, drops);
+        let over = st.stats().used_bytes;
+        assert!(over > limits.budget && over <= st.hard_limit(), "{over}");
+        assert!(st.has_work());
+        settle(&mut st);
+        let used = st.stats().used_bytes;
+        assert!(used <= limits.budget - limits.budget / 10, "{used}");
+        assert!(!st.has_work());
+        let id = st.find("big").expect("node");
+        assert_eq!(st.node(id).latest.expect("value").payload.len(), big.len());
+        audit(&st);
+    }
+
+    #[test]
+    fn an_insert_above_the_hard_ceiling_is_dropped() {
+        let limits = mid_limits();
+        let mut st = TopicStore::new(limits);
+        let big = vec![1u8; 256 * 1024];
+        let mut stored = 0;
+        let mut first_drop = None;
+        for i in 0..12 {
+            match st.insert(msg(&format!("big/{i}"), &big)) {
+                Insert::Stored(_) => stored += 1,
+                Insert::Dropped => {
+                    first_drop.get_or_insert(i);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(st.stats().used_bytes <= st.hard_limit());
+        }
+        assert!(
+            stored >= 5 && first_drop.is_some(),
+            "{stored} {first_drop:?}"
+        );
+        assert!(st.stats().drops > 0);
+        settle(&mut st);
         assert!(st.stats().used_bytes <= limits.budget);
-        // A message that needs few evictions is still stored.
-        assert!(matches!(
-            st.insert(msg("t/0", &[2u8; 700])),
-            Insert::Stored(_)
-        ));
+        // After the batch there is room again.
+        assert!(matches!(st.insert(msg("big/x", &big)), Insert::Stored(_)));
         audit(&st);
     }
 
@@ -2692,20 +3313,17 @@ mod tests {
     fn failed_replacement_keeps_the_old_value() {
         let limits = mid_limits();
         let mut st = TopicStore::new(limits);
-        // "first" is the oldest value.
         st.insert(msg("first", b"old value"));
-        let mut i = 0;
-        while st.stats().used_bytes < limits.budget - 64 * 1024 && i < 9_000 {
-            st.insert(msg(&format!("t/{i}"), &[0u8; 600]));
-            i += 1;
-        }
-        // Replacing "first" needs more than MAX_EVICTIONS_PER_INSERT evictions: it is dropped.
+        let target = st.hard_limit() - 64 * 1024;
+        fill_tiny(&mut st, target);
+        // Above the hard ceiling: the replacement is dropped and the old value stays.
         let big = vec![1u8; 1024 * 1024];
         assert_eq!(st.insert(msg("first", &big)), Insert::Dropped);
         let id = st.find("first").expect("node");
         let old = st.node(id).latest.expect("value");
         assert_eq!(&old.payload[..], b"old value");
         assert!(!old.truncated);
+        assert!(st.stats().used_bytes <= st.hard_limit());
         audit(&st);
     }
 
@@ -2743,7 +3361,7 @@ mod tests {
         let first = s.history(id).next().expect("newest");
         assert!(!first.truncated);
         assert_eq!(first.payload.as_ptr(), exact.as_ptr());
-        assert_eq!(s.history(NodeId(99)).count(), 0);
+        assert_eq!(s.history(NodeId::raw(99)).count(), 0);
         audit(&s);
     }
 
@@ -2869,16 +3487,18 @@ mod tests {
 
         // Rows and the op map go with the memory budget too.
         let mut t = TopicStore::new(Limits {
-            budget: 3 * (ROW_OVERHEAD + SENT_EXTRA + 3 + ARC_OVERHEAD),
+            budget: 4 * (ROW_OVERHEAD + SENT_EXTRA + 3 + ARC_OVERHEAD),
             ..big()
         });
         for op in 0..20 {
             assert!(matches!(sent(&mut t, op, "abc", b""), Insert::Recorded(_)));
+            settle(&mut t);
             audit(&t);
         }
-        assert_eq!(t.stats().list_rows, 3);
-        assert!(t.stats().list_drops >= 17);
-        assert_eq!(t.ops.len(), 3);
+        let rows = t.stats().list_rows;
+        assert!((3..=4).contains(&rows), "{rows}");
+        assert!(t.stats().list_drops >= 16);
+        assert_eq!(t.ops.len(), rows);
         // A sent message that cannot fit is dropped.
         let huge = vec![0u8; t.limits.budget];
         assert_eq!(sent(&mut t, 99, "abc", &huge), Insert::Dropped);
@@ -3231,12 +3851,13 @@ mod tests {
     fn pause_shows_removed_rows_and_one_marker() {
         let n = root_cost("a");
         let mut s = TopicStore::new(Limits {
-            budget: n + 4 * per_msg(200),
-            node_budget: n,
+            budget: n + 3 * per_msg(200),
+            node_budget: 4 * n,
             ..big()
         });
         for i in 0..3u8 {
             stored(s.insert(msg("a", &[i; 200])));
+            settle(&mut s);
         }
         let frozen = view_ids(&s);
         assert_eq!(frozen.len(), 3);
@@ -3247,6 +3868,7 @@ mod tests {
             if s.insert(msg("a", &[10 + i; 200])) == Insert::Dropped {
                 dropped += 1;
             }
+            settle(&mut s);
             audit(&s);
         }
         assert_eq!(dropped, 0);
@@ -3418,7 +4040,7 @@ mod tests {
         assert_eq!(s.colour_of(t), Some(1), "cached");
         assert_eq!(s.colour_of(other), Some(2));
         assert_eq!(s.colour_of(sys), None, "# does not match $SYS");
-        assert_eq!(s.colour_of(NodeId(999)), None);
+        assert_eq!(s.colour_of(NodeId::raw(999)), None);
         s.set_subscriptions(vec!["#".into(), "factory/#".into(), "$SYS/#".into()]);
         assert_eq!(s.colour_of(t), Some(0));
         assert_eq!(s.colour_of(sys), Some(2));
@@ -3426,6 +4048,377 @@ mod tests {
         assert_eq!(s.colour_of_topic("$x"), None);
         s.set_subscriptions(vec!["a/b#".into()]);
         assert_eq!(s.colour_of(t), None, "an invalid filter matches nothing");
+    }
+
+    #[test]
+    fn colours_equal_brute_force_on_random_filters() {
+        let words = ["a", "b", "c", "", "$SYS", "+", "#"];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let level = |rng: &mut Rng, wild: bool| {
+            let n = if wild { words.len() } else { 5 };
+            words[rng.below(n)]
+        };
+        let mut s = TopicStore::new(big());
+        let mut topics = Vec::new();
+        for _ in 0..300 {
+            let depth = 1 + rng.below(4);
+            let t: Vec<_> = (0..depth).map(|_| level(&mut rng, false)).collect();
+            topics.push(t.join("/"));
+        }
+        let ids: Vec<_> = topics
+            .iter()
+            .map(|t| stored(s.insert(msg(t, b"x"))))
+            .collect();
+        let mut some = 0;
+        for round in 0..40 {
+            let filters: Vec<String> = (0..1 + rng.below(30))
+                .map(|_| {
+                    let depth = 1 + rng.below(4);
+                    let f: Vec<_> = (0..depth).map(|_| level(&mut rng, true)).collect();
+                    let f = f.join("/");
+                    match rng.below(6) {
+                        0 => format!("$share/g/{f}"),
+                        1 => format!("{f}+"),
+                        _ => f,
+                    }
+                })
+                .collect();
+            s.set_subscriptions(filters.clone());
+            for (id, t) in ids.iter().zip(&topics) {
+                let want = filters.iter().position(|f| topic::matches(f, t));
+                assert_eq!(s.colour_of(*id), want, "round {round}: {t} in {filters:?}");
+                assert_eq!(s.colour_of_topic(t), want);
+                some += usize::from(want.is_some());
+            }
+        }
+        assert!(some > 500, "weak test data: {some}");
+        // The same list again keeps the cache (no new revision).
+        let rev = s.sub_rev;
+        s.set_subscriptions(s.subs.raw.clone());
+        assert_eq!(s.sub_rev, rev);
+    }
+
+    /// Random inserts, expands and collapses, with and without a tree filter. The spliced rows
+    /// must equal a full rebuild (`audit` checks it too).
+    #[test]
+    fn spliced_rows_equal_a_full_rebuild() {
+        let words = ["a", "b", "c", "", "B", "ab", "z", "$SYS"];
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let mut s = TopicStore::new(big());
+        for step in 0..4_000 {
+            match rng.below(10) {
+                0..=4 => {
+                    let depth = 1 + rng.below(5);
+                    let t: Vec<_> = (0..depth).map(|_| words[rng.below(words.len())]).collect();
+                    s.insert(msg(&t.join("/"), b"x"));
+                }
+                5..=8 if s.stats().topics > 0 => {
+                    let id = NodeId::raw(rng.below(s.stats().topics) as u32);
+                    let open = rng.below(3) != 0;
+                    s.set_expanded(id, open);
+                }
+                _ if step % 7 == 0 => {
+                    let text = ["", "a", "b/c", "z"][rng.below(4)];
+                    s.set_tree_filter(TreeFilter {
+                        text: text.into(),
+                        show_only: None,
+                    });
+                    while s.work(Instant::now() + Duration::from_millis(50)) {}
+                }
+                _ => {}
+            }
+            let expect = s.rebuild_rows();
+            let live = s.live_rows().to_vec();
+            assert_eq!(live, expect, "step {step}");
+        }
+        audit(&s);
+    }
+
+    #[test]
+    fn rows_splice_is_fast_with_100k_visible_nodes() {
+        let mut s = TopicStore::new(many_nodes());
+        for r in 0..10u32 {
+            let id = stored(s.insert(msg(&format!("r{r}/x"), b"1")));
+            s.set_expanded(s.parent(id).expect("root"), true);
+        }
+        let t0 = Instant::now();
+        let mut worst = Duration::ZERO;
+        for i in 0..100_000u32 {
+            // Shuffled order, so the inserts land all over the rows.
+            let k = i.wrapping_mul(2_654_435_761) % 100_000;
+            s.insert(msg(&format!("r{}/{k:06}_{i}", k % 10), b"1"));
+            if i % 16 == 0 {
+                let a = Instant::now();
+                std::hint::black_box(s.rows().len());
+                worst = worst.max(a.elapsed());
+            }
+        }
+        let total = t0.elapsed();
+        assert!(s.rows().len() > 90_000, "{}", s.rows().len());
+        let full = s.rebuild_rows();
+        assert_eq!(s.rows(), &full[..]);
+        // An expand or collapse of a big node splices once.
+        let r0 = s.find("r0").expect("root");
+        let a = Instant::now();
+        s.set_expanded(r0, false);
+        s.set_expanded(r0, true);
+        let toggle = a.elapsed();
+        let full = s.rebuild_rows();
+        assert_eq!(s.rows(), &full[..]);
+        eprintln!("rows splice: 100k inserts {total:?}, worst rows() {worst:?}, toggle {toggle:?}");
+        // The old code rebuilt all rows each time (about 10 ms per call at this size).
+        assert!(worst < Duration::from_millis(5), "worst rows() {worst:?}");
+    }
+
+    #[test]
+    fn take_returns_the_old_store() {
+        fn is_send<T: Send>() {}
+        is_send::<TopicStore>();
+        let mut s = TopicStore::new(big());
+        s.set_subscriptions(vec!["a/#".into()]);
+        let id = stored(s.insert(msg("a/b", b"1")));
+        let old = s.take();
+        assert_eq!(old.stats().topics, 2);
+        assert_eq!(old.node(id).msg_count, 1);
+        assert_eq!(s.stats().topics, 0);
+        let again = stored(s.insert(msg("a/b", b"1")));
+        assert_eq!(s.colour_of(again), Some(0), "subscriptions stay");
+        audit(&s);
+    }
+
+    /// A long run with ever-new topics and small limits. The memory never goes above the hard
+    /// ceiling, `work` brings it back to the budget, new topics keep coming in, and old idle
+    /// leaves go away.
+    fn long_run(messages: u64, topics: u64, tree_filter: bool) {
+        let limits = Limits {
+            latest_payload_max: 1024,
+            topic_cap: 20_000,
+            budget: 9 * 512 * 1024,
+            node_budget: 3 * 1024 * 1024,
+            history_len: 4,
+            history_payload_max: 256,
+            list_len: 1_000,
+        };
+        let topic = |k: u64| format!("site{}/line{}/dev{k}", k % 50, (k / 50) % 100);
+        let mut s = TopicStore::new(limits);
+        if tree_filter {
+            s.set_tree_filter(TreeFilter {
+                text: "dev7".into(),
+                show_only: None,
+            });
+        }
+        let first = stored(s.insert(msg(&topic(0), b"first")));
+        let payload = [7u8; 48];
+        let (mut worst_work, mut work_time, mut max_used, mut max_nodes) =
+            (Duration::ZERO, Duration::ZERO, 0, 0);
+        let t0 = Instant::now();
+        for i in 1..messages {
+            s.insert(msg(&topic(i % topics), &payload));
+            max_used = max_used.max(s.stats().used_bytes);
+            assert!(max_used <= s.hard_limit(), "over the ceiling at {i}");
+            if i % 100 == 0 {
+                // One frame: the work, then the view.
+                let a = Instant::now();
+                while s.work(a + Duration::from_secs(10)) {}
+                let took = a.elapsed();
+                worst_work = worst_work.max(took);
+                work_time += took;
+                let st = s.stats();
+                assert!(
+                    st.used_bytes <= limits.budget,
+                    "above the budget after work at {i}"
+                );
+                max_nodes = max_nodes.max(st.topics);
+                if i % 20_000 == 0 {
+                    if let Some(id) = s.find(&format!("site{}", i / 20_000 % 50)) {
+                        s.set_expanded(id, true);
+                    }
+                    let n = s.rows().len();
+                    assert!(tree_filter || n > 0);
+                }
+            }
+            if i % 100_000 == 0 {
+                settle(&mut s);
+                audit(&s);
+            }
+        }
+        let total = t0.elapsed();
+        settle(&mut s);
+        audit(&s);
+        let st = s.stats();
+        assert_eq!(st.topic_drops, 0, "new topics are always accepted");
+        assert_eq!(st.drops, 0);
+        assert!(max_nodes <= limits.topic_cap);
+        assert!(s.find(&topic(0)).is_none(), "an old idle leaf is gone");
+        assert!(s.find(&topic((messages - 1) % topics)).is_some());
+        // The stale id is safe, also if its slot has a new node now.
+        assert!(s.get(first).is_none());
+        assert_eq!(s.path(first), "");
+        assert_eq!(s.parent(first), None);
+        assert_eq!(s.history(first).count(), 0);
+        assert_eq!(s.colour_of(first), None);
+        assert!(!s.has_retained(first));
+        eprintln!(
+            "long run: {messages} messages, {topics} topics: {:?} total ({} ns per insert incl. work), \
+             work {work_time:?} (worst call {worst_work:?}), max used {} KiB (budget {} KiB, \
+             ceiling {} KiB), nodes at the end {}, max {max_nodes}",
+            total,
+            total.as_nanos() as u64 / messages,
+            max_used / 1024,
+            limits.budget / 1024,
+            s.hard_limit() / 1024,
+            st.topics
+        );
+    }
+
+    #[test]
+    fn long_run_with_ever_new_topics() {
+        long_run(200_000, 100_000, false);
+    }
+
+    #[test]
+    fn long_run_with_a_tree_filter() {
+        long_run(100_000, 50_000, true);
+    }
+
+    /// The full run: 2 million messages over 1 million topics. Run it with
+    /// `cargo test --release -p navigator-core --lib long_run_two_million -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "slow in a debug build"]
+    fn long_run_two_million_messages() {
+        long_run(2_000_000, 1_000_000, false);
+    }
+
+    #[test]
+    fn idle_leaves_go_in_order_and_parents_follow() {
+        let limits = Limits {
+            topic_cap: 20,
+            budget: 64 * 1024 * 1024,
+            node_budget: 64 * 1024 * 1024,
+            ..big()
+        };
+        let mut s = TopicStore::new(limits);
+        // A tree filter is on: the flags of the ancestors must follow the removals (`audit`).
+        s.set_tree_filter(TreeFilter {
+            text: "leaf".into(),
+            show_only: None,
+        });
+        let keep = stored(s.insert(msg("keep/x", b"1")));
+        s.set_expanded(s.find("keep").expect("root"), true);
+        let parent_msg = stored(s.insert(msg("p", b"own message")));
+        for i in 0..30 {
+            // Each topic has a pure structure parent "g{i}" that must go with its leaf.
+            s.insert(msg(&format!("g{i}/leaf"), b"1"));
+            // The oldest leaf is "keep/x". Touch it, so it is the newest.
+            s.insert(msg("keep/x", b"2"));
+            // "p" gets a child, and loses it again: it is a leaf with its own message.
+            if i == 5 {
+                s.insert(msg("p/child", b"c"));
+            }
+            settle(&mut s);
+            assert!(s.stats().topics <= 20);
+            audit(&s);
+        }
+        assert_eq!(s.stats().topic_drops, 0);
+        assert!(s.get(keep).is_some(), "a recently used leaf stays");
+        assert!(
+            s.find("g0").is_none() && s.find("g0/leaf").is_none(),
+            "no empty parent stays"
+        );
+        assert!(s.find("g29/leaf").is_some());
+        assert!(s.get(parent_msg).is_none() || s.find("p/child").is_none());
+        // The list rows of a removed node keep their topic and lose the node.
+        let n = s.list_len();
+        let mut no_node = 0;
+        for i in 0..n {
+            if let Some(RowView::Message { node, topic, .. }) = s.list_row(i)
+                && topic.starts_with("g0/")
+            {
+                assert_eq!(node, None);
+                no_node += 1;
+            }
+        }
+        assert_eq!(no_node, 1);
+        // Counts of the ancestors follow.
+        assert_eq!(s.node(s.find("keep").expect("keep")).subtree_topics, 1);
+        // A leaf that is open is not removed.
+        s.set_expanded(s.find("g29/leaf").expect("leaf"), true);
+        for i in 30..60 {
+            s.insert(msg(&format!("g{i}/leaf"), b"1"));
+            settle(&mut s);
+        }
+        assert!(s.find("g29/leaf").is_some(), "an open node stays");
+        audit(&s);
+    }
+
+    #[test]
+    fn nodes_are_not_removed_while_paused() {
+        let limits = Limits {
+            topic_cap: 20,
+            ..big()
+        };
+        let mut s = TopicStore::new(limits);
+        s.set_paused(true);
+        for i in 0..40 {
+            s.insert(msg(&format!("t/{i}"), b"1"));
+            settle(&mut s);
+        }
+        assert_eq!(
+            s.stats().topics,
+            20,
+            "full: no removal, new topics are dropped"
+        );
+        assert!(s.stats().topic_drops > 0);
+        s.set_paused(false);
+        settle(&mut s);
+        assert!(s.stats().topics <= 18);
+        s.insert(msg("t/new", b"1"));
+        audit(&s);
+    }
+
+    #[test]
+    fn budget_limits_and_live_changes() {
+        assert_eq!(Limits::default(), Limits::with_budget(BUDGET_DEFAULT));
+        assert_eq!(Limits::default().budget, 128 * 1024 * 1024);
+        assert_eq!(Limits::with_budget(0).budget, BUDGET_MIN);
+        assert_eq!(Limits::with_budget(usize::MAX).budget, BUDGET_MAX);
+        assert_eq!(BUDGET_MAX, 2_147_483_648);
+        let l = Limits::with_budget(512 * 1024 * 1024);
+        assert_eq!((l.budget, l.node_budget), (512 << 20, 128 << 20));
+        assert_eq!(l.list_len, Limits::default().list_len);
+
+        let mut s = TopicStore::new(Limits::default());
+        let payload = Bytes::from(vec![5u8; 100 * 1024]);
+        for i in 0..480 {
+            let m = incoming(&format!("big/{i}"), payload.clone(), MsgProps::default());
+            assert!(matches!(s.insert(m), Insert::Stored(_)));
+        }
+        settle(&mut s);
+        let before = s.stats();
+        assert!(before.used_bytes > 100 << 20 && before.used_bytes <= s.budget());
+        // Raising the budget needs no work.
+        assert_eq!(s.set_budget(1 << 30), 1 << 30);
+        assert!(!s.has_work());
+        assert_eq!(s.stats().used_bytes, before.used_bytes);
+        assert_eq!(s.hard_limit(), (1usize << 30) + (1 << 28));
+        // Lowering evicts nothing at once. `work` does it, in slices.
+        assert_eq!(s.set_budget(0), BUDGET_MIN, "clamped");
+        assert_eq!(s.stats().used_bytes, before.used_bytes);
+        assert!(s.has_work());
+        let (mut calls, mut worst) = (0, Duration::ZERO);
+        loop {
+            let a = Instant::now();
+            let more = s.work(a); // the deadline has passed: one round
+            worst = worst.max(a.elapsed());
+            calls += 1;
+            if !more {
+                break;
+            }
+        }
+        assert!(calls > 1, "the eviction is sliced: {calls}");
+        assert!(worst < Duration::from_millis(50), "{worst:?}");
+        assert!(s.stats().used_bytes <= BUDGET_MIN);
+        audit(&s);
     }
 
     #[test]
@@ -3490,7 +4483,10 @@ mod tests {
                 _ if i % 7 == 0 => s.clear(),
                 _ => {}
             }
-            assert!(s.stats().used_bytes <= limits.budget, "over budget at {i}");
+            assert!(
+                s.stats().used_bytes <= s.hard_limit(),
+                "over the ceiling at {i}"
+            );
             if i % 20 == 0 {
                 audit(&s);
             }
@@ -3748,7 +4744,7 @@ mod tests {
         s.insert(retained_msg("t", b"x", true, None));
         s.insert(msg("t", b""));
         assert!(s.has_retained(id));
-        assert!(!s.has_retained(NodeId(999)));
+        assert!(!s.has_retained(NodeId::raw(999)));
         let other = stored(s.insert(msg("u", b"v")));
         assert!(!s.has_retained(other));
         s.clear();
@@ -3937,7 +4933,8 @@ mod tests {
             );
             s.set_send_status(op, SendStatus::Sent);
         }
-        assert_eq!(s.sent_retained.len(), MAX_SENT_RETAINED);
+        assert_eq!(s.sent_retained.by_topic.len(), MAX_SENT_RETAINED);
+        assert_eq!(s.sent_retained.order.len(), MAX_SENT_RETAINED);
         assert!(!s.has_retained_topic("many/0") && s.has_retained_topic("many/1028"));
     }
 }

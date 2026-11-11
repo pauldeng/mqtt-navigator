@@ -20,6 +20,8 @@ use crate::inspector::{
 /// Below this window width the details open as a right sheet.
 pub(super) const NARROW: f32 = 1100.;
 const DETAIL_WIDTH: f32 = 360.;
+/// Height of one History row: two lines of small text and the padding.
+const HIST_ROW_H: f32 = 44.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DetailTab {
@@ -126,7 +128,7 @@ pub(super) struct Inspector {
     /// The History list takes the keys. `hist_cursor` is the row that Up and Down moved to.
     hist_focus: FocusHandle,
     hist_cursor: Option<SystemTime>,
-    hist_scroll: ScrollHandle,
+    hist_scroll: UniformListScrollHandle,
     /// The details sheet of a narrow window is open.
     pub(super) sheet_open: bool,
     /// Open the sheet at the next frame (a row was selected in a narrow window).
@@ -195,7 +197,7 @@ impl Inspector {
             hist_pick: None,
             hist_focus: cx.focus_handle(),
             hist_cursor: None,
-            hist_scroll: ScrollHandle::new(),
+            hist_scroll: UniformListScrollHandle::new(),
             sheet_open: false,
             want_sheet: false,
             _subs: subs,
@@ -280,7 +282,7 @@ impl Navigator {
             DetailOf::Nothing => None,
             DetailOf::Message => {
                 let s = self.sel_msg.as_ref()?;
-                let node = s.node.or_else(|| self.store.find(&s.topic));
+                let node = self.live_node(s.node, &s.topic);
                 // A History entry is a received message, also when the selected row is a sent one.
                 if let Some(h) = hist(node, s.topic.to_string(), Direction::Received) {
                     return Some(h);
@@ -322,10 +324,7 @@ impl Navigator {
             DetailOf::Nothing => None,
             DetailOf::Message => {
                 let s = self.sel_msg.as_ref()?;
-                Some((
-                    s.topic.to_string(),
-                    s.node.or_else(|| self.store.find(&s.topic)),
-                ))
+                Some((s.topic.to_string(), self.live_node(s.node, &s.topic)))
             }
             DetailOf::Topic => {
                 let id = self.sel_topic?;
@@ -422,6 +421,7 @@ impl Navigator {
             can_show_more: self.can_show_more(shown.as_ref()),
             payload_mode: self.comp.mode,
             theme: Some(self.settings.ui.theme_mode),
+            memory_mib: self.memory_mib(),
         }
     }
 
@@ -464,7 +464,14 @@ impl Navigator {
             blank: subject_changed || matches!(self.insp.view, PayloadView::Idle),
         };
         let payload = s.msg.payload.clone();
-        let decoder = want.choice.resolve(&payload, &s.msg.props);
+        // Auto scans the payload (UTF-8 check): the job does it, not the UI thread. Only Auto
+        // reads the properties.
+        let choice = want.choice;
+        let props = if choice.pick == DecoderPick::Auto {
+            s.msg.props.clone()
+        } else {
+            Default::default()
+        };
         let limit = if want.all {
             payload.len()
         } else {
@@ -474,6 +481,7 @@ impl Navigator {
             let out = cx
                 .background_executor()
                 .spawn(async move {
+                    let decoder = choice.resolve(&payload, &props);
                     let out = decode::render(decoder, &payload, limit, &cancel);
                     let hash = text_hash(&out);
                     (out, hash)
@@ -1139,84 +1147,124 @@ impl Navigator {
                 .child("This topic has no history.")
                 .into_any_element();
         };
-        let picked = self.insp.hist_pick.as_ref().map(|m| m.received_at);
-        let cursor = self.insp.hist_cursor;
-        let rows: Vec<(SystemTime, usize, u8, SharedString)> = self
-            .store
-            .history(node)
-            .map(|m| {
-                (
-                    m.received_at,
-                    m.original_size,
-                    m.qos.as_u8(),
-                    decode::preview(&m.payload, 120).into(),
-                )
-            })
-            .collect();
-        if rows.is_empty() {
+        let count = self.store.history(node).count();
+        if count == 0 {
             return div()
                 .text_color(muted)
                 .child("No history for this topic. The store may have removed it (memory limit).")
                 .into_any_element();
         }
-        let utc = self.utc_offset;
         // One focus handle for the whole list. Up and Down move the cursor, Enter shows the row.
+        // Only the visible rows are built.
         v_flex()
             .id("history")
             .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.insp.hist_scroll)
             .track_focus(&self.insp.hist_focus)
             .key_context(HIST_CONTEXT)
             .on_action(cx.listener(|v, _: &SelectPrev, _, cx| v.step_history(-1, cx)))
             .on_action(cx.listener(|v, _: &SelectNext, _, cx| v.step_history(1, cx)))
             .on_action(cx.listener(|v, _: &ConfirmRow, _, cx| v.confirm_history(cx)))
-            .children(rows.into_iter().map(|(at, size, qos, text)| {
-                let nanos = at
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos());
-                v_flex()
-                    .id(SharedString::from(format!("hist:{nanos}")))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if cursor == Some(at) {
-                        theme.ring
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .when(picked == Some(at), |d| d.bg(theme.accent))
-                    .hover(|d| d.bg(theme.muted))
-                    .on_click(cx.listener(move |v, _, window, cx| {
-                        v.insp.hist_focus.focus(window, cx);
-                        v.insp.hist_cursor = Some(at);
-                        v.pick_history(node, at, cx)
-                    }))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(
-                                div()
-                                    .font_family(theme.mono_font_family.clone())
-                                    .child(format_time(at, utc, true)),
-                            )
-                            .child(format!("QoS {qos}"))
-                            .child(div().flex_1())
-                            .child(format!("{size} B")),
-                    )
+            .child(
+                uniform_list(
+                    "history-rows",
+                    count,
+                    cx.processor(move |v, range: std::ops::Range<usize>, _window, cx| {
+                        let theme = cx.theme().clone();
+                        let picked = v.insp.hist_pick.as_ref().map(|m| m.received_at);
+                        let cursor = v.insp.hist_cursor;
+                        let utc = v.utc_offset;
+                        let rows: Vec<_> = v
+                            .store
+                            .history(node)
+                            .skip(range.start)
+                            .take(range.len())
+                            .map(|m| {
+                                (
+                                    m.received_at,
+                                    m.original_size,
+                                    m.qos.as_u8(),
+                                    SharedString::from(decode::preview(&m.payload, 120)),
+                                )
+                            })
+                            .collect();
+                        rows.into_iter()
+                            .map(|(at, size, qos, text)| {
+                                v.history_row(
+                                    at, size, qos, text, node, picked, cursor, utc, &theme, cx,
+                                )
+                            })
+                            .collect()
+                    }),
+                )
+                .track_scroll(&self.insp.hist_scroll)
+                .flex_1(),
+            )
+            .into_any_element()
+    }
+
+    /// One History row. Its height is `HIST_ROW_H`, so that the list can be virtual.
+    #[allow(clippy::too_many_arguments)]
+    fn history_row(
+        &self,
+        at: SystemTime,
+        size: usize,
+        qos: u8,
+        text: SharedString,
+        node: NodeId,
+        picked: Option<SystemTime>,
+        cursor: Option<SystemTime>,
+        utc: i32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let nanos = at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        v_flex()
+            .id(("hist", nanos))
+            .h(px(HIST_ROW_H))
+            .flex_none()
+            .overflow_hidden()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(if cursor == Some(at) {
+                theme.ring
+            } else {
+                gpui::transparent_black()
+            })
+            .when(picked == Some(at), |d| d.bg(theme.accent))
+            .hover(|d| d.bg(theme.muted))
+            .on_click(cx.listener(move |v, _, window, cx| {
+                v.insp.hist_focus.focus(window, cx);
+                v.insp.hist_cursor = Some(at);
+                v.pick_history(node, at, cx)
+            }))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
                     .child(
                         div()
                             .font_family(theme.mono_font_family.clone())
-                            .text_xs()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(text),
+                            .child(format_time(at, utc, true)),
                     )
-            }))
+                    .child(format!("QoS {qos}"))
+                    .child(div().flex_1())
+                    .child(format!("{size} B")),
+            )
+            .child(
+                div()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_xs()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(text),
+            )
             .into_any_element()
     }
 
@@ -1238,7 +1286,9 @@ impl Navigator {
             None => 0,
         };
         self.insp.hist_cursor = Some(times[ix]);
-        self.insp.hist_scroll.scroll_to_item(ix);
+        self.insp
+            .hist_scroll
+            .scroll_to_item(ix, ScrollStrategy::Nearest);
         cx.notify();
     }
 

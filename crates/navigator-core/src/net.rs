@@ -4,7 +4,7 @@
 //! "Threads and data flow" section of the plan, ADR 0002 and ARCHITECTURE.md.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::future::Future;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::rc::Rc;
@@ -31,7 +31,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinSet, LocalSet};
 
 use crate::model::{Incoming, MsgProps, Qos};
-use crate::tls::{self, TlsDiag};
+use crate::tls::{TlsDiag, TlsMaterial};
 
 pub use crate::profile::{Profile, Transport, Will};
 
@@ -191,7 +191,8 @@ pub struct NetStats {
 /// Queue limits of the net thread.
 #[derive(Clone, Copy, Debug)]
 pub struct NetLimits {
-    /// Largest incoming packet, in bytes. Also advertised as Maximum Packet Size.
+    /// Largest incoming packet (the whole packet), in bytes. The default is 1 MiB. It is
+    /// advertised as Maximum Packet Size in CONNECT, and the patched reader enforces it.
     pub max_packet: usize,
     /// Capacity of the queue to the UI, in messages.
     pub queue_len: usize,
@@ -203,7 +204,7 @@ pub struct NetLimits {
 impl Default for NetLimits {
     fn default() -> Self {
         Self {
-            max_packet: 2 * 1024 * 1024,
+            max_packet: 1024 * 1024,
             queue_len: 50_000,
             queue_bytes: 32 * 1024 * 1024,
         }
@@ -251,16 +252,14 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 ///   When the UI drains too slowly, `send` returns [`SendError::Full`] and the UI shows its
 ///   normal "try again" text. `Connect` gives no result, so it does not ask.
 /// - The automatic re-subscribe after a connect asks before it starts each filter. It also
-///   asks before it sends `Reconnected`. If the log has no room, it waits and tries again
-///   (see [`FEED_RETRY`]). So a profile with thousands of filters needs a UI that drains.
+///   asks before it sends `Reconnected`. If the log has no room, it waits for the UI to drain
+///   the log (see [`Net::recv_event`] and [`Net::events_drained`]). It runs no timer while it
+///   waits. So a profile with thousands of filters needs a UI that drains.
 const EVENTS_CAP: usize = 2048;
 /// Free room in the event log that a producer needs. Work in flight: the command queue (64),
 /// the session queue (256), the operations (`MAX_PENDING_OPS`), one in the supervisor and
 /// `Reconnected`. The rest is slack.
 const EVENTS_RESERVE: usize = 64 + 256 + MAX_PENDING_OPS + 1 + 64;
-/// Wait before the re-subscribe asks again for room in the full event log. The timer runs only
-/// while the re-subscribe is blocked.
-const FEED_RETRY: Duration = Duration::from_millis(50);
 /// Largest number of publish, subscribe and unsubscribe operations in flight at one time.
 const MAX_PENDING_OPS: usize = 256;
 const TOO_MANY_OPS_TEXT: &str = "Too many messages are waiting. Try again.";
@@ -308,6 +307,21 @@ pub struct Net {
     broker_max_packet: Arc<AtomicU32>,
     /// Becomes true when the net thread has ended.
     done: watch::Receiver<bool>,
+    /// Wakes the net thread when the UI took events out of the log (see [`Net::recv_event`]).
+    drained: Arc<Notify>,
+}
+
+/// A handle that tells the net thread "I took events out of the log". See
+/// [`Net::events_drained`].
+#[derive(Clone, Debug)]
+pub struct EventsDrained(Arc<Notify>);
+
+impl EventsDrained {
+    /// Call after you took events out of [`Net::events`]. It costs one atomic operation, so you
+    /// can call it after each event or after each batch. It never blocks.
+    pub fn notify(&self) {
+        self.0.notify_one();
+    }
 }
 
 impl Net {
@@ -324,6 +338,7 @@ impl Net {
         let (done_tx, done) = watch::channel(false);
 
         let events_weak = events_tx.downgrade();
+        let drained = Arc::new(Notify::new());
         let parts = (
             incoming_tx,
             events_tx,
@@ -331,13 +346,15 @@ impl Net {
             stats.clone(),
             queued_bytes.clone(),
             broker_max_packet.clone(),
+            drained.clone(),
         );
         // The thread is detached. `done_tx` is dropped if the thread cannot start or dies, and
         // that also ends `shutdown`.
         let thread = std::thread::Builder::new()
             .name("mqtt-net".into())
             .spawn(move || {
-                let (incoming, events, status, stats, queued_bytes, broker_max_packet) = parts;
+                let (incoming, events, status, stats, queued_bytes, broker_max_packet, drained) =
+                    parts;
                 let shared = Rc::new(Shared {
                     incoming,
                     events,
@@ -345,6 +362,7 @@ impl Net {
                     stats,
                     queued_bytes,
                     broker_max_packet,
+                    drained,
                     limits,
                     active: Cell::new(0),
                 });
@@ -382,7 +400,25 @@ impl Net {
             queued_bytes,
             broker_max_packet,
             done,
+            drained,
         }
+    }
+
+    /// Takes the next event out of the log and tells the net thread that there is more room. Use
+    /// it instead of `events.recv()`. The net thread waits for this signal when it has events to
+    /// send and the log is nearly full (see [`EVENTS_CAP`]).
+    pub async fn recv_event(&mut self) -> Option<Event> {
+        let event = self.events.recv().await;
+        self.drained.notify_one();
+        event
+    }
+
+    /// A handle for code that reads [`Net::events`] by itself (for example a task that owns the
+    /// receiver). Call [`EventsDrained::notify`] after you took events out of the log. Without
+    /// it, a re-subscribe that waits for room in a full log waits until some other net event
+    /// (an operation that ends, a command) wakes it.
+    pub fn events_drained(&self) -> EventsDrained {
+        EventsDrained(self.drained.clone())
     }
 
     /// Queues a Connect and returns its generation. The numbers grow with each call, and the
@@ -514,6 +550,8 @@ struct Shared {
     queued_bytes: Arc<AtomicUsize>,
     /// Maximum Packet Size of the broker from the last CONNACK. 0: not known.
     broker_max_packet: Arc<AtomicU32>,
+    /// The UI signals here when it took events out of the log (see [`Net::recv_event`]).
+    drained: Arc<Notify>,
     limits: NetLimits,
     /// Token of the one attempt that may change the status and queue messages. 0: none. The
     /// supervisor sets it when it starts an attempt, and clears it when it cancels or ends the
@@ -604,7 +642,13 @@ struct AttemptCtx {
     report: bool,
     /// The set was reported once for this connection (after its first CONNACK).
     announced: Rc<Cell<bool>>,
+    /// The parsed TLS files of this connect (see [`tls_material`]).
+    tls: TlsSlot,
 }
+
+/// The TLS files of one user Connect, read and parsed once. Empty until the first attempt has
+/// built them. Later attempts (after a lost connection) reuse them.
+type TlsSlot = Rc<RefCell<Option<Arc<TlsMaterial>>>>;
 
 /// The filters that a broker session may still hold. A filter comes in when its SUBSCRIBE is
 /// sent. It goes out only after a successful UNSUBACK, or when a CONNACK says that the session
@@ -687,6 +731,8 @@ struct Current {
     maybe: SessionSubs,
     /// See [`AttemptCtx::announced`].
     announced: Rc<Cell<bool>>,
+    /// See [`AttemptCtx::tls`].
+    tls: TlsSlot,
     /// Number of retries since the last stable connection.
     retries: u32,
     attempt: Option<Attempt>,
@@ -778,6 +824,7 @@ impl Sup {
             desired: Rc::new(RefCell::new(config.profile.subscriptions.clone())),
             maybe: self.session_subs(&config),
             announced: Rc::default(),
+            tls: Rc::default(),
             config: Rc::new(config),
             retries: 0,
             attempt: None,
@@ -804,6 +851,7 @@ impl Sup {
             maybe: c.maybe.clone(),
             report: c.config.profile.session_expiry_secs > 0,
             announced: c.announced.clone(),
+            tls: c.tls.clone(),
         };
         tracing::info!(generation = c.generation, retry = c.retries, "connecting");
         let handle = tokio::task::spawn_local(run_session(
@@ -1120,7 +1168,13 @@ async fn session(
         shared.limits.queue_len,
         shared.limits.queue_bytes,
     );
-    let (transport, diag) = match transport(config) {
+    // The files are read and parsed, and the connector is built, off the net thread (the system
+    // CA store alone takes some ms). A stop during that returns at once.
+    let tls = match tls_setup(config, &ctx.tls, stop).await {
+        Ok(t) => t,
+        Err(end) => return end,
+    };
+    let (transport, diag) = match transport(config, tls) {
         Ok(t) => t,
         Err(text) => return AttemptEnd::never_up(Outcome::Failed(text)),
     };
@@ -1195,10 +1249,11 @@ async fn session(
     let removed: VecDeque<String> = {
         let mut maybe = ctx.maybe.borrow_mut();
         let removed: VecDeque<String> = if session_present {
+            let desired: HashSet<&str> = filters.iter().map(|(d, _)| d.as_str()).collect();
             maybe
                 .filters
                 .iter()
-                .filter(|f| !filters.iter().any(|(d, _)| d == *f))
+                .filter(|f| !desired.contains(f.as_str()))
                 .cloned()
                 .collect()
         } else {
@@ -1228,9 +1283,7 @@ async fn session(
     // An operation that times out reports it here. The session then ends.
     let expired = Rc::new(Notify::new());
     // Subscribe in batches: `dispatch` rejects more than `MAX_PENDING_OPS` operations.
-    let retry = tokio::time::sleep(FEED_RETRY);
-    tokio::pin!(retry);
-    resub.feed(&client, ctx, shared, &expired, &mut ops, retry.as_mut());
+    resub.feed(&client, ctx, shared, &expired, &mut ops);
 
     let mut ingest = Ingest {
         shared: shared.clone(),
@@ -1246,11 +1299,17 @@ async fn session(
     tokio::pin!(report);
     let mut report_armed = false;
     let ended = loop {
+        // With no room in the event log the timer does not start. The drain signal re-checks.
+        let mut report_blocked = false;
         if !report_armed && ctx.report && ctx.maybe.borrow().dirty {
-            report
-                .as_mut()
-                .reset(tokio::time::Instant::now() + REPORT_DELAY);
-            report_armed = true;
+            if shared.has_room() {
+                report
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + REPORT_DELAY);
+                report_armed = true;
+            } else {
+                report_blocked = true;
+            }
         }
         tokio::select! {
             () = &mut report, if report_armed => {
@@ -1287,10 +1346,11 @@ async fn session(
                 if joined.is_err_and(|e| e.is_panic()) {
                     break Ended::OpPanic;
                 }
-                resub.feed(&client, ctx, shared, &expired, &mut ops, retry.as_mut());
+                resub.feed(&client, ctx, shared, &expired, &mut ops);
             },
-            () = &mut retry, if resub.blocked => {
-                resub.feed(&client, ctx, shared, &expired, &mut ops, retry.as_mut());
+            // The UI took events out of the log. A waiting re-subscribe or report tries again.
+            () = shared.drained.notified(), if resub.blocked || report_blocked => {
+                resub.feed(&client, ctx, shared, &expired, &mut ops);
             },
         }
     };
@@ -1333,14 +1393,15 @@ struct Resub {
     pending: VecDeque<(String, Qos)>,
     /// Filters to remove from a resumed session (see [`SessionSubs`]).
     unsubs: VecDeque<String>,
-    /// The last `feed` stopped because the event log has no room. The retry timer runs.
+    /// The last `feed` stopped because the event log has no room. It waits for the drain signal.
     blocked: bool,
 }
 
 impl Resub {
     /// Sends `Reconnected` and starts queued re-subscribes while the batch limit and the room in
     /// the event log allow. Half of the operation slots stay free for commands from the UI.
-    /// With no room, it starts the retry timer.
+    /// With no room, it stops and sets `blocked`: the session loop calls it again when the UI
+    /// drains the log.
     fn feed(
         &mut self,
         client: &Client,
@@ -1348,13 +1409,15 @@ impl Resub {
         shared: &Rc<Shared>,
         expired: &Rc<Notify>,
         ops: &mut JoinSet<()>,
-        retry: std::pin::Pin<&mut tokio::time::Sleep>,
     ) {
         let generation = ctx.generation;
         self.blocked = false;
         if self.announce {
             if !shared.has_room() {
-                return self.block(retry);
+                {
+                    self.blocked = true;
+                    return;
+                }
             }
             shared.event(Event::Reconnected {
                 generation,
@@ -1376,18 +1439,16 @@ impl Resub {
         }
         while ops.len() < MAX_PENDING_OPS / 2 && !self.pending.is_empty() {
             if !shared.has_room() {
-                return self.block(retry);
+                {
+                    self.blocked = true;
+                    return;
+                }
             }
             if let Some((filter, qos)) = self.pending.pop_front() {
                 let subscribe = Command::Subscribe { filter, qos };
                 dispatch(client, subscribe, ctx, shared, expired, ops);
             }
         }
-    }
-
-    fn block(&mut self, retry: std::pin::Pin<&mut tokio::time::Sleep>) {
-        self.blocked = true;
-        retry.reset(tokio::time::Instant::now() + FEED_RETRY);
     }
 }
 
@@ -1750,7 +1811,11 @@ async fn publish(client: &Client, o: &Outgoing) -> PublishResult {
 // ---------------------------------------------------------------------------------------------
 
 /// The transport for one attempt. The [`TlsDiag`] (TLS only) tells why a handshake failed.
-fn transport(c: &ConnectConfig) -> Result<(ConnectionTransportType, Option<TlsDiag>), String> {
+/// `tls` is the result of [`tls_setup`]. It is `Some` for TLS and WSS. This does no I/O.
+fn transport(
+    c: &ConnectConfig,
+    tls: Option<TlsParts>,
+) -> Result<(ConnectionTransportType, Option<TlsDiag>), String> {
     let p = &c.profile;
     let host = p.host.clone();
     match p.transport {
@@ -1762,7 +1827,7 @@ fn transport(c: &ConnectConfig) -> Result<(ConnectionTransportType, Option<TlsDi
             None,
         )),
         Transport::Tls => {
-            let (tls_config, diag) = tls_config(c)?;
+            let (tls_config, diag) = tls.ok_or(NO_TLS_TEXT)?;
             Ok((
                 ConnectionTransportType::Tls {
                     hostname: host,
@@ -1793,7 +1858,7 @@ fn transport(c: &ConnectConfig) -> Result<(ConnectionTransportType, Option<TlsDi
                 .into_client_request()
                 .map_err(|e| format!("Invalid WebSocket address: {e}"))?;
             let (tls_config, diag) = if secure {
-                let (config, diag) = tls_config(c)?;
+                let (config, diag) = tls.ok_or(NO_TLS_TEXT)?;
                 (Some(config), Some(diag))
             } else {
                 (None, None)
@@ -1809,26 +1874,67 @@ fn transport(c: &ConnectConfig) -> Result<(ConnectionTransportType, Option<TlsDi
     }
 }
 
-/// Reads the PEM files here. This runs on the net thread, never on the UI thread.
-fn tls_config(
+const NO_TLS_TEXT: &str = "TLS is not set up.";
+
+/// The TLS configuration of one attempt, and its diagnosis slot.
+type TlsParts = (ms_mqtt_client::transport::TlsConfig, TlsDiag);
+
+/// The TLS configuration of one attempt for a TLS or WSS profile. `Ok(None)` for other
+/// transports.
+///
+/// The first call of a connect reads the PEM files, parses them and decrypts the key. Every call
+/// builds the connector (this loads the system CA store). All of it runs in a blocking task, so
+/// the net thread keeps running. `stop` ends the wait at once (the task then finishes on its own
+/// and its result is dropped). Later attempts of the same connect reuse the parsed material from
+/// `slot`. An error is final for the connect, so it is not stored.
+async fn tls_setup(
     c: &ConnectConfig,
-) -> Result<(ms_mqtt_client::transport::TlsConfig, TlsDiag), String> {
+    slot: &TlsSlot,
+    stop: &Notify,
+) -> Result<Option<TlsParts>, AttemptEnd> {
     let p = &c.profile;
+    if !matches!(p.transport, Transport::Tls | Transport::Wss) {
+        return Ok(None);
+    }
+    let failed = |text: String| AttemptEnd::never_up(Outcome::Failed(text));
     let pair = match (&p.client_cert, &p.client_key) {
-        (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+        (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
         (None, None) => None,
-        _ => return Err("Set both the client certificate and the client key, or neither.".into()),
+        _ => {
+            return Err(failed(
+                "Set both the client certificate and the client key, or neither.".into(),
+            ));
+        }
     };
-    tls::build(
-        p.ca_file.as_deref(),
-        pair,
-        c.key_passphrase.as_deref(),
-        p.verify_tls,
-    )
+    let cached = slot.borrow().clone();
+    let (ca, passphrase, verify) = (p.ca_file.clone(), c.key_passphrase.clone(), p.verify_tls);
+    let job = tokio::task::spawn_blocking(move || {
+        let material = match cached {
+            Some(m) => m,
+            None => Arc::new(TlsMaterial::load(
+                ca.as_deref(),
+                pair.as_ref().map(|(c, k)| (c.as_path(), k.as_path())),
+                passphrase.as_deref(),
+                verify,
+            )?),
+        };
+        let parts = material.connector()?;
+        Ok::<_, String>((material, parts))
+    });
+    let built = tokio::select! {
+        built = job => built,
+        () = stop.notified() => return Err(AttemptEnd::never_up(Outcome::Disconnected)),
+    };
+    match built {
+        Ok(Ok((material, parts))) => {
+            *slot.borrow_mut() = Some(material);
+            Ok(Some(parts))
+        }
+        Ok(Err(text)) => Err(failed(text)),
+        Err(e) => Err(failed(format!("TLS set-up stopped unexpectedly: {e}"))),
+    }
 }
 
-/// Retry or stop after an I/O error. A certificate problem that the handshake recorded always
-/// stops. So does every error that we do not know.
 fn io_outcome(e: &std::io::Error, diag: Option<&TlsDiag>, has_client_cert: bool) -> Outcome {
     use std::io::ErrorKind as K;
     if let Some(text) = diag.and_then(TlsDiag::text) {
@@ -2011,6 +2117,7 @@ mod tests {
             stats: Arc::default(),
             queued_bytes: Arc::default(),
             broker_max_packet: Arc::default(),
+            drained: Arc::default(),
             limits: NetLimits::default(),
             active: Cell::new(0),
         });
@@ -2678,6 +2785,38 @@ mod tests {
         net.shutdown().await;
     }
 
+    /// The TLS files are read off the net thread. A CA "file" that blocks for ever (a FIFO with no
+    /// writer) must not stop a Disconnect.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnect_during_the_tls_build_returns_at_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let fifo = dir.path().join("ca.pem");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // no mkfifo on this machine
+        }
+        let mut net = Net::start(NetLimits::default());
+        let profile = Profile {
+            host: "localhost".into(),
+            port: 1,
+            transport: Transport::Tls,
+            ca_file: Some(fifo.clone()),
+            subscriptions: vec![],
+            ..Profile::default()
+        };
+        net.connect(ConnectConfig::from(profile)).expect("connect");
+        wait_status(&mut net, |s| matches!(s.state, ConnState::Connecting)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let t0 = tokio::time::Instant::now();
+        net.disconnect();
+        wait_status(&mut net, |s| matches!(s.state, ConnState::Disconnected)).await;
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        // Let the blocked read end, so that the thread can finish.
+        drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        net.shutdown().await;
+    }
+
     /// An attempt that is not the active one cannot change the status or queue a message.
     #[test]
     fn stale_attempt_results_are_dropped() {
@@ -2691,6 +2830,7 @@ mod tests {
             stats: Arc::default(),
             queued_bytes: Arc::default(),
             broker_max_packet: Arc::default(),
+            drained: Arc::default(),
             limits: NetLimits::default(),
             active: Cell::new(0),
         });

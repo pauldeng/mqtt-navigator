@@ -50,6 +50,8 @@ pub enum Cmd {
     FormatJson,
     ToggleComposer,
     Theme(ThemeMode),
+    /// The RAM limit of the store, in MiB (one of `MEMORY_OPTIONS_MIB`).
+    MemoryLimit(u32),
     ResetLayout,
     OpenLogFolder,
     CopyDiagnostics,
@@ -85,6 +87,8 @@ pub struct Facts {
     pub can_show_more: bool,
     pub payload_mode: PayloadMode,
     pub theme: Option<ThemeMode>,
+    /// The memory limit of the store now, in MiB.
+    pub memory_mib: u32,
 }
 
 /// One row of the table.
@@ -145,6 +149,24 @@ fn kind_not(f: &Facts, kind: NumberKind) -> bool {
 
 fn theme_not(mode: ThemeMode) -> impl Fn(&Facts) -> bool {
     move |f| f.theme != Some(mode)
+}
+
+/// The memory limits that the palette and the status bar offer, in MiB. Core clamps any value
+/// to its own range, so a value outside it can only come from the settings file.
+pub const MEMORY_OPTIONS_MIB: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
+
+/// "64 MiB", "1 GiB".
+pub fn memory_text(mib: u32) -> String {
+    if mib >= 1024 && mib.is_multiple_of(1024) {
+        format!("{} GiB", mib / 1024)
+    } else {
+        format!("{mib} MiB")
+    }
+}
+
+/// The row of the palette that matches the current state is marked.
+pub fn is_current(e: &Entry, f: &Facts) -> bool {
+    matches!(e.cmd, Cmd::MemoryLimit(m) if m == f.memory_mib)
 }
 
 /// Every action, in the order of the palette.
@@ -497,6 +519,48 @@ pub static COMMANDS: &[Entry] = &[
         |f| theme_not(ThemeMode::Dark)(f),
     ),
     e(
+        "memory-64",
+        "Memory limit: 64 MiB",
+        None,
+        Cmd::MemoryLimit(64),
+        always,
+    ),
+    e(
+        "memory-128",
+        "Memory limit: 128 MiB (default)",
+        None,
+        Cmd::MemoryLimit(128),
+        always,
+    ),
+    e(
+        "memory-256",
+        "Memory limit: 256 MiB",
+        None,
+        Cmd::MemoryLimit(256),
+        always,
+    ),
+    e(
+        "memory-512",
+        "Memory limit: 512 MiB",
+        None,
+        Cmd::MemoryLimit(512),
+        always,
+    ),
+    e(
+        "memory-1024",
+        "Memory limit: 1 GiB",
+        None,
+        Cmd::MemoryLimit(1024),
+        always,
+    ),
+    e(
+        "memory-2048",
+        "Memory limit: 2 GiB",
+        None,
+        Cmd::MemoryLimit(2048),
+        always,
+    ),
+    e(
         "reset-layout",
         "Reset the layout",
         None,
@@ -533,7 +597,9 @@ pub fn shortcut_text(e: &Entry) -> Option<String> {
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
-    use super::{COMMANDS, Cmd, Facts, available, shortcut_text};
+    use super::{
+        COMMANDS, Cmd, Facts, MEMORY_OPTIONS_MIB, available, is_current, memory_text, shortcut_text,
+    };
     use crate::composer::PayloadMode;
     use navigator_core::decode::{Endian, NumberKind};
     use std::collections::HashSet;
@@ -685,5 +751,39 @@ mod tests {
             ..Facts::default()
         };
         assert!(ids(&branch).contains(&"publish-to-topic"));
+    }
+
+    #[test]
+    fn memory_options_have_labels_and_the_current_one_is_marked() {
+        use navigator_core::store::{BUDGET_DEFAULT, BUDGET_MAX, BUDGET_MIN};
+        const MIB: usize = 1024 * 1024;
+        let default_mib = u32::try_from(BUDGET_DEFAULT / MIB).expect("small");
+        assert_eq!(memory_text(64), "64 MiB");
+        assert_eq!(memory_text(1024), "1 GiB");
+        assert_eq!(memory_text(2048), "2 GiB");
+        assert_eq!(memory_text(1536), "1536 MiB");
+        let rows: Vec<_> = COMMANDS
+            .iter()
+            .filter(|c| matches!(c.cmd, Cmd::MemoryLimit(_)))
+            .collect();
+        assert_eq!(rows.len(), MEMORY_OPTIONS_MIB.len());
+        for (row, mib) in rows.iter().zip(MEMORY_OPTIONS_MIB) {
+            assert_eq!(row.cmd, Cmd::MemoryLimit(mib));
+            // Every option is inside the range that core accepts.
+            assert!((BUDGET_MIN / MIB..=BUDGET_MAX / MIB).contains(&(mib as usize)));
+            let default = if mib == default_mib { " (default)" } else { "" };
+            assert_eq!(
+                row.label,
+                format!("Memory limit: {}{default}", memory_text(mib))
+            );
+        }
+        // Exactly one row is marked, and it is the current one.
+        let f = Facts {
+            memory_mib: 256,
+            ..Facts::default()
+        };
+        let marked: Vec<_> = rows.iter().filter(|r| is_current(r, &f)).collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].cmd, Cmd::MemoryLimit(256));
     }
 }

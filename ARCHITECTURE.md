@@ -67,7 +67,13 @@ Rules:
 
 ## Memory
 
-One budget (default 128 MiB) covers all stored data. There are also limits for each topic and for the topic count. The message list (up to 10 000 entries) is inside the same budget. When the store is full, it evicts in this order: the oldest message-list entries, then the oldest history, then the oldest latest-value payloads. See the TopicStore section of the plan.
+One memory limit covers all stored data: default 128 MiB, settable from 32 MiB to 2 GiB. There are also limits for each topic and for the topic count.
+
+- Storing a message never evicts. A message is dropped only above budget + 25%.
+- Once per frame, the store evicts in a batch down to 90% of the limit: the oldest history first, then the oldest message-list rows, then the oldest latest values.
+- Near the topic cap, the least recently updated leaf topics are removed the same way, so new topics are always accepted.
+
+See the TopicStore section of the plan.
 
 ## Persistence
 

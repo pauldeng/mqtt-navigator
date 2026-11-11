@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use ms_mqtt_client::transport::TlsConfig;
 use openssl::error::ErrorStack;
+use openssl::pkey::{PKey, Private};
 use openssl::ssl::{SslConnector, SslConnectorBuilder, SslMethod, SslVerifyMode, SslVersion};
 use openssl::x509::X509;
 
@@ -88,17 +89,36 @@ pub fn verify_text(f: &VerifyFailure) -> String {
     }
 }
 
-/// Builds the TLS configuration for one connection attempt.
+/// Builds the TLS configuration in one step: [`TlsMaterial::load`], then
+/// [`TlsMaterial::connector`].
 ///
-/// This reads the PEM files, so call it on the net thread only. The error text is for the user.
+/// This reads the PEM files, so it blocks. Call it from a blocking task, never from the UI thread
+/// or from the net thread. The error text is for the user.
 pub fn build(
     ca_file: Option<&Path>,
     client_cert: Option<(&Path, &Path)>,
     key_passphrase: Option<&str>,
     verify: bool,
 ) -> Result<(TlsConfig, TlsDiag), String> {
-    let (builder, diag) = connector(ca_file, client_cert, key_passphrase, verify)?;
-    Ok((TlsConfig::from(builder), diag))
+    TlsMaterial::load(ca_file, client_cert, key_passphrase, verify)?.connector()
+}
+
+/// The parsed certificates and the key of one profile. The reading, the parsing and the decrypt
+/// of the key take time (disk and CPU), so they happen once for each user Connect, in a blocking
+/// task. All reconnect attempts of that Connect share the result. Each attempt builds a connector
+/// from it ([`TlsMaterial::connector`]), with its own [`TlsDiag`].
+#[derive(Clone)]
+pub struct TlsMaterial {
+    ca: Vec<X509>,
+    client: Option<ClientAuth>,
+    verify: bool,
+}
+
+#[derive(Clone)]
+struct ClientAuth {
+    cert: X509,
+    chain: Vec<X509>,
+    key: PKey<Private>,
 }
 
 const ENCRYPTED_KEY_TEXT: &str =
@@ -107,10 +127,7 @@ const WRONG_PASSPHRASE_TEXT: &str = "The client key passphrase is wrong, or the 
 
 /// Reads a private key. An encrypted key with no passphrase fails at once: OpenSSL must never
 /// ask for a passphrase on the terminal, because that would block the net thread.
-fn private_key_from_pem(
-    pem: &[u8],
-    passphrase: Option<&str>,
-) -> Result<openssl::pkey::PKey<openssl::pkey::Private>, String> {
+fn private_key_from_pem(pem: &[u8], passphrase: Option<&str>) -> Result<PKey<Private>, String> {
     if pem.windows(9).any(|w| w == b"ENCRYPTED") {
         let pass = passphrase.ok_or_else(|| ENCRYPTED_KEY_TEXT.to_owned())?;
         return openssl::pkey::PKey::private_key_from_pem_passphrase(pem, pass.as_bytes())
@@ -121,71 +138,97 @@ fn private_key_from_pem(
         .map_err(|e| format!("The client key is not valid PEM: {e}"))
 }
 
-fn connector(
-    ca_file: Option<&Path>,
-    client_cert: Option<(&Path, &Path)>,
-    key_passphrase: Option<&str>,
-    verify: bool,
-) -> Result<(SslConnectorBuilder, TlsDiag), String> {
-    fn read(path: &Path, what: &str) -> Result<Vec<u8>, String> {
-        std::fs::read(path)
-            .map_err(|e| format!("Cannot read the {what} file {}: {e}", path.display()))
-    }
-    let tls = |e: ErrorStack| format!("TLS set-up failed: {e}");
-    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(tls)?;
-    builder
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
-        .map_err(tls)?;
-    if let Some(path) = ca_file {
-        let certs = X509::stack_from_pem(&read(path, "CA")?)
-            .map_err(|e| format!("The CA file {} is not valid PEM: {e}", path.display()))?;
-        if certs.is_empty() {
-            return Err(format!(
-                "The CA file {} has no certificate.",
-                path.display()
-            ));
+impl TlsMaterial {
+    /// Reads and parses the files. This blocks: run it in `spawn_blocking`. It also checks that
+    /// the certificate and the key belong together, so a wrong pair fails here, once.
+    pub fn load(
+        ca_file: Option<&Path>,
+        client_cert: Option<(&Path, &Path)>,
+        key_passphrase: Option<&str>,
+        verify: bool,
+    ) -> Result<Self, String> {
+        fn read(path: &Path, what: &str) -> Result<Vec<u8>, String> {
+            std::fs::read(path)
+                .map_err(|e| format!("Cannot read the {what} file {}: {e}", path.display()))
         }
-        let store = builder.cert_store_mut();
-        for cert in certs {
-            store.add_cert(cert).map_err(tls)?;
-        }
-    }
-    if let Some((cert_path, key_path)) = client_cert {
-        let mut chain = X509::stack_from_pem(&read(cert_path, "client certificate")?)
-            .map_err(|e| format!("The client certificate is not valid PEM: {e}"))?
-            .into_iter();
-        let cert = chain
-            .next()
-            .ok_or("The client certificate file has no certificate.")?;
-        let key = private_key_from_pem(&read(key_path, "client key")?, key_passphrase)?;
-        builder.set_certificate(&cert).map_err(tls)?;
-        // OpenSSL 3 can already refuse a wrong key in `set_private_key`.
-        let mismatch = |_| "The client certificate and key do not match.".to_owned();
-        builder.set_private_key(&key).map_err(mismatch)?;
-        builder.check_private_key().map_err(mismatch)?;
-        for extra in chain {
-            builder.add_extra_chain_cert(extra).map_err(tls)?;
-        }
-    }
-    let diag = TlsDiag::default();
-    if verify {
-        let slot = diag.clone();
-        builder.set_verify_callback(SslVerifyMode::PEER, move |preverify_ok, ctx| {
-            if !preverify_ok {
-                let error = ctx.error();
-                slot.record(VerifyFailure {
-                    code: error.as_raw(),
-                    text: error.error_string().to_owned(),
-                    not_after: ctx.current_cert().map(|c| c.not_after().to_string()),
-                });
+        let mut ca = Vec::new();
+        if let Some(path) = ca_file {
+            ca = X509::stack_from_pem(&read(path, "CA")?)
+                .map_err(|e| format!("The CA file {} is not valid PEM: {e}", path.display()))?;
+            if ca.is_empty() {
+                return Err(format!(
+                    "The CA file {} has no certificate.",
+                    path.display()
+                ));
             }
-            // The result stays as OpenSSL computed it.
-            preverify_ok
-        });
-    } else {
-        builder.set_verify(SslVerifyMode::NONE);
+        }
+        let mut client = None;
+        if let Some((cert_path, key_path)) = client_cert {
+            let mut chain = X509::stack_from_pem(&read(cert_path, "client certificate")?)
+                .map_err(|e| format!("The client certificate is not valid PEM: {e}"))?
+                .into_iter();
+            let cert = chain
+                .next()
+                .ok_or("The client certificate file has no certificate.")?;
+            let key = private_key_from_pem(&read(key_path, "client key")?, key_passphrase)?;
+            client = Some(ClientAuth {
+                cert,
+                chain: chain.collect(),
+                key,
+            });
+        }
+        let material = Self { ca, client, verify };
+        material.builder()?; // the pair check
+        Ok(material)
     }
-    Ok((builder, diag))
+
+    /// The configuration for one connection attempt, with a new [`TlsDiag`]. It loads the system
+    /// CA store (some ms), so call it in a blocking task too.
+    pub fn connector(&self) -> Result<(TlsConfig, TlsDiag), String> {
+        let (builder, diag) = self.builder()?;
+        Ok((TlsConfig::from(builder), diag))
+    }
+
+    fn builder(&self) -> Result<(SslConnectorBuilder, TlsDiag), String> {
+        let tls = |e: ErrorStack| format!("TLS set-up failed: {e}");
+        let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(tls)?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(tls)?;
+        let store = builder.cert_store_mut();
+        for cert in &self.ca {
+            store.add_cert(cert.clone()).map_err(tls)?;
+        }
+        if let Some(c) = &self.client {
+            builder.set_certificate(&c.cert).map_err(tls)?;
+            // OpenSSL 3 can already refuse a wrong key in `set_private_key`.
+            let mismatch = |_| "The client certificate and key do not match.".to_owned();
+            builder.set_private_key(&c.key).map_err(mismatch)?;
+            builder.check_private_key().map_err(mismatch)?;
+            for extra in &c.chain {
+                builder.add_extra_chain_cert(extra.clone()).map_err(tls)?;
+            }
+        }
+        let diag = TlsDiag::default();
+        if self.verify {
+            let slot = diag.clone();
+            builder.set_verify_callback(SslVerifyMode::PEER, move |preverify_ok, ctx| {
+                if !preverify_ok {
+                    let error = ctx.error();
+                    slot.record(VerifyFailure {
+                        code: error.as_raw(),
+                        text: error.error_string().to_owned(),
+                        not_after: ctx.current_cert().map(|c| c.not_after().to_string()),
+                    });
+                }
+                // The result stays as OpenSSL computed it.
+                preverify_ok
+            });
+        } else {
+            builder.set_verify(SslVerifyMode::NONE);
+        }
+        Ok((builder, diag))
+    }
 }
 
 #[cfg(test)]
@@ -419,7 +462,8 @@ mod tests {
 
         let dir = TempDir::new();
         let ca_path = ca.map(|c| dir.write("ca.pem", &c.to_pem().expect("pem")));
-        let (builder, diag) = connector(ca_path.as_deref(), None, None, verify).expect("build");
+        let material = TlsMaterial::load(ca_path.as_deref(), None, None, verify).expect("load");
+        let (builder, diag) = material.builder().expect("build");
         // Same steps as the vendored `tls_handshake`.
         let ssl = builder
             .build()

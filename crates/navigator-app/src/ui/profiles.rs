@@ -116,6 +116,9 @@ impl Navigator {
             ViewMode::Tree => View::Tree,
         };
         self.two_lines = ui.row_height == RowHeight::TwoLines;
+        // Core clamps the saved value. The clamped one shows. A lower limit makes work.
+        self.apply_memory_limit(ui.store_budget_mib);
+        self.kick_work();
         if self.user_resized {
             // The user was faster than the file. The new size wins.
             self.settings.ui.window_size = Some(self.last_size);
@@ -156,7 +159,7 @@ impl Navigator {
         }
     }
 
-    pub(super) fn on_resize(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+    pub(super) fn on_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let s = window.viewport_size();
         let now = (f32::from(s.width), f32::from(s.height));
         if now == self.last_size {
@@ -170,7 +173,16 @@ impl Navigator {
         self.user_resized = true;
         if self.settings.ui.window_size != Some(now) {
             self.settings.ui.window_size = Some(now);
-            self.persist();
+            // A drag sends many events. The save waits for the last one (a copy of all settings
+            // is made for each save). The timer starts from the event and ends with the save.
+            self.resize_save = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(RESIZE_SAVE).await;
+                this.update(cx, |v, _| {
+                    v.resize_save = None;
+                    v.persist();
+                })
+                .ok();
+            }));
         }
     }
 
@@ -232,19 +244,7 @@ impl Navigator {
 
     /// Makes `profile` the active one and shows its subscriptions. It starts no connection.
     fn set_active(&mut self, profile: Option<Profile>) {
-        self.subs = Subs {
-            rows: profile
-                .iter()
-                .flat_map(|p| p.subscriptions.iter())
-                .map(|(filter, qos)| Sub {
-                    filter: filter.clone(),
-                    qos: *qos,
-                    state: SubState::Pending,
-                })
-                .collect(),
-        };
-        self.synced_subs = self.subs.rows.iter().map(|s| s.filter.clone()).collect();
-        self.store.set_subscriptions(self.synced_subs.clone());
+        self.subs = Subs::from_profile(profile.as_ref().map_or(&[], |p| &p.subscriptions));
         self.profile = profile;
     }
 
@@ -302,7 +302,11 @@ impl Navigator {
     /// results.
     fn clear_data(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_connection();
-        self.store.clear();
+        // Dropping a full store (up to 128 MiB) takes long. A background thread does it.
+        let old = self.store.take();
+        cx.background_executor()
+            .spawn(async move { drop(old) })
+            .detach();
         self.sel_msg = None;
         self.sel_topic = None;
         self.detail_of = DetailOf::Nothing;

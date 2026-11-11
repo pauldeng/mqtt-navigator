@@ -12,6 +12,10 @@ mod persist;
 mod secrets;
 mod ui;
 
+use std::time::Duration;
+
+use gpui_kit::component::Theme;
+use gpui_kit::component::input::CursorBlink;
 use gpui_kit::*;
 use navigator_core::Qos;
 use navigator_core::net::{ConnectConfig, Transport};
@@ -36,6 +40,13 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // The default caret blinks every 500 ms for as long as an input has focus. This one
+            // stops after 5 s without typing, so a focused idle window sleeps. A theme change
+            // keeps the policy (`Theme::change` does not touch `cursor_blink`).
+            Theme::update(cx, |theme| {
+                theme.cursor_blink = CursorBlink::blinking(Duration::from_millis(500))
+                    .with_idle_timeout(Duration::from_secs(5));
+            });
             ui::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([

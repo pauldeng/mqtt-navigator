@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::WindowExt;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants, DropdownButton};
 use gpui_kit::component::command::{Command as PaletteList, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::TabBar;
@@ -172,18 +173,43 @@ enum RowData {
 
 /// Most merge work on the UI thread in one frame.
 const FRAME_BUDGET: Duration = Duration::from_millis(4);
-/// Wait between merges, so that many messages make one render.
+/// Part of each frame that `TopicStore::work` keeps while it has work. A flood cannot take it.
+const WORK_RESERVE: Duration = Duration::from_millis(1);
+/// `TopicStore::work` stops this long before the end of the frame. One round takes up to 0.4 ms
+/// (measured), and a round that starts before the deadline can end after it.
+const WORK_MARGIN: Duration = Duration::from_micros(750);
+/// Least time between two frames, so that many messages make one render.
 const COALESCE: Duration = Duration::from_millis(33);
+
+/// Merge time of one frame. While the store has work, the merge leaves `WORK_RESERVE` of it.
+fn merge_budget(has_work: bool) -> Duration {
+    if has_work {
+        FRAME_BUDGET - WORK_RESERVE
+    } else {
+        FRAME_BUDGET
+    }
+}
+
+/// How long the next frame waits, `since_last` after the start of the last one. `None`: no wait.
+/// The first message after a quiet time gets a frame at once, and a flood gets one frame in each
+/// `COALESCE`. Nothing waits while the loop is idle.
+fn coalesce_wait(since_last: Duration) -> Option<Duration> {
+    COALESCE.checked_sub(since_last).filter(|d| !d.is_zero())
+}
 /// After the first frame, a window resize in this time comes from the window system.
 // ponytail: a window manager resize later than this is saved as the user's size. Add a check
 // for user input (a mouse press on the window border) if that shows up.
 const RESIZE_SETTLE: Duration = Duration::from_secs(1);
+/// Quiet time after the last resize event before the size goes to the settings writer.
+const RESIZE_SAVE: Duration = Duration::from_millis(250);
 /// Wait before a filter text change applies.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 /// Row heights of the message list and the tree.
 const MIB: usize = 1024 * 1024;
 const ROW_HEIGHT: f32 = 24.;
 const ROW_HEIGHT_2: f32 = 40.;
+/// Height of one subscription row: the filter line and the state line.
+const SUB_ROW_H: f32 = 44.;
 
 /// Where one subscription row is in its life.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,20 +236,84 @@ impl SubState {
 }
 
 struct Sub {
-    filter: String,
+    /// Cheap to clone: the row, the index and the element ids share it.
+    filter: SharedString,
     qos: Qos,
     state: SubState,
+    /// Rises with each push, so `rows` stays sorted by it. The index stores it, not a position.
+    seq: u64,
 }
 
 /// The subscription rows. Free of gpui types, so that tests can run it.
+///
+/// `index` finds a row by filter in O(1). It holds the row `seq`, and the row is then found by
+/// binary search, so a removal never has to renumber the other rows.
 #[derive(Default)]
 struct Subs {
     rows: Vec<Sub>,
+    index: HashMap<SharedString, u64>,
+    next_seq: u64,
+    /// The rows changed since the store got the filters (see `Navigator::sync_subs`).
+    dirty: bool,
+    /// Rises when a row, or its state, may have changed. The subscription list redraws on it.
+    rev: u64,
 }
 
 impl Subs {
+    /// The rows of a profile. A filter that is in the list twice makes one row.
+    fn from_profile(list: &[(String, Qos)]) -> Self {
+        let mut subs = Self::default();
+        for (filter, qos) in list {
+            subs.push(filter, *qos);
+        }
+        subs
+    }
+
+    /// Adds a Pending row. A known filter changes nothing.
+    fn push(&mut self, filter: &str, qos: Qos) {
+        if self.index.contains_key(filter) {
+            return;
+        }
+        let filter = SharedString::from(filter.to_string());
+        self.index.insert(filter.clone(), self.next_seq);
+        self.rows.push(Sub {
+            filter,
+            qos,
+            state: SubState::Pending,
+            seq: self.next_seq,
+        });
+        self.next_seq += 1;
+        self.dirty = true;
+        self.rev += 1;
+    }
+
+    fn contains(&self, filter: &str) -> bool {
+        self.index.contains_key(filter)
+    }
+
+    fn pos(&self, filter: &str) -> Option<usize> {
+        let seq = *self.index.get(filter)?;
+        self.rows.binary_search_by_key(&seq, |s| s.seq).ok()
+    }
+
     fn row(&mut self, filter: &str) -> Option<&mut Sub> {
-        self.rows.iter_mut().find(|s| s.filter == filter)
+        self.rev += 1;
+        let i = self.pos(filter)?;
+        self.rows.get_mut(i)
+    }
+
+    fn remove(&mut self, filter: &str) {
+        if let Some(i) = self.pos(filter) {
+            self.rows.remove(i);
+            self.index.remove(filter);
+            self.dirty = true;
+            self.rev += 1;
+        }
+    }
+
+    /// True once after a change of the row list.
+    fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 
     /// Filters that the next Connect must subscribe. An accepted removal is not one of them.
@@ -231,7 +321,7 @@ impl Subs {
         self.rows
             .iter()
             .filter(|s| !s.state.removal_accepted())
-            .map(|s| (s.filter.clone(), s.qos))
+            .map(|s| (s.filter.to_string(), s.qos))
             .collect()
     }
 
@@ -239,7 +329,14 @@ impl Subs {
     /// come again. A row whose removal the net thread accepted is gone: the filter is not in the
     /// desired list, and the new session does not have it.
     fn connection_reset(&mut self) {
+        self.rev += 1;
+        let before = self.rows.len();
         self.rows.retain(|s| !s.state.removal_accepted());
+        if self.rows.len() != before {
+            self.index
+                .retain(|_, seq| self.rows.binary_search_by_key(seq, |s| s.seq).is_ok());
+            self.dirty = true;
+        }
         for s in &mut self.rows {
             s.state = SubState::Pending;
         }
@@ -270,9 +367,11 @@ impl Subs {
     /// The UNSUBSCRIBE result for `filter`.
     fn on_unsubscribed(&mut self, filter: &str, result: Result<(), String>) {
         match result {
-            Ok(()) => self
-                .rows
-                .retain(|s| s.filter != filter || !s.state.removal_accepted()),
+            Ok(()) => {
+                if self.row(filter).is_some_and(|s| s.state.removal_accepted()) {
+                    self.remove(filter);
+                }
+            }
             Err(why) => {
                 if let Some(s) = self.row(filter)
                     && s.state.removal_accepted()
@@ -396,6 +495,8 @@ pub struct Navigator {
     /// this time is not the user's. `None`: no frame yet.
     resize_settled_at: Option<Instant>,
     user_resized: bool,
+    /// The timer that saves the window size after the last resize event.
+    resize_save: Option<Task<()>>,
     last_size: (f32, f32),
     net: Net,
     store: TopicStore,
@@ -422,8 +523,6 @@ pub struct Navigator {
     /// The visible top row of the list and its pixel offset in the row. Kept while Follow is
     /// off, so that new rows do not move the content under the viewport.
     anchor: Option<Anchor>,
-    /// Subscription filters that the store has, in row order.
-    synced_subs: Vec<String>,
     /// Local time zone offset in seconds. It is read once in the background.
     utc_offset: i32,
     root_focus: FocusHandle,
@@ -439,6 +538,11 @@ pub struct Navigator {
     comp: compose::Composer,
     list_scroll: UniformListScrollHandle,
     tree_scroll: UniformListScrollHandle,
+    subs_scroll: UniformListScrollHandle,
+    /// The subscription rows, as a cached view: a message flood redraws the main view each frame,
+    /// and this list stays as it was until `sub_list_sig` changes.
+    sub_list: Entity<SubList>,
+    sub_list_sig: u64,
     sub_input: Entity<InputState>,
     /// Error text under the subscribe input.
     sub_error: Option<String>,
@@ -488,6 +592,9 @@ impl Navigator {
         let incoming = std::mem::replace(&mut net.incoming, tokio_channel_placeholder());
         let events = std::mem::replace(&mut net.events, tokio_channel_placeholder());
         let status_rx = net.status.clone();
+        // The UI reads the event log by itself. The net thread waits for room in a full log, and
+        // this handle tells it when the UI took events out.
+        let drained = net.events_drained();
 
         let sub_input = cx.new(|cx| InputState::new(window, cx).placeholder("Topic filter"));
         let filter_input = cx.new(|cx| {
@@ -540,7 +647,7 @@ impl Navigator {
 
         let (kick, kick_rx) = tokio::sync::mpsc::channel(1);
         Self::spawn_ingest(incoming, kick_rx, cx);
-        Self::spawn_events(events, cx);
+        Self::spawn_events(events, drained, cx);
         Self::spawn_status(status_rx, cx);
         // The time zone file is read off the UI thread.
         cx.spawn(async move |this, cx| {
@@ -558,17 +665,7 @@ impl Navigator {
         let root_focus = cx.focus_handle();
         root_focus.focus(window, cx);
 
-        let subs = Subs {
-            rows: profile
-                .iter()
-                .flat_map(|p| p.subscriptions.iter())
-                .map(|(filter, qos)| Sub {
-                    filter: filter.clone(),
-                    qos: *qos,
-                    state: SubState::Pending,
-                })
-                .collect(),
-        };
+        let subs = Subs::from_profile(profile.as_ref().map_or(&[], |p| &p.subscriptions));
         let path = crate::persist::settings_path();
         let (writer_errors, writer_errors_rx) = tokio::sync::mpsc::channel(4);
         let writer = path.clone().map(|p| Writer::start(p, writer_errors));
@@ -589,6 +686,7 @@ impl Navigator {
             sheet: None,
             resize_settled_at: None,
             user_resized: false,
+            resize_save: None,
             last_size: {
                 let s = window.viewport_size();
                 (f32::from(s.width), f32::from(s.height))
@@ -609,7 +707,6 @@ impl Navigator {
             debounce: None,
             kick,
             anchor: None,
-            synced_subs: Vec::new(),
             utc_offset: 0,
             root_focus,
             list_focus: cx.focus_handle(),
@@ -620,6 +717,12 @@ impl Navigator {
             comp: compose::Composer::new(window, cx),
             list_scroll: UniformListScrollHandle::new(),
             tree_scroll: UniformListScrollHandle::new(),
+            subs_scroll: UniformListScrollHandle::new(),
+            sub_list: {
+                let app = cx.weak_entity();
+                cx.new(|_| SubList { app })
+            },
+            sub_list_sig: 0,
             sub_input,
             sub_error: None,
             reconnected_at: None,
@@ -640,6 +743,10 @@ impl Navigator {
                 filter_events,
                 // On quit, the settings writer saves a pending change at once.
                 cx.on_app_quit(|v: &mut Self, _| {
+                    // A resize that waits for its timer is saved too.
+                    if v.resize_save.take().is_some() {
+                        v.persist();
+                    }
                     let net = v.net.shutdown();
                     let flush = v.writer.as_ref().map(Writer::flush);
                     async move {
@@ -651,7 +758,6 @@ impl Navigator {
                 }),
             ],
         };
-        this.sync_subs();
         this.sync_select(window, cx);
         // The command line gives a session profile: connect at once, as before.
         if this.profile.is_some()
@@ -715,7 +821,6 @@ impl Navigator {
                 self.connect_owners.drain(..extra);
                 // The broker forgets the subscriptions of the old connection.
                 self.subs.connection_reset();
-                self.sync_subs();
                 Ok(())
             }
             // ponytail: the command queue (64) is full only under extreme UI spam.
@@ -727,7 +832,7 @@ impl Navigator {
         let filter = self.sub_input.read(cx).value().to_string();
         let error = match validate_filter(&filter) {
             Err(text) => Some(text.to_string()),
-            Ok(()) if self.subs.rows.iter().any(|s| s.filter == filter) => {
+            Ok(()) if self.subs.contains(&filter) => {
                 Some(format!("You are already subscribed to {filter}."))
             }
             Ok(()) => None,
@@ -747,27 +852,23 @@ impl Navigator {
         self.sub_error = None;
         self.sub_input
             .update(cx, |i, cx| i.set_value("", window, cx));
-        self.subs.rows.push(Sub {
-            filter,
-            qos,
-            state: SubState::Pending,
-        });
-        self.sync_subs();
+        self.subs.push(&filter, qos);
         self.persist_subs();
         cx.notify();
     }
 
-    /// Gives the store the subscription filters in row order (the colours follow the order).
+    /// Gives the store the subscription filters in row order (the colours follow the order). It
+    /// runs at the start of a frame, not at each change: a burst of UNSUBACKs makes one copy.
     fn sync_subs(&mut self) {
-        if self
-            .synced_subs
-            .iter()
-            .eq(self.subs.rows.iter().map(|s| &s.filter))
-        {
-            return;
+        if self.subs.take_dirty() {
+            let filters = self
+                .subs
+                .rows
+                .iter()
+                .map(|s| s.filter.to_string())
+                .collect();
+            self.store.set_subscriptions(filters);
         }
-        self.synced_subs = self.subs.rows.iter().map(|s| s.filter.clone()).collect();
-        self.store.set_subscriptions(self.synced_subs.clone());
     }
 
     fn send_subscribe(&mut self, filter: &str, qos: Qos) -> Result<(), SendError> {
@@ -824,6 +925,7 @@ impl Navigator {
     ) {
         cx.spawn(async move |this, cx| {
             let mut pending = false;
+            let mut last_frame: Option<Instant> = None;
             loop {
                 let first = if pending {
                     rx.try_recv().ok()
@@ -841,6 +943,11 @@ impl Navigator {
                         }
                     }
                 };
+                // The wait comes before the frame, so an idle loop has no timer.
+                if let Some(wait) = last_frame.and_then(|t| coalesce_wait(t.elapsed())) {
+                    cx.background_executor().timer(wait).await;
+                }
+                last_frame = Some(Instant::now());
                 let frame = this.update(cx, |v, cx| {
                     let line = v.merge(first, &mut rx);
                     cx.notify();
@@ -856,7 +963,6 @@ impl Navigator {
                         }
                     }
                 }
-                cx.background_executor().timer(COALESCE).await;
             }
         })
         .detach();
@@ -939,7 +1045,8 @@ impl Navigator {
         rx: &mut tokio::sync::mpsc::Receiver<navigator_core::Incoming>,
     ) -> Option<String> {
         let start = Instant::now();
-        let deadline = start + FRAME_BUDGET;
+        let work = self.store.has_work();
+        let deadline = start + merge_budget(work);
         self.capture_anchor();
         let mut n = 0u64;
         let mut metrics_line = None;
@@ -964,11 +1071,22 @@ impl Navigator {
                 next = rx.try_recv().ok();
             }
         }
-        // Filter rebuilds and cap trims use what is left of the frame budget.
-        if self.store.has_work() && Instant::now() < deadline {
-            self.store.work(deadline);
+        // Filter rebuilds and cap trims keep a part of the frame. `work` always does one round,
+        // also when the merge used its time, so a flood cannot starve it.
+        if self.store.has_work() {
+            self.store.work(start + FRAME_BUDGET - WORK_MARGIN);
         }
         self.restore_anchor();
+        // `work` can remove the selected topic (an idle leaf, near the caps).
+        if self
+            .sel_topic
+            .is_some_and(|id| self.store.get(id).is_none())
+        {
+            self.sel_topic = None;
+            if self.detail_of == DetailOf::Topic {
+                self.detail_of = DetailOf::Nothing;
+            }
+        }
         let now = Instant::now();
         self.metrics.merge(now - start);
         if self.metrics.due(now) {
@@ -1088,9 +1206,15 @@ impl Navigator {
         .detach();
     }
 
-    fn spawn_events(mut rx: tokio::sync::mpsc::Receiver<Event>, cx: &mut Context<Self>) {
+    fn spawn_events(
+        mut rx: tokio::sync::mpsc::Receiver<Event>,
+        drained: navigator_core::net::EventsDrained,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             while let Some(ev) = rx.recv().await {
+                // The event left the log: the net thread may have room to send more.
+                drained.notify();
                 if this.update(cx, |v, cx| v.on_event(ev, cx)).is_err() {
                     break;
                 }
@@ -1147,7 +1271,6 @@ impl Navigator {
             // An UNSUBSCRIBE result shows on its row, not in the publish line.
             Event::Unsubscribed { filter, result, .. } => {
                 self.subs.on_unsubscribed(&filter, result);
-                self.sync_subs();
             }
         }
         cx.notify();
@@ -1166,7 +1289,6 @@ impl Navigator {
                             v.reconnected_at = None;
                             // The broker forgets the subscriptions. Results come again.
                             v.subs.connection_reset();
-                            v.sync_subs();
                         }
                         v.status = status;
                         cx.notify();
@@ -1332,7 +1454,7 @@ impl Navigator {
                 let node = self
                     .sel_msg
                     .as_ref()
-                    .and_then(|s| s.node.or_else(|| self.store.find(&s.topic)));
+                    .and_then(|s| self.live_node(s.node, &s.topic));
                 if let Some(node) = node {
                     // The tree shows the node: open its ancestors.
                     let mut up = self.store.parent(node);
@@ -1359,6 +1481,13 @@ impl Navigator {
             }
         }
         cx.notify();
+    }
+
+    /// The node of a topic. The store can remove a node at any `work` (an idle leaf, near the
+    /// caps), so a saved id is checked, and the topic is looked up again if it is gone.
+    pub(super) fn live_node(&self, node: Option<NodeId>, topic: &str) -> Option<NodeId> {
+        node.filter(|n| self.store.get(*n).is_some())
+            .or_else(|| self.store.find(topic))
     }
 
     fn connected(&self) -> bool {
@@ -1483,6 +1612,116 @@ impl Navigator {
         )
     }
 
+    /// One subscription row. Its height is `SUB_ROW_H`, so that the list can be virtual.
+    fn sub_row(&self, i: usize, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(s) = self.subs.rows.get(i) else {
+            return div().into_any_element();
+        };
+        let state: SharedString = match &s.state {
+            SubState::Pending if self.connected() => "Subscribing…".into(),
+            SubState::Pending => "Waiting for connection".into(),
+            SubState::Active(q) => format!("granted {}", q.as_u8()).into(),
+            SubState::Failed(e) | SubState::RemoveFailed(e) | SubState::NotRemoved(e) => {
+                e.clone().into()
+            }
+            SubState::Removing => "Removing…".into(),
+        };
+        let retry_remove = matches!(s.state, SubState::RemoveFailed(_) | SubState::NotRemoved(_));
+        let failed = retry_remove || matches!(s.state, SubState::Failed(_));
+        // The button of a failed row repeats the action that failed.
+        let retry_label = if retry_remove {
+            "Retry remove"
+        } else {
+            "Retry"
+        };
+        // The ids come from the filter, not from the index: they stay when rows move.
+        let row_id = ElementId::from(s.filter.clone());
+        let (retry, remove, pick) = (s.filter.clone(), s.filter.clone(), s.filter.clone());
+        let active = self.show_only.as_deref() == Some(&*s.filter);
+        v_flex()
+            .id(row_id.clone())
+            .h(px(SUB_ROW_H))
+            .flex_none()
+            .overflow_hidden()
+            .rounded_sm()
+            .when(active, |d| d.bg(theme.accent))
+            .child(
+                h_flex()
+                    .gap_2()
+                    // Click the filter to show only its messages. Click again to show all.
+                    .child(
+                        h_flex()
+                            .id((row_id.clone(), "pick"))
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |v, _, _, cx| v.toggle_show_only(&pick, cx)))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size_2()
+                                    .rounded_full()
+                                    .bg(chip_colour(i, theme)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_sm()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(s.filter.clone()),
+                            ),
+                    )
+                    .child(div().text_xs().child(match s.qos {
+                        Qos::AtMostOnce => "Q0",
+                        Qos::AtLeastOnce => "Q1",
+                    }))
+                    .child(
+                        Button::new((row_id.clone(), "remove"))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Remove subscription")
+                            .disabled(s.state == SubState::Removing)
+                            .on_click(cx.listener(move |v, _, _, cx| v.remove_sub(&remove, cx))),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(if failed {
+                                theme.danger
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(state),
+                    )
+                    .when(failed, |d| {
+                        d.child(
+                            Button::new((row_id, "retry"))
+                                .xsmall()
+                                .label(retry_label)
+                                .on_click(cx.listener(move |v, _, _, cx| {
+                                    if retry_remove {
+                                        v.remove_sub(&retry, cx)
+                                    } else {
+                                        v.retry_sub(&retry, cx)
+                                    }
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_subs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let qos_button = |q: Qos| {
@@ -1499,111 +1738,7 @@ impl Navigator {
                 cx.notify();
             }))
         };
-        let has_hash = self.subs.rows.iter().any(|s| s.filter == "#");
-        let rows = self.subs.rows.iter().enumerate().map(|(i, s)| {
-            let state: SharedString = match &s.state {
-                SubState::Pending if self.connected() => "Subscribing…".into(),
-                SubState::Pending => "Waiting for connection".into(),
-                SubState::Active(q) => format!("granted {}", q.as_u8()).into(),
-                SubState::Failed(e) | SubState::RemoveFailed(e) | SubState::NotRemoved(e) => {
-                    e.clone().into()
-                }
-                SubState::Removing => "Removing…".into(),
-            };
-            let failed = matches!(
-                s.state,
-                SubState::Failed(_) | SubState::RemoveFailed(_) | SubState::NotRemoved(_)
-            );
-            // The button of a failed row repeats the action that failed.
-            let retry_label =
-                if matches!(s.state, SubState::RemoveFailed(_) | SubState::NotRemoved(_)) {
-                    "Retry remove"
-                } else {
-                    "Retry"
-                };
-            let retry_remove =
-                matches!(s.state, SubState::RemoveFailed(_) | SubState::NotRemoved(_));
-            let (retry, remove) = (s.filter.clone(), s.filter.clone());
-            let (id_retry, id_remove, id_pick) = (
-                SharedString::from(format!("retry:{}", s.filter)),
-                SharedString::from(format!("remove:{}", s.filter)),
-                SharedString::from(format!("show-only:{}", s.filter)),
-            );
-            let (pick, active) = (
-                s.filter.clone(),
-                self.show_only.as_deref() == Some(s.filter.as_str()),
-            );
-            let chip = chip_colour(i, theme);
-            v_flex()
-                .rounded_sm()
-                .when(active, |d| d.bg(theme.accent))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        // Click the filter to show only its messages. Click again to show all.
-                        .child(
-                            h_flex()
-                                .id(id_pick)
-                                .flex_1()
-                                .min_w_0()
-                                .gap_2()
-                                .cursor_pointer()
-                                .on_click(
-                                    cx.listener(move |v, _, _, cx| v.toggle_show_only(&pick, cx)),
-                                )
-                                .child(div().flex_none().size_2().rounded_full().bg(chip))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .font_family(theme.mono_font_family.clone())
-                                        .text_sm()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(s.filter.clone()),
-                                ),
-                        )
-                        .child(div().text_xs().child(format!("Q{}", s.qos.as_u8())))
-                        .child(
-                            Button::new(id_remove)
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Close)
-                                .tooltip(format!("Remove subscription {}", s.filter))
-                                .disabled(s.state == SubState::Removing)
-                                .on_click(
-                                    cx.listener(move |v, _, _, cx| v.remove_sub(&remove, cx)),
-                                ),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .text_color(if failed {
-                                    theme.danger
-                                } else {
-                                    theme.muted_foreground
-                                })
-                                .child(state),
-                        )
-                        .when(failed, |d| {
-                            d.child(Button::new(id_retry).xsmall().label(retry_label).on_click(
-                                cx.listener(move |v, _, _, cx| {
-                                    if retry_remove {
-                                        v.remove_sub(&retry, cx)
-                                    } else {
-                                        v.retry_sub(&retry, cx)
-                                    }
-                                }),
-                            ))
-                        }),
-                )
-        });
+        let has_hash = self.subs.contains("#");
         v_flex()
             .w(px(260.))
             .h_full()
@@ -1617,14 +1752,11 @@ impl Navigator {
                     .text_color(theme.muted_foreground)
                     .child("SUBSCRIPTIONS"),
             )
-            // The rows scroll. The add input stays pinned below them.
+            // Only the visible rows are built. The add input stays pinned below them.
             .child(
-                div()
-                    .id("subs")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(v_flex().gap_1().children(rows)),
+                self.sub_list
+                    .clone()
+                    .cached(StyleRefinement::default().w_full().flex_1().min_h_0()),
             )
             .when(has_hash && self.subs.rows.len() > 1, |d| {
                 d.child(
@@ -1655,6 +1787,37 @@ impl Navigator {
             .when_some(self.sub_error.clone(), |d, e| {
                 d.child(div().text_xs().text_color(theme.danger).child(e))
             })
+    }
+
+    /// The rows of the subscription list. `SubList` draws it.
+    fn render_sub_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        uniform_list(
+            "subs",
+            self.subs.rows.len(),
+            cx.processor(|v, range: std::ops::Range<usize>, _window, cx| {
+                let theme = cx.theme().clone();
+                range.map(|i| v.sub_row(i, &theme, cx)).collect()
+            }),
+        )
+        .track_scroll(&self.subs_scroll)
+        .size_full()
+    }
+
+    /// Changes when the subscription list must draw again: rows or their states, the shown
+    /// filter, the connection (the "Waiting" text) or the theme colours that the rows use.
+    fn sub_list_sig(&self, theme: &Theme) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.subs.rev, &self.show_only, self.connected()).hash(&mut h);
+        for c in [
+            theme.accent,
+            theme.muted_foreground,
+            theme.danger,
+            theme.chart_1,
+        ] {
+            [c.h, c.s, c.l, c.a].map(f32::to_bits).hash(&mut h);
+        }
+        h.finish()
     }
 
     fn filters_active(&self) -> bool {
@@ -2146,7 +2309,10 @@ impl Navigator {
                 let ids: Vec<NodeId> = v.store.rows()[range].to_vec();
                 ids.into_iter()
                     .map(|id| {
-                        let n = v.store.node(id);
+                        // A paused snapshot can hold a node that `work` removed since.
+                        let Some(n) = v.store.get(id) else {
+                            return div().h(px(ROW_HEIGHT)).into_any_element();
+                        };
                         let chevron = if !n.has_children {
                             " "
                         } else if n.expanded {
@@ -2162,7 +2328,7 @@ impl Navigator {
                         };
                         let selected = v.sel_topic == Some(id);
                         h_flex()
-                            .id(("row", id.0 as usize))
+                            .id(("row", node_key(id)))
                             .h(px(ROW_HEIGHT))
                             .px_2()
                             .gap_2()
@@ -2208,6 +2374,7 @@ impl Navigator {
                                 v.select(id, generation, cx);
                                 v.insp.want_sheet = v.narrow && v.details_open;
                             }))
+                            .into_any_element()
                     })
                     .collect()
             }),
@@ -2217,8 +2384,46 @@ impl Navigator {
         .into_any_element()
     }
 
+    /// "used / limit". A click opens the list of limits (the same ones as in the palette).
+    fn render_memory(&self, used: usize, weak: WeakEntity<Self>) -> impl IntoElement {
+        let current = self.memory_mib();
+        DropdownButton::new("memory-limit")
+            .button(
+                Button::new("memory-limit-button")
+                    .xsmall()
+                    .ghost()
+                    .label(format!(
+                        "{} MiB / {}",
+                        used / MIB,
+                        crate::palette::memory_text(current)
+                    ))
+                    .tooltip("Memory limit"),
+            )
+            .dropdown_menu(move |menu, _, _| {
+                crate::palette::MEMORY_OPTIONS_MIB.into_iter().fold(
+                    menu.label("Memory limit"),
+                    |menu, mib| {
+                        let weak = weak.clone();
+                        menu.item(
+                            PopupMenuItem::new(crate::palette::memory_text(mib))
+                                .checked(mib == current)
+                                .on_click(move |_, _, cx| {
+                                    weak.update(cx, |v, cx| v.set_memory_limit(mib, cx)).ok();
+                                }),
+                        )
+                    },
+                )
+            })
+    }
+
+    /// The memory limit of the store now, in MiB.
+    pub(super) fn memory_mib(&self) -> u32 {
+        u32::try_from(self.store.budget() / MIB).unwrap_or(u32::MAX)
+    }
+
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.store.stats();
+        let memory = self.render_memory(s.used_bytes, cx.entity().downgrade());
         let drops = s.drops
             + s.topic_drops
             + self
@@ -2271,11 +2476,7 @@ impl Navigator {
                 .when(s.list_drops > 0, |d| {
                     d.child(format!("{} rows evicted", s.list_drops))
                 })
-                .child(format!(
-                    "{} / {} MiB",
-                    s.used_bytes / MIB,
-                    Limits::default().budget / MIB
-                ))
+                .child(memory)
                 .child(
                     div()
                         .when(drops > 0, |d| d.text_color(theme.danger))
@@ -2288,6 +2489,14 @@ impl Navigator {
 impl Render for Navigator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.metrics.frame_start(window);
+        self.sync_subs();
+        // A notify during the draw does not schedule a frame, so it goes out after the draw.
+        let sig = self.sub_list_sig(cx.theme());
+        if sig != self.sub_list_sig {
+            self.sub_list_sig = sig;
+            let list = self.sub_list.clone();
+            cx.defer_in(window, move |_, _, cx| list.update(cx, |_, cx| cx.notify()));
+        }
         if self.resize_settled_at.is_none() {
             self.resize_settled_at = Some(Instant::now() + RESIZE_SETTLE);
             let s = window.viewport_size();
@@ -2347,6 +2556,29 @@ impl Render for Navigator {
             )
             .child(self.render_status(cx))
     }
+}
+
+/// The subscription rows of the main view. Own view, so that gpui can reuse its last frame.
+struct SubList {
+    app: WeakEntity<Navigator>,
+}
+
+impl Render for SubList {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.app.upgrade() {
+            Some(app) => app.update(cx, |v, cx| v.render_sub_list(cx).into_any_element()),
+            None => div().into_any_element(),
+        }
+    }
+}
+
+/// A stable number for the element id of a tree row. `NodeId` keeps its fields private, and the
+/// default hasher has fixed keys, so the same id gives the same number.
+fn node_key(id: NodeId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
 }
 
 /// Colour of a subscription chip. The colours repeat after ten subscriptions.
@@ -2475,11 +2707,12 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
-        GenGate, Sub, SubState, Subs, connection_live, scroll_top_of, send_error_text, top_row,
-        validate_filter,
+        COALESCE, FRAME_BUDGET, GenGate, SubState, Subs, WORK_RESERVE, coalesce_wait,
+        connection_live, merge_budget, scroll_top_of, send_error_text, top_row, validate_filter,
     };
     use navigator_core::Qos;
     use navigator_core::net::SendError;
+    use std::time::Duration;
 
     #[test]
     fn a_connect_replaced_before_it_answers_is_never_accepted() {
@@ -2549,16 +2782,15 @@ mod tests {
     }
 
     fn subs(filters: &[&str]) -> Subs {
-        Subs {
-            rows: filters
-                .iter()
-                .map(|f| Sub {
-                    filter: f.to_string(),
-                    qos: Qos::AtMostOnce,
-                    state: SubState::Active(Qos::AtMostOnce),
-                })
-                .collect(),
+        let list: Vec<(String, Qos)> = filters
+            .iter()
+            .map(|f| (f.to_string(), Qos::AtMostOnce))
+            .collect();
+        let mut s = Subs::from_profile(&list);
+        for r in &mut s.rows {
+            r.state = SubState::Active(Qos::AtMostOnce);
         }
+        s
     }
 
     fn state(s: &mut Subs, f: &str) -> Option<SubState> {
@@ -2629,5 +2861,61 @@ mod tests {
         assert_eq!(state(&mut s, "c"), None);
         assert_eq!(state(&mut s, "b"), Some(SubState::Pending));
         assert_eq!(s.wanted(), vec![("b".to_string(), Qos::AtMostOnce)]);
+    }
+
+    #[test]
+    fn the_index_finds_rows_after_removals() {
+        let names: Vec<String> = (0..50).map(|i| format!("t/{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut s = subs(&refs);
+        // Remove every third row, then add two more.
+        for n in names.iter().step_by(3) {
+            s.begin_remove(n);
+            s.on_unsubscribed(n, Ok(()));
+        }
+        s.push("new/1", Qos::AtLeastOnce);
+        s.push("new/2", Qos::AtMostOnce);
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(s.contains(n), i % 3 != 0, "{n}");
+            assert_eq!(s.row(n).is_some(), i % 3 != 0, "{n}");
+        }
+        assert_eq!(s.row("new/1").map(|r| r.qos), Some(Qos::AtLeastOnce));
+        assert_eq!(s.rows.len(), s.index.len());
+        // The order of the rows is the order of the adds.
+        assert!(s.rows.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    #[test]
+    fn a_filter_is_one_row_and_a_change_sets_the_dirty_flag() {
+        let mut s = Subs::default();
+        assert!(!s.take_dirty());
+        s.push("a/#", Qos::AtMostOnce);
+        s.push("a/#", Qos::AtLeastOnce);
+        assert_eq!(s.rows.len(), 1);
+        assert!(s.take_dirty() && !s.take_dirty());
+        // A state change is not a change of the filter list.
+        s.on_subscribed("a/#", Ok(Qos::AtMostOnce));
+        assert!(!s.take_dirty());
+        s.begin_remove("a/#");
+        s.connection_reset();
+        assert!(s.rows.is_empty() && s.index.is_empty() && s.take_dirty());
+    }
+
+    #[test]
+    fn the_merge_leaves_the_work_reserve_only_when_there_is_work() {
+        assert_eq!(merge_budget(false), FRAME_BUDGET);
+        assert_eq!(merge_budget(true) + WORK_RESERVE, FRAME_BUDGET);
+        assert!(merge_budget(true) >= Duration::from_millis(3));
+    }
+
+    #[test]
+    fn a_frame_after_a_quiet_time_does_not_wait() {
+        assert_eq!(coalesce_wait(COALESCE), None);
+        assert_eq!(coalesce_wait(COALESCE * 3), None);
+        assert_eq!(coalesce_wait(Duration::ZERO), Some(COALESCE));
+        assert_eq!(
+            coalesce_wait(Duration::from_millis(30)),
+            Some(COALESCE - Duration::from_millis(30))
+        );
     }
 }

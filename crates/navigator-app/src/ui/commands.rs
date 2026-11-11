@@ -11,6 +11,9 @@ use super::*;
 use crate::diagnostics::{self, Info};
 use crate::palette::{self, Cmd};
 
+/// Id, label, shortcut text and "is the current choice" of one palette row.
+type PaletteRow = (&'static str, &'static str, Option<String>, bool);
+
 impl Navigator {
     /// Runs one action. Every action of the table is handled here.
     pub(super) fn run_cmd(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
@@ -63,6 +66,7 @@ impl Navigator {
                 self.persist();
                 cx.notify();
             }
+            Cmd::MemoryLimit(mib) => self.set_memory_limit(mib, cx),
             Cmd::ResetLayout => {
                 self.details_open = true;
                 self.insp.expanded = false;
@@ -78,6 +82,22 @@ impl Navigator {
     fn set_direction(&mut self, d: DirectionFilter, cx: &mut Context<Self>) {
         self.direction = d;
         self.apply_filters(cx);
+    }
+
+    /// Sets the RAM limit of the store. It applies at once. A lower limit makes the store evict
+    /// in small steps (`TopicStore::work`), so the frame loop gets a kick. Core clamps the value,
+    /// and the clamped value is the one that shows and persists.
+    pub(super) fn set_memory_limit(&mut self, mib: u32, cx: &mut Context<Self>) {
+        self.apply_memory_limit(mib);
+        self.persist();
+        self.kick_work();
+        cx.notify();
+    }
+
+    /// Gives the store the limit in MiB and keeps the clamped value in the settings.
+    pub(super) fn apply_memory_limit(&mut self, mib: u32) {
+        let applied = self.store.set_budget(mib as usize * MIB);
+        self.settings.ui.store_budget_mib = u32::try_from(applied / MIB).unwrap_or(u32::MAX);
     }
 
     pub(super) fn set_row_height(&mut self, two_lines: bool, cx: &mut Context<Self>) {
@@ -98,10 +118,18 @@ impl Navigator {
         }
         let entries = palette::available(&self.facts());
         let cmds: Rc<Vec<Cmd>> = Rc::new(entries.iter().map(|e| e.cmd).collect());
-        let rows: Rc<Vec<(&'static str, &'static str, Option<String>)>> = Rc::new(
+        let facts = self.facts();
+        let rows: Rc<Vec<PaletteRow>> = Rc::new(
             entries
                 .iter()
-                .map(|e| (e.id, e.label, palette::shortcut_text(e)))
+                .map(|e| {
+                    (
+                        e.id,
+                        e.label,
+                        palette::shortcut_text(e),
+                        palette::is_current(e, &facts),
+                    )
+                })
                 .collect(),
         );
         let state = cx.new(|cx| CommandState::new(window, cx));
@@ -111,8 +139,8 @@ impl Navigator {
             if first.replace(false) {
                 state.update(cx, |s, cx| s.focus(window, cx));
             }
-            let items = rows.iter().map(|(id, label, shortcut)| {
-                let (shortcut, label, id) = (shortcut.clone(), *label, *id);
+            let items = rows.iter().map(|(id, label, shortcut, current)| {
+                let (shortcut, label, id, current) = (shortcut.clone(), *label, *id, *current);
                 CommandItem::new()
                     .label(label)
                     .keywords([id])
@@ -122,6 +150,7 @@ impl Navigator {
                             .w_full()
                             .gap_2()
                             .child(div().flex_1().child(label))
+                            .when(current, |d| d.child(div().text_xs().child("✓")))
                             .when_some(shortcut.clone(), |d, s| {
                                 d.child(div().text_xs().text_color(muted).child(s))
                             })

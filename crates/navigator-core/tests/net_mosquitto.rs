@@ -642,25 +642,30 @@ async fn many_filters_and_a_slow_ui_lose_no_result() {
 
     let mut subs = std::collections::HashSet::new();
     let mut pubs = vec![0u8; PUBS as usize];
-    let mut take = |event: Event| match event {
-        Event::Subscribed {
-            filter,
-            result: Ok(_),
-            ..
-        } => assert!(subs.insert(filter), "a Subscribed result came twice"),
-        // While the 3000 re-subscribes use the operation slots, a publish can get the documented
-        // "Too many messages are waiting" answer. It is that publish's single result.
-        Event::Published {
-            op_id,
-            result: PublishResult::Acknowledged,
-            ..
-        } => pubs[op_id as usize] += 1,
-        Event::Published {
-            op_id,
-            result: PublishResult::Rejected(why),
-            ..
-        } if why.contains("Too many") => pubs[op_id as usize] += 1,
-        other => panic!("unexpected {other:?}"),
+    // This test reads `net.events` itself, so it tells the net thread when it made room.
+    let drained = net.events_drained();
+    let mut take = |event: Event| {
+        drained.notify();
+        match event {
+            Event::Subscribed {
+                filter,
+                result: Ok(_),
+                ..
+            } => assert!(subs.insert(filter), "a Subscribed result came twice"),
+            // While the 3000 re-subscribes use the operation slots, a publish can get the
+            // documented "Too many messages are waiting" answer. It is that publish's result.
+            Event::Published {
+                op_id,
+                result: PublishResult::Acknowledged,
+                ..
+            } => pubs[op_id as usize] += 1,
+            Event::Published {
+                op_id,
+                result: PublishResult::Rejected(why),
+                ..
+            } if why.contains("Too many") => pubs[op_id as usize] += 1,
+            other => panic!("unexpected {other:?}"),
+        }
     };
     let topic = format!("{p}/f/0");
     // The UI reads a few events at each tick. The publishes must wait for room.
