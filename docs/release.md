@@ -29,8 +29,8 @@ Add these in **Settings > Secrets and variables > Actions**.
 |---|---|
 | `MINISIGN_SECRET_KEY` | The text of the minisign secret key file. |
 | `MINISIGN_PASSWORD` | The password of that key. |
-| `WINDOWS_PFX_BASE64` | The Authenticode certificate (PFX), base64: `base64 -w0 cert.pfx`. |
-| `WINDOWS_PFX_PASSWORD` | The password of the PFX. |
+| `WINDOWS_PFX_BASE64` | Optional. The Authenticode certificate (PFX), base64: `base64 -w0 cert.pfx`. Without it, the Windows files are not signed. |
+| `WINDOWS_PFX_PASSWORD` | Optional. The password of the PFX. |
 
 The workflow uses `GITHUB_TOKEN` for everything else. Never put a key in the repository. The repository holds only the public key, `assets/update/minisign.pub`.
 
@@ -47,7 +47,7 @@ If the old key is lost or stolen, step 3 is not possible. Tell users to install 
 
 ## First start on a user machine
 
-- **Windows.** The installer and the programs have an Authenticode signature. SmartScreen can still warn about a new publisher until the file gains reputation. Choose **More info**, then **Run anyway**.
+- **Windows.** The installer and the programs have no Authenticode signature yet. SmartScreen warns about an unknown publisher. Choose **More info**, then **Run anyway**. Updates are safe: the app checks the minisign signature of each update.
 - **macOS.** The app has an ad-hoc signature, not a Developer ID. It is not notarized. Gatekeeper blocks the first start. Right-click the app, choose **Open**, then choose **Open** again. If macOS says the app is damaged, run `xattr -dr com.apple.quarantine "/Applications/MQTT Navigator.app"`. Copy the app to `/Applications` before the first start.
 - **Linux.** Run `chmod +x` on the AppImage. The `.deb` installs the app but does not update it. The app shows a link to the new release.
 

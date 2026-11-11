@@ -35,7 +35,9 @@ Our own updater in the app, built on `ureq` (native-tls), `minisign-verify` and 
 
 ### Windows Authenticode (D4)
 
-On `windows-2022`, sign the launcher, the payload and the NSIS installer with the owner's PFX (`signtool`, SHA-256, timestamp), then `signtool verify /pa`. Move to Azure Trusted Signing when the certificate renews.
+On `windows-2022`, sign the launcher, the payload and the NSIS installer with the owner's PFX (`signtool`, SHA-256, timestamp), then `signtool verify /pa`.
+
+Update 2026-11-11: the owner has no publicly trusted certificate. A self-signed certificate does not stop the SmartScreen warning, and Azure Artifact Signing and SignPath were not chosen. The Windows files ship unsigned. The workflow signs them only when the secret `WINDOWS_PFX_BASE64` is set. The minisign manifest still protects every update.
 
 ### macOS without a Developer ID (D5)
 

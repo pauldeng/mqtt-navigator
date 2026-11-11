@@ -15,7 +15,7 @@ Download the file for your system from [GitHub Releases](https://github.com/paul
 2. For the installer: run it. It installs for your user only. It does not need administrator rights.
 3. For the portable file: unpack the zip to a folder you can write to. Start `mqtt-navigator-launcher.exe`.
 
-The files have an Authenticode signature. SmartScreen can still warn about a new publisher until the file gains reputation. Select **More info**, then **Run anyway**.
+The files have no Authenticode signature yet, so SmartScreen warns about an unknown publisher. Select **More info**, then **Run anyway**. Check the file against `SHA256SUMS` on the release page first.
 
 ### macOS 15 and later (Apple silicon and Intel)
 

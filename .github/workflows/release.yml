@@ -105,13 +105,19 @@ jobs:
           tar -czf "stage/$name.tar.gz" "$name"
 
       # -------------------------------------------------------------- Windows
+      # Authenticode is optional. Without the secret WINDOWS_PFX_BASE64 the Windows files are unsigned.
       - name: Prepare signtool and the certificate
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
         run: |
-          if (-not $env:WINDOWS_PFX_BASE64) { throw "Secret WINDOWS_PFX_BASE64 is empty." }
+          if (-not $env:WINDOWS_PFX_BASE64) {
+            "::warning::No secret WINDOWS_PFX_BASE64. The Windows files are not signed."
+            "SIGN=0" >> $env:GITHUB_ENV
+            exit 0
+          }
+          "SIGN=1" >> $env:GITHUB_ENV
           $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
           $tool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
@@ -119,7 +125,7 @@ jobs:
           "PFX_PATH=$pfx" >> $env:GITHUB_ENV
           "SIGNTOOL=$($tool.FullName)" >> $env:GITHUB_ENV
       - name: Sign the launcher and the payload
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && env.SIGN == '1'
         shell: pwsh
         env:
           WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
@@ -131,21 +137,32 @@ jobs:
       - name: Package (NSIS)
         if: runner.os == 'Windows'
         run: cargo packager --release -p navigator-app --target "$TARGET" --formats nsis
-      - name: Sign the installer, verify all three, make the zip
+      - name: Stage the installer
         if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage | Out-Null
+          $name = "mqtt-navigator-$env:VERSION-$env:TARGET"
+          Copy-Item (Get-ChildItem dist\*-setup.exe | Select-Object -First 1).FullName "stage\$name-setup.exe"
+      - name: Sign the installer and verify all three
+        if: runner.os == 'Windows' && env.SIGN == '1'
         shell: pwsh
         env:
           WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
         run: |
-          New-Item -ItemType Directory stage | Out-Null
           $name = "mqtt-navigator-$env:VERSION-$env:TARGET"
           $setup = "stage\$name-setup.exe"
-          Copy-Item (Get-ChildItem dist\*-setup.exe | Select-Object -First 1).FullName $setup
           & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $env:PFX_PATH /p $env:WINDOWS_PFX_PASSWORD $setup
           if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for the installer" }
           $bin = "target\$env:TARGET\release"
           & $env:SIGNTOOL verify /pa $setup "$bin\mqtt-navigator-launcher.exe" "$bin\mqtt-navigator.exe"
           if ($LASTEXITCODE -ne 0) { throw "signtool verify failed" }
+      - name: Make the zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "mqtt-navigator-$env:VERSION-$env:TARGET"
+          $bin = "target\$env:TARGET\release"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item "$bin\mqtt-navigator.exe", "$bin\mqtt-navigator-launcher.exe", LICENSE-MIT, LICENSE-APACHE $name
           Compress-Archive -Path $name -DestinationPath "stage\$name.zip"
