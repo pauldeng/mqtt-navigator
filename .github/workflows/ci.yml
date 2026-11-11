@@ -6,9 +6,12 @@ on:
   pull_request:
   schedule:
     - cron: "17 3 * * 1" # weekly: the fuzz job
+    - cron: "43 2 * * *" # nightly: the soak job
+  workflow_dispatch: # starts the soak job by hand
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # The schedule is in the group, so that the weekly fuzz run does not cancel the nightly soak run.
+  group: ci-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -19,7 +22,7 @@ env:
 
 jobs:
   lint:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,7 +38,7 @@ jobs:
           if grep -i gpui core-tree.txt; then echo "navigator-core depends on gpui"; exit 1; fi
 
   test:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -56,7 +59,7 @@ jobs:
 
   size:
     # Linux x64 release size gate (ADR 0004). Other targets get a gate after their first build.
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     env:
       MAX_BYTES: "37317165" # 33 924 696 B measured on 2026-11-11, + 10%
@@ -76,7 +79,7 @@ jobs:
           test "$size" -le "$MAX_BYTES"
 
   broker-tests:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,7 +88,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: tests/broker/up.sh
-      - run: cargo test -p navigator-core --features broker-tests --test broker_matrix -- --test-threads=1
+      - run: cargo test -p navigator-core --features broker-tests --test broker_matrix --test broker_compat -- --test-threads=1
       - name: Load test (10 000 msg/s)
         env:
           LOAD_WARMUP_SECS: 30
@@ -97,7 +100,7 @@ jobs:
 
   # Runs on push to main and every week, not on pull requests.
   fuzz:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch' && github.event.schedule != '43 2 * * *'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -120,3 +123,26 @@ jobs:
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
+
+  # Runs every night and by hand. One hour at 500 msg/s with 6 broker restarts (P7).
+  soak:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '43 2 * * *'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (toolchain input = stable)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: tests/broker/up.sh mosquitto
+      - name: Soak test (1 h)
+        env:
+          SOAK_SECS: 3600
+          SOAK_RATE: 500
+        run: cargo test --release -p navigator-core --features broker-tests --test soak -- --ignored --nocapture
+      - name: Stop the broker
+        if: always()
+        run: tests/broker/down.sh

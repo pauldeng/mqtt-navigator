@@ -4,12 +4,18 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
 
 ## Open
 
-1. P1: Does `openssl/vendored` build in CI on Windows and macOS through feature unification?
-2. P6: Which updater do we use: `cargo-packager-updater` or a thin custom updater? (ADR 0005)
-3. P6: Which Authenticode signing method do we use: a certificate file or Azure Trusted Signing?
+1. P1: Does `openssl/vendored` build in CI on Windows and macOS through feature unification? Still open until the first CI run.
+2. First CI run on Windows and macOS: build, clippy, tests, and the size gate for each OS. Nobody has run them.
+3. First release run: set the GitHub secrets (`MINISIGN_SECRET_KEY`, `MINISIGN_PASSWORD`, `WINDOWS_PFX_BASE64`, `WINDOWS_PFX_PASSWORD`). Then test signtool, NSIS, the DMG, the update swap on Windows and macOS, and the attestations.
+4. Upstream: open an issue for `ms-mqtt-client` about the missing Maximum Packet Size check and the unbounded incoming queue. Remove the local patch (ADR 0002) when upstream fixes both.
+5. Licence check for the Ayu and Gruvbox themes. Add them only if the licence allows it.
+6. A person has not checked the UI in a real window. Every phase report lists UI checks that were not run.
+7. The Linux keyring (Secret Service) is not tested (no Secret Service on the development machine). The software renderer was checked on Linux on 2026-11-11: with the Mesa lavapipe Vulkan driver the app starts (first frame 238 ms); with no Vulkan driver it still starts and connects, but which renderer it used was not confirmed (no screenshot). Windows (WARP) is not checked.
 
 ## Closed
 
+- 2026-11-11: Updater → our own updater on `ureq`, `minisign-verify` and `sha2`, with a launcher that rolls back (ADR 0005).
+- 2026-11-11: Authenticode signing → the owner's PFX file now. Azure Trusted Signing when the certificate renews (ADR 0005).
 - 2026-11-10: Update source → public GitHub Releases of `pauldeng/mqtt-navigator`.
 - 2026-11-10: Signing → minisign manifest key and Windows Authenticode. No Apple Developer ID.
 - 2026-11-10: v1.0 scope → core, MQTT 5 properties, TLS and mTLS.

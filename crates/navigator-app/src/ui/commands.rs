@@ -48,6 +48,7 @@ impl Navigator {
             Cmd::ShowAll => self.show_all(cx),
             Cmd::ShowMore => self.show_more(window, cx),
             Cmd::CopyValue => self.copy_value(window, cx),
+            Cmd::CopyTopic => self.copy_topic(window, cx),
             Cmd::PublishToTopic => self.publish_to_topic(window, cx),
             Cmd::EditAndPublish => self.edit_and_publish(window, cx),
             Cmd::Reply => self.reply(window, cx),
@@ -188,7 +189,7 @@ impl Navigator {
         cx.spawn_in(window, async move |this, cx| {
             let made = cx
                 .background_executor()
-                .spawn(async move { std::fs::create_dir_all(&dir).map(|()| dir) })
+                .spawn(async move { navigator_core::private_fs::create_dir(&dir).map(|()| dir) })
                 .await;
             this.update_in(cx, |_, window, cx| match made {
                 Ok(dir) => cx.open_with_system(&dir),

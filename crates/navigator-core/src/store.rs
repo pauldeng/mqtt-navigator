@@ -62,7 +62,7 @@ pub const TEXT_FILTER_PAYLOAD_BYTES: usize = 1024;
 /// Most rows in the frozen tree view (paused). Rows after this are not shown while paused.
 pub const SNAPSHOT_MAX_ROWS: usize = 10_000;
 
-/// Bytes of the value preview in the frozen tree view.
+/// Characters of the value preview in the frozen tree view.
 const SNAPSHOT_PREVIEW_BYTES: usize = 64;
 
 /// While paused, the list may grow to this many times `list_len`, so the frozen rows stay.
@@ -2293,8 +2293,8 @@ impl TopicStore {
                     node.expanded
                 };
                 let preview: Box<str> = node.latest.as_ref().map_or_else(Box::default, |m| {
-                    let head = &m.payload[..m.payload.len().min(SNAPSHOT_PREVIEW_BYTES)];
-                    String::from_utf8_lossy(head).into()
+                    // The same text as the live row: no control or direction characters.
+                    crate::decode::preview(&m.payload, SNAPSHOT_PREVIEW_BYTES).into()
                 });
                 let entry = SnapEntry {
                     msg_count: node.msg_count,

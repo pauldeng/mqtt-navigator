@@ -7,6 +7,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::model::MsgProps;
+use crate::text::{escape, is_bidi_control};
 
 /// Default input limit of the UI: it renders the first 256 KiB. "Show all" passes the length of
 /// the stored payload.
@@ -374,8 +375,10 @@ fn number(
 }
 
 /// One-line preview of a payload: white space collapsed to one space, control characters as
-/// `·`, invalid UTF-8 as `bin 7b 22 …` (the first 16 bytes).
+/// `·`, direction controls as `⟨U+202E⟩`, invalid UTF-8 as `bin 7b 22 …` (the first 16 bytes).
 ///
+/// - Zero-width characters and joiners stay, so that emoji sequences and combining marks show
+///   correctly. Topics get the stricter [`crate::text::display_safe`].
 /// - It reads at most the first 512 bytes. The cost does not depend on the payload size.
 /// - It keeps `max_chars` characters and then adds `…`. A cut inside a UTF-8 sequence at byte
 ///   512 is not an error.
@@ -417,7 +420,12 @@ pub fn preview(payload: &[u8], max_chars: usize) -> String {
             }
             last_space = true;
         } else {
-            out.push(if c.is_control() { '·' } else { c });
+            if is_bidi_control(c) {
+                // A direction control can change how the text around it looks.
+                out.push_str(&escape(c));
+            } else {
+                out.push(if c.is_control() { '·' } else { c });
+            }
             last_space = false;
         }
         join = c == '\u{200d}';
@@ -732,6 +740,20 @@ mod tests {
         let long = "\u{e9}".repeat(400);
         assert!(!preview(long.as_bytes(), 80).starts_with("bin"));
         assert_eq!(preview(b"", 5), "");
+    }
+
+    #[test]
+    fn preview_shows_direction_controls() {
+        assert_eq!(
+            preview("pay \u{202e}fdp.exe \u{2066}x".as_bytes(), 80),
+            "pay ⟨U+202E⟩fdp.exe ⟨U+2066⟩x"
+        );
+        assert_eq!(
+            preview("a\u{200f}b\u{061c}".as_bytes(), 80),
+            "a⟨U+200F⟩b⟨U+061C⟩"
+        );
+        // An escape counts as one character.
+        assert_eq!(preview("\u{202e}abc".as_bytes(), 2), "⟨U+202E⟩a\u{2026}");
     }
 
     #[test]

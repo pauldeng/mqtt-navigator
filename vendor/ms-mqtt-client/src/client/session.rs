@@ -578,20 +578,32 @@ where
     }
 
     /// An incoming PUBLISH packet has been received from the server
-    pub fn incoming_publish(&mut self, publish: Publish<O::Shared>) {
+    // LOCAL PATCH (mqtt-navigator): a broker chooses the QoS bits and the packet identifier, so
+    // this function must never panic. It returns an error for a protocol violation. The caller
+    // then closes the connection.
+    pub fn incoming_publish(&mut self, publish: Publish<O::Shared>) -> Result<(), ProtocolError> {
         let incoming = match publish.packet_identifier_dup_qos {
             PacketIdentifierDupQoS::AtMostOnce => IncomingPublishAndToken::QoS0(publish),
-            PacketIdentifierDupQoS::AtLeastOnce(packet_identifier, _) => {
-                let r = self
+            PacketIdentifierDupQoS::AtLeastOnce(packet_identifier, dup) => {
+                // LOCAL PATCH (mqtt-navigator): the identifier is still in use, because we have
+                // not sent the PUBACK yet. With DUP this is a retransmission of that PUBLISH
+                // (MQTT 5, 3.3.1.1): the first delivery stays, we do not deliver a second copy
+                // and the pending PUBACK answers both. Without DUP it is a protocol violation.
+                if self
                     .in_application
                     .publishes
+                    .contains_key(&packet_identifier)
+                {
+                    return if dup {
+                        log::debug!("ignored a retransmitted PUBLISH, pkid {packet_identifier:?}");
+                        Ok(())
+                    } else {
+                        Err(ProtocolErrorRepr::DuplicatePacketIdentifier)?
+                    };
+                }
+                self.in_application
+                    .publishes
                     .insert(packet_identifier, PendingAcknowledgement::NotReady);
-                // TODO: How to handle if the pkid already exists? What should the error
-                // story / experience be precisely?
-                assert!(
-                    r.is_none(),
-                    "TODO: Handle the case where pkid already exists"
-                );
                 IncomingPublishAndToken::QoS1(
                     publish,
                     PubAckToken::new(
@@ -601,11 +613,10 @@ where
                     ),
                 )
             }
-            PacketIdentifierDupQoS::ExactlyOnce(packet_identifier, _) => {
-                self.in_application
-                    .publishes
-                    .insert(packet_identifier, PendingAcknowledgement::NotReady);
-                todo!()
+            // LOCAL PATCH (mqtt-navigator): the app never subscribes with QoS 2, so a broker that
+            // sends one breaks the protocol. No state is kept for it.
+            PacketIdentifierDupQoS::ExactlyOnce(..) => {
+                return Err(ProtocolErrorRepr::UnsupportedQoS2)?;
             }
         };
 
@@ -618,6 +629,7 @@ where
         if crate::local_limits::try_admit(cost) && self.ch.i_pub_tx.send(incoming).is_err() {
             crate::local_limits::release(cost);
         }
+        Ok(())
     }
 
     /// An incoming AUTH packet has been received from the server as part of a reauthentication process
@@ -1410,5 +1422,89 @@ mod tests {
             ct.now_or_never(),
             Some(Ok(ReauthResult::Success(_)))
         ));
+    }
+    // LOCAL PATCH (mqtt-navigator): incoming PUBLISH from a hostile broker.
+    fn publish_session() -> (
+        Session<BytesMut>,
+        tokio::sync::mpsc::UnboundedReceiver<
+            crate::client::channel_data::IncomingPublishAndToken<bytes::Bytes>,
+        >,
+    ) {
+        let (_sub_tx, sub_rx) = channel(1);
+        let (_publish_qos0_tx, publish_qos0_rx) = channel(1);
+        let (_publish_qos12_tx, publish_qos12_rx) = channel(1);
+        let (ack_tx, ack_rx) = unbounded_channel();
+        let (auth_tx, auth_rx) = channel(1);
+        let (_ping_tx, ping_rx) = channel(1);
+        let (incoming_publish_tx, incoming_publish_rx) = unbounded_channel();
+        let session = Session::new(
+            sub_rx,
+            publish_qos0_rx,
+            publish_qos12_rx,
+            ack_rx,
+            auth_rx,
+            ping_rx,
+            incoming_publish_tx,
+            ack_tx,
+            auth_tx,
+            PacketIdentifier::new(u16::MAX).unwrap(),
+            BytesMut::new(),
+        );
+        (session, incoming_publish_rx)
+    }
+
+    fn publish(id: Option<(u16, bool, bool)>) -> crate::mqtt_proto::Publish<bytes::Bytes> {
+        use crate::mqtt_proto::{PacketIdentifierDupQoS as Q, Publish, Topic};
+        Publish {
+            topic_name: Topic::new("a/b".into()).unwrap(),
+            packet_identifier_dup_qos: match id {
+                None => Q::AtMostOnce,
+                Some((n, dup, false)) => Q::AtLeastOnce(PacketIdentifier::new(n).unwrap(), dup),
+                Some((n, dup, true)) => Q::ExactlyOnce(PacketIdentifier::new(n).unwrap(), dup),
+            },
+            retain: false,
+            payload: bytes::Bytes::from_static(b"x"),
+            other_properties: Default::default(),
+        }
+    }
+
+    #[test]
+    fn incoming_qos2_publish_is_a_protocol_error_and_keeps_no_state() {
+        let (mut session, mut rx) = publish_session();
+        let err = session
+            .incoming_publish(publish(Some((1, false, true))))
+            .expect_err("QoS 2 is not supported");
+        assert!(err.is_unsupported_qos2());
+        assert!(session.in_application.publishes.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn duplicate_packet_id_with_dup_is_delivered_once() {
+        let (mut session, mut rx) = publish_session();
+        session
+            .incoming_publish(publish(Some((7, false, false))))
+            .unwrap();
+        // The PUBACK for id 7 is still pending. The broker sends the PUBLISH again with DUP.
+        session
+            .incoming_publish(publish(Some((7, true, false))))
+            .unwrap();
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(session.in_application.publishes.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_packet_id_without_dup_is_a_protocol_error() {
+        let (mut session, mut rx) = publish_session();
+        session
+            .incoming_publish(publish(Some((7, false, false))))
+            .unwrap();
+        let err = session
+            .incoming_publish(publish(Some((7, false, false))))
+            .expect_err("a reused id without DUP breaks the protocol");
+        assert!(err.is_duplicate_packet_id());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 }

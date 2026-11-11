@@ -55,6 +55,20 @@ pub enum ConnectError {
 #[error(transparent)]
 pub struct ProtocolError(#[from] ProtocolErrorRepr);
 
+// LOCAL PATCH (mqtt-navigator): the app tells these two errors apart to show the right text.
+impl ProtocolError {
+    /// The server sent a PUBLISH with QoS 2. This client does not support QoS 2.
+    pub fn is_unsupported_qos2(&self) -> bool {
+        matches!(self.0, ProtocolErrorRepr::UnsupportedQoS2)
+    }
+
+    /// The server sent a PUBLISH with a packet identifier that is still in use, and the DUP flag
+    /// was not set.
+    pub fn is_duplicate_packet_id(&self) -> bool {
+        matches!(self.0, ProtocolErrorRepr::DuplicatePacketIdentifier)
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ProtocolErrorRepr {
     #[error("protocol violation: malformed packet: {0}")]
@@ -67,4 +81,12 @@ pub(crate) enum ProtocolErrorRepr {
     UnexpectedPacket,
     #[error("protocol violation: missing or mismatched authentication method")]
     AuthenticationMethodMismatch,
+    // LOCAL PATCH (mqtt-navigator)
+    #[error(
+        "protocol violation: the server sent a QoS 2 PUBLISH, which this client does not support"
+    )]
+    UnsupportedQoS2,
+    // LOCAL PATCH (mqtt-navigator)
+    #[error("protocol violation: PUBLISH reuses a packet identifier that is in use, without DUP")]
+    DuplicatePacketIdentifier,
 }

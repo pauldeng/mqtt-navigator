@@ -1,4 +1,5 @@
-# Ports 18830 to 18837 on 127.0.0.1. See mosquitto.conf for the list.
+# Ports on 127.0.0.1: 18830 to 18837 Mosquitto (see mosquitto.conf), 18840 and 18841 EMQX,
+# 18850 and 18851 HiveMQ CE. Images are pinned by digest.
 name: navigator-broker
 services:
   mosquitto:
@@ -8,3 +9,24 @@ services:
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ./certs:/certs:ro
+
+  # EMQX 6.3.2 (the latest stable release when this file was written). Anonymous access is the
+  # default. 18840: TCP, 18841: WebSocket (path /mqtt).
+  emqx:
+    image: emqx/emqx:6.3.2@sha256:135116400e11b25224350b2e55c874f4e224d357b593fb554ca1b1f398c631ac
+    environment:
+      # A fixed node name, so that a restart does not change it.
+      EMQX_NODE__NAME: emqx@127.0.0.1
+    ports:
+      - "127.0.0.1:18840:1883"
+      - "127.0.0.1:18841:8083"
+
+  # HiveMQ CE 2026.5 (the latest release when this file was written). The image allows all
+  # clients. 18850: TCP, 18851: WebSocket (path /mqtt).
+  hivemq:
+    image: hivemq/hivemq-ce:2026.5@sha256:bac6d4d1d815bffe4bc9a7fca8d06ea12b32d34f84ef2f1851ff4548560ee67b
+    ports:
+      - "127.0.0.1:18850:1883"
+      - "127.0.0.1:18851:8000"
+    volumes:
+      - ./hivemq-config.xml:/opt/hivemq/conf/config.xml:ro

@@ -1028,6 +1028,19 @@ impl Connection {
                 DisconnectedEvent::PingTimeout
             }
             Err(err) => {
+                // LOCAL PATCH (mqtt-navigator): after a protocol violation, tell the server why
+                // we close the connection (MQTT 5, 4.13). This is best effort and short.
+                if matches!(err, InnerConnectionError::Protocol(_)) {
+                    let disconnect =
+                        mqtt_proto::Disconnect::new(DisconnectReasonCode::ProtocolError);
+                    let _ = maybe_timeout(Some(Duration::from_secs(1)), async {
+                        self.writer
+                            .write(&Packet::Disconnect(disconnect), ProtocolVersion::V5)
+                            .await?;
+                        self.writer.flush().await
+                    })
+                    .await;
+                }
                 self.session.transport_disconnect(&err);
                 match err {
                     InnerConnectionError::Io(e) => DisconnectedEvent::IoError(e),
@@ -1120,7 +1133,7 @@ impl Connection {
                         return Ok(InnerDisconnect::Server(disconnect));
                     }
 
-                    Packet::Publish(publish) => self.session.incoming_publish(publish),
+                    Packet::Publish(publish) => self.session.incoming_publish(publish)?,
 
                     Packet::PingResp(_) => {
                         // Remove ping response timer as we have successfully received a PINGRESP.

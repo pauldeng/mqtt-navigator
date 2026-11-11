@@ -4,12 +4,14 @@
 //! module decides what a draft is, how Text and Hex convert, which drafts are kept, and which
 //! actions fill the composer from a message.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use bytes::Bytes;
 use navigator_core::net::Outgoing;
 use navigator_core::publish::{parse_hex, to_hex};
 use navigator_core::store::Msg;
+use navigator_core::text::display_safe;
 use navigator_core::{MsgProps, Qos, decode};
 
 /// Most bytes that Drafts and Sent keep together.
@@ -186,7 +188,7 @@ impl Draft {
             PayloadMode::Text => decode::preview(self.payload.as_bytes(), 40),
             PayloadMode::Hex => decode::preview(self.payload.as_bytes(), 24),
         };
-        format!("{}  {}", self.topic, payload)
+        format!("{}  {}", display_safe(&self.topic), payload)
     }
 }
 
@@ -196,9 +198,10 @@ pub fn edit_unavailable(msg: &Msg, row_evicted: bool) -> Option<&'static str> {
     (msg.truncated || row_evicted || msg.payload.len() != msg.original_size).then_some(NOT_STORED)
 }
 
-/// A single-line input removes CR and LF. A topic or a property that has them would change
-/// without a sign. `LineKeep` shows such a string escaped (`\n`, `\r`, `\\`) and keeps the exact
-/// string until the user edits the field. Then the text of the field is the value.
+/// A single-line input removes CR and LF. A text view also shapes bidi controls and joiners, so
+/// a topic or a property with them would look like another string. `LineKeep` shows such a
+/// string escaped (`\n`, `\r`, `\\` for line breaks, `⟨U+202E⟩` for hidden characters) and keeps
+/// the exact string until the user edits the field. Then the text of the field is the value.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineKeep(Option<(String, String)>);
 
@@ -207,17 +210,31 @@ pub fn line_breaks_note(what: &str) -> String {
     format!("This {what} has line breaks; they are kept.")
 }
 
+/// The note for a field with kept hidden characters.
+pub fn hidden_chars_note(what: &str) -> String {
+    format!("This {what} has hidden characters; they are kept.")
+}
+
 impl LineKeep {
     /// Registers the exact string of a field. Returns the text for the input.
     pub fn set(&mut self, exact: &str) -> String {
-        if !exact.contains(['\n', '\r']) {
+        let breaks = exact.contains(['\n', '\r']);
+        let safe = display_safe(exact);
+        if matches!(safe, Cow::Borrowed(_)) {
             self.0 = None;
             return exact.to_string();
         }
-        let shown = exact
-            .replace('\\', "\\\\")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r");
+        let shown = if breaks {
+            display_safe(
+                &exact
+                    .replace('\\', "\\\\")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r"),
+            )
+            .into_owned()
+        } else {
+            safe.into_owned()
+        };
         self.0 = Some((shown.clone(), exact.to_string()));
         shown
     }
@@ -230,9 +247,28 @@ impl LineKeep {
         }
     }
 
-    /// True if the exact string (with line breaks) is still the value.
-    pub fn active(&self, current: &str) -> bool {
+    /// True if the exact string (not the text of the input) is still the value.
+    #[cfg(test)]
+    fn active(&self, current: &str) -> bool {
         self.0.as_ref().is_some_and(|(shown, _)| shown == current)
+    }
+
+    /// The note for the field, if the exact string (not the text of the input) is still the
+    /// value. `what`: "topic", "value".
+    pub fn note(&self, what: &str, current: &str) -> Option<String> {
+        let (_, exact) = self.0.as_ref().filter(|(shown, _)| shown == current)?;
+        let breaks = exact.contains(['\n', '\r']);
+        let hidden = matches!(
+            display_safe(&exact.replace(['\n', '\r'], "")),
+            Cow::Owned(_)
+        );
+        Some(match (breaks, hidden) {
+            (true, true) => {
+                format!("This {what} has line breaks and hidden characters; they are kept.")
+            }
+            (true, false) => line_breaks_note(what),
+            _ => hidden_chars_note(what),
+        })
     }
 }
 
@@ -410,7 +446,7 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
         ComposerModel, Draft, History, LineKeep, MAX_DRAFTS, MAX_SENT, NOT_STORED, PayloadMode,
-        edit_unavailable, line_breaks_note,
+        edit_unavailable, hidden_chars_note, line_breaks_note,
     };
     use bytes::Bytes;
     use navigator_core::store::Msg;
@@ -673,6 +709,37 @@ mod tests {
         let shown = k.set("a\nb");
         d.topic = k.value(&shown);
         assert_eq!(d.to_outgoing(1).expect("valid").topic, "a\nb");
+    }
+
+    #[test]
+    fn hidden_characters_are_shown_escaped_and_sent_unchanged() {
+        let exact = "ctl/\u{202e}gnp\u{200d}x";
+        let mut k = LineKeep::default();
+        let shown = k.set(exact);
+        assert_eq!(shown, "ctl/⟨U+202E⟩gnp⟨U+200D⟩x");
+        assert_eq!(
+            k.note("topic", &shown).as_deref(),
+            Some(hidden_chars_note("topic").as_str())
+        );
+        // Send uses the exact topic.
+        let mut d = draft("", "p");
+        d.topic = k.value(&shown);
+        assert_eq!(d.to_outgoing(1).expect("valid").topic, exact);
+        // An edit replaces the exact string and the note goes.
+        let edited = format!("{shown}!");
+        assert_eq!(k.value(&edited), edited);
+        assert_eq!(k.note("topic", &edited), None);
+        // Line breaks and hidden characters together.
+        let both = k.set("a\nb\u{202e}");
+        assert_eq!(both, "a\\nb⟨U+202E⟩");
+        assert_eq!(k.value(&both), "a\nb\u{202e}");
+        assert_eq!(
+            k.note("value", &both).as_deref(),
+            Some("This value has line breaks and hidden characters; they are kept.")
+        );
+        // Plain text has no note.
+        let plain = k.set("a/b");
+        assert_eq!(k.note("topic", &plain), None);
     }
 
     #[test]

@@ -45,7 +45,7 @@ None of the three has a direct "edit and publish" or "reply" action for a receiv
 │ [Q0│Q1] [Subscribe]│ [{"cmd":"stop"}       ] Q[0│1] ☐R │ ───────                │
 │                   │ > Properties          [Send ⌃⏎]    │ [Clear retained…]      │
 ├───────────────────┴─────────────────────────────────────┴────────────────────────┤
-│ mqtts://broker:8883 · 1 240 msg/s · 105 topics · 34 / 128 MiB · 0 dropped         │ StatusBar
+│ mqtts://broker:8883 · 1 240 msg/s · 105 topics · 34 MiB / 128 MiB · 0 dropped         │ StatusBar
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,9 +62,9 @@ The window has one place for each job:
 - **Left pane, Subscribe (major feature 1):**
   - One input: type a topic filter and press Enter. A toggle group (Q0 | Q1) next to it sets the QoS. QoS 0 is the default.
   - An invalid filter (for example `a/#/b` or an empty filter) shows an error under the input. The app does not send it.
-  - A new row shows "Subscribing…" until the SUBACK arrives. Then it shows the granted QoS and a message count.
-  - A rejected row shows the reason in text (for example "Not authorized (0x87)"), with **Retry** and **Remove**.
-  - The rows are `ListItem`s on a virtual list. Each subscription gets a colour automatically. A message takes the colour of the **first** subscription in the list that matches its topic. Click the colour chip to change the colour.
+  - A new row shows "Subscribing…" until the SUBACK arrives. Then it shows "granted 0" or "granted 1". The Q0 or Q1 tag is the QoS that you asked for. A row has no message count.
+  - A rejected row shows the reason in text (for example "Not authorized to subscribe."), with **Retry** and **Remove**.
+  - The rows are `ListItem`s on a virtual list. Each subscription gets a colour from its row position. The colours repeat after 10 rows. A message takes the colour of the **first** subscription in the list that matches its topic. The colour dot is not a control.
   - **Show only**: click a subscription to show only its messages, and click again to show all. This changes the view only. It does not unsubscribe. Remove (×) unsubscribes.
   - A new profile starts with the subscription `#`, so messages appear at once.
     - When you add a narrower filter while `#` exists, a hint asks "Remove # to receive only your filters?" with a **Remove #** button.
@@ -76,7 +76,7 @@ The window has one place for each job:
     - The order is always chronological, newest first. There is no sorting.
     - Sent messages show in the same list with an arrow-up icon and "Sent".
     - The "All | Received | Sent" filter shows in this view only.
-  - **Tree**: the live topic tree, sorted a–z, with message counts, subtopic counts and an activity marker.
+  - **Tree**: the live topic tree, sorted a–z, with a payload preview, a count of the topics below each row and the message count of each subtree. It has no activity marker.
   - **Selection** keeps a message ID, not only a topic:
     - The selected message stays visible in the details even if the store evicts it, until you select another one. Then the details show "Removed from the message list (memory limit)."
     - When you change views, the tree selects that message's topic. The list selects that message if its row still exists. If not, the list selects nothing.
@@ -138,7 +138,7 @@ Payloads are often long (400 characters or more, often JSON). Some are a single 
 - **Messages view, two lines (default):**
   - Line 1: time, subscription colour, topic, QoS, retained, size (right-aligned).
   - Line 2: the payload preview, in the monospace font, across the **full** row width. A short payload shows completely. A long payload shows its start and ends with "…".
-- **Row height option:** "1 line" or "2 lines". It is in the Messages header menu and in the command palette, and the app remembers it. With 1 line, the preview follows the topic.
+- **Row height option:** "1 line" or "2 lines". It is a button in the Messages header (its label shows the current height) and an entry in the command palette. The app remembers it. With 1 line, the preview follows the topic.
 - **Preview text:**
   - Line breaks and indentation collapse to one space, so JSON reads as `{"v":21.4,"u":"°C","ts":…}`.
   - Control characters show as `·`. A payload that is not valid UTF-8 shows as `bin 7b 22 76 …`.
@@ -238,7 +238,7 @@ Every view designs these states: empty, loading, error with a recovery action, d
 
 - Not built yet: the empty state for a connection without subscriptions, and the one for a broker that rejects `#`.
 - An error states the cause and the next step. Example: "Certificate expired on 2026-03-01. Renew the server certificate, or turn off verification."
-- A publish result is short: "Sent" (QoS 0), "Acknowledged" (QoS 1), "Rejected: not authorized (0x87)".
+- A publish result is short: "Sent" (QoS 0), "Acknowledged" (QoS 1), "Rejected: NotAuthorized" (the reason name of the broker, and its reason string if it sent one).
 
 ## 8. Keyboard
 
@@ -262,10 +262,11 @@ Other rules:
 | `Ctrl/Cmd+1` / `Ctrl/Cmd+2` | Messages view / Tree view |
 | `Ctrl/Cmd+Enter` (in the composer) | Send |
 | `Ctrl/Cmd+N` | New connection |
-| `Ctrl/Cmd+,` | Settings |
-| `F6` / `Shift+F6` | Next / previous pane |
+| `Ctrl/Cmd+,` | Settings (planned; not built in v1) |
+| `F6` / `Shift+F6` | Next / previous pane (planned; not built in v1) |
 | `Tab` / `Shift+Tab` | Next / previous control |
-| Arrows, `Left`, `Right`, `Enter` | Move, collapse, expand, select in the tree and the list |
+| `Up`, `Down` | Move the selection in the tree and the list |
+| `Left`, `Right` (tree) | Collapse, expand the selected topic |
 | `Up`, `Down`, `Enter` (in History) | Move the cursor in the rows of the History tab, show the row in the Value tab |
 
 - Pause, Edit and publish, Reply, Publish to this topic and the details pane have buttons and command palette entries. They have no shortcut, so that they cannot conflict with system or editor keys.
@@ -275,7 +276,7 @@ Other rules:
 ## 9. Motion and live data
 
 - Hover, selection and tab changes are instant.
-- The activity marker on a topic row is a dot that fades out over 1 s. It is not the only signal: the count changes too. If the OS asks for reduced motion, the dot shows without a fade.
+- Planned, not built in v1: an activity marker on a topic row (a dot that fades out over 1 s, without a fade when the OS asks for reduced motion). Today the changing count is the only signal.
 - "Follow newest" in the Messages view is on by default. Selecting a row or scrolling turns it off. Pause stops view updates (WCAG 2.2.2).
 
 ## 10. Accessibility

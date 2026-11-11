@@ -40,6 +40,7 @@ pub enum Cmd {
     ShowAll,
     ShowMore,
     CopyValue,
+    CopyTopic,
     PublishToTopic,
     EditAndPublish,
     Reply,
@@ -450,6 +451,9 @@ pub static COMMANDS: &[Entry] = &[
     ),
     e("copy-value", "Copy the value", None, Cmd::CopyValue, |f| {
         f.can_copy
+    }),
+    e("copy-topic", "Copy the topic", None, Cmd::CopyTopic, |f| {
+        f.can_publish_to_topic
     }),
     e(
         "publish-to-topic",
@@ -879,6 +883,8 @@ mod tests {
             ..Facts::default()
         };
         assert!(ids(&branch).contains(&"publish-to-topic"));
+        assert!(ids(&branch).contains(&"copy-topic"));
+        assert!(!ids(&base).contains(&"copy-topic"));
     }
 
     #[test]

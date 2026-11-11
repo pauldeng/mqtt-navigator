@@ -120,8 +120,6 @@ pub(super) struct Inspector {
     view: PayloadView,
     task: Option<Task<()>>,
     editor: Entity<EditorState>,
-    path: Entity<InputState>,
-    shown_path: SharedString,
     pub(super) decoder_select: Entity<SelectState<Vec<DecoderItem>>>,
     kind_select: Entity<SelectState<Vec<KindItem>>>,
     /// A History row that the user chose. The Value tab shows it instead of the selection.
@@ -146,8 +144,6 @@ impl Inspector {
                 .soft_wrap(true)
         });
         editor.update(cx, |e, cx| e.set_readonly(true, cx));
-        let path = cx.new(|cx| InputState::new(window, cx));
-        path.update(cx, |p, cx| p.set_readonly(true, cx));
         let items = DecoderPick::ALL.iter().map(|p| DecoderItem(*p)).collect();
         let decoder_select =
             cx.new(|cx| SelectState::new(items, Some(IndexPath::new(0)), window, cx));
@@ -191,8 +187,6 @@ impl Inspector {
             view: PayloadView::Idle,
             task: None,
             editor,
-            path,
-            shown_path: SharedString::default(),
             decoder_select,
             kind_select,
             hist_pick: None,
@@ -571,6 +565,15 @@ impl Navigator {
         window.push_notification(Notification::success("Value copied."), cx);
     }
 
+    /// Copies the original topic of the selection. The label shows the escaped form.
+    pub(super) fn copy_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((topic, _)) = self.selected_topic() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(topic));
+        window.push_notification(Notification::success("Topic copied."), cx);
+    }
+
     /// The width and the byte order of the Number decoder. The decoder is Number from now.
     pub(super) fn set_number(
         &mut self,
@@ -773,7 +776,10 @@ impl Navigator {
             }
             let (weak, topic) = (weak.clone(), topic.clone());
             dialog
-                .title(format!("Clear the retained message on {topic}?"))
+                .title(format!(
+                    "Clear the retained message on {}?",
+                    display_safe(&topic)
+                ))
                 .child(
                     div()
                         .text_sm()
@@ -828,17 +834,6 @@ impl Navigator {
     ) -> AnyElement {
         let shown = self.shown();
         self.ensure_render(shown.as_ref(), window, cx);
-        // The path input shows the topic. It changes with the topic only.
-        let path: SharedString = shown
-            .as_ref()
-            .map(|s| s.topic.clone().into())
-            .unwrap_or_default();
-        if path != self.insp.shown_path {
-            self.insp.shown_path = path.clone();
-            self.insp
-                .path
-                .update(cx, |p, cx| p.set_value(path.to_string(), window, cx));
-        }
         let wrap = self.insp.wrap;
         if self.insp.applied_wrap != wrap {
             self.insp.applied_wrap = wrap;
@@ -1040,16 +1035,24 @@ impl Navigator {
                 h_flex()
                     .gap_1()
                     .child(
+                        // The label shows the escaped topic. "Copy topic" copies the original.
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_sm()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .font_family(theme.mono_font_family.clone())
-                            .child(
-                                Input::new(&self.insp.path)
-                                    .small()
-                                    .appearance(false)
-                                    .readonly(true)
-                                    .aria_label("Topic"),
-                            ),
+                            .child(display_safe(&s.topic).into_owned()),
+                    )
+                    .child(
+                        Button::new("copy-topic")
+                            .small()
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .label("Copy topic")
+                            .on_click(cx.listener(|v, _, window, cx| v.copy_topic(window, cx))),
                     )
                     .child(
                         Button::new("copy-value")
@@ -1089,10 +1092,10 @@ impl Navigator {
                         DescriptionList::new()
                             .columns(1)
                             .label_width(ui(120.))
-                            .children(
-                                rows.into_iter()
-                                    .map(|(k, v)| DescriptionItem::new(k).value(v)),
-                            ),
+                            .children(rows.into_iter().map(|(k, v)| {
+                                DescriptionItem::new(display_safe(&k).into_owned())
+                                    .value(display_safe(&v).into_owned())
+                            })),
                     ),
                 )
             })

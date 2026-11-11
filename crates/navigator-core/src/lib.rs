@@ -4,10 +4,12 @@
 pub mod decode;
 pub mod model;
 pub mod net;
+pub mod private_fs;
 pub mod profile;
 pub mod publish;
 pub mod settings;
 pub mod store;
+pub mod text;
 pub mod tls;
 pub mod topic;
 

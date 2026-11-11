@@ -262,7 +262,7 @@ pub fn save_atomic_with_hook(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
+    crate::private_fs::create_dir(dir)?;
     let json = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -276,7 +276,9 @@ pub fn save_atomic_with_hook(
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut file =
+            crate::private_fs::private_file(OpenOptions::new().write(true).create_new(true))
+                .open(&tmp)?;
         let (first, rest) = json.split_at(json.len() / 2);
         file.write_all(first)?;
         hook(Checkpoint::PartialWrite);
@@ -473,5 +475,35 @@ mod tests {
                 assert_eq!(l.settings.profiles[0].name, "original");
             }
         }
+    }
+    /// The temp file and the final file are 0600. A new folder is 0700, also for an old 0644 file
+    /// that the save replaces.
+    #[cfg(unix)]
+    #[test]
+    fn saved_files_and_new_dirs_are_private_on_unix() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mode = |p: &Path| fs::metadata(p).expect("metadata").mode() & 0o777;
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("sub/settings.json");
+        let temp_mode = std::cell::Cell::new(None);
+        save_atomic_with_hook(&path, &with_name("a"), |at| {
+            if at == Checkpoint::PartialWrite {
+                let tmp = fs::read_dir(path.parent().expect("parent"))
+                    .expect("ls")
+                    .next()
+                    .expect("temp file")
+                    .expect("entry")
+                    .path();
+                temp_mode.set(Some(mode(&tmp)));
+            }
+        })
+        .expect("save");
+        assert_eq!(temp_mode.get(), Some(0o600));
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().expect("parent")), 0o700);
+        // An old file with the umask mode is replaced by a private one.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        save_atomic(&path, &with_name("b")).expect("save 2");
+        assert_eq!(mode(&path), 0o600);
     }
 }

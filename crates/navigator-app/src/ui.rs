@@ -39,6 +39,7 @@ use navigator_core::store::{
     Direction, DirectionFilter, Insert, Limits, ListFilter, Msg, NodeId, RowId, RowView,
     SendStatus, TopicStore, TreeFilter,
 };
+use navigator_core::text::display_safe;
 use uuid::Uuid;
 
 use crate::connections::{Choice, ConnectionSheet, ProfileItem, SheetEvent};
@@ -449,6 +450,15 @@ fn connection_live(state: &ConnState, gate: &GenGate, status_generation: u64) ->
         state,
         ConnState::Connected | ConnState::Connecting | ConnState::Reconnecting { .. }
     ) || gate.outstanding(status_generation)
+}
+
+/// A topic or filter as drawn: invisible and direction characters are made visible. The
+/// original string stays for publish, subscribe and copy.
+fn safe(s: &SharedString) -> SharedString {
+    match display_safe(s) {
+        std::borrow::Cow::Borrowed(_) => s.clone(),
+        std::borrow::Cow::Owned(o) => o.into(),
+    }
 }
 
 /// Text for a command that the net queue did not accept.
@@ -884,9 +894,10 @@ impl Navigator {
         let filter = self.sub_input.read(cx).value().to_string();
         let error = match validate_filter(&filter) {
             Err(text) => Some(text.to_string()),
-            Ok(()) if self.subs.contains(&filter) => {
-                Some(format!("You are already subscribed to {filter}."))
-            }
+            Ok(()) if self.subs.contains(&filter) => Some(format!(
+                "You are already subscribed to {}.",
+                display_safe(&filter)
+            )),
             Ok(()) => None,
         };
         if error.is_some() {
@@ -1743,7 +1754,7 @@ impl Navigator {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .child(s.filter.clone()),
+                    .child(safe(&s.filter)),
             )
             .child(Tag::secondary().xsmall().child(match s.qos {
                 Qos::AtMostOnce => "Q0",
@@ -2052,10 +2063,10 @@ impl Navigator {
         let list = self.store.list_filter();
         let mut chips: Vec<String> = Vec::new();
         if !list.text.is_empty() {
-            chips.push(format!("Text: {}", list.text));
+            chips.push(format!("Text: {}", display_safe(&list.text)));
         }
         if let Some(f) = &list.show_only {
-            chips.push(format!("Only: {f}"));
+            chips.push(format!("Only: {}", display_safe(f)));
         }
         if self.view == View::Messages {
             match list.direction {
@@ -2288,7 +2299,7 @@ impl Navigator {
                             d.max_w(ui(320.))
                         }
                     })
-                    .child(topic);
+                    .child(safe(&topic));
                 let line = h_flex()
                     .w_full()
                     .gap_2()
@@ -2470,7 +2481,7 @@ impl Navigator {
                             .child(
                                 div()
                                     .font_family(theme.mono_font_family.clone())
-                                    .child(n.name.to_string()),
+                                    .child(display_safe(n.name).into_owned()),
                             )
                             .when(n.subtree_topics > 0, |d| {
                                 d.child(

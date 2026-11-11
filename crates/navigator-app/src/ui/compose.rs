@@ -14,7 +14,7 @@ use navigator_core::publish::validate_outgoing;
 
 use super::profiles::display_name;
 use super::*;
-use crate::composer::{ComposerModel, Draft, LineKeep, PayloadMode, line_breaks_note};
+use crate::composer::{ComposerModel, Draft, LineKeep, PayloadMode};
 use crate::inspector::size_text;
 
 /// Height of the payload editor (design pixels, see [`ui`]).
@@ -50,11 +50,9 @@ impl Field {
             .update(cx, |i, cx| i.set_value(shown, window, cx));
     }
 
-    /// The note under the field, if the exact string has line breaks.
+    /// The note under the field, if the exact string has line breaks or hidden characters.
     fn note(&self, what: &str, cx: &App) -> Option<String> {
-        self.keep
-            .active(&self.input.read(cx).value())
-            .then(|| line_breaks_note(what))
+        self.keep.note(what, &self.input.read(cx).value())
     }
 }
 
@@ -620,7 +618,7 @@ impl Navigator {
                     div()
                         .text_xs()
                         .text_color(muted)
-                        .child(format!("to {name}")),
+                        .child(format!("to {}", display_safe(&name))),
                 )
             })
             .child(
@@ -771,7 +769,7 @@ impl Navigator {
 
     /// The "Properties" section: content type, response topic, correlation data, message expiry,
     /// payload format and user properties. "Send empty" keeps a property that is present but
-    /// empty. A line break in a text is kept (see [`LineKeep`]).
+    /// empty. A line break or a hidden character in a text is kept (see [`LineKeep`]).
     fn render_props(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.comp.props_open;
         let muted = cx.theme().muted_foreground;

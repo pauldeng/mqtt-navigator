@@ -26,7 +26,11 @@ pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLoc
 fn main() {
     STARTED.get_or_init(std::time::Instant::now);
     logging::init();
-    let cli = match cli_session(std::env::args().skip(1)) {
+    let cli = match cli_session(
+        std::env::args().skip(1),
+        std::env::var(PASSWORD_ENV).ok(),
+        &mut std::io::stdin().lock(),
+    ) {
         Ok(c) => c,
         Err(msg) => {
             eprintln!("{msg}\n\n{USAGE}");
@@ -50,6 +54,10 @@ fn main() {
             let task = cx.background_executor().spawn(async move {
                 match path {
                     Some(path) => {
+                        // Our own settings folder: only the owner may use it (Unix).
+                        if let Some(dir) = path.parent() {
+                            let _ = navigator_core::private_fs::tighten_dir(dir);
+                        }
                         persist::remove_stale_tmp(&path);
                         settings::load(&path)
                     }
@@ -88,9 +96,17 @@ fn open(cli: Option<ConnectConfig>, load: Load, cx: &mut App) {
 }
 
 const USAGE: &str = "Usage: mqtt-navigator [--host HOST] [--port PORT] [--tcp | --ws | --wss] \
-[--insecure] [--ca FILE] [--user NAME] [--password PASS] [--sub FILTER[:QOS]]...
+[--insecure] [--ca FILE] [--user NAME] [--password-stdin] [--sub FILTER[:QOS]]...
 
-TLS on port 8883 is the default. --tcp connects without encryption.";
+TLS on port 8883 is the default. --tcp connects without encryption.
+--password-stdin reads the password from the first line of the standard input.
+The environment variable MQTT_NAVIGATOR_PASSWORD also sets it (less safe).";
+
+/// The environment variable for the password. Other programs of the same user can read the
+/// environment of a process, so `--password-stdin` is the safer way.
+const PASSWORD_ENV: &str = "MQTT_NAVIGATOR_PASSWORD";
+
+const PASSWORD_ARG_TEXT: &str = "--password is not supported: the password would show in the process list and in the shell history. Use --password-stdin, or set MQTT_NAVIGATOR_PASSWORD.";
 
 /// The name of the session profile that the command line makes.
 const SESSION_NAME: &str = "Command line";
@@ -98,23 +114,50 @@ const SESSION_NAME: &str = "Command line";
 /// With arguments, the command line makes an unsaved session profile "Command line". Its
 /// password stays in memory (`ConnectConfig`). The app never writes the profile or the password
 /// to the settings file or the keyring. Without arguments there is no session profile.
-fn cli_session(args: impl Iterator<Item = String>) -> Result<Option<ConnectConfig>, String> {
+///
+/// The password comes from the first line of `stdin` (`--password-stdin`; no line ending, an
+/// empty line means no password) or else from `env_password`. Never from an argument.
+fn cli_session(
+    args: impl Iterator<Item = String>,
+    env_password: Option<String>,
+    stdin: &mut dyn std::io::BufRead,
+) -> Result<Option<ConnectConfig>, String> {
     let args: Vec<String> = args.collect();
     if args.is_empty() {
         return Ok(None);
     }
-    let mut config = parse_args(args.into_iter())?;
+    let (mut config, from_stdin) = parse_args(args.into_iter())?;
+    config.password = if from_stdin {
+        read_password(stdin)?
+    } else {
+        env_password.filter(|p| !p.is_empty())
+    };
     config.profile.name = SESSION_NAME.into();
     // A value that is too long makes the MQTT library panic at the connect.
     config.validate()?;
     Ok(Some(config))
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<ConnectConfig, String> {
+/// One line from `stdin`. A password never has a line ending. The read stops at a size that
+/// `ConnectConfig::validate` rejects.
+fn read_password(stdin: &mut dyn std::io::BufRead) -> Result<Option<String>, String> {
+    use std::io::{BufRead as _, Read as _};
+    let mut line = String::new();
+    stdin
+        .take(70_000)
+        .read_line(&mut line)
+        .map_err(|e| format!("Cannot read the password from the standard input: {e}."))?;
+    let line = line.trim_end_matches(['\n', '\r']);
+    Ok((!line.is_empty()).then(|| line.to_owned()))
+}
+
+/// The config and whether `--password-stdin` is set.
+fn parse_args(args: impl Iterator<Item = String>) -> Result<(ConnectConfig, bool), String> {
     let mut c = ConnectConfig::from(navigator_core::net::Profile::default());
     let p = &mut c.profile;
     let mut port = None;
     let mut subs = Vec::new();
+    let mut password_stdin = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value."));
@@ -135,7 +178,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ConnectConfig, Strin
             "--insecure" => p.verify_tls = false,
             "--ca" => p.ca_file = Some(value("--ca")?.into()),
             "--user" => p.username = Some(value("--user")?),
-            "--password" => c.password = Some(value("--password")?),
+            "--password-stdin" => password_stdin = true,
+            // Also `--password=secret`: say nothing about what follows the name.
+            a if a.starts_with("--password") => return Err(PASSWORD_ARG_TEXT.into()),
             "--sub" => {
                 let v = value("--sub")?;
                 let (filter, qos) = match v.rsplit_once(':') {
@@ -146,14 +191,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ConnectConfig, Strin
                 subs.push((filter, qos));
             }
             "-h" | "--help" => return Err("MQTT Navigator".into()),
-            other => return Err(format!("Unknown option: {other}")),
+            // Print only the name: a value after `=` can be a secret.
+            other => {
+                let name = other.split_once('=').map_or(other, |(n, _)| n);
+                return Err(format!("Unknown option: {name}"));
+            }
         }
     }
     p.port = port.unwrap_or(p.transport.default_port());
     if !subs.is_empty() {
         p.subscriptions = subs;
     }
-    Ok(c)
+    Ok((c, password_stdin))
 }
 
 #[cfg(test)]
@@ -162,7 +211,8 @@ mod tests {
     use super::{ConnectConfig, Qos, Transport, cli_session, parse_args};
 
     fn parse(s: &str) -> Result<navigator_core::net::Profile, String> {
-        parse_args(s.split_whitespace().map(String::from)).map(|c: ConnectConfig| c.profile)
+        parse_args(s.split_whitespace().map(String::from))
+            .map(|(c, _): (ConnectConfig, bool)| c.profile)
     }
 
     #[test]
@@ -188,7 +238,19 @@ mod tests {
     }
 
     fn session(s: &str) -> Result<Option<ConnectConfig>, String> {
-        cli_session(s.split_whitespace().map(String::from))
+        session_with(s, None, "")
+    }
+
+    fn session_with(
+        s: &str,
+        env: Option<&str>,
+        stdin: &str,
+    ) -> Result<Option<ConnectConfig>, String> {
+        cli_session(
+            s.split_whitespace().map(String::from),
+            env.map(String::from),
+            &mut stdin.as_bytes(),
+        )
     }
 
     #[test]
@@ -198,9 +260,13 @@ mod tests {
 
     #[test]
     fn arguments_make_an_unsaved_command_line_profile() {
-        let c = session("--host b.example --tcp --user u --password secret")
-            .expect("valid")
-            .expect("a session");
+        let c = session_with(
+            "--host b.example --tcp --user u --password-stdin",
+            None,
+            "secret\n",
+        )
+        .expect("valid")
+        .expect("a session");
         let p = &c.profile;
         assert_eq!(p.name, "Command line");
         assert_eq!((p.host.as_str(), p.port), ("b.example", 1883));
@@ -216,13 +282,88 @@ mod tests {
     fn too_long_values_are_rejected_with_a_plain_message() {
         let long = "a".repeat(65_536);
         let user = session(&format!("--user {long}")).expect_err("user");
-        let pass = session(&format!("--password {long}")).expect_err("password");
+        let pass = session_with("--password-stdin", None, &long).expect_err("password");
         assert!(user.contains("user name"), "{user}");
         assert!(
             pass.contains("password") && !pass.contains("aaaa"),
             "{pass}"
         );
         assert!(session(&format!("--user {}", "a".repeat(65_535))).is_ok());
+    }
+
+    fn password(s: &str, env: Option<&str>, stdin: &str) -> Option<String> {
+        session_with(s, env, stdin)
+            .expect("valid")
+            .expect("a session")
+            .password
+    }
+
+    #[test]
+    fn password_argument_is_refused_and_not_echoed() {
+        let e = session("--tcp --password hunter2").expect_err("refused");
+        assert!(
+            e.contains("--password-stdin") && !e.contains("hunter2"),
+            "{e}"
+        );
+        let e = parse("--password").expect_err("refused without a value too");
+        assert!(e.contains("--password-stdin"), "{e}");
+        for arg in [
+            "--password=hunter2",
+            "--passwordhunter2",
+            "--password-stdin=hunter2",
+        ] {
+            let e = parse(arg).expect_err("refused");
+            assert!(
+                e.contains("--password-stdin") && !e.contains("hunter2"),
+                "{arg}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_option_error_never_prints_a_value() {
+        let e = parse("--bogus=secret").expect_err("unknown");
+        assert!(
+            e.starts_with("Unknown option: --bogus") && !e.contains("secret"),
+            "{e}"
+        );
+        let e = parse("--host=secret").expect_err("unknown");
+        assert!(e.contains("--host") && !e.contains("secret"), "{e}");
+    }
+
+    #[test]
+    fn password_from_stdin_loses_the_line_ending_and_keeps_spaces() {
+        let p = |stdin| password("--tcp --password-stdin", None, stdin);
+        assert_eq!(p("s3cret\n").as_deref(), Some("s3cret"));
+        assert_eq!(p("s3cret\r\n").as_deref(), Some("s3cret"));
+        assert_eq!(p("s3cret").as_deref(), Some("s3cret"));
+        assert_eq!(p(" a b \nsecond line\n").as_deref(), Some(" a b "));
+        assert_eq!(p("\n"), None);
+        assert_eq!(p(""), None);
+    }
+
+    #[test]
+    fn password_from_the_environment_and_stdin_wins() {
+        assert_eq!(
+            password("--tcp", Some("fromenv"), "").as_deref(),
+            Some("fromenv")
+        );
+        assert_eq!(password("--tcp", Some(""), ""), None);
+        assert_eq!(password("--tcp", None, "ignored\n"), None);
+        assert_eq!(
+            password("--tcp --password-stdin", Some("fromenv"), "fromstdin\n").as_deref(),
+            Some("fromstdin")
+        );
+        // An empty line on stdin means no password, also when the environment has one.
+        assert_eq!(
+            password("--tcp --password-stdin", Some("fromenv"), "\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_environment_alone_makes_no_session() {
+        assert!(session_with("", Some("x"), "").expect("valid").is_none());
     }
 
     #[test]

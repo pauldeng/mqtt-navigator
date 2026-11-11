@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
+use navigator_core::private_fs;
 use tracing_subscriber::EnvFilter;
 
 const LOG_NAME: &str = "mqtt-navigator.log";
@@ -46,11 +47,12 @@ impl RotatingFile {
     fn open(&mut self) -> io::Result<&mut File> {
         if self.file.is_none() {
             if let Some(dir) = self.path.parent() {
-                fs::create_dir_all(dir)?;
+                // The log folder is ours: 0700 on Unix, also if an older version made it with
+                // the umask.
+                private_fs::create_dir(dir)?;
+                let _ = private_fs::tighten_dir(dir);
             }
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
+            let file = private_fs::private_file(OpenOptions::new().create(true).append(true))
                 .open(&self.path)?;
             self.size = file.metadata()?.len();
             self.file = Some(file);
@@ -178,8 +180,15 @@ fn write_crash_file(dir: &Path, info: &std::panic::PanicHookInfo<'_>) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let _ = fs::create_dir_all(dir);
-    let _ = fs::write(dir.join(format!("crash-{secs}.txt")), text);
+    let _ = write_crash_text(dir, secs, &text);
+}
+
+/// The crash file is private (0600 on Unix), like the log.
+fn write_crash_text(dir: &Path, secs: u64, text: &str) -> io::Result<()> {
+    private_fs::create_dir(dir)?;
+    private_fs::private_file(OpenOptions::new().write(true).create(true).truncate(true))
+        .open(dir.join(format!("crash-{secs}.txt")))?
+        .write_all(text.as_bytes())
 }
 
 #[cfg(test)]
@@ -216,6 +225,32 @@ mod tests {
             fs::read_to_string(dir.join("mqtt-navigator.log.1")).expect("old log"),
             "cccccccc\ndddddddd\n"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The folder is 0700 and the log files are 0600, also an old folder with a wide mode.
+    #[cfg(unix)]
+    #[test]
+    fn log_folder_and_files_are_private_on_unix() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mode = |p: &Path| fs::metadata(p).expect("metadata").mode() & 0o777;
+        let dir = temp_dir("private");
+        let path = dir.join(LOG_NAME);
+        let mut f = RotatingFile::new(path.clone(), 10);
+        f.write_line(b"aaaaaaaa\n").expect("write");
+        f.write_line(b"bbbbbbbb\n").expect("rotate");
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir.join("mqtt-navigator.log.1")), 0o600);
+        // An older version made the folder with the umask.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+        RotatingFile::new(dir.join("other.log"), 10)
+            .write_line(b"x\n")
+            .expect("write");
+        assert_eq!(mode(&dir), 0o700);
+        // The crash file.
+        write_crash_text(&dir, 1, "x").expect("crash file");
+        assert_eq!(mode(&dir.join("crash-1.txt")), 0o600);
         let _ = fs::remove_dir_all(&dir);
     }
 

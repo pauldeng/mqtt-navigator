@@ -16,7 +16,7 @@ use bytes::Bytes;
 use ms_mqtt_client::client::{
     Client, ClientOptions, ConnectResult, DisconnectedEvent, KeepAliveConfig, new_client,
 };
-use ms_mqtt_client::error::ConnectError;
+use ms_mqtt_client::error::{ConnectError, ProtocolError};
 use ms_mqtt_client::local_limits;
 use ms_mqtt_client::packet::{
     ConnAckReason, ConnectProperties, DeliveryQoS, DisconnectProperties, DisconnectReason,
@@ -31,6 +31,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinSet, LocalSet};
 
 use crate::model::{Incoming, MsgProps, Qos};
+use crate::text::display_safe;
 use crate::tls::{TlsDiag, TlsMaterial};
 
 pub use crate::profile::{Profile, Transport, Will};
@@ -1462,6 +1463,21 @@ async fn drain(ops: &mut JoinSet<()>) {
 const CLIENT_CERT_TEXT: &str =
     "The broker needs a client certificate. Add your certificate and key.";
 const PROTOCOL_TEXT: &str = "The broker sent data that is not valid MQTT 5.";
+const QOS2_TEXT: &str = "The broker sent a message with QoS 2, which this app does not support.";
+const DUPLICATE_ID_TEXT: &str =
+    "The broker broke the MQTT protocol: it reused a packet ID that was still in use.";
+
+/// The text of a protocol error. It is final: the app does not connect again.
+fn protocol_text(e: &ProtocolError) -> String {
+    if e.is_unsupported_qos2() {
+        QOS2_TEXT
+    } else if e.is_duplicate_packet_id() {
+        DUPLICATE_ID_TEXT
+    } else {
+        PROTOCOL_TEXT
+    }
+    .into()
+}
 
 /// Turns incoming publishes into `Incoming` and queues them for the UI. Never waits for the UI.
 struct Ingest {
@@ -1797,7 +1813,7 @@ async fn publish(client: &Client, o: &Outgoing) -> PublishResult {
             match token.await {
                 Ok(ack) if ack.is_success() => PublishResult::Acknowledged,
                 Ok(ack) => PublishResult::Rejected(match ack.properties.reason_string {
-                    Some(text) => format!("{:?}: {text}", ack.reason),
+                    Some(text) => format!("{:?}: {}", ack.reason, display_safe(&text)),
                     None => format!("{:?}", ack.reason),
                 }),
                 Err(_) => PublishResult::LostOnDisconnect,
@@ -1988,7 +2004,7 @@ fn io_outcome(e: &std::io::Error, diag: Option<&TlsDiag>, has_client_cert: bool)
 fn connect_outcome(e: &ConnectError, diag: Option<&TlsDiag>, has_client_cert: bool) -> Outcome {
     match e {
         ConnectError::Io(e) => io_outcome(e, diag, has_client_cert),
-        ConnectError::Protocol(_) => Outcome::Failed(PROTOCOL_TEXT.into()),
+        ConnectError::Protocol(e) => Outcome::Failed(protocol_text(e)),
         ConnectError::ResponseTimeout => {
             Outcome::Retry("The broker did not answer the connection request.".into())
         }
@@ -2035,10 +2051,10 @@ fn disconnect_outcome(event: DisconnectedEvent) -> Outcome {
         DisconnectedEvent::ApplicationDisconnect => Outcome::Disconnected,
         DisconnectedEvent::ServerDisconnect(d) => {
             let temporary = disconnect_is_temporary(&d.reason);
-            let reason = d
-                .properties
-                .reason_string
-                .unwrap_or_else(|| format!("{:?}", d.reason));
+            let reason = d.properties.reason_string.map_or_else(
+                || format!("{:?}", d.reason),
+                |s| display_safe(&s).into_owned(),
+            );
             let text = format!("The broker closed the connection: {reason}.");
             if temporary {
                 Outcome::Retry(text)
@@ -2047,7 +2063,7 @@ fn disconnect_outcome(event: DisconnectedEvent) -> Outcome {
             }
         }
         DisconnectedEvent::IoError(e) => io_outcome(&e, None, false),
-        DisconnectedEvent::ProtocolError(_) => Outcome::Failed(PROTOCOL_TEXT.into()),
+        DisconnectedEvent::ProtocolError(e) => Outcome::Failed(protocol_text(&e)),
         DisconnectedEvent::PingTimeout => {
             Outcome::Retry("The broker did not answer the keep-alive ping.".into())
         }
@@ -2070,7 +2086,9 @@ fn connack_text(ack: &ms_mqtt_client::packet::ConnAck) -> String {
         ConnAckReason::ConnectionRateExceeded => "the connection rate is exceeded",
         _ => "",
     };
-    match (&ack.properties.reason_string, reason) {
+    // The broker chooses this text. It can hold direction controls.
+    let text = ack.properties.reason_string.as_deref().map(display_safe);
+    match (&text, reason) {
         (Some(s), "") => format!("The broker rejected the connection: {s}."),
         (Some(s), r) => format!("The broker rejected the connection: {r} ({s})."),
         (None, "") => format!("The broker rejected the connection: {:?}.", ack.reason),
@@ -2675,6 +2693,54 @@ mod tests {
         assert!(broker.accepts() >= 2);
         net.disconnect();
         wait_status(&mut net, |s| s.state == ConnState::Disconnected).await;
+        net.shutdown().await;
+    }
+
+    /// A broker that sends QoS 2 breaks the protocol. The session ends with a plain text and no
+    /// retry. The net thread lives on and can connect again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn qos2_publish_fails_the_session_without_retry_or_panic() {
+        let broker = Fake::start(|n, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            if n == 0 {
+                let Some((0x82, body)) = read_packet(&mut sock) else {
+                    return;
+                };
+                answer_subscribe(&mut sock, &body);
+                // PUBLISH QoS 2, topic "t", packet ID 1, no properties, payload "x".
+                let _ = sock.write_all(&[0x34, 0x07, 0x00, 0x01, b't', 0x00, 0x01, 0x00, b'x']);
+            }
+            // The client sends a DISCONNECT with reason 0x82. Then the connection ends.
+            if n == 0 {
+                let got = read_packet(&mut sock);
+                assert_eq!(got, Some((0xe0, vec![0x82])), "DISCONNECT 0x82");
+            } else {
+                while read_packet(&mut sock).is_some() {}
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &["#"]),
+        ))))
+        .expect("send");
+        let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
+        assert!(
+            matches!(&s.state, ConnState::Failed(t) if t == QOS2_TEXT),
+            "{s:?}"
+        );
+        tokio::time::sleep(BACKOFF_MAX).await;
+        assert!(matches!(net.status.borrow().state, ConnState::Failed(_)));
+        assert_eq!(broker.accepts(), 1, "no retry");
+        // The thread is alive: a new connect works.
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        assert_eq!(broker.accepts(), 2);
+        net.disconnect();
         net.shutdown().await;
     }
 
