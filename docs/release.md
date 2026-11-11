@@ -61,6 +61,15 @@ cargo packager --release -p navigator-app --formats appimage,deb   # Linux
 
 The files appear in `dist/`. The packager does not build the programs. Build both first. `cargo packager` starts the launcher (`mqtt-navigator-launcher`) from the shortcut, the desktop entry and the `.app`.
 
+### Icons and desktop entry
+
+- The packager names the Linux desktop entry and the icons after the main binary (`mqtt-navigator-launcher`). The window app id is `io.github.pauldeng.mqtt-navigator`, and the shell matches the window by that name. So `crates/navigator-app/Cargo.toml` turns off `generate-desktop-entry`. It installs `assets/linux/io.github.pauldeng.mqtt-navigator.desktop` and the hicolor icons (16 to 512 px) with the app id as the name (`[package.metadata.packager.deb.files]`).
+- The deb also has one extra icon, `hicolor/512x512/apps/mqtt-navigator-launcher.png`. The AppImage step needs a PNG in `icons`. It is harmless.
+- The AppImage has the same entry. Its file name in the AppDir is `mqtt-navigator-launcher.desktop`, because the packager script links that name in the AppDir root. The root icon is `io.github.pauldeng.mqtt-navigator.png`.
+- Windows: `build.rs` in `navigator-app` and `navigator-launcher` embeds `assets/icon/icon.ico` as icon resource ID 1 with `winresource`. It needs `rc.exe` (Windows SDK, on the GitHub Windows runner). Nobody built this without CI. To check a release build, open the exe properties in Explorer (icon and "MQTT Navigator" product name) and look at the taskbar icon.
+- macOS: the packager copies `assets/icon/icon.icns` to `Contents/Resources/icon.icns` and sets `CFBundleIconFile` to `icon.icns`. Check `plutil -p "dist/MQTT Navigator.app/Contents/Info.plist"` after packaging.
+- Linux AppImage and bare binary: on the first start the app adds a user desktop entry. See the user guide.
+
 Other tools: `cargo about generate about.hbs` (licence text, see `about.toml`) and `cargo cyclonedx --format json --describe binaries --target all` (SBOM). The `sign-manifest.sh` script needs `minisign`.
 
 ## Not covered

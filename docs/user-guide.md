@@ -40,6 +40,17 @@ Your system needs Vulkan (`libvulkan1`) and a Wayland or X11 session.
 - **AppImage:** run `chmod +x MQTT-Navigator-*.AppImage`. Then start the file. The AppImage updates itself.
 - **deb:** run `sudo apt install ./mqtt-navigator_*.deb`. The deb does not update itself. See [Updates](#updates).
 
+**App menu and dock icon.** On first start, the AppImage and the bare program add themselves to your app menu. This lets the dock and the task bar show the icon. The app writes `~/.local/share/applications/io.github.pauldeng.mqtt-navigator.desktop` and the icons `~/.local/share/icons/hicolor/<size>/apps/io.github.pauldeng.mqtt-navigator.png` (48, 128, 256 and 512 px). The entry starts the AppImage file, or else the launcher. The app does this once, in the background. If the `.deb` is installed, the app does not add an entry. It removes the entry and the icons that it added before, because the `.deb` has its own. If you move or rename the AppImage, the next start of the moved file repairs the entry. The app never changes an entry that starts another program. The app adds no entry if the path has a `%` character, because GNOME cannot start such a path from an entry.
+
+To remove the app from your app menu, delete the AppImage or the program. Then delete these files (use `$XDG_DATA_HOME` instead of `~/.local/share` if you set it):
+
+```bash
+rm ~/.local/share/applications/io.github.pauldeng.mqtt-navigator.desktop
+rm ~/.local/share/icons/hicolor/*/apps/io.github.pauldeng.mqtt-navigator.png
+```
+
+If you start the app again, it adds the entry again. On X11 the window icon comes from the app itself. On macOS, a program that does not run from the `.app` shows a generic Dock icon.
+
 ## First run
 
 1. Start the app. It opens with the message "Add a broker to start." The screen also has **Connect to localhost:1883 (not encrypted)** for a broker on your own computer.

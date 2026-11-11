@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MQTT Navigator
+Comment=A fast, native MQTT client for the desktop.
+Exec=mqtt-navigator-launcher
+Icon=io.github.pauldeng.mqtt-navigator
+Terminal=false
+Categories=Development;
+Keywords=MQTT;broker;IoT;
+StartupWMClass=io.github.pauldeng.mqtt-navigator
+NoDisplay=false

@@ -4,6 +4,9 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+- The app icon now shows on every platform. Windows: the exe has the icon resource. Linux X11: the window has an icon. Linux Wayland: the `.deb` has a desktop entry and icons (16–512 px) named after the app id. The AppImage and the bare program add a user entry and icons on the first start.
+
 ## [0.1.0] - not released yet
 
 First version. It has not been published. The list below is what the version contains.

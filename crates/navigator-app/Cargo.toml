@@ -43,10 +43,10 @@ out-dir = "../../dist"
 license-file = "../../LICENSE-MIT"
 copyright = "Copyright (c) MQTT Navigator contributors"
 long-description = "A fast, native, cross-platform MQTT 5.0 client for desktop. Subscribe to topics, browse them as a tree or a message list, inspect payloads, and publish messages."
+# The Linux icons are not here: the packager would name them after the main binary
+# (mqtt-navigator-launcher.png), and the window app id is different. See [deb.files]. One PNG must
+# stay for the AppImage (.DirIcon). macOS uses the .icns file (CFBundleIconFile), NSIS the .ico file.
 icons = [
-  "../../assets/icon/icon-32.png",
-  "../../assets/icon/icon-128.png",
-  "../../assets/icon/icon-256.png",
   "../../assets/icon/icon-512.png",
   "../../assets/icon/icon.icns",
   "../../assets/icon/icon.ico",
@@ -64,8 +64,30 @@ installer-mode = "currentUser"
 minimum-system-version = "13.0"
 signing-identity = "-"
 
+# The packager names the desktop entry and the icons after the main binary. The window app id is
+# io.github.pauldeng.mqtt-navigator, and GNOME and KDE match the window by that name. So the
+# generated entry is off, and `files` installs the entry and the icons with the app id as name.
 [package.metadata.packager.linux]
-generate-desktop-entry = true
+generate-desktop-entry = false
+
+[package.metadata.packager.deb.files]
+"../../assets/linux/io.github.pauldeng.mqtt-navigator.desktop" = "usr/share/applications/io.github.pauldeng.mqtt-navigator.desktop"
+"../../assets/icon/icon-16.png" = "usr/share/icons/hicolor/16x16/apps/io.github.pauldeng.mqtt-navigator.png"
+"../../assets/icon/icon-32.png" = "usr/share/icons/hicolor/32x32/apps/io.github.pauldeng.mqtt-navigator.png"
+"../../assets/icon/icon-48.png" = "usr/share/icons/hicolor/48x48/apps/io.github.pauldeng.mqtt-navigator.png"
+"../../assets/icon/icon-64.png" = "usr/share/icons/hicolor/64x64/apps/io.github.pauldeng.mqtt-navigator.png"
+"../../assets/icon/icon-128.png" = "usr/share/icons/hicolor/128x128/apps/io.github.pauldeng.mqtt-navigator.png"
+"../../assets/icon/icon-256.png" = "usr/share/icons/hicolor/256x256/apps/io.github.pauldeng.mqtt-navigator.png"
+"../../assets/icon/icon-512.png" = "usr/share/icons/hicolor/512x512/apps/io.github.pauldeng.mqtt-navigator.png"
+
+# The AppImage script links `<main binary>.desktop` in the AppDir root, so the entry has that name
+# here. linuxdeploy makes the root icon `io.github.pauldeng.mqtt-navigator.png` itself. It links the
+# smallest icon of that name in hicolor (a test with 16 px gave a 16 px root icon). So there is only
+# one: 512 px. Do not name the entry after the app id: AppRun adds the AppDir to XDG_DATA_DIRS,
+# and the app would think that a system entry exists and write no user entry.
+[package.metadata.packager.appimage.files]
+"../../assets/linux/io.github.pauldeng.mqtt-navigator.desktop" = "usr/share/applications/mqtt-navigator-launcher.desktop"
+"../../assets/icon/icon-512.png" = "usr/share/icons/hicolor/512x512/apps/io.github.pauldeng.mqtt-navigator.png"
 
 [package.metadata.packager.deb]
 section = "net"
@@ -83,8 +105,15 @@ depends = [
 [target."cfg(windows)".dependencies]
 windows-native-keyring-store = "1.1.0"
 
+[target."cfg(windows)".build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

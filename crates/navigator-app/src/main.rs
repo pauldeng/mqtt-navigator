@@ -3,6 +3,8 @@
 
 mod composer;
 mod connections;
+#[cfg(target_os = "linux")]
+mod desktop_entry;
 mod diagnostics;
 mod inspector;
 mod logging;
@@ -19,6 +21,9 @@ use navigator_core::net::{ConnectConfig, Transport};
 use navigator_core::settings::{self, Load};
 
 actions!(navigator, [Quit]);
+
+/// The Linux app id (Wayland `app_id`, X11 class). The desktop entry and the icons have this name.
+const APP_ID: &str = "io.github.pauldeng.mqtt-navigator";
 
 /// Process start, for the first-frame metric.
 pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -52,7 +57,7 @@ fn main() {
             // the first frame has the saved theme and pane widths.
             let path = persist::settings_path();
             let task = cx.background_executor().spawn(async move {
-                match path {
+                let load = match path {
                     Some(path) => {
                         // Our own settings folder: only the owner may use it (Unix).
                         if let Some(dir) = path.parent() {
@@ -68,26 +73,59 @@ fn main() {
                         ),
                         read_only: true,
                     },
+                };
+                Prepared {
+                    load,
+                    // About 1 ms. It stays off the UI thread, before the window opens.
+                    #[cfg(target_os = "linux")]
+                    icon: desktop_entry::window_icon(),
                 }
             });
             cx.spawn(async move |cx| {
-                let load = task.await;
-                cx.update(|cx| open(cli, load, cx));
+                let prepared = task.await;
+                cx.update(|cx| open(cli, prepared, cx));
             })
             .detach();
         });
 }
 
-fn open(cli: Option<ConnectConfig>, load: Load, cx: &mut App) {
+/// What the background task makes before the window opens.
+struct Prepared {
+    load: Load,
+    /// X11 window icon. Wayland, Windows and macOS take the icon from the system (see
+    /// `docs/release.md`).
+    #[cfg(target_os = "linux")]
+    icon: Option<std::sync::Arc<image::RgbaImage>>,
+}
+
+fn open(cli: Option<ConnectConfig>, prepared: Prepared, cx: &mut App) {
+    let Prepared {
+        load,
+        #[cfg(target_os = "linux")]
+        icon,
+    } = prepared;
     let ui = &load.settings.ui;
     themes::init(&ui.theme_preset, ui.theme_mode, cx);
-    let options = WindowOptions {
+    #[allow(unused_mut)]
+    let mut options = WindowOptions {
         window_min_size: Some(size(px(960.), px(600.))),
-        // Linux: the desktop entry names this id as StartupWMClass.
-        app_id: Some("io.github.pauldeng.mqtt-navigator".into()),
+        // Linux: the desktop entry has this name and this StartupWMClass.
+        app_id: Some(APP_ID.into()),
         ..gpui_kit::component::TitleBar::window_options()
     };
+    #[cfg(target_os = "linux")]
+    {
+        options.icon = icon;
+    }
     if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
+        // Linux without a package: add the app to the user's app menu, so that the dock shows
+        // the icon. It runs in the background, after the first frame.
+        #[cfg(target_os = "linux")]
+        window.on_next_frame(|_, cx| {
+            cx.background_executor()
+                .spawn(async { desktop_entry::ensure_user_entry() })
+                .detach();
+        });
         cx.new(|cx| ui::Navigator::new(cli, load, window, cx))
     }) {
         eprintln!("Cannot open the window: {err:#}");
