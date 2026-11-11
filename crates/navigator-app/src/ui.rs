@@ -5,6 +5,7 @@ mod commands;
 mod compose;
 mod details;
 mod profiles;
+mod update;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -529,6 +530,8 @@ pub struct Navigator {
     /// Keep the newest row at the top of the Messages view.
     follow: bool,
     two_lines: bool,
+    /// The update badge, and the check that runs.
+    update: update::UpdateUi,
     direction: DirectionFilter,
     /// The subscription filter of "Show only".
     show_only: Option<String>,
@@ -730,6 +733,7 @@ impl Navigator {
             sel_topic: None,
             follow: true,
             two_lines: true,
+            update: update::UpdateUi::default(),
             direction: DirectionFilter::All,
             show_only: None,
             filter_input,
@@ -775,16 +779,30 @@ impl Navigator {
                 sub_events,
                 filter_events,
                 // On quit, the settings writer saves a pending change at once.
-                cx.on_app_quit(|v: &mut Self, _| {
+                cx.on_app_quit(|v: &mut Self, cx| {
                     // A resize that waits for its timer is saved too.
                     if v.resize_save.take().is_some() {
                         v.persist();
                     }
                     let net = v.net.shutdown();
                     let flush = v.writer.as_ref().map(Writer::flush);
+                    let restart = v.update.restart.take();
+                    let background = cx.background_executor().clone();
                     async move {
                         if let Some(flush) = flush {
                             let _ = flush.await;
+                        }
+                        // "Restart to update": the launcher applies the update and starts the
+                        // new version. This comes after the save and before the slow net stop.
+                        if let Some(install) = restart {
+                            background
+                                .spawn(async move {
+                                    let args = std::env::args_os().skip(1);
+                                    if let Err(e) = navigator_update::restart(&install, args) {
+                                        tracing::warn!(error = %e, "Cannot start the launcher");
+                                    }
+                                })
+                                .await;
                         }
                         net.await
                     }
@@ -1615,6 +1633,7 @@ impl Navigator {
                             .prefix(IconName::Search),
                     ),
                 )
+                .children(self.render_update_badge(cx))
                 .child(
                     Button::new("palette")
                         .small()
@@ -2673,6 +2692,7 @@ impl Render for Navigator {
         }
         if self.resize_settled_at.is_none() {
             self.resize_settled_at = Some(Instant::now() + RESIZE_SETTLE);
+            self.mark_healthy(cx);
             let s = window.viewport_size();
             self.last_size = (f32::from(s.width), f32::from(s.height));
         }

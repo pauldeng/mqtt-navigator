@@ -1,5 +1,7 @@
 # Third-party notices
 
+This file covers the files that live in the repository. The release workflow appends the licence texts of all Rust dependencies (made by `cargo about`) to the copy in each release.
+
 ## Bundled colour themes
 
 The JSON files in [`assets/themes/`](assets/themes/) come unchanged from [gpui-kit](https://github.com/longbridge/gpui-kit/tree/main/themes). They are embedded in the app. gpui-kit is licensed under Apache-2.0 (Copyright 2024 - 2026 Longbridge). Each theme keeps the licence of its upstream project.

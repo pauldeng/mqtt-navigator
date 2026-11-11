@@ -19,6 +19,7 @@ dirs = "7.0.0"
 gpui-kit = "0.9.1"
 keyring-core = "1.0.1"
 navigator-core = { path = "../navigator-core" }
+navigator-update = { path = "../navigator-update" }
 tokio = { version = "1.54.1", features = ["sync", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "std"] }
@@ -26,6 +27,58 @@ uuid = { version = "1.29.2", default-features = false }
 
 [lints]
 workspace = true
+
+# Packaging (ADR 0005): `cargo packager --release -p navigator-app --formats <fmt>`, see docs/release.md.
+# The launcher is the main binary: shortcuts, the desktop entry and the .app start it, and it starts the payload.
+# Both binaries must exist in target/<triple>/release before packaging.
+[package.metadata.packager]
+product-name = "MQTT Navigator"
+identifier = "io.github.pauldeng.mqtt-navigator"
+publisher = "MQTT Navigator contributors"
+authors = ["MQTT Navigator contributors"]
+homepage = "https://github.com/pauldeng/mqtt-navigator"
+description = "A fast, native MQTT client for the desktop."
+category = "DeveloperTool"
+out-dir = "../../dist"
+license-file = "../../LICENSE-MIT"
+copyright = "Copyright (c) MQTT Navigator contributors"
+long-description = "A fast, native, cross-platform MQTT 3.1.1 and 5.0 client for desktop. Browse topics as a tree, inspect payloads, and publish messages."
+icons = [
+  "../../assets/icon/icon-32.png",
+  "../../assets/icon/icon-128.png",
+  "../../assets/icon/icon-256.png",
+  "../../assets/icon/icon-512.png",
+  "../../assets/icon/icon.icns",
+  "../../assets/icon/icon.ico",
+]
+resources = ["../../LICENSE-MIT", "../../LICENSE-APACHE"]
+binaries = [
+  { path = "mqtt-navigator-launcher", main = true },
+  { path = "mqtt-navigator", main = false },
+]
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"
+
+[package.metadata.packager.macos]
+minimum-system-version = "13.0"
+signing-identity = "-"
+
+[package.metadata.packager.linux]
+generate-desktop-entry = true
+
+[package.metadata.packager.deb]
+section = "net"
+depends = [
+  "libc6",
+  "libgcc-s1",
+  "libxcb1",
+  "libxkbcommon0",
+  "libxkbcommon-x11-0",
+  "libfontconfig1",
+  "libvulkan1",
+  "libwayland-client0",
+]
 
 [target."cfg(windows)".dependencies]
 windows-native-keyring-store = "1.1.0"

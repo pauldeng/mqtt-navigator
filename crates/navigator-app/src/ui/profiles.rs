@@ -133,6 +133,10 @@ impl Navigator {
             }
         }
         self.sync_select(window, cx);
+        // One check at start, never on a timer. A metrics run makes no network traffic.
+        if ui.check_updates && std::env::var_os("MQTT_NAVIGATOR_METRICS").is_none() {
+            self.check_updates(false, window, cx);
+        }
         cx.notify();
     }
 

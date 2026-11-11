@@ -57,6 +57,10 @@ pub enum Cmd {
     ResetLayout,
     OpenLogFolder,
     CopyDiagnostics,
+    /// Check for a new version now.
+    CheckUpdates,
+    /// Turn the check at start on or off.
+    UpdateCheckAtStart(bool),
     Quit,
 }
 
@@ -93,6 +97,8 @@ pub struct Facts {
     pub preset: &'static str,
     /// The memory limit of the store now, in MiB.
     pub memory_mib: u32,
+    /// The check for a new version at start is on.
+    pub check_updates: bool,
 }
 
 /// One row of the table.
@@ -645,6 +651,27 @@ pub static COMMANDS: &[Entry] = &[
         Cmd::CopyDiagnostics,
         always,
     ),
+    e(
+        "check-updates",
+        "Check for updates…",
+        None,
+        Cmd::CheckUpdates,
+        always,
+    ),
+    e(
+        "update-check-off",
+        "Turn off the update check at start",
+        None,
+        Cmd::UpdateCheckAtStart(false),
+        |f| f.check_updates,
+    ),
+    e(
+        "update-check-on",
+        "Turn on the update check at start",
+        None,
+        Cmd::UpdateCheckAtStart(true),
+        |f| !f.check_updates,
+    ),
     e("quit", "Quit", Some("Mod+Q"), Cmd::Quit, always),
 ];
 
@@ -786,6 +813,19 @@ mod tests {
         };
         let v = ids(&f);
         assert!(!v.contains(&"theme-flexoki") && v.contains(&"theme-solarized"));
+    }
+
+    #[test]
+    fn the_update_check_can_be_turned_off_and_on() {
+        let on = ids(&Facts {
+            check_updates: true,
+            ..Facts::default()
+        });
+        assert!(on.contains(&"check-updates") && on.contains(&"update-check-off"));
+        assert!(!on.contains(&"update-check-on"));
+        let off = ids(&Facts::default());
+        assert!(off.contains(&"check-updates") && off.contains(&"update-check-on"));
+        assert!(!off.contains(&"update-check-off"));
     }
 
     #[test]

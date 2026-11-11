@@ -75,6 +75,8 @@ fn open(cli: Option<ConnectConfig>, load: Load, cx: &mut App) {
     themes::init(&ui.theme_preset, ui.theme_mode, cx);
     let options = WindowOptions {
         window_min_size: Some(size(px(960.), px(600.))),
+        // Linux: the desktop entry names this id as StartupWMClass.
+        app_id: Some("io.github.pauldeng.mqtt-navigator".into()),
         ..gpui_kit::component::TitleBar::window_options()
     };
     if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {

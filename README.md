@@ -31,6 +31,8 @@ Requirements: the latest stable Rust (`rustup update stable` or `mise install`).
 cargo run --release
 ```
 
+To build the installers, see [docs/release.md](docs/release.md).
+
 ## More information
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the app works.

@@ -1,0 +1,31 @@
+[package]
+name = "navigator-update"
+description = "Signed self-update for MQTT Navigator: manifest check, download, staging, and the launcher swap logic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# Tests only: allows an http://127.0.0.1 download prefix. The release build never enables it.
+test-http = []
+
+[lints]
+workspace = true
+
+[dependencies]
+minisign-verify = "0.3.0"
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+ureq = { version = "3.5.1", default-features = false, features = ["native-tls-no-default"] }  # OS trust store (PlatformVerifier). The "native-tls" feature adds webpki-root-certs (CDLA licence) and is off.
+
+[dev-dependencies]
+dirs = "7.0.0"
+minisign = "0.10.0"
+tempfile = "3.27.0"
+# Tests only: turns on the `test-http` feature of this crate (http://127.0.0.1 downloads).
+navigator-update = { path = ".", features = ["test-http"] }

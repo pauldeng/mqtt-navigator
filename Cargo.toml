@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/navigator-core", "crates/navigator-app"]
+members = ["crates/navigator-core", "crates/navigator-app", "crates/navigator-update", "crates/navigator-launcher"]
 exclude = ["vendor", "fuzz"]
 default-members = ["crates/navigator-app"]
 

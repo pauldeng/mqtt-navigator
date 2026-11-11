@@ -55,6 +55,9 @@ pub struct UiState {
     /// [`STORE_BUDGET_MIB_MIN`]..=[`STORE_BUDGET_MIB_MAX`] when it loads.
     #[serde(deserialize_with = "clamped_mib")]
     pub store_budget_mib: u32,
+    /// Check for a new version once at start (the only network traffic besides the broker). The
+    /// palette entry "Check for updates…" works when this is off.
+    pub check_updates: bool,
 }
 
 /// Any number in the file is accepted and clamped. A wrong value must not make the whole file
@@ -82,6 +85,7 @@ impl Default for UiState {
             pane_widths: Vec::new(),
             window_size: None,
             store_budget_mib: STORE_BUDGET_MIB_DEFAULT,
+            check_updates: true,
         }
     }
 }
@@ -322,6 +326,7 @@ mod tests {
             pane_widths: vec![200.0, 300.5],
             window_size: Some((1200.0, 800.0)),
             store_budget_mib: 512,
+            check_updates: false,
         };
         save_atomic(&path, &s).expect("save");
         let l = load(&path);
@@ -339,6 +344,10 @@ mod tests {
         assert_eq!(l.settings.ui, UiState::default());
         assert_eq!(l.settings.ui.theme_preset, "default");
         assert_eq!(l.settings.ui.store_budget_mib, 128);
+        assert!(
+            l.settings.ui.check_updates,
+            "an old file keeps the update check on"
+        );
         assert_eq!(l.settings.profiles[0].port, 8883);
     }
 

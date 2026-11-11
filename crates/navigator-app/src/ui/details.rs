@@ -424,6 +424,7 @@ impl Navigator {
             theme: Some(self.settings.ui.theme_mode),
             preset: crate::themes::preset_by_id(&self.settings.ui.theme_preset).id,
             memory_mib: self.memory_mib(),
+            check_updates: self.settings.ui.check_updates,
         }
     }
 

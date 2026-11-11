@@ -71,6 +71,12 @@ impl Navigator {
             }
             Cmd::OpenLogFolder => self.open_log_folder(window, cx),
             Cmd::CopyDiagnostics => self.copy_diagnostics(window, cx),
+            Cmd::CheckUpdates => self.check_updates(true, window, cx),
+            Cmd::UpdateCheckAtStart(on) => {
+                self.settings.ui.check_updates = on;
+                self.persist();
+                cx.notify();
+            }
             Cmd::Quit => cx.quit(),
         }
     }

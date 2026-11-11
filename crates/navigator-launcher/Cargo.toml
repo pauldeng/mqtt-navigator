@@ -1,0 +1,18 @@
+[package]
+name = "navigator-launcher"
+description = "Tiny launcher of MQTT Navigator: applies a staged update, rolls back a bad one, starts the app."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mqtt-navigator-launcher"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

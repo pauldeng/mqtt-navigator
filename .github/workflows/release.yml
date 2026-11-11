@@ -1,0 +1,235 @@
+name: Release
+
+# Push a tag `vX.Y.Z` to build a draft release. See docs/release.md and ADR 0005.
+# Patterns from pavi2410/based `release.yml` (MIT) and vicanso/zedis `publish.yml` (Apache-2.0).
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PACKAGER_VERSION: "0.11.8"
+  CARGO_ABOUT_VERSION: "0.9.3"
+  CARGO_CYCLONEDX_VERSION: "0.5.10"
+
+jobs:
+  draft:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The tag must match the crate version
+        id: v
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -I -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists already."
+            exit 0
+          fi
+          flags=""
+          case "$VERSION" in *-*) flags="--prerelease" ;; esac
+          gh release create "$TAG" --draft --verify-tag $flags --title "MQTT Navigator $TAG" --generate-notes
+
+  build:
+    needs: draft
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15, target: x86_64-apple-darwin } # cross build on the arm64 runner
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.draft.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (toolchain input = stable)
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libzstd-dev libvulkan1 libfuse2t64
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version "$CARGO_PACKAGER_VERSION"
+      - name: Build the payload and the launcher
+        run: cargo build --release --locked --target "$TARGET" -p navigator-app -p navigator-launcher
+
+      # ---------------------------------------------------------------- Linux
+      - name: Package (AppImage, deb, tar)
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          cargo packager --release -p navigator-app --target "$TARGET" --formats appimage,deb
+          mkdir stage
+          name="mqtt-navigator-$VERSION-$TARGET"
+          cp dist/*.AppImage "stage/$name.AppImage"
+          cp dist/*.deb "stage/$name.deb"
+          mkdir "$name"
+          cp "target/$TARGET/release/mqtt-navigator" "target/$TARGET/release/mqtt-navigator-launcher" LICENSE-MIT LICENSE-APACHE "$name/"
+          tar -czf "stage/$name.tar.gz" "$name"
+
+      # -------------------------------------------------------------- Windows
+      - name: Prepare signtool and the certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+        run: |
+          if (-not $env:WINDOWS_PFX_BASE64) { throw "Secret WINDOWS_PFX_BASE64 is empty." }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          $tool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          "PFX_PATH=$pfx" >> $env:GITHUB_ENV
+          "SIGNTOOL=$($tool.FullName)" >> $env:GITHUB_ENV
+      - name: Sign the launcher and the payload
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          foreach ($f in 'mqtt-navigator-launcher.exe', 'mqtt-navigator.exe') {
+            & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $env:PFX_PATH /p $env:WINDOWS_PFX_PASSWORD "target\$env:TARGET\release\$f"
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $f" }
+          }
+      - name: Package (NSIS)
+        if: runner.os == 'Windows'
+        run: cargo packager --release -p navigator-app --target "$TARGET" --formats nsis
+      - name: Sign the installer, verify all three, make the zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          New-Item -ItemType Directory stage | Out-Null
+          $name = "mqtt-navigator-$env:VERSION-$env:TARGET"
+          $setup = "stage\$name-setup.exe"
+          Copy-Item (Get-ChildItem dist\*-setup.exe | Select-Object -First 1).FullName $setup
+          & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $env:PFX_PATH /p $env:WINDOWS_PFX_PASSWORD $setup
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for the installer" }
+          $bin = "target\$env:TARGET\release"
+          & $env:SIGNTOOL verify /pa $setup "$bin\mqtt-navigator-launcher.exe" "$bin\mqtt-navigator.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed" }
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item "$bin\mqtt-navigator.exe", "$bin\mqtt-navigator-launcher.exe", LICENSE-MIT, LICENSE-APACHE $name
+          Compress-Archive -Path $name -DestinationPath "stage\$name.zip"
+      - name: Remove the certificate
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: if ($env:PFX_PATH) { Remove-Item -Force -ErrorAction SilentlyContinue $env:PFX_PATH }
+
+      # ---------------------------------------------------------------- macOS
+      - name: Package (.app with ad-hoc signature, DMG, zip)
+        if: runner.os == 'macOS'
+        run: |
+          # macos.signing-identity = "-" makes the packager sign the bundle ad hoc, inside out.
+          cargo packager --release -p navigator-app --target "$TARGET" --formats app,dmg
+          app="dist/MQTT Navigator.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          mkdir stage
+          name="mqtt-navigator-$VERSION-$TARGET"
+          cp dist/*.dmg "stage/$name.dmg"
+          ditto -c -k --keepParent "$app" "stage/$name.app.zip"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: stage/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [draft, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # upload to the draft release
+      id-token: write # provenance attestations
+      attestations: write
+    env:
+      VERSION: ${{ needs.draft.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (toolchain input = stable)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: staging
+      - name: Install tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y minisign
+          cargo install cargo-about --locked --version "$CARGO_ABOUT_VERSION" --features cli
+          cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
+      - name: Licence notices (hand-written theme section + Rust licences)
+        run: |
+          cp THIRD-PARTY-NOTICES.md staging/THIRD-PARTY-NOTICES.md
+          printf '\n' >> staging/THIRD-PARTY-NOTICES.md
+          cargo about generate --locked --all-features about.hbs >> staging/THIRD-PARTY-NOTICES.md
+      - name: SBOM (CycloneDX)
+        run: |
+          cargo cyclonedx --format json --describe binaries --target all
+          for f in crates/*/*_bin.cdx.json; do
+            cp "$f" "staging/mqtt-navigator-$VERSION-$(basename "$f" _bin.cdx.json).cdx.json"
+          done
+      - name: SHA256SUMS
+        run: cd staging && sha256sum * > SHA256SUMS
+      - name: latest.json and its minisign signature
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          base="https://github.com/${{ github.repository }}/releases/download/$TAG"
+          python3 -I scripts/make-manifest.py --version "$VERSION" --base-url "$base" --out staging/latest.json \
+            "x86_64-unknown-linux-gnu=staging/mqtt-navigator-$VERSION-x86_64-unknown-linux-gnu.AppImage" \
+            "x86_64-pc-windows-msvc=staging/mqtt-navigator-$VERSION-x86_64-pc-windows-msvc.zip" \
+            "aarch64-apple-darwin=staging/mqtt-navigator-$VERSION-aarch64-apple-darwin.app.zip" \
+            "x86_64-apple-darwin=staging/mqtt-navigator-$VERSION-x86_64-apple-darwin.app.zip"
+          scripts/sign-manifest.sh staging/latest.json
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: staging/*
+      - name: Upload to the draft release
+        run: |
+          ls -l staging
+          gh release upload "$TAG" staging/* --clobber
