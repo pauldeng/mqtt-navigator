@@ -42,7 +42,7 @@ category = "DeveloperTool"
 out-dir = "../../dist"
 license-file = "../../LICENSE-MIT"
 copyright = "Copyright (c) MQTT Navigator contributors"
-long-description = "A fast, native, cross-platform MQTT 3.1.1 and 5.0 client for desktop. Browse topics as a tree, inspect payloads, and publish messages."
+long-description = "A fast, native, cross-platform MQTT 5.0 client for desktop. Subscribe to topics, browse them as a tree or a message list, inspect payloads, and publish messages."
 icons = [
   "../../assets/icon/icon-32.png",
   "../../assets/icon/icon-128.png",
