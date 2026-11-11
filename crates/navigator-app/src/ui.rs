@@ -11,15 +11,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::component::WindowExt;
-use gpui_kit::component::button::{Button, ButtonVariants, DropdownButton};
+use gpui_kit::component::button::{Button, ButtonVariants, DropdownButton, Toggle, ToggleGroup};
 use gpui_kit::component::command::{Command as PaletteList, CommandItem, CommandState};
+use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::list::ListItem;
+use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::TabBar;
+use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Sizable, Theme, TitleBar, h_flex, v_flex,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, Theme, TitleBar, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -28,7 +33,7 @@ use navigator_core::decode::preview;
 use navigator_core::net::{
     Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, SendError, Status,
 };
-use navigator_core::settings::{RowHeight, Settings, ThemeMode, ViewMode};
+use navigator_core::settings::{Load, RowHeight, Settings, ThemeMode, ViewMode};
 use navigator_core::store::{
     Direction, DirectionFilter, Insert, Limits, ListFilter, Msg, NodeId, RowId, RowView,
     SendStatus, TopicStore, TreeFilter,
@@ -61,6 +66,12 @@ actions!(
         CollapseNode
     ]
 );
+
+/// Design pixels as `Rems`. The design is drawn at the default 16 px rem. Layout uses this
+/// instead of `px(..)`, so that it follows the zoom (the theme `font_size`).
+pub(crate) const fn ui(px: f32) -> Rems {
+    rems(px / 16.0)
+}
 
 const CONTEXT: &str = "Navigator";
 const LIST_CONTEXT: &str = "NavigatorList";
@@ -204,12 +215,18 @@ const RESIZE_SETTLE: Duration = Duration::from_secs(1);
 const RESIZE_SAVE: Duration = Duration::from_millis(250);
 /// Wait before a filter text change applies.
 const DEBOUNCE: Duration = Duration::from_millis(150);
-/// Row heights of the message list and the tree.
 const MIB: usize = 1024 * 1024;
-const ROW_HEIGHT: f32 = 24.;
-const ROW_HEIGHT_2: f32 = 40.;
-/// Height of one subscription row: the filter line and the state line.
-const SUB_ROW_H: f32 = 44.;
+/// Row heights in design pixels (at a 16 px rem, see [`ui`]): a message row of 1 line and of 2
+/// lines, a tree row, and a subscription row (the filter line and the state line).
+const ROW_H1: f32 = 30.;
+const ROW_H2: f32 = 44.;
+const TREE_ROW_H: f32 = 28.;
+const SUB_ROW_H: f32 = 48.;
+/// Widths of the side panes in design pixels: default, least and most. The centre pane keeps at
+/// least `CENTRE_MIN`.
+const LEFT_W: (f32, f32, f32) = (260., 180., 420.);
+const RIGHT_W: (f32, f32, f32) = (360., 280., 720.);
+const CENTRE_MIN: f32 = 360.;
 
 /// Where one subscription row is in its life.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -536,6 +553,14 @@ pub struct Navigator {
     /// The window is narrower than `details::NARROW`: the details open as a sheet.
     narrow: bool,
     comp: compose::Composer,
+    /// The widths of the three panes (subscriptions, centre, details).
+    panes: Entity<ResizableState>,
+    /// The details width before "Expand". "Restore" returns to it.
+    expand_restore: Option<Pixels>,
+    /// "Reset layout" asked for the default pane widths. The next frame does it.
+    pane_reset: bool,
+    /// Pixels of one rem in the last frame. Row heights follow it (zoom).
+    rem: f32,
     list_scroll: UniformListScrollHandle,
     tree_scroll: UniformListScrollHandle,
     subs_scroll: UniformListScrollHandle,
@@ -573,7 +598,12 @@ struct Rate {
 impl Navigator {
     /// `cli` is the session profile from the command line. The window opens first. The settings
     /// arrive later, as an event.
-    pub fn new(cli: Option<ConnectConfig>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        cli: Option<ConnectConfig>,
+        load: Load,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut secret_cache = HashMap::new();
         let profile = cli.map(|c| {
             // The command line password stays in memory. It is never saved.
@@ -618,11 +648,11 @@ impl Navigator {
             },
         );
 
-        // Theme follows the system (event-driven), until the settings say Light or Dark.
-        Theme::sync_system_appearance(Some(window), cx);
+        // `main` applied the saved theme. In System mode, a change of the OS appearance (an
+        // event, no polling) applies again.
         let appearance = cx.observe_window_appearance(window, |v, window, cx| {
             if v.settings.ui.theme_mode == ThemeMode::System {
-                Theme::sync_system_appearance(Some(window), cx);
+                v.apply_theme(window, cx);
             }
         });
         let bounds = cx.observe_window_bounds(window, |v, window, cx| v.on_resize(window, cx));
@@ -666,9 +696,8 @@ impl Navigator {
         root_focus.focus(window, cx);
 
         let subs = Subs::from_profile(profile.as_ref().map_or(&[], |p| &p.subscriptions));
-        let path = crate::persist::settings_path();
         let (writer_errors, writer_errors_rx) = tokio::sync::mpsc::channel(4);
-        let writer = path.clone().map(|p| Writer::start(p, writer_errors));
+        let writer = crate::persist::settings_path().map(|p| Writer::start(p, writer_errors));
         let mut this = Self {
             session: profile.clone(),
             profile,
@@ -715,6 +744,10 @@ impl Navigator {
             details_open: true,
             narrow: false,
             comp: compose::Composer::new(window, cx),
+            panes: cx.new(|_| ResizableState::default()),
+            expand_restore: None,
+            pane_reset: false,
+            rem: 16.,
             list_scroll: UniformListScrollHandle::new(),
             tree_scroll: UniformListScrollHandle::new(),
             subs_scroll: UniformListScrollHandle::new(),
@@ -765,7 +798,8 @@ impl Navigator {
         {
             tracing::warn!(%why, "The command line connection is not valid");
         }
-        this.spawn_settings(path, writer_errors_rx, window, cx);
+        this.spawn_write_errors(writer_errors_rx, window, cx);
+        this.apply_settings(load, window, cx);
         this
     }
 
@@ -968,12 +1002,14 @@ impl Navigator {
         .detach();
     }
 
+    /// A design height in pixels now. The rows are `ui(..)` high, so this equals their height.
+    fn scaled(&self, design: f32) -> f32 {
+        design * self.rem / 16.
+    }
+
+    /// Height of one message row in pixels (the scroll anchor needs it).
     fn row_height(&self) -> f32 {
-        if self.two_lines {
-            ROW_HEIGHT_2
-        } else {
-            ROW_HEIGHT
-        }
+        self.scaled(if self.two_lines { ROW_H2 } else { ROW_H1 })
     }
 
     /// Remembers the top visible row, so that `restore_anchor` can undo the shift of new rows.
@@ -1546,11 +1582,11 @@ impl Navigator {
                 .pr_2()
                 .gap_3()
                 .child(
-                    div().w(px(180.)).child(
+                    div().w(ui(180.)).child(
                         Select::new(&self.profile_select)
                             .small()
                             .placeholder("No connections")
-                            .menu_width(px(260.)),
+                            .menu_width(ui(260.)),
                     ),
                 )
                 .child(
@@ -1563,7 +1599,7 @@ impl Navigator {
                                 div()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .max_w(px(360.))
+                                    .max_w(ui(360.))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
@@ -1573,7 +1609,7 @@ impl Navigator {
                 )
                 .child(div().flex_1())
                 .child(
-                    div().w(px(300.)).child(
+                    div().w(ui(300.)).child(
                         Input::new(&self.filter_input)
                             .small()
                             .prefix(IconName::Search),
@@ -1583,22 +1619,11 @@ impl Navigator {
                     Button::new("palette")
                         .small()
                         .ghost()
-                        .label("Commands")
+                        .label("Commands…")
                         .tooltip(format!("Command palette ({}+K)", crate::palette::MOD))
                         .on_click(cx.listener(|v, _, window, cx| v.open_palette(window, cx))),
                 )
-                .child(
-                    Button::new("theme")
-                        .small()
-                        .ghost()
-                        .label(match self.settings.ui.theme_mode {
-                            ThemeMode::System => "Theme: System",
-                            ThemeMode::Light => "Theme: Light",
-                            ThemeMode::Dark => "Theme: Dark",
-                        })
-                        .tooltip("Change the theme")
-                        .on_click(cx.listener(|v, _, window, cx| v.cycle_theme(window, cx))),
-                )
+                .child(self.render_theme_menu(cx))
                 .child(
                     Button::new("connect")
                         .small()
@@ -1610,6 +1635,48 @@ impl Navigator {
                         .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx))),
                 ),
         )
+    }
+
+    /// The title bar menu: "Appearance" (System, Light, Dark) and "Theme" (the presets). The
+    /// checked items show the current choice.
+    fn render_theme_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.settings.ui.theme_mode;
+        let current = crate::themes::preset_by_id(&self.settings.ui.theme_preset);
+        let weak = cx.entity().downgrade();
+        Button::new("theme")
+            .small()
+            .ghost()
+            .icon(IconName::Palette)
+            .label(current.label)
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.label("Appearance");
+                for (label, m) in [
+                    ("System", ThemeMode::System),
+                    ("Light", ThemeMode::Light),
+                    ("Dark", ThemeMode::Dark),
+                ] {
+                    let weak = weak.clone();
+                    menu = menu.item(PopupMenuItem::new(label).checked(mode == m).on_click(
+                        move |_, window, cx| {
+                            weak.update(cx, |v, cx| v.set_appearance(m, window, cx))
+                                .ok();
+                        },
+                    ));
+                }
+                menu = menu.separator().label("Theme");
+                for p in crate::themes::PRESETS {
+                    let weak = weak.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(p.label)
+                            .checked(p.id == current.id)
+                            .on_click(move |_, window, cx| {
+                                weak.update(cx, |v, cx| v.set_preset(p.id, window, cx)).ok();
+                            }),
+                    );
+                }
+                menu
+            })
     }
 
     /// One subscription row. Its height is `SUB_ROW_H`, so that the list can be virtual.
@@ -1638,110 +1705,121 @@ impl Navigator {
         let row_id = ElementId::from(s.filter.clone());
         let (retry, remove, pick) = (s.filter.clone(), s.filter.clone(), s.filter.clone());
         let active = self.show_only.as_deref() == Some(&*s.filter);
-        v_flex()
-            .id(row_id.clone())
-            .h(px(SUB_ROW_H))
+        let line = h_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                div()
+                    .flex_none()
+                    .size_2()
+                    .rounded_full()
+                    .bg(chip_colour(i, theme)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_sm()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(s.filter.clone()),
+            )
+            .child(Tag::secondary().xsmall().child(match s.qos {
+                Qos::AtMostOnce => "Q0",
+                Qos::AtLeastOnce => "Q1",
+            }))
+            .child(
+                Button::new((row_id.clone(), "remove"))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Remove subscription")
+                    .disabled(s.state == SubState::Removing)
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        // The row itself toggles "Show only": keep this click on the button.
+                        cx.stop_propagation();
+                        v.remove_sub(&remove, cx)
+                    })),
+            );
+        let status = h_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(if failed {
+                        theme.danger
+                    } else if active {
+                        theme.accent_foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .child(state),
+            )
+            .when(failed, |d| {
+                d.child(
+                    Button::new((row_id.clone(), "retry"))
+                        .xsmall()
+                        .label(retry_label)
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            cx.stop_propagation();
+                            if retry_remove {
+                                v.remove_sub(&retry, cx)
+                            } else {
+                                v.retry_sub(&retry, cx)
+                            }
+                        })),
+                )
+            });
+        // Click the row to show only its messages. Click again to show all. The state of the
+        // row (selected) is the fill of the row.
+        ListItem::new(row_id)
+            .h(ui(SUB_ROW_H))
             .flex_none()
             .overflow_hidden()
             .rounded_sm()
-            .when(active, |d| d.bg(theme.accent))
-            .child(
-                h_flex()
-                    .gap_2()
-                    // Click the filter to show only its messages. Click again to show all.
-                    .child(
-                        h_flex()
-                            .id((row_id.clone(), "pick"))
-                            .flex_1()
-                            .min_w_0()
-                            .gap_2()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |v, _, _, cx| v.toggle_show_only(&pick, cx)))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .size_2()
-                                    .rounded_full()
-                                    .bg(chip_colour(i, theme)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_sm()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(s.filter.clone()),
-                            ),
-                    )
-                    .child(div().text_xs().child(match s.qos {
-                        Qos::AtMostOnce => "Q0",
-                        Qos::AtLeastOnce => "Q1",
-                    }))
-                    .child(
-                        Button::new((row_id.clone(), "remove"))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Remove subscription")
-                            .disabled(s.state == SubState::Removing)
-                            .on_click(cx.listener(move |v, _, _, cx| v.remove_sub(&remove, cx))),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(if failed {
-                                theme.danger
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .child(state),
-                    )
-                    .when(failed, |d| {
-                        d.child(
-                            Button::new((row_id, "retry"))
-                                .xsmall()
-                                .label(retry_label)
-                                .on_click(cx.listener(move |v, _, _, cx| {
-                                    if retry_remove {
-                                        v.remove_sub(&retry, cx)
-                                    } else {
-                                        v.retry_sub(&retry, cx)
-                                    }
-                                })),
-                        )
-                    }),
-            )
+            .px_2()
+            .py_0p5()
+            .selected(active)
+            .on_click(cx.listener(move |v, _, _, cx| v.toggle_show_only(&pick, cx)))
+            .child(v_flex().w_full().child(line).child(status))
             .into_any_element()
     }
 
     fn render_subs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let qos_button = |q: Qos| {
-            let b = Button::new(("sub-qos", q.as_u8() as usize))
-                .small()
-                .label(format!("Q{}", q.as_u8()));
-            let b = if self.sub_qos == q {
-                b.primary()
-            } else {
-                b.ghost()
-            };
-            b.on_click(cx.listener(move |v, _, _, cx| {
-                v.sub_qos = q;
-                cx.notify();
-            }))
-        };
+        // A toggle group with a selected state: QoS 0 or QoS 1. A click on the selected one
+        // keeps it.
+        let qos = ToggleGroup::new("sub-qos")
+            .segmented()
+            .single()
+            .small()
+            .child(
+                Toggle::new("sub-qos-0")
+                    .label("Q0")
+                    .checked(self.sub_qos == Qos::AtMostOnce),
+            )
+            .child(
+                Toggle::new("sub-qos-1")
+                    .label("Q1")
+                    .checked(self.sub_qos == Qos::AtLeastOnce),
+            )
+            .on_click(cx.listener(|v, checks: &Vec<bool>, _, cx| {
+                if let Some(ix) = checks.iter().position(|c| *c) {
+                    v.sub_qos = if ix == 0 {
+                        Qos::AtMostOnce
+                    } else {
+                        Qos::AtLeastOnce
+                    };
+                    cx.notify();
+                }
+            }));
         let has_hash = self.subs.contains("#");
         v_flex()
-            .w(px(260.))
-            .h_full()
+            .size_full()
             .border_r_1()
             .border_color(theme.border)
             .p_2()
@@ -1750,7 +1828,7 @@ impl Navigator {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("SUBSCRIPTIONS"),
+                    .child("Subscriptions"),
             )
             // Only the visible rows are built. The add input stays pinned below them.
             .child(
@@ -1781,8 +1859,7 @@ impl Navigator {
                 h_flex()
                     .gap_1()
                     .child(div().flex_1().child(Input::new(&self.sub_input).small()))
-                    .child(qos_button(Qos::AtMostOnce))
-                    .child(qos_button(Qos::AtLeastOnce)),
+                    .child(qos),
             )
             .when_some(self.sub_error.clone(), |d, e| {
                 d.child(div().text_xs().text_color(theme.danger).child(e))
@@ -1808,9 +1885,17 @@ impl Navigator {
     fn sub_list_sig(&self, theme: &Theme) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (self.subs.rev, &self.show_only, self.connected()).hash(&mut h);
+        (
+            self.subs.rev,
+            &self.show_only,
+            self.connected(),
+            self.rem.to_bits(),
+            theme.theme_name(),
+        )
+            .hash(&mut h);
         for c in [
             theme.accent,
+            theme.accent_foreground,
             theme.muted_foreground,
             theme.danger,
             theme.chart_1,
@@ -1847,7 +1932,7 @@ impl Navigator {
             .border_b_1()
             .border_color(theme.border)
             .child(
-                div().flex_none().w(px(150.)).child(
+                div().flex_none().w(ui(150.)).child(
                     TabBar::new("view")
                         .segmented()
                         .small()
@@ -1861,7 +1946,7 @@ impl Navigator {
             )
             .when(messages, |d| {
                 d.child(
-                    div().flex_none().w(px(210.)).child(
+                    div().flex_none().w(ui(210.)).child(
                         TabBar::new("direction")
                             .segmented()
                             .small()
@@ -1887,7 +1972,6 @@ impl Navigator {
                     .ghost()
                     .icon(IconName::PanelRight)
                     .label("Details")
-                    .tooltip("Show or hide the details")
                     .on_click(cx.listener(|v, _, window, cx| v.toggle_details(window, cx))),
             )
             .when(paused, |d| {
@@ -1910,14 +1994,14 @@ impl Navigator {
             )
             .when(messages, |d| {
                 d.child(
-                    Button::new("follow")
+                    // A toggle with a selected state, not a primary/ghost swap.
+                    Toggle::new("follow")
                         .small()
-                        .when(self.follow, |b| b.primary())
-                        .when(!self.follow, |b| b.ghost())
+                        .icon(IconName::ArrowDown)
                         .label("Follow")
-                        .tooltip("Keep the newest message in view")
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.follow = !v.follow;
+                        .checked(self.follow)
+                        .on_click(cx.listener(|v, on: &bool, _, cx| {
+                            v.follow = *on;
                             cx.notify();
                         })),
                 )
@@ -1926,7 +2010,6 @@ impl Navigator {
                         .small()
                         .ghost()
                         .label(if self.two_lines { "2 lines" } else { "1 line" })
-                        .tooltip("Row height")
                         .on_click(cx.listener(|v, _, _, cx| {
                             v.two_lines = !v.two_lines;
                             v.settings.ui.row_height = if v.two_lines {
@@ -1972,13 +2055,9 @@ impl Navigator {
                 .border_b_1()
                 .border_color(theme.border)
                 .children(chips.into_iter().map(|c| {
-                    div()
-                        .max_w(px(260.))
-                        .px_2()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_xs()
+                    Tag::secondary()
+                        .small()
+                        .max_w(ui(260.))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
@@ -1999,33 +2078,61 @@ impl Navigator {
         if self.profile.is_none() {
             return self.render_no_profile(cx);
         }
-        let filtered = self.filters_active();
-        let text = if filtered {
-            match self.view {
-                View::Messages => "No messages match the filters.",
-                View::Tree => "No topics match the filters.",
-            }
-        } else if self.connected() {
-            "No messages yet. Messages show here when the broker sends them."
+        if self.filters_active() {
+            let (title, what) = match self.view {
+                View::Messages => (
+                    "No messages match the filters",
+                    "Change or clear the filters.",
+                ),
+                View::Tree => (
+                    "No topics match the filters",
+                    "Change or clear the filters.",
+                ),
+            };
+            return empty_state(
+                title,
+                what,
+                [Button::new("clear-filters-empty")
+                    .small()
+                    .label("Clear filters")
+                    .on_click(cx.listener(|v, _, window, cx| v.clear_filters(window, cx)))
+                    .into_any_element()],
+            );
+        }
+        if self.connected() {
+            return empty_state(
+                "No messages yet",
+                "Messages show here when the broker sends them.",
+                [],
+            );
+        }
+        let connecting = self.connecting()
+            || matches!(
+                self.status.state,
+                ConnState::Connecting | ConnState::Reconnecting { .. }
+            );
+        let (title, what, action) = if connecting {
+            (
+                format!("Connecting to {}…", self.url()),
+                "Messages show here when the connection is up.",
+                "Cancel",
+            )
         } else {
-            "Connect to a broker to see messages."
+            (
+                "Not connected".to_string(),
+                "Connect to a broker to see messages.",
+                "Connect",
+            )
         };
-        v_flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .text_color(cx.theme().muted_foreground)
-            .child(text)
-            .when(filtered, |d| {
-                d.child(
-                    Button::new("clear-filters-empty")
-                        .small()
-                        .label("Clear filters")
-                        .on_click(cx.listener(|v, _, window, cx| v.clear_filters(window, cx))),
-                )
-            })
-            .into_any_element()
+        empty_state(
+            &title,
+            what,
+            [Button::new("connect-empty")
+                .small()
+                .label(action)
+                .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx)))
+                .into_any_element()],
+        )
     }
 
     /// The centre pane: header, filter chips and the active view. The composer is added by the
@@ -2123,7 +2230,7 @@ impl Navigator {
 
     /// One row of the message list. Its height is fixed, so that the list can be virtual.
     fn message_row(&self, row: RowData, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let height = px(self.row_height());
+        let height = ui(if self.two_lines { ROW_H2 } else { ROW_H1 });
         let mono = theme.mono_font_family.clone();
         let muted = theme.muted_foreground;
         match row {
@@ -2159,7 +2266,7 @@ impl Navigator {
                         if self.two_lines {
                             d.flex_1()
                         } else {
-                            d.max_w(px(320.))
+                            d.max_w(ui(320.))
                         }
                     })
                     .child(topic);
@@ -2178,11 +2285,13 @@ impl Navigator {
                     .child(chip)
                     .when(sent.is_some(), |d| {
                         d.child(
-                            div()
+                            h_flex()
                                 .flex_none()
+                                .gap_0p5()
                                 .text_xs()
                                 .text_color(muted)
-                                .child("↑ Sent"),
+                                .child(Icon::new(IconName::ArrowUp).xsmall())
+                                .child("Sent"),
                         )
                     })
                     .child(topic)
@@ -2226,7 +2335,7 @@ impl Navigator {
                     .child(preview);
                 let size = div()
                     .flex_none()
-                    .w(px(64.))
+                    .w(ui(64.))
                     .flex()
                     .justify_end()
                     .font_family(mono)
@@ -2311,15 +2420,13 @@ impl Navigator {
                     .map(|id| {
                         // A paused snapshot can hold a node that `work` removed since.
                         let Some(n) = v.store.get(id) else {
-                            return div().h(px(ROW_HEIGHT)).into_any_element();
+                            return div().h(ui(TREE_ROW_H)).into_any_element();
                         };
-                        let chevron = if !n.has_children {
-                            " "
-                        } else if n.expanded {
-                            "▾"
+                        let chevron = n.has_children.then_some(if n.expanded {
+                            IconName::ChevronDown
                         } else {
-                            "▸"
-                        };
+                            IconName::ChevronRight
+                        });
                         // Paused: the store has the preview of the snapshot.
                         let preview: SharedString = match (n.preview, n.latest) {
                             (Some(p), _) => p.to_string().into(),
@@ -2329,14 +2436,18 @@ impl Navigator {
                         let selected = v.sel_topic == Some(id);
                         h_flex()
                             .id(("row", node_key(id)))
-                            .h(px(ROW_HEIGHT))
+                            .h(ui(TREE_ROW_H))
                             .px_2()
                             .gap_2()
                             .text_sm()
                             .when(selected, |d| d.bg(theme.accent))
                             .hover(|d| d.bg(theme.muted))
-                            .child(div().w(px(n.depth as f32 * 14.)))
-                            .child(div().w(px(12.)).child(chevron))
+                            .child(div().w(ui(n.depth as f32 * 14.)))
+                            .child(
+                                div().w(ui(14.)).flex_none().when_some(chevron, |d, icon| {
+                                    d.child(Icon::new(icon).xsmall())
+                                }),
+                            )
                             .child(
                                 div()
                                     .font_family(theme.mono_font_family.clone())
@@ -2355,7 +2466,7 @@ impl Navigator {
                                 div()
                                     .font_family(theme.mono_font_family.clone())
                                     .text_color(theme.muted_foreground)
-                                    .max_w(px(320.))
+                                    .max_w(ui(320.))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
@@ -2363,7 +2474,7 @@ impl Navigator {
                             )
                             .child(
                                 div()
-                                    .w(px(72.))
+                                    .w(ui(72.))
                                     .flex()
                                     .justify_end()
                                     .font_family(theme.mono_font_family.clone())
@@ -2396,8 +2507,7 @@ impl Navigator {
                         "{} MiB / {}",
                         used / MIB,
                         crate::palette::memory_text(current)
-                    ))
-                    .tooltip("Memory limit"),
+                    )),
             )
             .dropdown_menu(move |menu, _, _| {
                 crate::palette::MEMORY_OPTIONS_MIB.into_iter().fold(
@@ -2414,6 +2524,69 @@ impl Navigator {
                     },
                 )
             })
+    }
+
+    /// Width limits of the panes in pixels: (initial, least, most) for the two side panes, and
+    /// the least of the centre. The saved widths are clamped to them, and the sides never take
+    /// the room that the centre needs. Rems give the limits, so that they follow the zoom.
+    fn pane_limits(&self, window: &Window) -> PaneLimits {
+        let rem = window.rem_size();
+        let to_px = |v: f32| ui(v).to_pixels(rem);
+        let total = window.viewport_size().width;
+        let centre = to_px(CENTRE_MIN);
+        let saved = |i: usize| self.settings.ui.pane_widths.get(i).copied();
+        let left_max =
+            to_px(LEFT_W.2).min((total - centre - to_px(RIGHT_W.1)).max(to_px(LEFT_W.1)));
+        let left_min = to_px(LEFT_W.1);
+        let left = saved(0)
+            .filter(|w| w.is_finite())
+            .map_or(to_px(LEFT_W.0), px)
+            .clamp(left_min, left_max);
+        let right_min = to_px(RIGHT_W.1);
+        // The same rule as the left pane: the design maximum, or less when the centre needs
+        // the room. Expand uses its own, wider target (`resize_panel` does not save it).
+        let right_max = to_px(RIGHT_W.2)
+            .min((total - left - centre).max(right_min))
+            .max(right_min);
+        let right = saved(1)
+            .filter(|w| w.is_finite())
+            .map_or(to_px(RIGHT_W.0), px)
+            .clamp(
+                right_min,
+                (total - left - centre).clamp(right_min, right_max),
+            );
+        PaneLimits {
+            left: (left, left_min, left_max),
+            right: (right, right_min, right_max),
+            centre,
+        }
+    }
+
+    /// The user dragged a handle. Save the side widths. A drag ends "Expand".
+    fn panes_resized(&mut self, sizes: &[Pixels]) {
+        let w = |i: usize| sizes.get(i).map(|s| f32::from(*s));
+        let saved = &self.settings.ui.pane_widths;
+        let left = w(0).or_else(|| saved.first().copied());
+        // The details panel keeps its last size while it is hidden.
+        let right = w(2).or_else(|| saved.get(1).copied());
+        if let (Some(l), Some(r)) = (left, right) {
+            self.settings.ui.pane_widths = vec![l.round(), r.round()];
+            self.insp.expanded = false;
+            self.expand_restore = None;
+            self.persist();
+        }
+    }
+
+    /// Puts the side panes at their default widths. The widths are no longer saved.
+    fn reset_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.ui.pane_widths.clear();
+        self.persist();
+        let limits = self.pane_limits(window);
+        self.panes.update(cx, |s, cx| {
+            s.resize_panel(0, limits.left.0, window, cx);
+            s.resize_panel(2, limits.right.0, window, cx);
+        });
+        cx.notify();
     }
 
     /// The memory limit of the store now, in MiB.
@@ -2435,9 +2608,9 @@ impl Navigator {
         let mut left = h_flex().gap_3().text_xs().child(self.url());
         if let Some(p) = &self.profile {
             if !p.transport.is_encrypted() {
-                left = left.child(div().text_color(theme.warning).child("Not encrypted"));
+                left = left.child(Tag::warning().xsmall().child("Not encrypted"));
             } else if !p.verify_tls {
-                left = left.child(div().text_color(theme.warning).child("Insecure TLS"));
+                left = left.child(Tag::warning().xsmall().child("Insecure TLS"));
             }
         }
         if self.reconnected_at.is_some() {
@@ -2489,6 +2662,7 @@ impl Navigator {
 impl Render for Navigator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.metrics.frame_start(window);
+        self.rem = f32::from(window.rem_size());
         self.sync_subs();
         // A notify during the draw does not schedule a frame, so it goes out after the draw.
         let sig = self.sub_list_sig(cx.theme());
@@ -2512,11 +2686,12 @@ impl Render for Navigator {
             cx.defer_in(window, |_, window, cx| window.close_sheet(cx));
         }
         let chips = self.render_chips(cx);
-        let details = if self.details_open && !self.narrow {
-            Some(self.render_details(window, false, cx))
-        } else {
-            None
-        };
+        let show_details = self.details_open && !self.narrow;
+        let details = show_details.then(|| self.render_details(window, false, cx));
+        if std::mem::take(&mut self.pane_reset) {
+            cx.defer_in(window, |v, window, cx| v.reset_panes(window, cx));
+        }
+        let limits = self.pane_limits(window);
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -2538,24 +2713,65 @@ impl Render for Navigator {
             .on_action(cx.listener(|_, _: &FocusPrevField, window, cx| window.focus_prev(cx)))
             .child(self.render_title(cx))
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_subs(cx))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(self.render_header(cx))
-                            .children(chips)
-                            .child(self.render_list_area(cx))
-                            .child(self.render_composer(cx)),
-                    )
-                    .children(details),
+                div().flex_1().min_h_0().w_full().child(
+                    h_resizable("panes")
+                        .with_state(&self.panes)
+                        .on_resize({
+                            let weak = cx.entity().downgrade();
+                            move |state, _, cx| {
+                                let sizes = state.read(cx).sizes().clone();
+                                weak.update(cx, |v, _| v.panes_resized(&sizes)).ok();
+                            }
+                        })
+                        .child(
+                            resizable_panel()
+                                .size(limits.left.0)
+                                .size_range(limits.left.1..limits.left.2)
+                                .fixed()
+                                .child(self.render_subs(cx)),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size_range(limits.centre..Pixels::MAX)
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .child(self.render_header(cx))
+                                        .children(chips)
+                                        .child(self.render_list_area(cx))
+                                        .child(self.render_composer(window, cx)),
+                                ),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(limits.right.0)
+                                // Expanded: the pane may take the room up to the centre
+                                // minimum; a drag ends Expand and is capped again.
+                                .size_range(
+                                    limits.right.1..if self.insp.expanded {
+                                        Pixels::MAX
+                                    } else {
+                                        limits.right.2
+                                    },
+                                )
+                                .fixed()
+                                .visible(show_details)
+                                .children(details),
+                        ),
+                ),
             )
             .child(self.render_status(cx))
     }
+}
+
+/// Pane widths in pixels: (initial, least, most) of the left and the right pane, and the least
+/// of the centre.
+struct PaneLimits {
+    left: (Pixels, Pixels, Pixels),
+    right: (Pixels, Pixels, Pixels),
+    centre: Pixels,
 }
 
 /// The subscription rows of the main view. Own view, so that gpui can reuse its last frame.
@@ -2570,6 +2786,29 @@ impl Render for SubList {
             None => div().into_any_element(),
         }
     }
+}
+
+/// An empty state: a title, one sentence and the actions (one of them at most is primary).
+pub(crate) fn empty_state(
+    title: &str,
+    description: &str,
+    actions: impl IntoIterator<Item = AnyElement>,
+) -> AnyElement {
+    let mut content = EmptyContent::new();
+    let mut has_action = false;
+    for a in actions {
+        content = content.child(a);
+        has_action = true;
+    }
+    Empty::new()
+        .m_3()
+        .header(
+            EmptyHeader::new()
+                .title(EmptyTitle::new().child(title.to_string()))
+                .description(EmptyDescription::new().child(description.to_string())),
+        )
+        .when(has_action, |e| e.content(content))
+        .into_any_element()
 }
 
 /// A stable number for the element id of a tree row. `NodeId` keeps its fields private, and the
@@ -2708,8 +2947,10 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
         COALESCE, FRAME_BUDGET, GenGate, SubState, Subs, WORK_RESERVE, coalesce_wait,
-        connection_live, merge_budget, scroll_top_of, send_error_text, top_row, validate_filter,
+        connection_live, merge_budget, scroll_top_of, send_error_text, top_row, ui,
+        validate_filter,
     };
+    use gpui_kit::{px, rems};
     use navigator_core::Qos;
     use navigator_core::net::SendError;
     use std::time::Duration;
@@ -2755,6 +2996,14 @@ mod tests {
         // A cancel ends it.
         g.clear();
         assert!(!connection_live(&idle, &g, 0));
+    }
+
+    #[test]
+    fn layout_sizes_follow_the_rem() {
+        // At the default rem (16 px) a design pixel is a pixel. At twice the rem, it doubles.
+        assert_eq!(ui(30.).to_pixels(px(16.)), px(30.));
+        assert_eq!(ui(30.).to_pixels(px(32.)), px(60.));
+        assert_eq!(ui(16.), rems(1.));
     }
 
     #[test]

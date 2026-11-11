@@ -8,7 +8,9 @@ This page is the design reference for the user interface. Read [ARCHITECTURE.md]
 - Keep the UI simple and professional, in a dense developer-tool style.
 - Use **gpui-kit components only**. Do not use a webview or web UI. Do not depend on `gpui-webview` or `gpui-shell`.
 - Use only theme tokens from `cx.theme()`. Do not put raw colour values in components.
-- Each area has one primary action: Connect or Disconnect in the title bar, Subscribe in the left pane, Send in the composer.
+- Each area has one primary action: Connect or Disconnect in the title bar, Send in the composer, Save and connect in the connection sheet. The subscribe input has no button: Enter adds the filter.
+- A choice shows its selected state (a toggle group, a toggle, a selected list row). Do not swap primary and ghost buttons to show a choice.
+- Follow the [gpui-kit design guides](https://gpui-kit.com/docs/design-guides.md) for sizes, copy and states.
 - All actions work from the keyboard. The one exception is pane resizing, which uses the mouse ("Reset layout" is in the command palette).
 
 Sources:
@@ -31,17 +33,17 @@ None of the three has a direct "edit and publish" or "reply" action for a receiv
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │ [prod-broker ▾] ● Connected      🔍 Filter topics and payloads   Ctrl+K  [Disconnect] │ TitleBar
 ├───────────────────┬─────────────────────────────────────┬────────────────────────┤
-│ SUBSCRIPTIONS     │ [Messages│Tree]  [All│Received│Sent]  │ factory/line1/temp   R │
-│ ■ #           Q0  │                   ⏸ Pause  ✓ Follow │ [Value] [History]      │
+│ Subscriptions     │ [Messages│Tree]  [All│Received│Sent]  │ factory/line1/temp   R │
+│ ■ #           Q0  │                   ⏸ Pause [Follow] │ [Value] [History]      │
 │ ■ factory/#   Q1  │ 12:04:01.120 ■ factory/line1/temp  │ { "v": 21.4,           │
 │ ■ secret/#    ✗   │              QoS1 R  {"v":21.4,…}   │   "u": "°C" }          │
 │   Not authorized  │ 12:04:01.087 ■ home/garage/door    │ QoS 1 · Retained · 20 B│
 │                   │              QoS0    "closed"       │ content-type  app/json │
-│                   │ 12:04:00.990 ↑ factory/cmd   Sent  │ site          nz       │
+│                   │ 12:04:00.990 ↑Sent factory/cmd      │ site          nz       │
 │                   ├─────────────────────────────────────┤ [Edit and publish]     │
-│ [topic/filter    ]│ PUBLISH  [factory/line1/cmd     ]  │ [Reply]                │
+│ [topic/filter    ]│ Publish  [factory/line1/cmd     ]  │ [Reply]                │
 │ [Q0│Q1] [Subscribe]│ [{"cmd":"stop"}       ] Q[0│1] ☐R │ ───────                │
-│                   │ ▸ Properties          [Send ⌃⏎]    │ [Clear retained]       │
+│                   │ > Properties          [Send ⌃⏎]    │ [Clear retained…]      │
 ├───────────────────┴─────────────────────────────────────┴────────────────────────┤
 │ mqtts://broker:8883 · 1 240 msg/s · 105 topics · 34 / 128 MiB · 0 dropped         │ StatusBar
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -51,17 +53,18 @@ The window has one place for each job:
 
 - **Title bar:**
   - The profile `Select`. Its last item, "Manage connections…", opens the connection sheet (section 3.1).
+  - The theme menu (a `DropdownMenu`, section 5).
   - The connection state, as a dot **and** text: "Connecting…", "Connected", "Reconnecting (3)…", "Disconnected: not authorized".
   - The filter, and the command palette.
   - The one primary action. It is "Connect" when disconnected, "Cancel" while connecting, and "Disconnect" when connected.
   - If you select a different profile while connected, the app asks "Disconnect from prod and connect to test? Messages from prod are removed.". It does not change the active broker silently.
-  - **Data belongs to one profile.** Switching to another profile clears the received messages, the selection, the composer and History ▾. A disconnect or a reconnect with the **same** profile keeps them, and the list shows a marker row "Reconnected 12:05:10".
+  - **Data belongs to one profile.** Switching to another profile clears the received messages, the selection, the composer and History. A disconnect or a reconnect with the **same** profile keeps them, and the list shows a marker row "Reconnected 12:05:10".
 - **Left pane, Subscribe (major feature 1):**
-  - One input: type a topic filter and press Enter. QoS 0 is the default, and a small toggle sets QoS 1.
+  - One input: type a topic filter and press Enter. A toggle group (Q0 | Q1) next to it sets the QoS. QoS 0 is the default.
   - An invalid filter (for example `a/#/b` or an empty filter) shows an error under the input. The app does not send it.
   - A new row shows "Subscribing…" until the SUBACK arrives. Then it shows the granted QoS and a message count.
   - A rejected row shows the reason in text (for example "Not authorized (0x87)"), with **Retry** and **Remove**.
-  - Each subscription gets a colour automatically. A message takes the colour of the **first** subscription in the list that matches its topic. Click the colour chip to change the colour.
+  - The rows are `ListItem`s on a virtual list. Each subscription gets a colour automatically. A message takes the colour of the **first** subscription in the list that matches its topic. Click the colour chip to change the colour.
   - **Show only**: click a subscription to show only its messages, and click again to show all. This changes the view only. It does not unsubscribe. Remove (×) unsubscribes.
   - A new profile starts with the subscription `#`, so messages appear at once.
     - When you add a narrower filter while `#` exists, a hint asks "Remove # to receive only your filters?" with a **Remove #** button.
@@ -71,22 +74,22 @@ The window has one place for each job:
   - **Messages**:
     - One dense row for each message: time, subscription colour, topic, QoS, retained, payload preview.
     - The order is always chronological, newest first. There is no sorting.
-    - Sent messages show in the same list with an "↑ Sent" mark.
+    - Sent messages show in the same list with an arrow-up icon and "Sent".
     - The "All | Received | Sent" filter shows in this view only.
   - **Tree**: the live topic tree, sorted a–z, with message counts, subtopic counts and an activity marker.
   - **Selection** keeps a message ID, not only a topic:
     - The selected message stays visible in the details even if the store evicts it, until you select another one. Then the details show "Removed from the message list (memory limit)."
     - When you change views, the tree selects that message's topic. The list selects that message if its row still exists. If not, the list selects nothing.
-  - **Pause and Follow:**
+  - **Pause and Follow** (Follow is a toggle with a selected state):
     - Pause freezes the view. Ingest continues inside the memory budget. The header shows "Paused · 1 240 new".
     - If the budget removed messages while paused, a marker row says "Older messages were removed (memory limit)".
     - Follow keeps the newest row in view. Selecting a row or scrolling turns Follow off.
-  - **Filters** (section 3.2) show as chips under the header, with one **Clear filters** action.
+  - **Filters** (section 3.2) show as `Tag`s under the header, with one **Clear filters** action.
 - **Bottom of the centre pane, Publish (major feature 2):**
   - The composer is always visible. It has topic, payload, QoS 0/1, Retain and **Send** (`Ctrl/Cmd+Enter`). It shows the target broker next to Send, for example "to prod".
   - Payload mode is **Text** or **Hex**. A Hex payload is sent as raw bytes.
   - "Properties" opens the MQTT 5 fields: content type, response topic, correlation data, message expiry, user properties.
-  - The **History ▾** button has two groups: **Drafts** (the last 5 replaced drafts) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. Nothing is saved to disk.
+  - The **History** menu has two groups: **Drafts** (the last 5 replaced drafts) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. Nothing is saved to disk.
   - **Every** replacement of the composer content first saves the current draft to Drafts, if it has content and was not sent. This includes History recall, Edit and publish, Reply, and Publish to this topic.
   - The topic and the property texts are single-line inputs. A text with a line break shows escaped (`\n`) with the note "This topic has line breaks; they are kept.". The composer keeps the exact text until you edit that field.
   - Content type, correlation data and each user property have **Send empty**: a property that is present but empty stays present in Edit and publish and in the sent message.
@@ -105,7 +108,8 @@ The window has one place for each job:
   - **Clear retained** shows only for a topic that has a retained message. It sits apart from the other actions and asks for confirmation. The store tracks the broker state for each topic: a retained message with a payload sets it, a retained message with an empty payload or our own acknowledged Clear ends it, and the Message Expiry Interval of the retained message ends it. A message without the Retain flag changes nothing.
   - The pane header has a close button. The pane stays closed until you open it again (button in the centre header, or the command palette).
   - When the window is narrower than 1 100 px, the details open as a right-side sheet.
-- **Status bar:** URL, msg/s, topics, memory used against the budget, and drops (red with text when above 0). A warning tag shows "Not encrypted" for TCP and WS, and "Insecure TLS" when TLS verification is off.
+- **Status bar:** URL, msg/s, topics, memory used against the budget, and drops (red with text when above 0). A `Tag::warning()` shows "Not encrypted" for TCP and WS, and "Insecure TLS" when TLS verification is off.
+- **Panes:** the three panes (subscriptions, centre, details) are resizable. Each side pane has a least and a most width in rem, and the centre keeps at least 22.5 rem. The app saves the two side widths (`ui.pane_widths`) and clamps them when it loads them. "Expand" widens the details pane. The expanded width is not saved. "Reset layout" restores the default widths (16.25 rem and 22.5 rem).
 
 ### 3.1 Connection sheet
 
@@ -114,7 +118,8 @@ The window has one place for each job:
 - To turn TLS off, select TCP or WS. The sheet then shows a warning: "Not encrypted. Passwords and messages are sent in clear text."
 - **TLS** (TLS and WSS only): verify the server certificate (on), CA file, client certificate and key.
 - **Advanced** (collapsed): WebSocket path, clean start, session expiry, keepalive, Will message.
-- Buttons: **Save and connect** (primary), **Save**, **Cancel**. Validation runs when you press a button, and focus moves to the first wrong field.
+- The saved connections are `ListItem` rows. The row of the draft is selected. "New connection" is the last row.
+- Buttons: **Save and connect** (primary), **Save**, **Cancel**. A button that opens a dialog ends with "…" (for example "Delete connection…"). A dialog has **Cancel** and a verb ("Discard changes", "Switch connection"). Validation runs when you press a button, and focus moves to the first wrong field.
 - There is no separate "Test connection" button. "Save and connect" is the test, and a failure shows its cause in the sheet.
 
 ### 3.2 Filter scope
@@ -129,7 +134,7 @@ The window has one place for each job:
 
 Payloads are often long (400 characters or more, often JSON). Some are a single number.
 
-- **Rows have a fixed height.** The virtual list renders only visible rows, and it needs one row height. Rows do not expand in place. The details pane shows the full payload.
+- **Rows have a fixed height.** The virtual list renders only visible rows, and it needs one row height. Rows do not expand in place. The details pane shows the full payload. Heights are in rem and the view reads them from `window.rem_size()` in each frame, so they follow the zoom: 30 px (1 line) and 44 px (2 lines) at the default 16 px rem.
 - **Messages view, two lines (default):**
   - Line 1: time, subscription colour, topic, QoS, retained, size (right-aligned).
   - Line 2: the payload preview, in the monospace font, across the **full** row width. A short payload shows completely. A long payload shows its start and ends with "…".
@@ -150,50 +155,71 @@ Payloads are often long (400 characters or more, often JSON). Some are a single 
 
 ## 4. Component map
 
+This table lists what the app uses now.
+
 | UI part | gpui-kit component |
 |---|---|
 | Window and overlays | `gpui_kit::open_window` with `TitleBar::window_options()`. `Root` hosts dialogs, sheets, toasts, menus. |
-| Title bar | `TitleBar` with `Select` (profiles), `Input` with a search icon prefix, `Kbd`, `Button` |
-| Three panes | `h_resizable` with `resizable_panel().size_range(..)`. We save `sizes()` in `on_resize`. |
-| Subscriptions list | `List` / `ListItem`; a small colour chip (`div` with a theme `chart_1`…`chart_5` / palette colour); `Tag` (QoS); `Button::ghost().xsmall().icon(..)` (remove); `Input` with `InputEvent::PressEnter` and a `ToggleGroup` for QoS (add) |
+| Title bar | `TitleBar` with `Select` (profiles), `Input` with a search icon prefix, `Button` (commands, theme menu, connect) |
+| Theme menu | `Button::dropdown_menu` with a `PopupMenu`: section "Appearance" and section "Theme", each with a checked item |
+| Three panes | `h_resizable` with `resizable_panel().size(saved).size_range(..)`. The side panels are `.fixed()`. We save the widths in `on_resize`. |
+| Subscriptions list | `ListItem` rows (selected state = "Show only") in a `uniform_list`; a colour chip (`div` with a theme `chart_1`…`chart_5` colour); `Tag` (QoS); `Button::ghost().xsmall().icon(..)` (remove); `Input` with `InputEvent::PressEnter` and a `ToggleGroup` for the QoS |
 | Messages / Tree switch, All / Received / Sent filter | `TabBar::segmented()` |
-| Topic tree | `Tree` with `TreeState`, which renders through `uniform_list`. **Risk:** `set_items` and expand rebuild all entries. P1 measures 100k topics. The fallback is our own flat row list on `uniform_list`. |
-| Message list | `DataTable` with a `TableDelegate` (virtualized, one fixed row height for 1-line or 2-line rows). The delegate reads our buffer newest-first. P1 checks that a 2-line row (metadata line + full-width preview line) works in `DataTable`. If it does not, use `uniform_list` with our own row layout. |
-| Detail tabs (Value, History) | `TabBar::underline()`. We switch the content ourselves. |
-| Publish composer | `v_flex` at the bottom of the centre pane, in a vertical `v_resizable` split with the message view. `Input` (topic), `Editor` (payload), `TabBar::segmented()` (Text / Hex), `ToggleGroup` (QoS), `Switch` (Retain), `Collapsible` (Properties), `DropdownButton` (History ▾), `Button::primary()` (Send). |
+| Follow | `Toggle` |
+| Filter chips, status warnings | `Tag`, `Tag::warning()` |
+| Topic tree | Our own flat rows on `uniform_list` (chevron icons from `IconName`). gpui-kit `Tree` rebuilds all entries on each change, which is too slow for 100k topics. |
+| Message list | Our own rows on `uniform_list`: one fixed row height for 1-line or 2-line rows, so the scroll anchor stays exact. |
+| Detail tabs (Value, History) | `TabBar::underline()`. We switch the content ourselves. History rows are `ListItem`s. |
+| Publish composer | `v_flex` at the bottom of the centre pane. `Input` (topic), `Editor` (payload), `TabBar::segmented()` (Text / Hex), `ToggleGroup` (QoS), `Switch` (Retain), `Collapsible` (Properties), `DropdownButton` (History), `Button::primary()` (Send). |
 | Narrow window details | `open_sheet_at(Placement::Right, ..)` below 1 100 px |
 | Decoder choice | `Select` |
-| Payload view and Publish editor | `Editor` (`.language("json")`). P5 measures the `tree-sitter` feature (JSON only) before we enable it. Without it, the editor shows plain text. |
+| Payload view and Publish editor | `Editor`. Without the `tree-sitter` feature, the editor shows plain text. |
 | MQTT 5 properties (view) | `DescriptionList` |
 | User properties (edit) | Rows of two `Input`s and a remove `Button`, plus an "Add property" button. gpui-kit has no key-value editor. |
-| QoS choice | `ToggleGroup` with two toggles, 0 and 1 |
 | Retain, verify TLS | `Switch` |
-| Connection editor | `open_sheet_at(Placement::Right, ..)` with `v_form` and `field` |
+| Connection editor | `open_sheet_at(Placement::Right, ..)` with `v_form` and `field`; `ListItem` rows for the saved connections |
 | Certificate files | GPUI `cx.prompt_for_paths(..)` (native file dialog). The path is read off the UI thread. |
-| Confirm (clear retained, delete profile) | `open_alert_dialog` |
+| Confirm (clear retained, delete profile, switch, discard) | `open_alert_dialog` and `open_dialog` |
 | Messages to the user | `push_notification`. Errors stay until the user closes them. |
-| Update notes | `Popover` with `TextView::markdown` |
 | Command palette | `Command` in `open_dialog` |
-| Empty states | `Empty` |
-| Loading | `Spinner`, `Button::loading(true)` |
+| Empty states | `Empty` with `EmptyHeader`, `EmptyTitle`, `EmptyDescription` and `EmptyContent` |
 | Status bar | `StatusBar` with `.left()` and `.right()` |
-| Icons | Lucide icons from `gpui_kit::assets::Assets` (101 icons, 44 KiB). Use one icon set only. |
+| Icons | Lucide icons from `gpui_kit::assets::Assets`. Use one icon set only. Use icons, not text glyphs (chevrons, arrows, check marks). |
+
+Not used yet: `Spinner`, `Button::loading`, `Popover` with `TextView` (update notes), `Kbd`.
 
 ## 5. Theme
 
-- Light and dark come from the gpui-kit built-in themes.
-- Setting "Appearance": **System** (default), Light, Dark. You can change it in Settings and in the command palette. The app saves it.
+- Light and dark come from gpui-kit theme files. The app bundles seven theme families (JSON files in `assets/themes/`, notices in [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)) and the gpui-kit default.
+- A **preset** pairs one light and one dark theme:
+
+  | Preset | Light | Dark |
+  |---|---|---|
+  | Default (default) | Default Light | Default Dark |
+  | Catppuccin | Catppuccin Latte | Catppuccin Mocha |
+  | Solarized | Solarized Light | Solarized Dark |
+  | Everforest | Everforest Light | Everforest Dark |
+  | Flexoki | Flexoki Light | Flexoki Dark |
+  | Mellifluous | Mellifluous Light | Mellifluous Dark |
+  | macOS Classic | macOS Classic Light | macOS Classic Dark |
+  | Tokyo Night | Default Light | Tokyo Night |
+
+- Setting "Appearance": **System** (default), Light, Dark. The title bar theme menu has two sections, "Appearance" and "Theme". The command palette has "Appearance: …" and "Theme: …" entries. The app saves `ui.theme_mode` and `ui.theme_preset`. An unknown preset id means "default".
+- The app applies the saved preset before the first window opens, so the first frame has the right colours. After each change it sets the font size, the font families and the caret blink again, because a theme change resets them.
 - System mode follows the OS. Use `cx.observe_window_appearance` and `Theme::sync_system_appearance`. This is an event; there is no polling.
 - Status colours use the semantic tokens `success`, `warning`, `danger`, `info`. Each status also has an icon or text.
 - Test contrast in both themes on the real surface. Text needs 4.5:1. Icons, borders and focus rings need 3:1.
 - Do not reuse a light-theme value in the dark theme.
 
-## 6. Typography
+## 6. Typography and size
 
 - UI text: the system UI font (gpui-kit default). Payloads, topics, timestamps, counts and sizes: the monospace theme font. No fonts are bundled.
 - Right-align numbers. Use the monospace font for numbers, so the columns do not move.
-- Use a small scale: 13 px for body text and 12 px for secondary text. Use weight 400 and 500 only. The theme `font_size` setting is also the app zoom.
+- Use the gpui type scale: `text_sm` for body text and `text_xs` for secondary text. Do not set font sizes in pixels. Use weight 400 and 500 only.
+- Layout uses rem, not pixels. The theme `font_size` is the base rem and the app zoom. The helper `ui(px) -> Rems` (`rems(px / 16.0)`) turns a design pixel at the default 16 px rem into rems. Pixels are only for hairlines (1 px borders) and the minimum window size.
+- List row heights come from `window.rem_size()` in each frame, so the virtual lists follow the zoom.
 - Payloads and topics are selectable and can be copied.
+- Copy: sentence case for labels and section titles. A button or menu item that opens a dialog or sheet ends with "…". A confirm dialog has "Cancel" and a verb. Keep tooltips for icon-only buttons, and for shortcuts and disabled reasons. Rows use the default arrow cursor.
 
 ## 7. States
 
@@ -201,14 +227,16 @@ Every view designs these states: empty, loading, error with a recovery action, d
 
 | Where | Empty-state text | Action |
 |---|---|---|
-| No profiles | "Add a broker to start." | "New connection" (TLS), "Connect to localhost:1883 (not encrypted)" |
+| No profiles | "Add a broker to start." | "New connection…" (primary), "Connect to localhost:1883 (not encrypted)" |
 | Connected, no subscriptions | "Subscribe to a topic filter to see messages." | Focus the subscribe input |
-| Connecting | "Connecting to broker:8883…" | "Cancel" |
+| Connecting | "Connecting to mqtts://broker:8883…" | "Cancel" |
 | Broker rejected `#` | "The broker does not allow #. Subscribe to a narrower filter." | Focus the subscribe input |
-| Subscribed, no messages yet | "No messages yet. Messages show here when the broker sends them." | — |
-| Filters have no match | "No messages match the filters." (Tree: "No topics match the filters.") | "Clear filters" |
+| Subscribed, no messages yet | "No messages yet" and "Messages show here when the broker sends them." | — |
+| Not connected | "Not connected" and "Connect to a broker to see messages." | "Connect" |
+| Filters have no match | "No messages match the filters" (Tree: "No topics match the filters") | "Clear filters" |
 | No selection | "Select a topic with a message." | — |
 
+- Not built yet: the empty state for a connection without subscriptions, and the one for a broker that rejects `#`.
 - An error states the cause and the next step. Example: "Certificate expired on 2026-03-01. Renew the server certificate, or turn off verification."
 - A publish result is short: "Sent" (QoS 0), "Acknowledged" (QoS 1), "Rejected: not authorized (0x87)".
 

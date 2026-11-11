@@ -39,10 +39,7 @@ impl Navigator {
             Cmd::RowHeight1 => self.set_row_height(false, cx),
             Cmd::RowHeight2 => self.set_row_height(true, cx),
             Cmd::ToggleDetails => self.toggle_details(window, cx),
-            Cmd::ToggleExpand => {
-                self.insp.expanded = !self.insp.expanded;
-                cx.notify();
-            }
+            Cmd::ToggleExpand => self.set_expanded(!self.insp.expanded, window, cx),
             Cmd::Decoder(pick) => self.set_decoder(pick, window, cx),
             Cmd::NumberKind(kind) => self.set_number(Some(kind), None, window, cx),
             Cmd::NumberEndian(endian) => self.set_number(None, Some(endian), window, cx),
@@ -60,17 +57,16 @@ impl Navigator {
             Cmd::PayloadMode(mode) => self.set_payload_mode(mode, window, cx),
             Cmd::FormatJson => self.format_json(window, cx),
             Cmd::ToggleComposer => self.toggle_composer(cx),
-            Cmd::Theme(mode) => {
-                self.settings.ui.theme_mode = mode;
-                self.apply_theme(mode, window, cx);
-                self.persist();
-                cx.notify();
-            }
+            Cmd::Theme(mode) => self.set_appearance(mode, window, cx),
+            Cmd::ThemePreset(id) => self.set_preset(id, window, cx),
             Cmd::MemoryLimit(mib) => self.set_memory_limit(mib, cx),
             Cmd::ResetLayout => {
                 self.details_open = true;
                 self.insp.expanded = false;
+                self.expand_restore = None;
                 self.comp.collapsed = false;
+                // The next frame sets the pane widths: the details pane may be hidden now.
+                self.pane_reset = true;
                 cx.notify();
             }
             Cmd::OpenLogFolder => self.open_log_folder(window, cx),
@@ -150,7 +146,7 @@ impl Navigator {
                             .w_full()
                             .gap_2()
                             .child(div().flex_1().child(label))
-                            .when(current, |d| d.child(div().text_xs().child("✓")))
+                            .when(current, |d| d.child(Icon::new(IconName::Check).small()))
                             .when_some(shortcut.clone(), |d, s| {
                                 d.child(div().text_xs().text_color(muted).child(s))
                             })

@@ -3,7 +3,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use gpui_kit::component::button::DropdownButton;
+use gpui_kit::component::button::{DropdownButton, Toggle, ToggleGroup};
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::PopupMenuItem;
@@ -17,7 +17,7 @@ use super::*;
 use crate::composer::{ComposerModel, Draft, LineKeep, PayloadMode, line_breaks_note};
 use crate::inspector::size_text;
 
-/// Rows of the payload editor.
+/// Height of the payload editor (design pixels, see [`ui`]).
 const PAYLOAD_HEIGHT: f32 = 84.;
 
 /// Format refuses a payload above this size, and a result above [`FORMAT_MAX_OUT`]: setting a
@@ -517,7 +517,11 @@ impl Navigator {
         cx.notify();
     }
 
-    pub(super) fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_composer(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let connected = self.connected();
@@ -544,18 +548,20 @@ impl Navigator {
             .map(|e| (e.seq, e.label.clone().into()))
             .collect();
         let weak = cx.entity().downgrade();
+        let rem = window.rem_size();
         let history = DropdownButton::new("composer-history")
             .button(
                 Button::new("composer-history-button")
                     .small()
                     .ghost()
-                    .label("History"),
+                    .label("History")
+                    .dropdown_caret(true),
             )
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu
-                    .min_w(px(280.))
-                    .max_w(px(520.))
-                    .max_h(px(360.))
+                    .min_w(ui(280.).to_pixels(rem))
+                    .max_w(ui(520.).to_pixels(rem))
+                    .max_h(ui(360.).to_pixels(rem))
                     .scrollable(true);
                 if drafts.is_empty() && sent.is_empty() {
                     return menu.item(PopupMenuItem::new("No history yet.").disabled(true));
@@ -582,7 +588,7 @@ impl Navigator {
         let header = h_flex()
             .gap_2()
             .items_center()
-            .child(div().text_xs().text_color(muted).child("PUBLISH"))
+            .child(div().text_xs().text_color(muted).child("Publish"))
             .child(
                 div()
                     .flex_1()
@@ -663,26 +669,37 @@ impl Navigator {
                 .into_any_element()
         } else {
             let mode_ix = usize::from(self.comp.mode == PayloadMode::Hex);
-            let qos_button = |q: Qos| {
-                let b = Button::new(("qos", q.as_u8() as usize))
-                    .small()
-                    .label(format!("QoS {}", q.as_u8()));
-                let b = if self.comp.qos == q {
-                    b.primary()
-                } else {
-                    b.ghost()
-                };
-                b.on_click(cx.listener(move |v, _, _, cx| {
-                    v.comp.qos = q;
-                    v.comp.model.edited();
-                    cx.notify();
-                }))
-            };
+            // A toggle group with a selected state. A click on the selected one keeps it.
+            let qos = ToggleGroup::new("qos")
+                .segmented()
+                .single()
+                .small()
+                .child(
+                    Toggle::new("qos-0")
+                        .label("QoS 0")
+                        .checked(self.comp.qos == Qos::AtMostOnce),
+                )
+                .child(
+                    Toggle::new("qos-1")
+                        .label("QoS 1")
+                        .checked(self.comp.qos == Qos::AtLeastOnce),
+                )
+                .on_click(cx.listener(|v, checks: &Vec<bool>, _, cx| {
+                    if let Some(ix) = checks.iter().position(|c| *c) {
+                        v.comp.qos = if ix == 0 {
+                            Qos::AtMostOnce
+                        } else {
+                            Qos::AtLeastOnce
+                        };
+                        v.comp.model.edited();
+                        cx.notify();
+                    }
+                }));
             v_flex()
                 .gap_2()
                 .child(
                     Editor::new(&self.comp.payload)
-                        .h(px(PAYLOAD_HEIGHT))
+                        .h(ui(PAYLOAD_HEIGHT))
                         .bordered(true)
                         .small(),
                 )
@@ -692,7 +709,7 @@ impl Navigator {
                         .gap_2()
                         .items_center()
                         .child(
-                            div().w(px(110.)).child(
+                            div().w(ui(110.)).child(
                                 TabBar::new("payload-mode")
                                     .segmented()
                                     .small()
@@ -714,14 +731,12 @@ impl Navigator {
                                 .small()
                                 .ghost()
                                 .label("Format")
-                                .tooltip("Format the payload as JSON")
                                 .disabled(self.comp.mode == PayloadMode::Hex)
                                 .on_click(
                                     cx.listener(|v, _, window, cx| v.format_json(window, cx)),
                                 ),
                         )
-                        .child(qos_button(Qos::AtMostOnce))
-                        .child(qos_button(Qos::AtLeastOnce))
+                        .child(qos)
                         .child(
                             Switch::new("retain")
                                 .checked(self.comp.retain)

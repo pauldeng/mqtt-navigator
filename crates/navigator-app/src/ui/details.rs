@@ -19,9 +19,10 @@ use crate::inspector::{
 
 /// Below this window width the details open as a right sheet.
 pub(super) const NARROW: f32 = 1100.;
-const DETAIL_WIDTH: f32 = 360.;
-/// Height of one History row: two lines of small text and the padding.
-const HIST_ROW_H: f32 = 44.;
+/// Width of the details sheet (design pixels, see [`ui`]).
+const SHEET_WIDTH: f32 = 420.;
+/// Height of one History row (design pixels): two lines of small text and the padding.
+const HIST_ROW_H: f32 = 48.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DetailTab {
@@ -421,6 +422,7 @@ impl Navigator {
             can_show_more: self.can_show_more(shown.as_ref()),
             payload_mode: self.comp.mode,
             theme: Some(self.settings.ui.theme_mode),
+            preset: crate::themes::preset_by_id(&self.settings.ui.theme_preset).id,
             memory_mib: self.memory_mib(),
         }
     }
@@ -659,6 +661,27 @@ impl Navigator {
         cx.notify();
     }
 
+    /// "Expand" widens the details pane over the message list. "Restore" returns it to the width
+    /// that it had before. The expanded width is not saved.
+    pub(super) fn set_expanded(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if on == self.insp.expanded {
+            return;
+        }
+        self.insp.expanded = on;
+        let limits = self.pane_limits(window);
+        let current = self.panes.read(cx).sizes().get(2).copied();
+        let target = if on {
+            self.expand_restore = current;
+            let room = window.viewport_size().width - limits.left.0;
+            (room * 0.75).max(limits.right.0)
+        } else {
+            self.expand_restore.take().unwrap_or(limits.right.0)
+        };
+        self.panes
+            .update(cx, |s, cx| s.resize_panel(2, target, window, cx));
+        cx.notify();
+    }
+
     pub(super) fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.narrow {
             if self.insp.sheet_open {
@@ -686,7 +709,7 @@ impl Navigator {
             let weak = weak.clone();
             sheet
                 .title("Details")
-                .size(px(DETAIL_WIDTH + 60.))
+                .size(ui(SHEET_WIDTH))
                 .on_close(move |_, _, cx| {
                     weak.update(cx, |v, _| v.insp.sheet_open = false).ok();
                 })
@@ -833,7 +856,7 @@ impl Navigator {
                     .flex_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("MESSAGE"),
+                    .child("Message"),
             )
             .when(!sheet, |d| {
                 d.child(
@@ -850,9 +873,8 @@ impl Navigator {
                         } else {
                             "Expand the details"
                         })
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.insp.expanded = !v.insp.expanded;
-                            cx.notify();
+                        .on_click(cx.listener(|v, _, window, cx| {
+                            v.set_expanded(!v.insp.expanded, window, cx)
                         })),
                 )
                 .child(
@@ -885,33 +907,22 @@ impl Navigator {
 
         let topic = self.selected_topic();
         let body = match &shown {
-            None => div()
-                .text_color(theme.muted_foreground)
-                .child(if topic.is_some() {
-                    "This topic has no stored message."
+            None => {
+                if topic.is_some() {
+                    empty_state("No message", "This topic has no stored message.", [])
                 } else {
-                    "Select a topic with a message."
-                })
-                .into_any_element(),
+                    empty_state("Nothing selected", "Select a topic with a message.", [])
+                }
+            }
             Some(s) => match tab {
                 DetailTab::Value => self.render_value(s, cx).into_any_element(),
                 DetailTab::History => self.render_history(s, cx).into_any_element(),
             },
         };
         let actions = topic.map(|_| self.render_actions(shown.as_ref(), cx));
-        let width = if self.insp.expanded {
-            (self.last_size.0 - 260.).max(DETAIL_WIDTH) * 0.75
-        } else {
-            DETAIL_WIDTH
-        };
         v_flex()
-            .when(!sheet, |d| {
-                d.w(px(width))
-                    .h_full()
-                    .border_l_1()
-                    .border_color(theme.border)
-            })
-            .when(sheet, |d| d.size_full())
+            .size_full()
+            .when(!sheet, |d| d.border_l_1().border_color(theme.border))
             .p_3()
             .gap_2()
             .child(head)
@@ -925,13 +936,9 @@ impl Navigator {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let m = &s.msg;
+        let sent = s.direction == Direction::Sent;
         let meta = format!(
-            "{}{} · {}",
-            if s.direction == Direction::Sent {
-                "↑ Sent · "
-            } else {
-                ""
-            },
+            "{} · {}",
             format_time(m.received_at, self.utc_offset, true),
             meta_line(
                 m.qos,
@@ -964,7 +971,7 @@ impl Navigator {
             .gap_2()
             .items_center()
             .child(
-                div().w(px(96.)).child(
+                div().w(ui(96.)).child(
                     Select::new(&self.insp.decoder_select)
                         .small()
                         .accessibility_label("Decoder"),
@@ -972,14 +979,14 @@ impl Navigator {
             )
             .when(choice.pick == DecoderPick::Number, |d| {
                 d.child(
-                    div().w(px(96.)).child(
+                    div().w(ui(96.)).child(
                         Select::new(&self.insp.kind_select)
                             .small()
                             .accessibility_label("Number type"),
                     ),
                 )
                 .child(
-                    div().w(px(80.)).child(
+                    div().w(ui(80.)).child(
                         TabBar::new("endian")
                             .segmented()
                             .small()
@@ -1014,7 +1021,7 @@ impl Navigator {
         } else {
             div()
                 .flex_1()
-                .min_h(px(120.))
+                .min_h(ui(120.))
                 .child(
                     Editor::new(&self.insp.editor)
                         .h_full()
@@ -1050,16 +1057,22 @@ impl Navigator {
                             .icon(IconName::Copy)
                             .label("Copy")
                             .disabled(!can_copy)
-                            .tooltip(if can_copy {
-                                "Copy the value shown below"
-                            } else {
-                                "The value is not ready."
-                            })
+                            .when(!can_copy, |b| b.tooltip("The value is not ready."))
                             .on_click(cx.listener(|v, _, window, cx| v.copy_value(window, cx))),
                     ),
             )
             .child(toolbar)
-            .child(div().text_xs().text_color(muted).child(meta))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .when(sent, |d| {
+                        d.child(Icon::new(IconName::ArrowUp).xsmall())
+                            .child("Sent ·")
+                    })
+                    .child(meta),
+            )
             .when(s.evicted, |d| {
                 d.child(
                     div()
@@ -1070,11 +1083,11 @@ impl Navigator {
             })
             .when(!rows.is_empty(), |d| {
                 d.child(
-                    div().id("props").max_h(px(140.)).overflow_y_scroll().child(
+                    div().id("props").max_h(ui(140.)).overflow_y_scroll().child(
                         // One column: the details pane is narrow, and values are long.
                         DescriptionList::new()
                             .columns(1)
-                            .label_width(px(120.))
+                            .label_width(ui(120.))
                             .children(
                                 rows.into_iter()
                                     .map(|(k, v)| DescriptionItem::new(k).value(v)),
@@ -1139,20 +1152,16 @@ impl Navigator {
     }
 
     fn render_history(&mut self, s: &Shown, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
         let Some(node) = s.node else {
-            return div()
-                .text_color(muted)
-                .child("This topic has no history.")
-                .into_any_element();
+            return empty_state("No history", "This topic has no history.", []);
         };
         let count = self.store.history(node).count();
         if count == 0 {
-            return div()
-                .text_color(muted)
-                .child("No history for this topic. The store may have removed it (memory limit).")
-                .into_any_element();
+            return empty_state(
+                "No history",
+                "The store may have removed it (memory limit).",
+                [],
+            );
         }
         // One focus handle for the whole list. Up and Down move the cursor, Enter shows the row.
         // Only the visible rows are built.
@@ -1221,49 +1230,48 @@ impl Navigator {
         let nanos = at
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
-        v_flex()
-            .id(("hist", nanos))
-            .h(px(HIST_ROW_H))
+        let is_picked = picked == Some(at);
+        let tone = move |d: Div| if is_picked { d } else { d.text_color(muted) };
+        // The picked row is the selected one. The keyboard cursor is the outline.
+        ListItem::new(("hist", nanos))
+            .h(ui(HIST_ROW_H))
             .flex_none()
             .overflow_hidden()
-            .px_2()
-            .py_1()
             .rounded_sm()
-            .border_1()
-            .border_color(if cursor == Some(at) {
-                theme.ring
-            } else {
-                gpui::transparent_black()
-            })
-            .when(picked == Some(at), |d| d.bg(theme.accent))
-            .hover(|d| d.bg(theme.muted))
+            .px_2()
+            .py_0p5()
+            .selected(is_picked)
+            .secondary_selected(cursor == Some(at))
             .on_click(cx.listener(move |v, _, window, cx| {
                 v.insp.hist_focus.focus(window, cx);
                 v.insp.hist_cursor = Some(at);
                 v.pick_history(node, at, cx)
             }))
             .child(
-                h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(
+                v_flex()
+                    .w_full()
+                    .child(tone(
+                        h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .child(format_time(at, utc, true)),
+                            )
+                            .child(format!("QoS {qos}"))
+                            .child(div().flex_1())
+                            .child(format!("{size} B")),
+                    ))
+                    .child(tone(
                         div()
                             .font_family(theme.mono_font_family.clone())
-                            .child(format_time(at, utc, true)),
-                    )
-                    .child(format!("QoS {qos}"))
-                    .child(div().flex_1())
-                    .child(format!("{size} B")),
-            )
-            .child(
-                div()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_xs()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(text),
+                            .text_xs()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(text),
+                    )),
             )
             .into_any_element()
     }
@@ -1368,7 +1376,7 @@ impl Navigator {
                     Button::new("clear-retained")
                         .small()
                         .danger()
-                        .label("Clear retained")
+                        .label("Clear retained…")
                         .on_click(
                             cx.listener(|v, _, window, cx| v.confirm_clear_retained(window, cx)),
                         ),

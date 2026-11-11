@@ -1,16 +1,13 @@
 //! Profiles, settings and secrets of the main window. All file and keyring work runs in the
 //! background. Its result comes back as an event that calls one of these methods.
 
-use std::path::PathBuf;
-
+use gpui_kit::component::WindowExt;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ThemeMode as ComponentTheme, WindowExt};
 use navigator_core::net::Transport;
 use navigator_core::profile::{dedupe_names, export_profiles, import_profiles};
-use navigator_core::settings::{self, Load};
+use navigator_core::settings::Load;
 
 use super::*;
-use crate::persist;
 use crate::secrets::{self, Edit, Stored};
 
 /// The smallest window that the app restores. It is the minimum size of the window.
@@ -57,33 +54,13 @@ impl Navigator {
     // -----------------------------------------------------------------------------------------
 
     /// Starts the background load of the settings and the listener of writer errors.
-    pub(super) fn spawn_settings(
+    /// Shows the errors of the settings writer as notifications.
+    pub(super) fn spawn_write_errors(
         &mut self,
-        path: Option<PathBuf>,
         mut write_errors: tokio::sync::mpsc::Receiver<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let task: Task<Load> = match path {
-            // The cleanup and the load share one job: a save cannot run before it ends.
-            Some(path) => cx.background_executor().spawn(async move {
-                persist::remove_stale_tmp(&path);
-                settings::load(&path)
-            }),
-            None => Task::ready(Load {
-                settings: Settings::default(),
-                notice: Some(
-                    "The system has no settings folder. Changes are not saved.".to_string(),
-                ),
-                read_only: true,
-            }),
-        };
-        cx.spawn_in(window, async move |this, cx| {
-            let load = task.await;
-            cx.update(|window, cx| this.update(cx, |v, cx| v.apply_settings(load, window, cx)))
-                .ok();
-        })
-        .detach();
         cx.spawn_in(window, async move |this, cx| {
             while let Some(text) = write_errors.recv().await {
                 let alive = cx.update(|window, cx| {
@@ -101,16 +78,27 @@ impl Navigator {
         window.push_notification(note, cx);
     }
 
-    /// The settings have arrived. Apply them, unless the user has already acted.
-    fn apply_settings(&mut self, load: Load, window: &mut Window, cx: &mut Context<Self>) {
+    /// The settings are here (`main` loaded them before the window opened). Apply them.
+    pub(super) fn apply_settings(
+        &mut self,
+        load: Load,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.settings = load.settings;
         self.read_only = load.read_only;
         self.settings_loaded = true;
         if let Some(notice) = load.notice {
-            self.notify(Notification::warning(notice), window, cx);
+            // The window has no notification host until its first frame.
+            cx.defer_in(window, move |v, window, cx| {
+                v.notify(Notification::warning(notice), window, cx)
+            });
         }
         let ui = self.settings.ui.clone();
-        self.apply_theme(ui.theme_mode, window, cx);
+        if ui.theme_mode == ThemeMode::System {
+            // `main` had no window to ask. The window knows its appearance better.
+            self.apply_theme(window, cx);
+        }
         self.view = match ui.view {
             ViewMode::Messages => View::Messages,
             ViewMode::Tree => View::Tree,
@@ -186,22 +174,31 @@ impl Navigator {
         }
     }
 
-    pub(super) fn apply_theme(&self, mode: ThemeMode, window: &mut Window, cx: &mut Context<Self>) {
-        match mode {
-            ThemeMode::System => Theme::sync_system_appearance(Some(window), cx),
-            ThemeMode::Light => Theme::change(ComponentTheme::Light, Some(window), cx),
-            ThemeMode::Dark => Theme::change(ComponentTheme::Dark, Some(window), cx),
-        }
+    /// Applies the saved preset and appearance (see `crate::themes`).
+    pub(super) fn apply_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::themes::apply(
+            &self.settings.ui.theme_preset,
+            self.settings.ui.theme_mode,
+            Some(window),
+            cx,
+        );
     }
 
-    pub(super) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let next = match self.settings.ui.theme_mode {
-            ThemeMode::System => ThemeMode::Light,
-            ThemeMode::Light => ThemeMode::Dark,
-            ThemeMode::Dark => ThemeMode::System,
-        };
-        self.settings.ui.theme_mode = next;
-        self.apply_theme(next, window, cx);
+    pub(super) fn set_appearance(
+        &mut self,
+        mode: ThemeMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.ui.theme_mode = mode;
+        self.apply_theme(window, cx);
+        self.persist();
+        cx.notify();
+    }
+
+    pub(super) fn set_preset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.ui.theme_preset = crate::themes::preset_by_id(id).id.into();
+        self.apply_theme(window, cx);
         self.persist();
         cx.notify();
     }
@@ -358,8 +355,12 @@ impl Navigator {
                 })
                 .description(format!("Messages from {from} are removed."))
                 .confirm()
-                .ok_text(if same { "Reconnect" } else { "Switch" })
-                .cancel_text("Stay")
+                .ok_text(if same {
+                    "Reconnect"
+                } else {
+                    "Switch connection"
+                })
+                .cancel_text("Cancel")
                 .on_ok(move |_, window, cx| {
                     on_ok
                         .update(cx, |v, cx| v.switch_to(id, true, window, cx))
@@ -799,45 +800,37 @@ impl Navigator {
     // Empty state
     // -----------------------------------------------------------------------------------------
 
-    /// "No profiles" state (docs/ui-design.md, section 7).
+    /// "No profiles" state (docs/ui-design.md, section 7). "New connection…" is the one primary
+    /// action. The localhost shortcut is a plain button next to it.
     pub(super) fn render_no_profile(&self, cx: &mut Context<Self>) -> AnyElement {
-        let body = v_flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .text_color(cx.theme().muted_foreground);
-        if !self.settings_loaded {
-            return body.child("Loading settings…").into_any_element();
-        }
         if !self.settings.profiles.is_empty() {
-            return body
-                .child("Select a connection.")
-                .child(
-                    Button::new("manage-empty")
-                        .small()
-                        .label("Manage connections…")
-                        .on_click(
-                            cx.listener(|v, _, window, cx| v.open_sheet(None, false, window, cx)),
-                        ),
-                )
-                .into_any_element();
+            return empty_state(
+                "No connection selected",
+                "Choose a connection to see messages.",
+                [Button::new("manage-empty")
+                    .small()
+                    .label("Manage connections…")
+                    .on_click(cx.listener(|v, _, window, cx| v.open_sheet(None, false, window, cx)))
+                    .into_any_element()],
+            );
         }
-        body.child("Add a broker to start.")
-            .child(
+        empty_state(
+            "Add a broker to start",
+            "Topics and messages show here.",
+            [
                 Button::new("new-connection")
                     .small()
                     .primary()
-                    .label("New connection")
-                    .on_click(cx.listener(|v, _, window, cx| v.open_sheet(None, true, window, cx))),
-            )
-            .child(
+                    .label("New connection…")
+                    .on_click(cx.listener(|v, _, window, cx| v.open_sheet(None, true, window, cx)))
+                    .into_any_element(),
                 Button::new("connect-local")
                     .small()
                     .label("Connect to localhost:1883 (not encrypted)")
-                    .on_click(cx.listener(|v, _, window, cx| v.quick_connect(window, cx))),
-            )
-            .into_any_element()
+                    .on_click(cx.listener(|v, _, window, cx| v.quick_connect(window, cx)))
+                    .into_any_element(),
+            ],
+        )
     }
 
     /// Saves a plain TCP profile for localhost and connects it.

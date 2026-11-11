@@ -44,6 +44,9 @@ pub enum RowHeight {
 #[serde(default)]
 pub struct UiState {
     pub theme_mode: ThemeMode,
+    /// Id of the colour theme preset (see the app's `themes` module). An unknown id means
+    /// "default".
+    pub theme_preset: String,
     pub view: ViewMode,
     pub row_height: RowHeight,
     pub pane_widths: Vec<f32>,
@@ -73,6 +76,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             theme_mode: ThemeMode::default(),
+            theme_preset: "default".into(),
             view: ViewMode::default(),
             row_height: RowHeight::default(),
             pane_widths: Vec::new(),
@@ -312,6 +316,7 @@ mod tests {
         s.last_profile_id = Some(s.profiles[0].id);
         s.ui = UiState {
             theme_mode: ThemeMode::Dark,
+            theme_preset: "tokyo-night".into(),
             view: ViewMode::Tree,
             row_height: RowHeight::OneLine,
             pane_widths: vec![200.0, 300.5],
@@ -332,6 +337,7 @@ mod tests {
         let l = load(&path);
         assert_eq!(l.settings.schema_version, 1);
         assert_eq!(l.settings.ui, UiState::default());
+        assert_eq!(l.settings.ui.theme_preset, "default");
         assert_eq!(l.settings.ui.store_budget_mib, 128);
         assert_eq!(l.settings.profiles[0].port, 8883);
     }

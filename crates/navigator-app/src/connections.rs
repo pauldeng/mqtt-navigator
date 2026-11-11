@@ -8,11 +8,14 @@ use std::str::FromStr;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::form::{Field, field, v_form};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::list::ListItem;
 use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::component::sheet::Sheet;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::TabBar;
-use gpui_kit::component::{ActiveTheme, Placement, Sizable, WindowExt, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Icon, IconName, Placement, Sizable, WindowExt, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use navigator_core::Qos;
@@ -265,7 +268,7 @@ impl ConnectionSheet {
             let on_close = entity.clone();
             sheet
                 .title("Connections")
-                .size(px(540.))
+                .size(crate::ui::ui(540.))
                 // A click outside must not drop the draft. Escape and the close button can
                 // still close the sheet: `dismissed` brings it back if the draft has changes.
                 .overlay_closable(false)
@@ -553,9 +556,9 @@ impl ConnectionSheet {
                 .title("Discard your changes?")
                 .description("The changes to this connection are not saved.")
                 .confirm()
-                .ok_text("Discard")
+                .ok_text("Discard changes")
                 .ok_variant(ButtonVariant::Danger)
-                .cancel_text("Keep editing")
+                .cancel_text("Cancel")
                 .on_ok(move |_, window, cx| {
                     entity.update(cx, |s, cx| s.run(act, window, cx));
                     true
@@ -732,30 +735,34 @@ impl ConnectionSheet {
             .child(title)
     }
 
+    /// The saved connections. The one in the draft is the selected row. "New connection" is a
+    /// row, too: it is selected while the draft is new.
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        h_flex()
-            .flex_wrap()
-            .gap_1()
+        let row = |id: SharedString| ListItem::new(id).rounded_sm().px_2().py_0p5().text_sm();
+        v_flex()
+            .gap_0p5()
             .children(self.profiles.iter().map(|p| {
                 let id = p.id;
                 let active = !self.is_new && self.origin.id == id;
-                let b = Button::new(SharedString::from(format!("profile:{id}")))
-                    .small()
-                    .label(p.name.clone())
+                row(format!("profile:{id}").into())
+                    .selected(active)
+                    .child(p.name.clone())
                     .on_click(cx.listener(move |s, _, window, cx| {
                         if s.is_new || s.origin.id != id {
                             s.guard(Act::Select(id), window, cx);
                         }
-                    }));
-                if active { b.primary() } else { b.ghost() }
+                    }))
             }))
             .child(
-                Button::new("new-profile")
-                    .small()
-                    .label("New connection")
-                    .when(self.is_new, |b| b.primary())
-                    .when(!self.is_new, |b| b.ghost())
+                row("new-profile".into())
+                    .selected(self.is_new)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(Icon::new(IconName::Plus).small())
+                            .child("New connection"),
+                    )
                     .on_click(cx.listener(|s, _, window, cx| {
                         if !s.is_new {
                             s.guard(Act::New, window, cx);
@@ -857,7 +864,6 @@ impl Render for ConnectionSheet {
                                     Button::new("new-client-id")
                                         .small()
                                         .label("New ID")
-                                        .tooltip("Make a new random client ID")
                                         .on_click(cx.listener(|s, _, window, cx| {
                                             let id = Profile::new().client_id;
                                             Self::set_text(&s.client_id, &id, window, cx);
@@ -1029,7 +1035,7 @@ impl Render for ConnectionSheet {
                         Button::new("delete")
                             .small()
                             .danger()
-                            .label("Delete connection")
+                            .label("Delete connection…")
                             .on_click(cx.listener(|s, _, window, cx| s.confirm_delete(window, cx))),
                     ),
                 )

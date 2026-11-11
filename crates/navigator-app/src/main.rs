@@ -10,15 +10,13 @@ mod messages;
 mod palette;
 mod persist;
 mod secrets;
+mod themes;
 mod ui;
 
-use std::time::Duration;
-
-use gpui_kit::component::Theme;
-use gpui_kit::component::input::CursorBlink;
 use gpui_kit::*;
 use navigator_core::Qos;
 use navigator_core::net::{ConnectConfig, Transport};
+use navigator_core::settings::{self, Load};
 
 actions!(navigator, [Quit]);
 
@@ -40,30 +38,51 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            // The default caret blinks every 500 ms for as long as an input has focus. This one
-            // stops after 5 s without typing, so a focused idle window sleeps. A theme change
-            // keeps the policy (`Theme::change` does not touch `cursor_blink`).
-            Theme::update(cx, |theme| {
-                theme.cursor_blink = CursorBlink::blinking(Duration::from_millis(500))
-                    .with_idle_timeout(Duration::from_secs(5));
-            });
             ui::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("ctrl-q", Quit, None),
             ]);
-            let options = WindowOptions {
-                window_min_size: Some(size(px(960.), px(600.))),
-                ..gpui_kit::component::TitleBar::window_options()
-            };
-            if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| ui::Navigator::new(cli, window, cx))
-            }) {
-                eprintln!("Cannot open the window: {err:#}");
-                cx.quit();
-            }
+            // The settings load in the background. The window opens when they are here, so that
+            // the first frame has the saved theme and pane widths.
+            let path = persist::settings_path();
+            let task = cx.background_executor().spawn(async move {
+                match path {
+                    Some(path) => {
+                        persist::remove_stale_tmp(&path);
+                        settings::load(&path)
+                    }
+                    None => Load {
+                        settings: settings::Settings::default(),
+                        notice: Some(
+                            "The system has no settings folder. Changes are not saved.".into(),
+                        ),
+                        read_only: true,
+                    },
+                }
+            });
+            cx.spawn(async move |cx| {
+                let load = task.await;
+                cx.update(|cx| open(cli, load, cx));
+            })
+            .detach();
         });
+}
+
+fn open(cli: Option<ConnectConfig>, load: Load, cx: &mut App) {
+    let ui = &load.settings.ui;
+    themes::init(&ui.theme_preset, ui.theme_mode, cx);
+    let options = WindowOptions {
+        window_min_size: Some(size(px(960.), px(600.))),
+        ..gpui_kit::component::TitleBar::window_options()
+    };
+    if let Err(err) = gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| ui::Navigator::new(cli, load, window, cx))
+    }) {
+        eprintln!("Cannot open the window: {err:#}");
+        cx.quit();
+    }
 }
 
 const USAGE: &str = "Usage: mqtt-navigator [--host HOST] [--port PORT] [--tcp | --ws | --wss] \

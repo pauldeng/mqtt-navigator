@@ -50,6 +50,8 @@ pub enum Cmd {
     FormatJson,
     ToggleComposer,
     Theme(ThemeMode),
+    /// A colour theme preset, by id (see `crate::themes`).
+    ThemePreset(&'static str),
     /// The RAM limit of the store, in MiB (one of `MEMORY_OPTIONS_MIB`).
     MemoryLimit(u32),
     ResetLayout,
@@ -87,6 +89,8 @@ pub struct Facts {
     pub can_show_more: bool,
     pub payload_mode: PayloadMode,
     pub theme: Option<ThemeMode>,
+    /// The id of the colour theme preset now.
+    pub preset: &'static str,
     /// The memory limit of the store now, in MiB.
     pub memory_mib: u32,
 }
@@ -147,6 +151,10 @@ fn kind_not(f: &Facts, kind: NumberKind) -> bool {
     f.number.is_some_and(|(k, _)| k != kind)
 }
 
+fn preset_not(f: &Facts, id: &str) -> bool {
+    f.preset != id
+}
+
 fn theme_not(mode: ThemeMode) -> impl Fn(&Facts) -> bool {
     move |f| f.theme != Some(mode)
 }
@@ -186,14 +194,14 @@ pub static COMMANDS: &[Entry] = &[
     ),
     e(
         "manage-connections",
-        "Manage connections",
+        "Manage connections…",
         None,
         Cmd::ManageConnections,
         always,
     ),
     e(
         "new-connection",
-        "New connection",
+        "New connection…",
         Some("Mod+N"),
         Cmd::NewConnection,
         always,
@@ -454,7 +462,7 @@ pub static COMMANDS: &[Entry] = &[
     e("reply", "Reply", None, Cmd::Reply, |f| f.has_reply),
     e(
         "clear-retained",
-        "Clear the retained message",
+        "Clear the retained message…",
         None,
         Cmd::ClearRetained,
         |f| f.has_retained && f.connected,
@@ -517,6 +525,62 @@ pub static COMMANDS: &[Entry] = &[
         None,
         Cmd::Theme(ThemeMode::Dark),
         |f| theme_not(ThemeMode::Dark)(f),
+    ),
+    e(
+        "theme-default",
+        "Theme: Default",
+        None,
+        Cmd::ThemePreset("default"),
+        |f| preset_not(f, "default"),
+    ),
+    e(
+        "theme-catppuccin",
+        "Theme: Catppuccin",
+        None,
+        Cmd::ThemePreset("catppuccin"),
+        |f| preset_not(f, "catppuccin"),
+    ),
+    e(
+        "theme-solarized",
+        "Theme: Solarized",
+        None,
+        Cmd::ThemePreset("solarized"),
+        |f| preset_not(f, "solarized"),
+    ),
+    e(
+        "theme-everforest",
+        "Theme: Everforest",
+        None,
+        Cmd::ThemePreset("everforest"),
+        |f| preset_not(f, "everforest"),
+    ),
+    e(
+        "theme-flexoki",
+        "Theme: Flexoki",
+        None,
+        Cmd::ThemePreset("flexoki"),
+        |f| preset_not(f, "flexoki"),
+    ),
+    e(
+        "theme-mellifluous",
+        "Theme: Mellifluous",
+        None,
+        Cmd::ThemePreset("mellifluous"),
+        |f| preset_not(f, "mellifluous"),
+    ),
+    e(
+        "theme-macos-classic",
+        "Theme: macOS Classic",
+        None,
+        Cmd::ThemePreset("macos-classic"),
+        |f| preset_not(f, "macos-classic"),
+    ),
+    e(
+        "theme-tokyo-night",
+        "Theme: Tokyo Night",
+        None,
+        Cmd::ThemePreset("tokyo-night"),
+        |f| preset_not(f, "tokyo-night"),
     ),
     e(
         "memory-64",
@@ -698,6 +762,30 @@ mod tests {
             })
             .contains(&"direction-sent")
         );
+    }
+
+    #[test]
+    fn every_theme_preset_has_one_palette_entry() {
+        for p in crate::themes::PRESETS {
+            let rows: Vec<_> = COMMANDS
+                .iter()
+                .filter(|c| c.cmd == Cmd::ThemePreset(p.id))
+                .collect();
+            assert_eq!(rows.len(), 1, "{}", p.id);
+            assert_eq!(rows[0].label, format!("Theme: {}", p.label));
+        }
+        let presets = COMMANDS
+            .iter()
+            .filter(|c| matches!(c.cmd, Cmd::ThemePreset(_)))
+            .count();
+        assert_eq!(presets, crate::themes::PRESETS.len());
+        // The preset in use is not offered again.
+        let f = Facts {
+            preset: "flexoki",
+            ..Facts::default()
+        };
+        let v = ids(&f);
+        assert!(!v.contains(&"theme-flexoki") && v.contains(&"theme-solarized"));
     }
 
     #[test]
