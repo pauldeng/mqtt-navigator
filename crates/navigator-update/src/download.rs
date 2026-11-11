@@ -296,7 +296,7 @@ fn bad_archive() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_tree, extract_app, extract_payload, find_payload, listing_ok, name_ok};
+    use super::*;
     use crate::swap::PAYLOAD;
 
     #[test]

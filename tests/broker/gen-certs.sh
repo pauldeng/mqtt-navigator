@@ -51,6 +51,6 @@ sign expired "$local_san" serverAuth 20200101000000Z 20200102000000Z
 
 # Password file for listener 18831: user "test", password "test-pass". Made in the broker image.
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/certs:/certs" --entrypoint mosquitto_passwd \
-  "$(sed -n 's/^ *image: *//p' compose.yml)" -b -c /certs/passwd test test-pass
+  "$(grep -m1 -o 'eclipse-mosquitto:[^ ]*' compose.yml)" -b -c /certs/passwd test test-pass
 # The broker user must read the files. The keys are for tests only.
 chmod 644 certs/*

@@ -111,7 +111,7 @@ jobs:
         working-directory: fuzz
         run: |
           for target in decode_render parse_hex topic_matches profile_import; do
-            cargo fuzz run "$target" -- -max_total_time=60
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
           done
       - name: Keep the crash input
         if: failure()
