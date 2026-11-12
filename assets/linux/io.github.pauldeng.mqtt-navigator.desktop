@@ -2,7 +2,7 @@
 Type=Application
 Name=MQTT Navigator
 Comment=A fast, native MQTT client for the desktop.
-Exec=mqtt-navigator-launcher
+Exec=mqtt-navigator
 Icon=io.github.pauldeng.mqtt-navigator
 Terminal=false
 Categories=Development;

@@ -187,13 +187,10 @@ fn fixture(version: &str, advertised: &[u8], served: Vec<u8>, cut: Option<usize>
     let dir = tempfile::tempdir().expect("dir");
     let app = dir.path().join("app");
     fs::create_dir(&app).expect("app dir");
-    fs::write(app.join(swap::LAUNCHER), "launcher").expect("launcher");
     fs::write(app.join(swap::PAYLOAD), "old").expect("payload");
     let install = Install {
         kind: Kind::Exe,
         path: app.join(swap::PAYLOAD),
-        launcher: app.join(swap::LAUNCHER),
-        payload: app.join(swap::PAYLOAD),
     };
     Fixture {
         k,
@@ -398,16 +395,31 @@ fn detect_finds_self_update_and_notice_cases() {
     let app = fs::canonicalize(dir.path()).expect("path").join("app");
     fs::create_dir(&app).expect("dir");
     let exe = app.join(swap::PAYLOAD);
-    // No launcher next to the payload (a development build): notice only.
-    assert!(matches!(
-        detect_from(&exe, None),
-        UpdateMode::NoticeOnly { .. }
-    ));
-    fs::write(app.join(swap::LAUNCHER), "l").expect("launcher");
     let UpdateMode::SelfUpdate(i) = detect_from(&exe, None) else {
         panic!("self update");
     };
     assert_eq!((i.kind, &i.path), (Kind::Exe, &exe));
+    // A development build: a folder above the exe has the CACHEDIR.TAG that cargo writes in
+    // `target/`. Notice only.
+    let dev = app.join("target/release");
+    fs::create_dir_all(&dev).expect("target");
+    fs::write(
+        app.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .expect("tag");
+    let UpdateMode::NoticeOnly { reason } = detect_from(&dev.join(swap::PAYLOAD), None) else {
+        panic!("a development build must not update itself");
+    };
+    assert!(reason.contains("development build"), "{reason}");
+    // An AppImage is never a development build.
+    let UpdateMode::SelfUpdate(i) = detect_from(
+        &dev.join(swap::PAYLOAD),
+        Some(app.join("x.AppImage").into()),
+    ) else {
+        panic!("appimage");
+    };
+    assert_eq!(i.kind, Kind::AppImage);
     // AppImage: the file is the install.
     let ai = app.join("x.AppImage");
     let UpdateMode::SelfUpdate(i) = detect_from(&exe, Some(ai.clone().into())) else {
@@ -418,7 +430,6 @@ fn detect_finds_self_update_and_notice_cases() {
     let bundle = dir.path().join("Mqtt.app");
     let macos = bundle.join("Contents/MacOS");
     fs::create_dir_all(&macos).expect("bundle");
-    fs::write(macos.join(swap::LAUNCHER), "l").expect("launcher");
     let UpdateMode::SelfUpdate(i) = detect_from(&macos.join(swap::PAYLOAD), None) else {
         panic!("bundle");
     };
@@ -448,7 +459,6 @@ fn deb_and_read_only_folders_get_a_notice() {
     let dir = tempfile::tempdir().expect("dir");
     let app = fs::canonicalize(dir.path()).expect("path").join("app");
     fs::create_dir(&app).expect("dir");
-    fs::write(app.join(swap::LAUNCHER), "l").expect("launcher");
     fs::set_permissions(&app, fs::Permissions::from_mode(0o555)).expect("chmod");
     let mode = detect_from(&app.join(swap::PAYLOAD), None);
     fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).expect("chmod back");
@@ -459,6 +469,6 @@ fn deb_and_read_only_folders_get_a_notice() {
 }
 
 #[test]
-fn the_launcher_and_the_app_use_the_same_data_folder() {
+fn the_update_code_and_the_app_use_the_same_data_folder() {
     assert_eq!(swap::data_local_dir(), dirs::data_local_dir());
 }

@@ -29,7 +29,7 @@ pub fn detect() -> UpdateMode {
     }
 }
 
-/// `exe` is the running payload. `appimage` is the value of `$APPIMAGE`.
+/// `exe` is the running program. `appimage` is the value of `$APPIMAGE`.
 pub fn detect_from(exe: &Path, appimage: Option<OsString>) -> UpdateMode {
     let is_appimage = appimage.as_ref().is_some_and(|a| !a.is_empty());
     if cfg!(target_os = "linux") && !is_appimage && (exe.starts_with("/usr") || dpkg_owns(exe)) {
@@ -38,7 +38,7 @@ pub fn detect_from(exe: &Path, appimage: Option<OsString>) -> UpdateMode {
         );
     }
     let Some(install) = Install::locate(exe, appimage) else {
-        return notice("This copy was not started by the launcher.");
+        return notice("This is a development build. It does not update itself.");
     };
     if install.kind == Kind::App && install.path.starts_with("/Volumes") {
         return notice("Copy this app to Applications, then start it from there.");

@@ -12,9 +12,9 @@
 
 | Platform | Source | How |
 |---|---|---|
-| Windows | `icon.ico` | `build.rs` of `navigator-app` and `navigator-launcher` embeds it as icon resource ID 1 (`winresource`). gpui loads the window and taskbar icon from the ID 1 resource of the exe. The shortcuts and Explorer use it too. |
+| Windows | `icon.ico` | `build.rs` of `navigator-app` embeds it as icon resource ID 1 (`winresource`). gpui loads the window and taskbar icon from the ID 1 resource of the exe. The shortcuts and Explorer use it too. |
 | Linux, X11 | `icon-256.png` | The app embeds it and sets `WindowOptions.icon` (`desktop_entry.rs`). |
-| Linux, Wayland | `icon-{16..512}.png` | Wayland has no window icon. The shell looks for the desktop entry `io.github.pauldeng.mqtt-navigator.desktop` (the app id) and shows its icon `io.github.pauldeng.mqtt-navigator`. The `.deb` installs both (`[deb.files]` in `crates/navigator-app/Cargo.toml`). The AppImage has only `mqtt-navigator-launcher.desktop` and a 512 px icon inside. A bare binary or an AppImage adds a user entry (`~/.local/share/applications`) and icons (48–512 px) on its first start. |
+| Linux, Wayland | `icon-{16..512}.png` | Wayland has no window icon. The shell looks for the desktop entry `io.github.pauldeng.mqtt-navigator.desktop` (the app id) and shows its icon `io.github.pauldeng.mqtt-navigator`. The `.deb` installs both (`[deb.files]` in `crates/navigator-app/Cargo.toml`). The AppImage has only `mqtt-navigator.desktop` and a 512 px icon inside. A bare binary or an AppImage adds a user entry (`~/.local/share/applications`) and icons (48–512 px) on its first start. |
 | macOS | `icon.icns` | The packager copies it to `Contents/Resources/icon.icns` and sets `CFBundleIconFile`. A bare binary (not in a `.app`) shows a generic Dock icon. |
 
 The desktop entry is `assets/linux/io.github.pauldeng.mqtt-navigator.desktop`. The packager and the app use the same file.

@@ -1,4 +1,4 @@
-//! The launcher side: swap, trial, rollback, and kills between the steps (plan P6).
+//! The start side: swap, trial, rollback, and kills between the steps (plan P6).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,12 +30,7 @@ fn env(kind: Kind) -> Env {
                 "x.AppImage"
             });
             fs::write(&path, "old").expect("old");
-            Install {
-                kind,
-                path,
-                launcher: app.join(swap::LAUNCHER),
-                payload: app.join(swap::PAYLOAD),
-            }
+            Install { kind, path }
         }
         Kind::App => {
             let macos = app.join("M.app/Contents/MacOS");
@@ -44,8 +39,6 @@ fn env(kind: Kind) -> Env {
             Install {
                 kind,
                 path: app.join("M.app"),
-                launcher: macos.join(swap::LAUNCHER),
-                payload: macos.join(swap::PAYLOAD),
             }
         }
     };
@@ -107,9 +100,13 @@ fn a_staged_update_is_swapped_and_the_previous_copy_is_kept() {
         let plan = e.start();
         assert_eq!(e.version(), "new", "{kind:?}");
         assert!(e.prev_exists());
-        assert_eq!(plan.exec, e.install.run_path());
-        assert_eq!(read_state(&e.dir), State::Started("2.0.0".into()));
+        assert_eq!(plan.exec, Some(e.install.run_path()));
+        assert_eq!(read_state(&e.dir), State::Swapped("2.0.0".into()));
         assert!(!exists(&swap::staged_dir(&e.dir)));
+        // The new copy starts for the first time: no start of another copy follows.
+        let plan = e.start();
+        assert_eq!(plan.exec, None);
+        assert_eq!(read_state(&e.dir), State::Running("2.0.0".into()));
         // The app opens a window: the trial ends and the previous copy stays.
         e.healthy("2.0.0");
         e.start();
@@ -128,22 +125,16 @@ fn a_new_version_that_never_becomes_healthy_is_rolled_back() {
         e.stage("2.0.0");
         let plan = e.start();
         assert_eq!(e.version(), "new");
-        if kind == Kind::AppImage {
-            // The old launcher starts the new image. The new launcher begins the trial.
-            assert_eq!(plan.exec, e.install.path);
-            assert_eq!(read_state(&e.dir), State::Swapped("2.0.0".into()));
-            let plan = e.start();
-            assert_eq!(
-                plan.exec, e.install.payload,
-                "no rollback at the first start"
-            );
-            assert_eq!(read_state(&e.dir), State::Started("2.0.0".into()));
-            assert_eq!(e.version(), "new");
-        }
+        assert_eq!(plan.exec, Some(e.install.run_path()));
+        assert_eq!(read_state(&e.dir), State::Swapped("2.0.0".into()));
+        // The first start of the new copy: no rollback.
+        assert_eq!(e.start().exec, None);
+        assert_eq!(read_state(&e.dir), State::Running("2.0.0".into()));
+        assert_eq!(e.version(), "new");
         // The next start finds no marker of 2.0.0.
         let plan = e.start();
         assert_eq!(e.version(), "old", "{kind:?}");
-        assert_eq!(plan.exec, e.install.run_path());
+        assert_eq!(plan.exec, Some(e.install.run_path()));
         assert!(
             plan.log.iter().any(|l| l.contains("rolled back")),
             "{:?}",
@@ -179,12 +170,28 @@ fn a_failed_start_after_the_swap_is_undone() {
     );
     assert_eq!(e.version(), "old");
     assert_eq!(read_state(&e.dir), State::None);
+    assert_eq!(swap::read_failed(&e.dir).as_deref(), Some("2.0.0"));
 }
 
-/// A launcher that is killed after any step of the swap. The next start must leave a whole
+#[test]
+fn a_failed_start_does_not_undo_a_trial_that_runs_or_a_legacy_trial() {
+    for state in [
+        State::Running("2.0.0".into()),
+        State::Started("2.0.0".into()),
+    ] {
+        let e = env(Kind::Exe);
+        e.stage("2.0.0");
+        e.start();
+        swap::write_state(&e.dir, &state).expect("state");
+        assert_eq!(swap::start_failed(&e.install, &e.dir), None);
+        assert_eq!(e.version(), "new");
+    }
+}
+
+/// A program that is killed after any step of the swap. The next start must leave a whole
 /// install, and either finish the update or go back to the old version.
 #[test]
-fn a_launcher_killed_between_the_steps_recovers() {
+fn a_program_killed_between_the_steps_recovers() {
     for kind in [Kind::Exe, Kind::App, Kind::AppImage] {
         for kill_at in [
             Step::StateWritten,
@@ -196,7 +203,7 @@ fn a_launcher_killed_between_the_steps_recovers() {
             e.stage("2.0.0");
             let killed = prepare(&e.install, &e.dir, &mut |s| s == kill_at);
             assert!(killed.is_err(), "{kind:?} {kill_at:?}");
-            // The next launcher start repairs the install.
+            // The next start repairs the install.
             e.start();
             let label = format!("{kind:?} killed at {kill_at:?}");
             // Whole install, either version.
@@ -205,7 +212,7 @@ fn a_launcher_killed_between_the_steps_recovers() {
             match v.as_str() {
                 // Updated: the trial runs, the state says so, and no half file is left.
                 "new" => assert!(
-                    matches!(read_state(&e.dir), State::Started(_) | State::Swapped(_)),
+                    matches!(read_state(&e.dir), State::Swapped(_) | State::Running(_)),
                     "{label}: {:?}",
                     read_state(&e.dir)
                 ),
@@ -261,10 +268,8 @@ fn copy_keeps_links_and_trees() {
 fn into_trial(e: &Env) {
     e.stage("2.0.0");
     e.start();
-    if e.install.kind == Kind::AppImage {
-        e.start(); // The new launcher begins the trial.
-    }
-    assert_eq!(read_state(&e.dir), State::Started("2.0.0".into()));
+    e.start(); // The first start of the new copy begins the trial.
+    assert_eq!(read_state(&e.dir), State::Running("2.0.0".into()));
     assert_eq!(e.version(), "new");
 }
 
@@ -282,7 +287,7 @@ fn assert_rolled_back(e: &Env, label: &str) {
     assert!(!exists(&swap::staged_dir(&e.dir)), "{label}: staged");
 }
 
-/// A launcher killed after any step of a rollback. The install path must always hold a whole
+/// A program killed after any step of a rollback. The install path must always hold a whole
 /// copy, or the previous copy must still be on disk. The next start ends the rollback.
 #[test]
 fn a_rollback_killed_between_the_steps_recovers() {
@@ -298,10 +303,10 @@ fn a_rollback_killed_between_the_steps_recovers() {
             let label = format!("{kind:?} killed at {kill_at:?}");
             let killed = prepare(&e.install, &e.dir, &mut |s| s == kill_at);
             assert!(killed.is_err(), "{label}");
-            // The state still says `started`: the rollback is not over.
+            // The state still says `running`: the rollback is not over.
             assert_eq!(
                 read_state(&e.dir),
-                State::Started("2.0.0".into()),
+                State::Running("2.0.0".into()),
                 "{label}"
             );
             match kill_at {
@@ -313,8 +318,8 @@ fn a_rollback_killed_between_the_steps_recovers() {
                 _ => assert_eq!(e.version(), "old", "{label}"),
             }
             let plan = e.start();
-            // After the restore, the user starts the restored file: the sibling is right.
-            let ok = plan.exec == e.install.run_path() || plan.exec == e.install.payload;
+            // After the restore, the restored copy starts. Without a restore, this process goes on.
+            let ok = plan.exec == Some(e.install.run_path()) || plan.exec.is_none();
             assert!(ok, "{label}: {:?}", plan.log);
             assert_rolled_back(&e, &label);
             e.start();
@@ -341,7 +346,7 @@ fn a_rolled_back_version_is_never_applied_again() {
     e.stage("2.1.0");
     e.start();
     assert_eq!(e.version(), "new");
-    assert_eq!(read_state(&e.dir), State::Started("2.1.0".into()));
+    assert_eq!(read_state(&e.dir), State::Swapped("2.1.0".into()));
 }
 
 #[test]
@@ -370,7 +375,7 @@ fn the_trial_state_is_written_only_after_the_staged_copy_is_gone() {
     assert_eq!(read_state(&e.dir), State::Swapping("2.0.0".into()));
     e.start();
     assert!(!exists(&swap::staged_dir(&e.dir)));
-    assert_eq!(read_state(&e.dir), State::Started("2.0.0".into()));
+    assert_eq!(read_state(&e.dir), State::Swapped("2.0.0".into()));
 }
 
 /// The update folder on another volume than the install: `place` must copy. Skipped when
@@ -400,8 +405,9 @@ fn a_copy_across_volumes_leaves_no_staged_folder() {
             "{kind:?}: staged is gone"
         );
         assert!(!exists(&e.install.path.with_extension("new")));
-        assert_eq!(read_state(&e.dir), State::Started("2.0.0".into()));
+        assert_eq!(read_state(&e.dir), State::Swapped("2.0.0".into()));
         // Never healthy: the previous copy returns, and the version never comes back.
+        e.start();
         e.start();
         assert_eq!(e.version(), "old");
         assert!(!exists(&swap::staged_dir(&e.dir)));
@@ -423,5 +429,5 @@ fn a_kill_between_the_copy_and_the_last_rename_finishes_the_swap() {
     let plan = e.start();
     assert_eq!(e.version(), "new", "{:?}", plan.log);
     assert_eq!(fs::read_to_string(e.install.prev()).expect("prev"), "old");
-    assert_eq!(read_state(&e.dir), State::Started("2.0.0".into()));
+    assert_eq!(read_state(&e.dir), State::Swapped("2.0.0".into()));
 }

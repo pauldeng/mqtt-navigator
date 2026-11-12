@@ -4,6 +4,15 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed
+
+- One program on every platform: `mqtt-navigator` (`mqtt-navigator.exe` on Windows). The separate launcher is gone. The app applies a staged update at its own start and rolls back a version that never opens a window.
+- Windows: the exe has no console window. In a terminal, `--help` and errors still print.
+- A Windows install of 0.1.0 keeps `mqtt-navigator-launcher.exe` as the shortcut target. It still works: it starts `mqtt-navigator.exe`. To remove it, uninstall the app, then install the new version.
+- A development build never updates itself.
+- macOS: one universal app (Apple silicon and Intel) in one `.dmg`, as `…-universal-apple-darwin`.
+- Windows: the exe links the C runtime statically. It does not need the Visual C++ Redistributable.
+
 ## [0.1.0] - 2026-11-12
 
 First version.

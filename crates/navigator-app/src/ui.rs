@@ -802,14 +802,14 @@ impl Navigator {
                         if let Some(flush) = flush {
                             let _ = flush.await;
                         }
-                        // "Restart to update": the launcher applies the update and starts the
-                        // new version. This comes after the save and before the slow net stop.
+                        // "Restart to update": the new process applies the update at its
+                        // start and runs the new version. This comes after the save and before the slow net stop.
                         if let Some(install) = restart {
                             background
                                 .spawn(async move {
                                     let args = std::env::args_os().skip(1);
                                     if let Err(e) = navigator_update::restart(&install, args) {
-                                        tracing::warn!(error = %e, "Cannot start the launcher");
+                                        tracing::warn!(error = %e, "Cannot start the app again");
                                     }
                                 })
                                 .await;

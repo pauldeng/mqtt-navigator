@@ -11,7 +11,7 @@ use super::*;
 
 /// What the badge shows.
 enum Badge {
-    /// The update is staged. "Restart to update" starts the launcher.
+    /// The update is staged. "Restart to update" starts the app again.
     Ready { version: String, install: Install },
     /// This copy cannot update itself. The badge opens the release page.
     Notice {
@@ -26,7 +26,7 @@ pub(super) struct UpdateUi {
     /// A check runs now. The start check and the palette check never overlap.
     checking: bool,
     badge: Option<Badge>,
-    /// Set by "Restart to update". The quit handler starts the launcher after it saved the
+    /// Set by "Restart to update". The quit handler starts the app again after it saved the
     /// settings.
     pub(super) restart: Option<Install>,
 }
@@ -107,8 +107,8 @@ impl Navigator {
         cx.notify();
     }
 
-    /// The first frame is here: tell the launcher that this version runs. The launcher rolls
-    /// back a new version that never writes this marker.
+    /// The first frame is here: tell the next start that this version runs. The next start
+    /// rolls back a new version that never writes this marker.
     pub(super) fn mark_healthy(&self, cx: &mut Context<Self>) {
         cx.background_executor()
             .spawn(async {
@@ -116,8 +116,11 @@ impl Navigator {
                     return;
                 };
                 // No trial, no marker: a development run leaves no files.
-                if matches!(swap::read_state(&dir), State::Started(_))
-                    && let Err(e) = swap::write_healthy(&dir, env!("CARGO_PKG_VERSION"))
+                // `Started`: the 0.1.0 launcher began this trial and it still reads the marker.
+                if matches!(
+                    swap::read_state(&dir),
+                    State::Running(_) | State::Started(_)
+                ) && let Err(e) = swap::write_healthy(&dir, env!("CARGO_PKG_VERSION"))
                 {
                     tracing::warn!(error = %e, "Cannot write the health marker");
                 }
@@ -125,7 +128,7 @@ impl Navigator {
             .detach();
     }
 
-    /// "Restart to update": quit now. The quit handler starts the launcher.
+    /// "Restart to update": quit now. The quit handler starts the app again.
     fn restart_to_update(&mut self, cx: &mut Context<Self>) {
         if let Some(Badge::Ready { install, .. }) = &self.update.badge {
             self.update.restart = Some(install.clone());

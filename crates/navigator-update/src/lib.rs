@@ -1,9 +1,9 @@
 //! Signed self-update (ADR 0005). Everything here blocks: the app runs it on a background
-//! thread. No gpui. The launcher shares [`swap`] with the app.
+//! thread. No gpui.
 //!
 //! Flow: [`check_and_stage`] fetches `latest.json` and `latest.json.minisig`, runs [`verify`],
 //! downloads the artifact of this build's target to `staging/`, checks size and SHA-256, and
-//! only then renames `staging/` to `staged/`. The launcher applies `staged/` at the next start.
+//! only then renames `staging/` to `staged/`. [`startup`] applies `staged/` at the next start.
 //!
 //! The target triple comes from `build.rs` (`env!("TARGET")`), so the manifest key is exact.
 #![forbid(unsafe_code)]
@@ -250,7 +250,7 @@ pub fn check(
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     UpToDate,
-    /// Downloaded, verified and staged. The launcher applies it at the next start.
+    /// Downloaded, verified and staged. [`startup`] applies it at the next start.
     Ready {
         version: String,
     },
@@ -288,7 +288,7 @@ pub fn check_and_stage(
 }
 
 /// [`check_and_stage`] with the values of this build. Blocking. It also returns the detected
-/// mode, so the app can restart through the launcher later.
+/// mode, so the app can restart later.
 pub fn run_check(running: &str) -> Result<(Outcome, UpdateMode)> {
     let dir = swap::update_dir()
         .ok_or_else(|| Error::Io(io::Error::other("This system has no data folder.")))?;
@@ -297,18 +297,150 @@ pub fn run_check(running: &str) -> Result<(Outcome, UpdateMode)> {
     Ok((outcome, mode))
 }
 
-/// Starts the launcher (the AppImage itself on Linux) with `args`. The caller quits next. The
-/// launcher applies the staged update and starts the new version.
+/// Starts this app again with `args`. The caller quits next. The new process runs [`startup`],
+/// which applies the staged update. Windows allows a rename of a running exe, so the new process
+/// can move the old exe aside while the old process still closes.
 pub fn restart(install: &Install, args: impl IntoIterator<Item = OsString>) -> io::Result<()> {
-    let program = match install.kind {
-        swap::Kind::AppImage => &install.path,
-        _ => &install.launcher,
-    };
-    Command::new(program)
+    Command::new(install.run_path())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// Call this first in `main()`, before anything else. It runs the update protocol
+/// ([`swap::prepare`]): it finishes or undoes an interrupted swap, ends or rolls back a trial,
+/// and applies a staged update. When another copy must run (a new version, or the old one after
+/// a rollback), it starts that copy with the same arguments. Then it replaces this process
+/// (Unix) or ends it (Windows). A development build does nothing. Every error goes to
+/// `update.log`, and the app goes on. It never uses the network.
+pub fn startup() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let appimage = std::env::var_os("APPIMAGE");
+    if let (Some(inst), Some(dir)) = (Install::locate(&exe, appimage), swap::update_dir()) {
+        startup_at(&inst, &dir, &args, &mut reexec);
+    }
+}
+
+/// Starts `program`. Unix: replaces this process, so it returns only an error. Windows: starts
+/// it detached and ends this process, so it also returns only an error.
+fn reexec(program: &Path, args: &[OsString]) -> io::Error {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.exec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0008); // DETACHED_PROCESS: the new app has no console.
+        match cmd.spawn() {
+            Ok(_) => std::process::exit(0),
+            Err(e) => e,
+        }
+    }
+}
+
+/// [`startup`] for a known install. `start` gets the program to start. It returns only on error.
+fn startup_at(
+    inst: &Install,
+    dir: &Path,
+    args: &[OsString],
+    start: &mut dyn FnMut(&Path, &[OsString]) -> io::Error,
+) {
+    let Ok(plan) = swap::prepare(inst, dir, &mut |_| false) else {
+        return;
+    };
+    // The log comes first: a successful start replaces this process.
+    write_log(&plan.log);
+    let Some(program) = plan.exec else { return };
+    let e = start(&program, args);
+    let mut lines = vec![format!("cannot start {}: {e}", program.display())];
+    // A new copy that does not start: put the previous copy back and try it.
+    if let Some(back) = swap::start_failed(inst, dir) {
+        lines.push("rolled back after a failed start".into());
+        write_log(&lines);
+        let e = start(&back, args);
+        lines = vec![format!("cannot start {}: {e}", back.display())];
+    }
+    write_log(&lines);
+}
+
+/// Best effort: appends the lines to `<log_dir>/update.log`.
+fn write_log(lines: &[String]) {
+    use std::io::Write as _;
+    let Some(dir) = swap::log_dir().filter(|_| !lines.is_empty()) else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("update.log"))
+    {
+        for line in lines {
+            let _ = writeln!(f, "{secs} update: {line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use swap::{State, commit_staged, staging_dir};
+
+    /// An exe install with a staged "2.0.0".
+    fn staged_install() -> (tempfile::TempDir, Install, PathBuf) {
+        let tmp = tempfile::tempdir().expect("dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("path");
+        let dir = root.join("update");
+        let path = root.join(swap::PAYLOAD);
+        std::fs::write(&path, "old").expect("old");
+        std::fs::create_dir_all(staging_dir(&dir)).expect("staging");
+        std::fs::write(staging_dir(&dir).join("payload"), "new").expect("new");
+        commit_staged(&dir, "2.0.0", &path).expect("commit");
+        let inst = Install {
+            kind: swap::Kind::Exe,
+            path,
+        };
+        (tmp, inst, dir)
+    }
+
+    #[test]
+    fn a_swap_starts_the_new_copy_with_the_same_arguments() {
+        let (_tmp, inst, dir) = staged_install();
+        let args = vec![OsString::from("--tcp")];
+        let started = RefCell::new(Vec::new());
+        startup_at(&inst, &dir, &args, &mut |p, a| {
+            started.borrow_mut().push((p.to_path_buf(), a.to_vec()));
+            io::Error::other("test")
+        });
+        // The start fails, so the swap is undone and the old copy is tried.
+        let started = started.into_inner();
+        assert_eq!(started.len(), 2, "{started:?}");
+        assert_eq!(started[0], (inst.path.clone(), args.clone()));
+        assert_eq!(started[1], (inst.path.clone(), args));
+        assert_eq!(std::fs::read_to_string(&inst.path).expect("exe"), "old");
+        assert_eq!(swap::read_state(&dir), State::None);
+        assert_eq!(swap::read_failed(&dir).as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn a_start_that_needs_no_other_copy_starts_nothing() {
+        let (_tmp, inst, dir) = staged_install();
+        std::fs::remove_dir_all(swap::staged_dir(&dir)).expect("no update");
+        startup_at(&inst, &dir, &[], &mut |_, _| panic!("no start expected"));
+    }
 }

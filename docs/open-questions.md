@@ -14,7 +14,7 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
 ## Closed
 
 - 2026-11-11: First CI run on `main` passed on Ubuntu, macOS 15 and Windows 2022 (build, clippy, tests, vendored OpenSSL), plus fuzz and the broker tests.
-- 2026-11-11: Updater → our own updater on `ureq`, `minisign-verify` and `sha2`, with a launcher that rolls back (ADR 0005).
+- 2026-11-11: Updater → our own updater on `ureq`, `minisign-verify` and `sha2`, with a rollback of a bad version (ADR 0005; the separate launcher is gone since 2026-11-12).
 - 2026-11-11: Authenticode signing → ship the Windows files unsigned for now. The workflow signs them when the secret `WINDOWS_PFX_BASE64` is set (ADR 0005).
 - 2026-11-10: Update source → public GitHub Releases of `pauldeng/mqtt-navigator`.
 - 2026-11-10: Signing → minisign manifest key and Windows Authenticode. No Apple Developer ID.

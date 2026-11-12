@@ -11,7 +11,8 @@ The app has two major features: **Subscribe** and **Publish**. Received messages
 | Crate | Contents | Rule |
 |---|---|---|
 | `navigator-core` | MQTT session, topic store, decoders, profiles, settings | It must not depend on gpui. It forbids `unsafe`. |
-| `navigator-app` | gpui-kit UI, updater, `main()`. The binary is `mqtt-navigator`. | It is the only crate that knows the UI. |
+| `navigator-update` | Update check, signed download, and the swap and rollback steps. | It has no gpui. `swap.rs` uses only `std`. |
+| `navigator-app` | gpui-kit UI, updater, `main()`. The binary is `mqtt-navigator`, the only program that ships. | It is the only crate that knows the UI. |
 
 ## Threads
 
@@ -47,6 +48,7 @@ Rules:
 - The reconnect timer runs only in the `Reconnecting` state.
 - A settings change starts a write after 500 ms of quiet.
 - The update check runs once at start, and when the user selects "Check for updates". It has no periodic timer.
+- The first call of `main()` is `navigator_update::startup()`. It applies a staged update, or rolls back a version that never opened a window, and starts the right copy again. It does no network work. See [ADR 0005](docs/adr/0005-release-and-update.md).
 
 ## Responsive UI
 

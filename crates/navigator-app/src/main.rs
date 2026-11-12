@@ -1,5 +1,9 @@
 //! MQTT Navigator desktop app. P1 tracer bullet: connect, subscribe, topic tree, latest value,
 //! publish, disconnect.
+//!
+//! Windows release builds use the GUI subsystem, so a start from Explorer shows no console. For
+//! command line output (`--help`, a usage error) the app attaches to the console of its parent.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod composer;
 mod connections;
@@ -28,7 +32,32 @@ const APP_ID: &str = "io.github.pauldeng.mqtt-navigator";
 /// Process start, for the first-frame metric.
 pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// Prints a line of command line output to the standard error.
+/// Windows: the exe has no console of its own, so it attaches to the console of the parent
+/// first (cmd, PowerShell). When the parent has none, or this is a debug build that has a
+/// console, the call fails and does nothing.
+fn eprintln_cli(text: &str) {
+    #[cfg(windows)]
+    {
+        static ATTACH: std::sync::Once = std::sync::Once::new();
+        ATTACH.call_once(|| {
+            // SAFETY: `AttachConsole` takes a process id constant and no pointer. It has no
+            // preconditions. A failure only means that there is no console to attach to.
+            #[allow(unsafe_code)]
+            unsafe {
+                windows_sys::Win32::System::Console::AttachConsole(
+                    windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+                );
+            }
+        });
+    }
+    eprintln!("{text}");
+}
+
 fn main() {
+    // First: apply a staged update, or roll back a bad one, before anything else (ADR 0005).
+    // This may start another copy of the app and end this process.
+    navigator_update::startup();
     STARTED.get_or_init(std::time::Instant::now);
     logging::init();
     let cli = match cli_session(
@@ -38,7 +67,7 @@ fn main() {
     ) {
         Ok(c) => c,
         Err(msg) => {
-            eprintln!("{msg}\n\n{USAGE}");
+            eprintln_cli(&format!("{msg}\n\n{USAGE}"));
             std::process::exit(2);
         }
     };
@@ -128,7 +157,7 @@ fn open(cli: Option<ConnectConfig>, prepared: Prepared, cx: &mut App) {
         });
         cx.new(|cx| ui::Navigator::new(cli, load, window, cx))
     }) {
-        eprintln!("Cannot open the window: {err:#}");
+        eprintln_cli(&format!("Cannot open the window: {err:#}"));
         cx.quit();
     }
 }

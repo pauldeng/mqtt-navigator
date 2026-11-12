@@ -4050,6 +4050,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-native-keyring-store",
+ "windows-sys 0.61.2",
  "winresource",
  "zbus-secret-service-keyring-store",
 ]
@@ -4068,14 +4069,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "navigator-launcher"
-version = "0.1.0"
-dependencies = [
- "tempfile",
- "winresource",
 ]
 
 [[package]]

@@ -13,9 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use navigator_update::Install;
-use navigator_update::swap::Kind;
-
 use crate::APP_ID;
 
 const ENTRY_FILE: &str = "io.github.pauldeng.mqtt-navigator.desktop";
@@ -50,7 +47,7 @@ pub fn ensure_user_entry() {
     else {
         return;
     };
-    let Some(exec) = launcher_path() else {
+    let Some(exec) = exec_path() else {
         return;
     };
     let system = system_data_dirs(std::env::var_os("XDG_DATA_DIRS"));
@@ -66,13 +63,11 @@ pub fn ensure_user_entry() {
     }
 }
 
-/// What the entry starts: the AppImage file, else the launcher next to the app, else the app.
-fn launcher_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    match Install::locate(&exe, std::env::var_os("APPIMAGE")) {
-        Some(i) if i.kind == Kind::AppImage => Some(i.path),
-        Some(i) => Some(i.launcher),
-        None => Some(exe),
+/// What the entry starts: the AppImage file, else the app itself.
+fn exec_path() -> Option<PathBuf> {
+    match std::env::var_os("APPIMAGE").filter(|a| !a.is_empty()) {
+        Some(appimage) => Some(appimage.into()),
+        None => std::env::current_exe().ok(),
     }
 }
 
@@ -258,7 +253,7 @@ mod tests {
     #[test]
     fn exec_round_trip() {
         for p in [
-            "/usr/bin/mqtt-navigator-launcher",
+            "/usr/bin/mqtt-navigator",
             "/home/a b/My Apps/MQTT $x\"y`z\\w.AppImage",
         ] {
             let text = render(Path::new(p)).expect("renders");
@@ -281,16 +276,16 @@ mod tests {
         let sys = tempfile::tempdir().expect("tempdir");
         let bin = home.path().join("bin");
         std::fs::create_dir_all(&bin).expect("mkdir");
-        let launcher = bin.join("mqtt-navigator-launcher");
-        std::fs::write(&launcher, b"").expect("write");
+        let exe = bin.join("mqtt-navigator");
+        std::fs::write(&exe, b"").expect("write");
         let system = [sys.path().to_path_buf()];
 
-        assert!(install(home.path(), &system, &launcher).expect("first"));
+        assert!(install(home.path(), &system, &exe).expect("first"));
         let entry = home.path().join("applications").join(ENTRY_FILE);
         assert!(
             std::fs::read_to_string(&entry)
                 .expect("read")
-                .contains(launcher.to_str().expect("utf8"))
+                .contains(exe.to_str().expect("utf8"))
         );
         for size in [48, 128, 256, 512] {
             let png = home
@@ -299,10 +294,10 @@ mod tests {
             assert!(png.is_file(), "{png:?}");
         }
         // A valid entry stays.
-        assert!(!install(home.path(), &system, &launcher).expect("second"));
+        assert!(!install(home.path(), &system, &exe).expect("second"));
 
         // Our entry that starts a missing program is repaired.
-        std::fs::remove_file(&launcher).expect("rm");
+        std::fs::remove_file(&exe).expect("rm");
         let moved = bin.join("MQTT.AppImage");
         std::fs::write(&moved, b"").expect("write");
         assert!(install(home.path(), &system, &moved).expect("repair"));

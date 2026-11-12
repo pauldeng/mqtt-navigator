@@ -16,7 +16,7 @@ The app reads `latest.json` from the latest published release. A draft is not vi
 |---|---|
 | Linux x64 | `.AppImage`, `.deb`, `.tar.gz` |
 | Windows x64 | `-setup.exe` (per-user), `.zip` (portable) |
-| macOS arm64 and x64 | `.dmg`, `.app.zip` |
+| macOS universal (arm64 and x64 in one app) | `.dmg`, `.app.zip` |
 | All | `SHA256SUMS`, `latest.json`, `latest.json.minisig`, SBOM (`*.cdx.json`), `THIRD-PARTY-NOTICES.md`, build attestations |
 
 The AppImage, the Windows `.zip` and the macOS `.app.zip` are the update files. `latest.json` lists them.
@@ -55,18 +55,18 @@ If the old key is lost or stolen, step 3 is not possible. Tell users to install 
 
 ```bash
 cargo install cargo-packager --locked --version 0.11.8
-cargo build --release -p navigator-app -p navigator-launcher
+cargo build --release -p navigator-app
 cargo packager --release -p navigator-app --formats appimage,deb   # Linux
 ```
 
-The files appear in `dist/`. The packager does not build the programs. Build both first. `cargo packager` starts the launcher (`mqtt-navigator-launcher`) from the shortcut, the desktop entry and the `.app`.
+The files appear in `dist/`. The packager does not build the program. Build it first. The shortcut, the desktop entry and the `.app` start `mqtt-navigator`. The app applies a staged update at its own start (ADR 0005).
 
 ### Icons and desktop entry
 
-- The packager names the Linux desktop entry and the icons after the main binary (`mqtt-navigator-launcher`). The window app id is `io.github.pauldeng.mqtt-navigator`, and the shell matches the window by that name. So `crates/navigator-app/Cargo.toml` turns off `generate-desktop-entry`. It installs `assets/linux/io.github.pauldeng.mqtt-navigator.desktop` and the hicolor icons (16 to 512 px) with the app id as the name (`[package.metadata.packager.deb.files]`).
-- The deb also has one extra icon, `hicolor/512x512/apps/mqtt-navigator-launcher.png`. The AppImage step needs a PNG in `icons`. It is harmless.
-- The AppImage has the same entry. Its file name in the AppDir is `mqtt-navigator-launcher.desktop`, because the packager script links that name in the AppDir root. The root icon is `io.github.pauldeng.mqtt-navigator.png`.
-- Windows: `build.rs` in `navigator-app` and `navigator-launcher` embeds `assets/icon/icon.ico` as icon resource ID 1 with `winresource`. It needs `rc.exe` (Windows SDK, on the GitHub Windows runner). Nobody built this without CI. To check a release build, open the exe properties in Explorer (icon and "MQTT Navigator" product name) and look at the taskbar icon.
+- The packager names the Linux desktop entry and the icons after the main binary (`mqtt-navigator`). The window app id is `io.github.pauldeng.mqtt-navigator`, and the shell matches the window by that name. So `crates/navigator-app/Cargo.toml` turns off `generate-desktop-entry`. It installs `assets/linux/io.github.pauldeng.mqtt-navigator.desktop` and the hicolor icons (16 to 512 px) with the app id as the name (`[package.metadata.packager.deb.files]`).
+- The deb also has one extra icon, `hicolor/512x512/apps/mqtt-navigator.png`. The AppImage step needs a PNG in `icons`. It is harmless.
+- The AppImage has the same entry. Its file name in the AppDir is `mqtt-navigator.desktop`, because the packager script links that name in the AppDir root. The root icon is `io.github.pauldeng.mqtt-navigator.png`.
+- Windows: `build.rs` in `navigator-app` embeds `assets/icon/icon.ico` as icon resource ID 1 with `winresource`. It needs `rc.exe` (Windows SDK, on the GitHub Windows runner). Nobody built this without CI. To check a release build, open the exe properties in Explorer (icon and "MQTT Navigator" product name) and look at the taskbar icon.
 - macOS: the packager copies `assets/icon/icon.icns` to `Contents/Resources/icon.icns` and sets `CFBundleIconFile` to `icon.icns`. Check `plutil -p "dist/MQTT Navigator.app/Contents/Info.plist"` after packaging.
 - Linux AppImage and bare binary: on the first start the app adds a user desktop entry. See the user guide.
 
@@ -76,5 +76,5 @@ Other tools: `cargo about generate about.hbs` (licence text, see `about.toml`) a
 
 - Notarization and a Developer ID for macOS.
 - MSI, rpm, Flatpak, winget, scoop, Homebrew.
-- Delta updates, periodic update checks, update of the Windows launcher.
+- Delta updates, periodic update checks, removal of the 0.1.0 launcher file from an existing Windows install. The file is harmless: it starts `mqtt-navigator.exe`. A reinstall removes it.
 - The Windows and macOS steps run only in GitHub Actions. Nobody tested them without a push.

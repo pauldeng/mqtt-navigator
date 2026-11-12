@@ -256,8 +256,8 @@ fn extract_app(zip: &Path, staging: &Path, payload: &Path) -> Result<()> {
     }
 }
 
-/// Windows: a zip with one top-level folder that holds the payload and the launcher. Only the
-/// payload is taken. The launcher is never replaced. The zip has no links.
+/// Windows: a zip with one top-level folder that holds the exe and the licences. Only the exe
+/// is taken. The zip has no links.
 fn extract_payload(zip: &Path, staging: &Path, payload: &Path) -> Result<()> {
     let out = staging.join("unzipped");
     fs::create_dir(&out)?;

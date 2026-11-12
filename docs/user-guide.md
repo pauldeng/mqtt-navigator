@@ -13,13 +13,13 @@ Download the file for your system from [GitHub Releases](https://github.com/paul
 
 1. Download `-setup.exe` (installer) or `.zip` (portable).
 2. For the installer: run it. It installs for your user only. It does not need administrator rights.
-3. For the portable file: unpack the zip to a folder you can write to. Start `mqtt-navigator-launcher.exe`.
+3. For the portable file: unpack the zip to a folder you can write to. Start `mqtt-navigator.exe`.
 
 The files have no Authenticode signature yet, so SmartScreen warns about an unknown publisher. Select **More info**, then **Run anyway**. Check the file against `SHA256SUMS` on the release page first.
 
 ### macOS 15 and later (Apple silicon and Intel)
 
-1. Download the `.dmg` for your CPU.
+1. Download the `.dmg`. One app runs on Apple silicon and on Intel.
 2. Open the DMG. Drag **MQTT Navigator** to **Applications**.
 3. Right-click the app and select **Open**. Select **Open** again in the dialog.
 
@@ -40,7 +40,7 @@ Your system needs Vulkan (`libvulkan1`) and a Wayland or X11 session.
 - **AppImage:** run `chmod +x MQTT-Navigator-*.AppImage`. Then start the file. The AppImage updates itself.
 - **deb:** run `sudo apt install ./mqtt-navigator_*.deb`. The deb does not update itself. See [Updates](#updates).
 
-**App menu and dock icon.** On first start, the AppImage and the bare program add themselves to your app menu. This lets the dock and the task bar show the icon. The app writes `~/.local/share/applications/io.github.pauldeng.mqtt-navigator.desktop` and the icons `~/.local/share/icons/hicolor/<size>/apps/io.github.pauldeng.mqtt-navigator.png` (48, 128, 256 and 512 px). The entry starts the AppImage file, or else the launcher. The app does this once, in the background. If the `.deb` is installed, the app does not add an entry. It removes the entry and the icons that it added before, because the `.deb` has its own. If you move or rename the AppImage, the next start of the moved file repairs the entry. The app never changes an entry that starts another program. The app adds no entry if the path has a `%` character, because GNOME cannot start such a path from an entry.
+**App menu and dock icon.** On first start, the AppImage and the bare program add themselves to your app menu. This lets the dock and the task bar show the icon. The app writes `~/.local/share/applications/io.github.pauldeng.mqtt-navigator.desktop` and the icons `~/.local/share/icons/hicolor/<size>/apps/io.github.pauldeng.mqtt-navigator.png` (48, 128, 256 and 512 px). The entry starts the AppImage file, or else the program itself. The app does this once, in the background. If the `.deb` is installed, the app does not add an entry. It removes the entry and the icons that it added before, because the `.deb` has its own. If you move or rename the AppImage, the next start of the moved file repairs the entry. The app never changes an entry that starts another program. The app adds no entry if the path has a `%` character, because GNOME cannot start such a path from an entry.
 
 To remove the app from your app menu, delete the AppImage or the program. Then delete these files (use `$XDG_DATA_HOME` instead of `~/.local/share` if you set it):
 
@@ -270,8 +270,10 @@ The theme files keep the licences of their projects. See [THIRD-PARTY-NOTICES.md
 - To turn off the check at start, use "Turn off the update check at start" in the command palette.
 - The check reads `latest.json` from the latest published GitHub release. The file has a minisign signature, and the app verifies it. The app also checks the SHA-256 hash and the size of the download. It rejects an older or equal version.
 - When an update is ready, the title bar shows "Update 0.2.0 ready". Select it, then **Restart to update** (or **Later**). The app never restarts by itself.
-- The app keeps one previous copy. If the new version never opens a window, the launcher restores the old one.
+- The app keeps one previous copy. If the new version never opens a window, the next start restores the old one.
 - **Windows (installer), AppImage, macOS app:** the app updates itself.
+- **Version 0.1.0 on Windows:** the shortcut starts `mqtt-navigator-launcher.exe`. It still works: it starts `mqtt-navigator.exe`. A reinstall with the installer removes it.
+- **A development build** (started from `target/`) never updates itself.
 - **deb install, or a folder you cannot write to:** the app cannot update itself. The title bar shows "Update <version> available", for example "Update 0.2.0 available". Point at it to see why. Select it to open the release page. Install the new deb yourself.
 - The update check is the only network traffic other than your broker. The app sends no telemetry.
 
@@ -315,6 +317,8 @@ mqtt-navigator [--host HOST] [--port PORT] [--tcp | --ws | --wss] [--insecure]
 | `-h`, `--help` | Show the usage and exit with code 2. |
 
 With options, the app makes a session connection called "Command line". The app never saves it or its password. A wrong option prints the usage and exits with code 2.
+
+**Windows.** `mqtt-navigator.exe` is a windowed program. In a terminal, `--help` and error messages print in that terminal. The terminal does not wait for the app: the prompt comes back at once. Use `start /wait mqtt-navigator.exe ...` in `cmd` to wait. `--password-stdin` reads a piped standard input as on other systems.
 
 There is no `--password PASS` option. A password in an argument shows in the process list (`/proc/<pid>/cmdline`) and in the shell history. The app prints a message and exits with code 2 if you use it.
 

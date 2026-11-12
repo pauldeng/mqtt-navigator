@@ -1,6 +1,6 @@
 [package]
 name = "navigator-update"
-description = "Signed self-update for MQTT Navigator: manifest check, download, staging, and the launcher swap logic."
+description = "Signed self-update for MQTT Navigator: manifest check, download, staging, and the swap logic that runs at the start of the app."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,16 +1,32 @@
-//! The on-disk update protocol. It uses only `std`, because the launcher includes this file
-//! with `#[path]` and must stay dependency-free. The app uses it too (staging, health marker).
+//! The on-disk update protocol. It uses only `std`. The app runs [`prepare`] at the very start of
+//! `main()` (see `navigator_update::startup`). The app also uses this file for staging and for
+//! the health marker.
+//!
+//! Version 0.1.0 had a separate launcher program that ran the same protocol. A 0.1.0 Windows
+//! install keeps that launcher as the shortcut target, and it runs its own `prepare` first.
+//! So the update folder format must stay as 0.1.0 reads it. A test (`swap_compat.rs`) runs the
+//! 0.1.0 code against this code.
 //!
 //! Update folder `<data_local_dir>/mqtt-navigator/update/`:
 //!
 //! | Name | Meaning |
 //! |---|---|
 //! | `staging/` | A download in progress. It never becomes `staged` before the hash matched. |
-//! | `staged/payload` | The verified new file (AppImage, payload exe) or `.app` folder. |
+//! | `staged/payload` | The verified new file (AppImage, exe) or `.app` folder. |
 //! | `staged/version`, `staged/for` | Its version, and the install path that it is meant for. |
-//! | `state` | `swapping V`, `swapped V` (AppImage only) or `started V`. No file: no update. |
+//! | `state` | `swapping V`, `swapped V`, `running V` or `started V`. No file: no update. |
 //! | `healthy` | The version of the app that opened a window. |
-//! | `failed` | The last version that was rolled back. The app does not offer it again, and the launcher never applies a staged update of that version. |
+//! | `failed` | The last version that was rolled back. The app does not offer it again, and `prepare` never applies a staged update of that version. |
+//!
+//! State words, and what [`prepare`] does with each at the start:
+//!
+//! | State | Written by | Action at the start |
+//! |---|---|---|
+//! | none | | Apply a matching `staged/` update. Start it. |
+//! | `swapping V` | the swap | The swap was interrupted. Repair it, finish it, and start the install. |
+//! | `swapped V` | the swap (and the 0.1.0 launcher, AppImage only) | First start of V. Write `running V`. Go on. |
+//! | `running V` | the first start of V | `healthy` is V: the trial ends. Else: roll back, and start the old copy. |
+//! | `started V` | the 0.1.0 launcher only | It owns the trial. Never roll back. `healthy` is V: end it. Else: leave it. |
 
 use std::ffi::OsString;
 use std::fs;
@@ -21,11 +37,6 @@ pub const PAYLOAD: &str = if cfg!(windows) {
     "mqtt-navigator.exe"
 } else {
     "mqtt-navigator"
-};
-pub const LAUNCHER: &str = if cfg!(windows) {
-    "mqtt-navigator-launcher.exe"
-} else {
-    "mqtt-navigator-launcher"
 };
 
 /// The same folder as `dirs::data_local_dir()` (a test checks it), without the `dirs` crate.
@@ -52,38 +63,32 @@ pub fn log_dir() -> Option<PathBuf> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A Linux AppImage file. The launcher is inside it.
+    /// A Linux AppImage file.
     AppImage,
-    /// A macOS `.app` folder. The launcher is inside it.
+    /// A macOS `.app` folder.
     App,
-    /// The payload exe next to the launcher (Windows, or a Linux folder).
+    /// The exe itself (Windows, or a Linux folder).
     Exe,
 }
 
-/// What an update replaces, and the programs that start it.
+/// What an update replaces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Install {
     pub kind: Kind,
-    /// The thing that the swap replaces: the AppImage file, the `.app` folder or the payload.
+    /// The thing that the swap replaces: the AppImage file, the `.app` folder or the exe.
     pub path: PathBuf,
-    /// The program that the user starts (it applies updates).
-    pub launcher: PathBuf,
-    /// The app, next to the launcher.
-    pub payload: PathBuf,
 }
 
 impl Install {
-    /// Finds the install from the path of the running program (the launcher or the payload).
-    /// `None`: no launcher is next to it (a development build, for example).
+    /// Finds the install from the path of the running program.
+    /// `None`: a development build (the exe is in a cargo `target` folder), or a `Contents/MacOS`
+    /// folder that is not in an `.app`. A development build never updates itself.
     pub fn locate(exe: &Path, appimage: Option<OsString>) -> Option<Self> {
         let dir = exe.parent()?;
-        let launcher = dir.join(LAUNCHER);
-        let payload = dir.join(PAYLOAD);
-        if !launcher.is_file() {
-            return None;
-        }
         let (kind, path) = if let Some(ai) = appimage.filter(|a| !a.is_empty()) {
             (Kind::AppImage, PathBuf::from(ai))
+        } else if in_cargo_target(exe) {
+            return None;
         } else if dir.ends_with("Contents/MacOS") {
             let bundle = dir.parent()?.parent()?;
             if bundle.extension()? != "app" {
@@ -91,17 +96,12 @@ impl Install {
             }
             (Kind::App, bundle.to_path_buf())
         } else {
-            (Kind::Exe, payload.clone())
+            (Kind::Exe, exe.to_path_buf())
         };
-        Some(Self {
-            kind,
-            path,
-            launcher,
-            payload,
-        })
+        Some(Self { kind, path })
     }
 
-    /// The program to start after a swap. The old copy of the payload may be gone or moved.
+    /// The program to start after a swap or a rollback. The old copy may be gone or moved.
     pub fn run_path(&self) -> PathBuf {
         match self.kind {
             Kind::AppImage | Kind::Exe => self.path.clone(),
@@ -120,6 +120,14 @@ impl Install {
     }
 }
 
+/// Cargo writes `CACHEDIR.TAG` into its `target` folder. A folder above the exe has it: a
+/// development build.
+fn in_cargo_target(exe: &Path) -> bool {
+    exe.ancestors()
+        .skip(1)
+        .any(|d| d.join("CACHEDIR.TAG").is_file())
+}
+
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
@@ -134,9 +142,12 @@ pub enum State {
     None,
     /// The swap started. It may be half done.
     Swapping(String),
-    /// AppImage: the old launcher swapped the file and starts the new image.
+    /// The swap is done. The new version did not start yet. The 0.1.0 launcher writes it for an
+    /// AppImage.
     Swapped(String),
-    /// The new version was started. A `healthy` marker of this version ends the trial.
+    /// The new version runs its trial. A `healthy` marker of this version ends it.
+    Running(String),
+    /// A trial that the 0.1.0 launcher started. Only the 0.1.0 launcher rolls it back.
     Started(String),
 }
 
@@ -147,6 +158,7 @@ pub fn read_state(dir: &Path) -> State {
     match text.trim().split_once(' ') {
         Some(("swapping", v)) => State::Swapping(v.into()),
         Some(("swapped", v)) => State::Swapped(v.into()),
+        Some(("running", v)) => State::Running(v.into()),
         Some(("started", v)) => State::Started(v.into()),
         _ => State::None,
     }
@@ -157,6 +169,7 @@ pub fn write_state(dir: &Path, state: &State) -> io::Result<()> {
         State::None => return clear_state(dir),
         State::Swapping(v) => format!("swapping {v}"),
         State::Swapped(v) => format!("swapped {v}"),
+        State::Running(v) => format!("running {v}"),
         State::Started(v) => format!("started {v}"),
     };
     write_atomic(&dir.join("state"), text.as_bytes())
@@ -197,7 +210,7 @@ pub fn staged_dir(dir: &Path) -> PathBuf {
     dir.join("staged")
 }
 
-/// A verified update that waits for the launcher: its version and the install path it is for.
+/// A verified update that waits for the next start: its version and the install path it is for.
 pub fn read_staged(dir: &Path) -> Option<(String, PathBuf)> {
     let s = staged_dir(dir);
     if fs::symlink_metadata(s.join("payload")).is_err() {
@@ -252,9 +265,9 @@ pub fn copy_any(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The launcher steps
+// The start steps
 
-/// A point of [`prepare`] where a test can "kill" the launcher.
+/// A point of [`prepare`] where a test can "kill" the program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     StateWritten,
@@ -265,9 +278,9 @@ pub enum Step {
     BadMoved,
     /// Rollback: the previous copy is the install again. `.bad` is still there.
     PrevRestored,
-    /// Rollback: `.bad` is deleted. The state still says `started`.
+    /// Rollback: `.bad` is deleted. The state still says `running`.
     BadRemoved,
-    /// Rollback: the `failed` marker is written. The state still says `started`.
+    /// Rollback: the `failed` marker is written. The state still says `running`.
     FailedWritten,
 }
 
@@ -279,17 +292,18 @@ fn step(hook: &mut dyn FnMut(Step) -> bool, s: Step) -> Result<(), Killed> {
 #[derive(Debug)]
 pub struct Killed;
 
-/// What the launcher does next.
+/// What the program does next.
 #[derive(Debug)]
 pub struct Plan {
-    /// The program to start with the same arguments.
-    pub exec: PathBuf,
-    /// Lines for the launcher log.
+    /// `Some`: start this program with the same arguments, and end this process. `None`: go on
+    /// in this process.
+    pub exec: Option<PathBuf>,
+    /// Lines for the update log.
     pub log: Vec<String>,
 }
 
-/// Does all file work of one launcher start, but does not start anything. It finishes or
-/// undoes an interrupted swap, ends or rolls back a trial, and applies a staged update.
+/// Does all file work of one start, but does not start anything. It finishes or undoes an
+/// interrupted swap, ends or rolls back a trial, and applies a staged update.
 /// `hook` is called after each step. When it returns `true`, the function stops at once.
 pub fn prepare(
     inst: &Install,
@@ -297,21 +311,32 @@ pub fn prepare(
     hook: &mut dyn FnMut(Step) -> bool,
 ) -> Result<Plan, Killed> {
     let mut log = Vec::new();
-    let sibling = inst.payload.clone();
     match read_state(dir) {
         State::None => {}
         State::Swapped(v) => {
-            let _ = write_state(dir, &State::Started(v.clone()));
-            log.push(format!("update {v}: new image started"));
-            return Ok(Plan { exec: sibling, log });
+            // The first start of the new version. The next start asks for the health marker.
+            let _ = write_state(dir, &State::Running(v.clone()));
+            log.push(format!("update {v}: first start"));
+            return Ok(Plan { exec: None, log });
         }
-        State::Started(v) => {
+        State::Running(v) => {
             if read_healthy(dir).as_deref() == Some(v.as_str()) {
                 let _ = clear_state(dir);
                 log.push(format!("update {v}: healthy, trial ended"));
             } else {
-                let exec = rollback(inst, dir, &v, hook, &mut log)?.unwrap_or(sibling);
+                let exec = rollback(inst, dir, &v, hook, &mut log)?;
                 return Ok(Plan { exec, log });
+            }
+        }
+        State::Started(v) => {
+            // The 0.1.0 launcher in front of us owns this trial and rolls it back. Never roll
+            // back here. While it runs, do not apply an update: that would delete its `.prev`.
+            if read_healthy(dir).as_deref() == Some(v.as_str()) {
+                let _ = clear_state(dir);
+                log.push(format!("update {v}: healthy, trial ended"));
+            } else {
+                log.push(format!("update {v}: the 0.1.0 launcher owns this trial"));
+                return Ok(Plan { exec: None, log });
             }
         }
         State::Swapping(v) => {
@@ -335,8 +360,10 @@ pub fn prepare(
                 let _ = clear_state(dir);
             } else {
                 log.push(format!("update {v}: interrupted swap was complete"));
-                let exec = finish(inst, dir, &v).unwrap_or(sibling);
-                return Ok(Plan { exec, log });
+                return Ok(Plan {
+                    exec: finish(inst, dir, &v).ok(),
+                    log,
+                });
             }
         }
     }
@@ -350,17 +377,20 @@ pub fn prepare(
                 "update {v}: rolled back before, staged copy dropped"
             ));
         } else if let Some(exec) = swap(inst, dir, &v, hook, &mut log)? {
-            return Ok(Plan { exec, log });
+            return Ok(Plan {
+                exec: Some(exec),
+                log,
+            });
         }
     }
-    Ok(Plan { exec: sibling, log })
+    Ok(Plan { exec: None, log })
 }
 
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-/// Marks the new version as started. Returns the program to start. It removes `staged/` first
+/// Marks the swap as done (`swapped`). Returns the program to start. It removes `staged/` first
 /// and checks that it is gone: a staged copy that stays would be applied again after a
 /// rollback. When `staged/` cannot be removed, nothing is written and the caller undoes the swap.
 fn finish(inst: &Install, dir: &Path, v: &str) -> io::Result<PathBuf> {
@@ -372,12 +402,7 @@ fn finish(inst: &Install, dir: &Path, v: &str) -> io::Result<PathBuf> {
             .unwrap_or_else(|| io::Error::other("still there")));
     }
     let _ = remove_any(&dir.join("healthy"));
-    let state = if inst.kind == Kind::AppImage {
-        State::Swapped(v.into())
-    } else {
-        State::Started(v.into())
-    };
-    let _ = write_state(dir, &state);
+    let _ = write_state(dir, &State::Swapped(v.into()));
     Ok(inst.run_path())
 }
 
@@ -554,14 +579,13 @@ fn rollback(
     Ok(exec)
 }
 
-/// The launcher could not start the program of a [`Plan`] after a swap. Undoes the swap.
+/// The program of a [`Plan`] did not start after a swap. Undoes the swap. Returns the program
+/// to start instead.
 pub fn start_failed(inst: &Install, dir: &Path) -> Option<PathBuf> {
     match read_state(dir) {
-        State::Started(v) | State::Swapped(v) => {
-            rollback(inst, dir, &v, &mut |_| false, &mut Vec::new())
-                .ok()
-                .flatten()
-        }
+        State::Swapped(v) => rollback(inst, dir, &v, &mut |_| false, &mut Vec::new())
+            .ok()
+            .flatten(),
         _ => None,
     }
 }
