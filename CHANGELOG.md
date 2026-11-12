@@ -4,12 +4,9 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
-### Fixed
-- The app icon now shows on every platform. Windows: the exe has the icon resource. Linux X11: the window has an icon. Linux Wayland: the `.deb` has a desktop entry and icons (16–512 px) named after the app id. The AppImage and the bare program add a user entry and icons on the first start.
+## [0.1.0] - 2026-11-12
 
-## [0.1.0] - not released yet
-
-First version. It has not been published. The list below is what the version contains.
+First version.
 
 ### Added
 
@@ -36,7 +33,7 @@ First version. It has not been published. The list below is what the version con
 - Background formatting of long payloads, with Show all and Show more.
 
 **Publish**
-- Always-visible composer: Text or Hex payload, QoS 0 or 1, retain, all MQTT 5 properties, JSON format.
+- Always-visible composer: Text or Hex payload, QoS 0 or 1, retain, MQTT 5 properties (content type, response topic, correlation data, message expiry, payload format, user properties), JSON format.
 - Drafts and Sent history. Edit and publish, Reply, Publish to this topic, Clear retained.
 
 **Memory and speed**
@@ -46,13 +43,14 @@ First version. It has not been published. The list below is what the version con
 
 **Appearance**
 - System, Light and Dark appearance. Eight theme presets.
-- Command palette (`Ctrl/Cmd+K`) with every action.
+- Command palette (`Ctrl/Cmd+K`) with most actions.
 - Saved window size, pane widths and view.
 
 **Updates and packages**
 - Signed updates from GitHub Releases. One check at start, which you can turn off.
-- Rollback to the previous version when a new version does not start.
+- Rollback to the previous version when a new version does not open its window.
 - Windows installer and portable zip, macOS DMG (arm64 and x64), Linux AppImage and deb.
+- The app icon on every platform. Windows: the exe has the icon resource. Linux X11: the window has an icon. Linux Wayland: the `.deb` has a desktop entry and icons named after the app id. The AppImage and the bare program add a user entry and icons on the first start.
 - SBOM, SHA-256 sums and build attestations for each release.
 
 **Support**
@@ -63,12 +61,13 @@ First version. It has not been published. The list below is what the version con
 
 - MQTT 5.0 only. QoS 0 and 1 only.
 - No proxy support, no message export, no accessibility support.
+- The Windows files have no Authenticode signature. SmartScreen warns on the first start.
 - The macOS app has an ad-hoc signature, not a Developer ID. It is not notarized. The first start needs right-click, then **Open**.
 - A deb install does not update itself.
-- Nobody has run the Windows and macOS builds, the keyring on those systems, or the update swap on them. The first release workflow run will test them.
+- CI builds and tests Windows and macOS. A person has not yet run the Windows installer, the macOS DMG, the keyring on those systems, or the update swap.
 - A person has not yet checked the UI in a real window.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
-- A software renderer (virtual machine, remote desktop) is not tested.
+- Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
 [Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/pauldeng/mqtt-navigator/releases/tag/v0.1.0
