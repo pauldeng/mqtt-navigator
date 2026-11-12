@@ -86,6 +86,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libzstd-dev libvulkan1 libfuse2t64
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked --version "$CARGO_PACKAGER_VERSION"
+      # Git Bash puts its own perl first on PATH. That perl has no Locale::Maketext::Simple, so the
+      # vendored OpenSSL Configure fails. Point openssl-src at the runner's Strawberry Perl.
+      - name: Use Strawberry Perl for OpenSSL
+        if: runner.os == 'Windows'
+        run: echo 'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' >> "$GITHUB_ENV"
       - name: Build the payload and the launcher
         run: cargo build --release --locked --target "$TARGET" -p navigator-app -p navigator-launcher
 
