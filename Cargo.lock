@@ -4032,7 +4032,7 @@ dependencies = [
 
 [[package]]
 name = "navigator-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "navigator-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ms-mqtt-client",
@@ -4073,7 +4073,7 @@ dependencies = [
 
 [[package]]
 name = "navigator-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs 7.0.0",
  "minisign",

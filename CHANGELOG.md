@@ -4,6 +4,8 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-12
+
 ### Changed
 
 - One program on every platform: `mqtt-navigator` (`mqtt-navigator.exe` on Windows). The separate launcher is gone. The app applies a staged update at its own start and rolls back a version that never opens a window.
@@ -78,5 +80,6 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/pauldeng/mqtt-navigator/releases/tag/v0.1.0
