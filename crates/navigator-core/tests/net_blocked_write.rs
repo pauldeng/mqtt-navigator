@@ -59,6 +59,7 @@ async fn disconnect_during_a_blocked_write_is_prompt() {
     // About 20 MB are far more than the socket buffers hold, so the writes are blocked.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut results = Vec::new();
+    // Take every event, so no result stays behind another event.
     while let Ok(event) = net.events.try_recv() {
         if let Event::Published { result, .. } = event {
             results.push(result);
@@ -97,6 +98,10 @@ async fn disconnect_during_a_blocked_write_is_prompt() {
     assert!(
         results.iter().all(|r| *r != PublishResult::TimedOut),
         "an operation timed out: {results:?}"
+    );
+    assert!(
+        results.contains(&PublishResult::LostOnDisconnect),
+        "no blocked send reported LostOnDisconnect: {results:?}"
     );
     done_tx.send(()).expect("broker thread");
     net.shutdown().await;

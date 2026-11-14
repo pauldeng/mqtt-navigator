@@ -6,10 +6,11 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ms_mqtt_client::client::{ClientOptions, ConnectResult, KeepAliveConfig, new_client};
-use ms_mqtt_client::packet::{ConnectProperties, PublishProperties};
-use ms_mqtt_client::topic::TopicName;
-use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
+use navigator_core::model::Qos;
+
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::Publisher;
 
 struct Args {
     host: String,
@@ -53,73 +54,52 @@ fn parse_args() -> Result<Args, String> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = parse_args()?;
-    let (client, connect_handle, mut receiver) = new_client(ClientOptions::default());
-    let connection = match connect_handle
-        .connect(
-            ConnectionTransportConfig {
-                transport_type: ConnectionTransportType::Tcp {
-                    hostname: a.host.clone(),
-                    port: a.port,
-                },
-                timeout: Some(Duration::from_secs(10)),
-                proxy: None,
-                tcp_nodelay: true,
-            },
-            true,
-            KeepAliveConfig::Infinite,
-            None,
-            None,
-            None,
-            ConnectProperties::default(),
-            Some(Duration::from_secs(10)),
-        )
-        .await
-    {
-        ConnectResult::Success(connection, _, _handle) => connection,
-        ConnectResult::Failure(_, e) => return Err(e.into()),
-    };
-
-    let topics: Vec<TopicName> = (0..a.topics)
-        .map(|i| TopicName::new(format!("flood/t{i}")))
-        .collect::<Result<_, _>>()?;
+    let mut publisher = Publisher::connect(&a.host, a.port).await?;
+    let topics: Vec<String> = (0..a.topics).map(|i| format!("flood/t{i}")).collect();
     let payload = Bytes::from(vec![b'x'; a.size]);
     let batch = (a.rate / 100).max(1);
 
-    let sender = async {
-        let mut tick = tokio::time::interval(Duration::from_millis(10));
-        let mut report = Instant::now();
-        let (start, mut sent, mut last_sent, mut next) = (Instant::now(), 0u64, 0u64, 0usize);
-        while start.elapsed() < Duration::from_secs(a.secs) {
-            tick.tick().await;
-            for _ in 0..batch {
-                // The client queue is bounded, so this waits when the broker is slower than the rate.
-                let token = client
-                    .publish_qos0(
-                        topics[next].clone(),
-                        payload.clone(),
-                        false,
-                        PublishProperties::default(),
-                    )
-                    .await?;
-                drop(token);
-                next = (next + 1) % topics.len();
-                sent += 1;
-            }
-            if report.elapsed() >= Duration::from_secs(1) {
-                let secs = report.elapsed().as_secs_f64();
-                println!(
-                    "rate: {:.0} msg/s (total {sent})",
-                    (sent - last_sent) as f64 / secs
-                );
-                (report, last_sent) = (Instant::now(), sent);
-            }
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    let mut report = Instant::now();
+    let (start, mut sent, mut last_sent, mut next) = (Instant::now(), 0u64, 0u64, 0usize);
+    while start.elapsed() < Duration::from_secs(a.secs) {
+        tick.tick().await;
+        if !publisher.connected() {
+            return Err("connection ended".into());
         }
-        Ok::<(), Box<dyn std::error::Error>>(())
-    };
-    // The connection makes progress only while it is polled. The receiver stays empty (no subscriptions).
-    tokio::select! {
-        (_, event) = connection.run_until_disconnect() => Err(format!("connection ended: {event:?}").into()),
-        _ = receiver.recv() => Ok(()),
-        result = sender => result,
+        for _ in 0..batch {
+            // The queue of `Net` is bounded, so this waits when the broker is slower than the rate.
+            publisher
+                .send(&topics[next], payload.clone(), Qos::AtMostOnce)
+                .await?;
+            next = (next + 1) % topics.len();
+            sent += 1;
+        }
+        if report.elapsed() >= Duration::from_secs(1) {
+            publisher.drain();
+            // Results that are not `Sent` (for example a local rejection) do not count.
+            let good = sent - publisher.failed.len() as u64;
+            let secs = report.elapsed().as_secs_f64();
+            println!(
+                "rate: {:.0} msg/s (total {good})",
+                (good - last_sent) as f64 / secs
+            );
+            (report, last_sent) = (Instant::now(), good);
+        }
     }
+    publisher.settle(Duration::from_secs(5)).await;
+    println!(
+        "done: sent {sent}, results ok {}, failed {}",
+        publisher.done,
+        publisher.failed.len()
+    );
+    let (accepted, done, failed) = (publisher.accepted, publisher.done, publisher.failed.len());
+    publisher.shutdown().await;
+    if failed > 0 || done != accepted {
+        return Err(format!(
+            "accepted {accepted}, ok {done}, failed {failed}: the run is not clean"
+        )
+        .into());
+    }
+    Ok(())
 }

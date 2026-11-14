@@ -39,8 +39,6 @@ broker-tests = []
 
 [dev-dependencies]
 tempfile = "3.27.0"
-# Test publishers and examples/flood.rs still use the old client until S3 ports them.
-ms-mqtt-client = { version = "0.1.0", features = ["websockets"] }
 # The spike (examples/ntex_spike.rs) captures `log` records.
 log = "0.4"
 tokio = { version = "1.54.1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }

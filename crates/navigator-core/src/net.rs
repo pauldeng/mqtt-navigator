@@ -3151,38 +3151,51 @@ mod tests {
         net.shutdown().await;
     }
 
-    /// The reasons for a bad topic name are the texts of the old client: controls, NUL,
-    /// non-characters, unassigned code points, wildcards, empty and too long.
+    /// The reasons for a bad topic name are fixed texts (taken from the old client in S2 round 2):
+    /// controls, NUL, non-characters, unassigned code points, wildcards, empty, too long.
     #[test]
-    fn topic_errors_are_the_texts_of_the_old_client() {
-        use ms_mqtt_client::topic::TopicName;
+    fn topic_errors_have_fixed_texts() {
         let long = "a".repeat(70_000);
-        let cases = [
-            "",
-            "a/b",
-            "a/+",
-            "a/#",
-            "a#",
-            "a\0b",
-            "a\u{7}b",
-            "a\u{85}b",
-            "a\u{7f}b",
-            "a\u{fdd0}b",
-            "a\u{ffff}b",
-            "a\u{10fffe}b",
-            "a\u{378}b",
-            "a\u{e0080}b",
-            "a\u{10fffd}b",
-            "a\u{e000}b",
-            "a\u{200b}b",
-            "a/\u{e9}/\u{1f600}",
-            &long,
+        let cases: [(&str, Option<&str>); 19] = [
+            ("", Some("empty topic")),
+            ("a/b", None),
+            ("a/+", Some("bad topic a/+")),
+            ("a/#", Some("bad topic a/#")),
+            ("a#", Some("bad topic a#")),
+            ("a\0b", Some("bad string: contains U+0000")),
+            ("a\u{7}b", Some("bad string: contains control codepoint")),
+            ("a\u{85}b", Some("bad string: contains control codepoint")),
+            ("a\u{7f}b", Some("bad string: contains control codepoint")),
+            (
+                "a\u{fdd0}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            (
+                "a\u{ffff}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            (
+                "a\u{10fffe}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            (
+                "a\u{378}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            (
+                "a\u{e0080}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            ("a\u{10fffd}b", None),
+            ("a\u{e000}b", None),
+            ("a\u{200b}b", None),
+            ("a/\u{e9}/\u{1f600}", None),
+            (&long, Some("bad string: longer than 65,535 bytes")),
         ];
-        for t in cases {
-            let old = TopicName::new(t).err().map(|e| e.to_string());
+        for (t, want) in cases {
             assert_eq!(
-                crate::topic::topic_error(t),
-                old,
+                crate::topic::topic_error(t).as_deref(),
+                want,
                 "{:?}",
                 t.chars().take(20).collect::<String>()
             );
@@ -3249,54 +3262,70 @@ mod tests {
         }
     }
 
-    /// The reasons for a bad filter are the texts of the old client, for each kind of fault.
+    /// The reasons for a bad filter are fixed texts (taken from the old client): each kind of fault.
     #[test]
-    fn filter_errors_are_the_texts_of_the_old_client() {
-        use ms_mqtt_client::topic::TopicFilter;
+    fn filter_errors_have_fixed_texts() {
         let long = "a".repeat(70_000);
-        let cases = [
-            "",
-            "a/b",
-            "a/+/c",
-            "#",
-            "+",
-            "a/#",
-            "$SYS/#",
-            "$share/g/a/#",
-            "$share/g/",
-            "$share/g",
-            "$share//a",
-            "$share/+/a",
-            "$share/g/a#",
-            "foo/#baz",
-            "foo/baz#",
-            "foo/#/baz",
-            "a+",
-            "+a",
-            "a/b+",
-            "a\u{378}b",
-            "a\u{e0080}b",
-            "a\u{10fffd}b",
-            "a\u{e000}b",
-            "a\u{200b}b",
-            "+/\u{378}",
-            "$share/g/\u{e000}/#",
-            "a\0b",
-            "a\u{7}b",
-            "a\u{85}b",
-            "a\u{fdd0}b",
-            "a\u{ffff}b",
-            "a\u{10fffe}b",
-            "a/\u{e9}/\u{1f600}",
-            &long,
+        let cases: [(&str, Option<&str>); 34] = [
+            ("", Some("empty filter")),
+            ("a/b", None),
+            ("a/+/c", None),
+            ("#", None),
+            ("+", None),
+            ("a/#", None),
+            ("$SYS/#", None),
+            ("$share/g/a/#", None),
+            ("$share/g/", Some("empty filter")),
+            ("$share/g", Some("bad filter $share/g")),
+            ("$share//a", Some("bad filter $share//a")),
+            ("$share/+/a", Some("bad filter $share/+/a")),
+            ("$share/g/a#", Some("bad filter a#")),
+            ("foo/#baz", Some("bad filter foo/#baz")),
+            ("foo/baz#", Some("bad filter foo/baz#")),
+            ("foo/#/baz", Some("bad filter foo/#/baz")),
+            ("a+", Some("bad filter a+")),
+            ("+a", Some("bad filter +a")),
+            ("a/b+", Some("bad filter a/b+")),
+            (
+                "a\u{378}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            (
+                "a\u{e0080}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            ("a\u{10fffd}b", None),
+            ("a\u{e000}b", None),
+            ("a\u{200b}b", None),
+            (
+                "+/\u{378}",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            ("$share/g/\u{e000}/#", None),
+            ("a\0b", Some("bad string: contains U+0000")),
+            ("a\u{7}b", Some("bad string: contains control codepoint")),
+            ("a\u{85}b", Some("bad string: contains control codepoint")),
+            (
+                "a\u{fdd0}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            (
+                "a\u{ffff}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            (
+                "a\u{10fffe}b",
+                Some("bad string: contains non-character codepoint"),
+            ),
+            ("a/\u{e9}/\u{1f600}", None),
+            (&long, Some("bad string: longer than 65,535 bytes")),
         ];
-        for f in cases {
-            let old = TopicFilter::new(f).err().map(|e| e.to_string());
+        for (t, want) in cases {
             assert_eq!(
-                filter_error(f),
-                old,
+                filter_error(t).as_deref(),
+                want,
                 "{:?}",
-                f.chars().take(20).collect::<String>()
+                t.chars().take(20).collect::<String>()
             );
         }
     }

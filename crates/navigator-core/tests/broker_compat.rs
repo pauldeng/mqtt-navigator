@@ -6,35 +6,27 @@
 //! Run: `tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test
 //! broker_compat -- --test-threads=1 --nocapture && tests/broker/down.sh`.
 #![cfg(feature = "broker-tests")]
-// Each test holds `LIMITS` for its whole run. The guard must live across the awaits.
-#![allow(clippy::await_holding_lock)]
 
-use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::process::Command as Process;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ms_mqtt_client::client::{ClientOptions, ConnectResult, KeepAliveConfig, new_client};
-use ms_mqtt_client::packet::{ConnectProperties, SessionExpiryInterval};
-use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
     Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
     PublishResult, Transport,
 };
 
+/// The restart test restarts the broker that the other tests of the same broker use. It takes the
+/// write side; every other test takes the read side, so a restart never runs beside another test.
+/// Nothing else needs serialization: each test has its own topic prefix and client IDs, and
+/// `Net` has no process-global state.
+static BROKER: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 const WAIT: Duration = Duration::from_secs(10);
 /// A broker restart takes up to 20 s. The client waits 1 s or more before it retries.
 const RESTART_WAIT: Duration = Duration::from_secs(60);
-
-/// Every `Net` sets the process-global `ms_mqtt_client::local_limits`. Each test takes this lock.
-static LIMITS: Mutex<()> = Mutex::new(());
-
-fn limits_lock() -> std::sync::MutexGuard<'static, ()> {
-    LIMITS.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// One broker: its compose service and its anonymous listeners.
 #[derive(Clone, Copy)]
@@ -203,7 +195,6 @@ async fn round_trip(net: &mut Net, prefix: &str, generation: u64) {
 }
 
 async fn tcp_and_ws_round_trip(b: Broker) {
-    let _limits = limits_lock();
     for (port, transport) in [(b.tcp, Transport::Tcp), (b.ws, Transport::Ws)] {
         let mut net = Net::start(NetLimits::default());
         let prefix = prefix();
@@ -216,7 +207,6 @@ async fn tcp_and_ws_round_trip(b: Broker) {
 
 /// MQTT 3.1.1: QoS 0 and QoS 1 round trip on TCP and WebSocket. There are no properties.
 async fn v3_tcp_and_ws_round_trip(b: Broker) {
-    let _limits = limits_lock();
     for (port, transport) in [(b.tcp, Transport::Tcp), (b.ws, Transport::Ws)] {
         let mut net = Net::start(NetLimits::default());
         let prefix = prefix();
@@ -246,7 +236,6 @@ async fn retained(b: Broker) {
 }
 
 async fn retained_with(b: Broker, protocol: Protocol) {
-    let _limits = limits_lock();
     let prefix = prefix();
     let topic = format!("{prefix}/r");
     let mut publisher = Net::start(NetLimits::default());
@@ -306,7 +295,6 @@ async fn persistent_session(b: Broker) {
 
 /// MQTT 3.1.1: Clean Session off is the persistent session. The profile expiry does not matter.
 async fn persistent_session_with(b: Broker, protocol: Protocol) {
-    let _limits = limits_lock();
     let prefix = prefix();
     let mut p = profile(b.tcp, Transport::Tcp, &prefix);
     p.clean_start = false;
@@ -346,7 +334,7 @@ async fn persistent_session_with(b: Broker, protocol: Protocol) {
 /// After a restart the session goes back to `Connected` with the same generation, subscribes
 /// again, and messages flow.
 async fn restart_reconnects(b: Broker) {
-    let _limits = limits_lock();
+    let _broker = BROKER.write().await;
     let mut net = Net::start(NetLimits::default());
     let prefix = prefix();
     let generation = connect(&mut net, profile(b.tcp, Transport::Tcp, &prefix)).await;
@@ -390,67 +378,47 @@ async fn restart_reconnects(b: Broker) {
 /// Prints what the broker says in CONNACK, for a client that asks for 600 s keep alive and a
 /// session expiry of 7 days. Checks only what MQTT 5 requires of every broker.
 async fn connack_probe(b: Broker) {
-    let _limits = limits_lock();
-    let (_client, connect_handle, _receiver) = new_client(ClientOptions::default());
-    let ConnectResult::Success(_connection, connack, _handle) = connect_handle
-        .connect(
-            ConnectionTransportConfig {
-                transport_type: ConnectionTransportType::Tcp {
-                    hostname: "127.0.0.1".into(),
-                    port: b.tcp,
-                },
-                timeout: Some(WAIT),
-                proxy: None,
-                tcp_nodelay: true,
-            },
-            true,
-            KeepAliveConfig::Duration {
-                ping_after: NonZeroU16::new(600).expect("non-zero"),
-                response_timeout: Duration::from_secs(10),
-            },
-            None,
-            None,
-            None,
-            ConnectProperties {
-                session_expiry_interval: SessionExpiryInterval::Duration(7 * 86_400),
-                ..ConnectProperties::default()
-            },
-            Some(WAIT),
-        )
-        .await
-    else {
-        panic!("{}: connect failed", b.service);
+    let mut net = Net::start(NetLimits::default());
+    let mut p = profile(b.tcp, Transport::Tcp, &prefix());
+    p.keepalive_secs = 600;
+    p.session_expiry_secs = 7 * 86_400;
+    connect(&mut net, p).await;
+    let details = loop {
+        match next_event(&mut net, WAIT).await {
+            Event::ConnectionDetails { details, .. } => break details,
+            Event::Subscribed { .. } | Event::SessionFilters { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
     };
-    let p = &connack.properties;
+    let v5 = details
+        .v5
+        .as_ref()
+        .expect("an MQTT 5 connection has v5 details");
     println!(
-        "compat {}: session_present {} session_expiry {:?} receive_max {} max_qos {:?} \
-         retain {} max_packet {} topic_alias_max {} wildcard {} sub_ids {} shared {} \
-         server_keep_alive {:?} assigned_id {} user_props {:?}",
+        "compat {}: session_present {} keep_alive {} server_keep_alive {:?} receive_max {} \
+         max_qos {} retain {} max_packet {:?} topic_alias_max {} wildcard {} sub_ids {} \
+         shared {} assigned_id {}",
         b.service,
-        connack.session_present,
-        p.session_expiry_interval,
-        p.receive_maximum,
-        p.maximum_qos,
-        p.retain_available,
-        p.maximum_packet_size,
-        p.topic_alias_maximum,
-        p.wildcard_subscription_available,
-        p.subscription_identifiers_available,
-        p.shared_subscription_available,
-        p.server_keep_alive,
-        p.assigned_client_identifier.is_some(),
-        p.user_properties,
+        details.session_present,
+        v5.keep_alive_secs,
+        v5.server_keep_alive_secs,
+        v5.receive_max,
+        v5.max_qos,
+        v5.retain_available,
+        v5.max_packet_size,
+        v5.topic_alias_max,
+        v5.wildcard_subscriptions,
+        v5.subscription_ids,
+        v5.shared_subscriptions,
+        v5.assigned_client_id.is_some(),
     );
-    assert!(connack.is_success());
-    assert!(!connack.session_present, "clean start gives a new session");
+    assert_eq!(details.protocol, Protocol::V5);
+    assert!(!details.session_present, "clean start gives a new session");
     assert!(
-        p.retain_available,
+        v5.retain_available,
         "all three brokers keep retained messages"
     );
-    assert!(p.wildcard_subscription_available);
-
-    let mut net = Net::start(NetLimits::default());
-    connect(&mut net, profile(b.tcp, Transport::Tcp, &prefix())).await;
+    assert!(v5.wildcard_subscriptions);
     println!(
         "compat {}: Net::broker_max_packet {:?}",
         b.service,
@@ -466,36 +434,43 @@ macro_rules! broker_tests {
 
             #[tokio::test(flavor = "current_thread")]
             async fn connack_probe() {
+                let _broker = BROKER.read().await;
                 super::connack_probe($broker).await;
             }
 
             #[tokio::test(flavor = "current_thread")]
             async fn tcp_and_websocket_round_trip_with_properties() {
+                let _broker = BROKER.read().await;
                 tcp_and_ws_round_trip($broker).await;
             }
 
             #[tokio::test(flavor = "current_thread")]
             async fn retained_delivery_and_clear() {
+                let _broker = BROKER.read().await;
                 retained($broker).await;
             }
 
             #[tokio::test(flavor = "current_thread")]
             async fn persistent_session_keeps_queued_message() {
+                let _broker = BROKER.read().await;
                 persistent_session($broker).await;
             }
 
             #[tokio::test(flavor = "current_thread")]
             async fn v3_tcp_and_websocket_round_trip() {
+                let _broker = BROKER.read().await;
                 v3_tcp_and_ws_round_trip($broker).await;
             }
 
             #[tokio::test(flavor = "current_thread")]
             async fn v3_retained_delivery_and_clear() {
+                let _broker = BROKER.read().await;
                 retained_with($broker, Protocol::V311).await;
             }
 
             #[tokio::test(flavor = "current_thread")]
             async fn v3_persistent_session_keeps_queued_message() {
+                let _broker = BROKER.read().await;
                 persistent_session_with($broker, Protocol::V311).await;
             }
 

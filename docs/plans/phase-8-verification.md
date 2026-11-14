@@ -711,3 +711,231 @@ Logs: `s2dr5-*.txt`. This section replaces the design of round 4 (values compare
 - D1 in the plan now says: `options` and `req` on `Command::Subscribe`, `req` on the `Subscribed` result, `attempt` on `Status`, and the `ConnectionDetails` event with its `attempt`.
 
 Gate (round 5): fmt, clippy `--all-features -D warnings` and `cargo deny check` ok; `cargo test --workspace` 337 passed, 0 failed, 1 ignored (`s2dr5-test.txt`); `tests/broker/up.sh` all three brokers ok; broker suite `--no-fail-fast -- --test-threads=1` (`s2dr5-broker.txt`): unit 182 (1 ignored), `broker_compat` 24, `broker_matrix` 22, `load_ci` 1, `net_blocked_write` 1, `net_mosquitto` 31 passed, 0 failed; `soak` ignored. EMQX and HiveMQ stopped afterwards (no prune); Mosquitto still runs.
+
+## S3 Port the tests and tools
+
+Date: 2026-11-15. Branch `feat/ntex-mqtt`, base commit 61ca6ae. Nothing is committed. Logs: `s3-*.txt` in the scratchpad (`ntex/`).
+
+### What changed
+
+- `ms-mqtt-client` is out of `navigator-core` (dev-dependency removed). `cargo tree -i ms-mqtt-client` says the package is not in the graph. The grep for `ms_mqtt_client` and `ms-mqtt-client` in `crates/` and `fuzz/` finds two places, both left for S5: the `[patch]` in `Cargo.toml` and `fuzz/Cargo.toml`, and the log filter `ms_mqtt_client=off` in `navigator-app/src/logging.rs`. `vendor/ms-mqtt-client` is unchanged. Cargo prints "patch ... was not used" until S5 removes the `[patch]`. `Cargo.lock` and `fuzz/Cargo.lock` lose `ms-mqtt-client` and the crates only it used (`async-tungstenite`, `derive-where`, and others).
+- One test publisher for all tools: `tests/common/mod.rs` (`Publisher`). It is a second `Net` (the code path of the app). `send` waits while the command queue or the event log is full. `drain` counts the results. `settle` waits for the results. `examples/flood.rs` includes it with `#[path]`. Users: `net_mosquitto.rs` (`publish_plain`: QoS 1, waits for the PUBACK result), `load_ci.rs`, `soak.rs`, `flood.rs`. `broker_compat.rs::connack_probe` reads `Event::ConnectionDetails` from `Net`.
+- `fuzz/fuzz_targets` never used the old client. Nothing to port.
+- `net.rs` unit tests `topic_errors_*` and `filter_errors_*` compared our texts with the old client. The old client is gone, so they are now tables with the texts that the old client gave (taken from the old client at HEAD, 19 topics and 34 filters, same cases). They are named `topic_errors_have_fixed_texts` and `filter_errors_have_fixed_texts`.
+- New fake broker `tests/common/fake.rs`: TCP, TLS, WS, WSS on the loopback with blocking sockets, certificates made in memory, optional client certificate check. New test files: `tests/net_fake.rs` (89 tests, 8 are `#[ignore]`), `tests/net_fd_leak.rs`, `tests/net_keepalive_tasks.rs`. Both of the last two have their own binary because they use process-global state (file descriptor count, the `log` logger).
+- `broker_matrix.rs` and `net_mosquitto.rs` have more tests (see below). The spike example stays.
+
+### The `LIMITS` locks
+
+All `LIMITS` locks are removed (`net_mosquitto.rs`, `broker_matrix.rs`, `broker_compat.rs`). Plan line 116 ("The test lock for `local_limits` goes away"). What I checked for another need of serialization:
+
+- `net_mosquitto.rs`: no test restarts the broker or takes a fixed port. The proxy tests bind port 0. Every test has its own topic prefix (process ID and time). Every profile has a random client ID (`Profile::default`). The fixed client IDs of the v3 tests (`v3-basic`, `v3-mib`, `v3-limit-sub`, `v3-limit-pub`, `v3-persist-other`, `v3-clean-other`) are each used by one test only. The persistent v3 session test uses an ID with the process ID. Result: no lock needed. 10 runs and a full run with the default test threads pass (below).
+- `broker_matrix.rs` and `broker_compat.rs` have a test that restarts a broker (`broker_restart_reconnects_and_resubscribes`, `restart_reconnects`). A restart in parallel with the other tests of the file would break them. So `LIMITS` became a `tokio::sync::RwLock` (`BROKER`): the restart test takes the write side, every other test takes the read side. A tokio lock is held across `await` without a clippy `await_holding_lock` allow, and works between the runtimes of different tests. This is a lock for another reason than `local_limits`.
+- The `ms_mqtt_client::local_limits` global is gone. `Net` has no process-global state (S2).
+
+### Spike cases: moved, already covered, not moved
+
+Cases of `examples/ntex_spike/cases.rs` and `fakecases.rs` (run 6, 93 cases). "Moved" means: a new test in `tests/` that runs `Net` against the fake broker or Mosquitto, at the plan bound.
+
+| Spike case | Where it is now |
+|---|---|
+| a: round trips v3/v5 on TCP, TCP + password, TLS, mTLS, WS, WSS | Already covered: `broker_matrix` `anonymous_tcp`, `password_tcp`, `tls_with_test_ca`, `mtls_with_client_certificate`, `websocket`, `secure_websocket_with_test_ca` and the `v3_` twins (S2b) |
+| a: TLS and WSS with a DNS name (`localhost`) | Moved: `broker_matrix` `tls_with_a_dns_name`, `secure_websocket_with_a_dns_name`, `v3_` twins |
+| b: expired, wrong host, unknown CA, mTLS without certificate (v5) | Already covered: `broker_matrix` `tls_expired_certificate`, `tls_wrong_host_name`, `tls_without_the_ca_is_not_trusted`, `mtls_without_client_certificate_fails` |
+| b: the same on v3 | Moved: the four tests above, plus `tls_verify_off_accepts_untrusted_certificates` and `mtls_mismatched_key_fails`, now run for both versions (`*_with(protocol)`, `v3_` twins) |
+| b: local key texts | Already covered: `tls::tests::encrypted_client_key_fails_at_once`, `mismatched_client_key_is_reported` |
+| c: varint boundaries; incoming exactly max and +1 (v3, v5); non-minimal length encoding | Already covered (S2b): `the_largest_remaining_length_is_exact_at_the_varint_boundaries`, `an_incoming_packet_of_max_packet_passes_and_one_more_byte_fails`, `v3_non_minimal_length_encoding_is_checked_by_remaining_length` |
+| c: v3 outgoing exactly 1 MiB and +1 | Already covered: `a_v3_publish_of_max_packet_is_sent_and_one_more_byte_is_refused`, `net_mosquitto::v3_a_packet_of_one_mib_round_trips_and_one_byte_more_is_refused` |
+| c: exactly 1 MiB out and in on TCP, WS, WSS (v5), WS, WSS (v3) | Moved: `broker_matrix` `one_mib_over_tcp`, `one_mib_over_websocket`, `one_mib_over_secure_websocket`, `v3_one_mib_over_websocket`, `v3_one_mib_over_secure_websocket`. See deviation 4 (the v5 packet that returns is 3 bytes smaller) |
+| c: v5 CONNACK announces Maximum Packet Size: exact size sent, +1 refused before the send | Moved: `net_fake::a_v5_publish_over_the_announced_maximum_packet_size_is_refused_before_the_send` |
+| d: stalled write, v3 and v5, TCP, TLS, WS, WSS | Moved: `net_fake::stalled_write::*` (8 tests; v3, TLS, WS, WSS were "Not run" in S1) |
+| d: blocked write buffer + missing PINGRESP (ka 2 s, bound 17 s) | Moved: `net_fake::v3_stalled_write_with_keep_alive_2_s`, `v5_...` |
+| d: PINGREQ never answered, ka 2 s, with and without publishes | Moved: `net_fake::missing_pingresp::*` (8 wires; v3 was not run on `Net`), `v3_missing_pingresp_with_publishes`, `v5_...`. The v5 TCP case also exists as `net.rs::a_missing_pingresp_ends_the_attempt_with_the_general_text` |
+| d: ka 60 s and 70 s | Moved, `#[ignore]` (see below): `net_fake::v3_keep_alive_60_s`, `v5_keep_alive_60_s`, `v3_keep_alive_70_s`, `v5_keep_alive_70_s` |
+| d: old keep-alive tasks end (20 connects) | Moved: `net_keepalive_tasks::old_keep_alive_tasks_end` (v3 and v5) |
+| d: 2 MiB header, 1 MiB limit | Moved: `net_fake::big_header::*` (TCP and TLS, both versions): the end comes at once with the size text. The RSS was not measured |
+| d: incoming QoS 2 (v3, v5) | Already covered: `qos2_publish_fails_the_session_without_retry_or_panic`, `v3_qos2_closes_without_pubrec` |
+| d: half fixed header, half PUBLISH payload on TCP and TLS | Moved: `net_fake::half_fixed_header::*`, `half_payload::*` (at the plan values: 10 s check, bound 13 s) |
+| d: disconnect while a half frame waits (4 transports) | Moved: `net_fake::disconnect_while_a_half_frame_waits::*` (8 wires) |
+| d: WS and WSS half binary frame, ka 2 s | Moved: `net_fake::half_binary_frame::*` (WSS was "Not run" for the stalled upgrade; the half frame ran in S1 and now runs on `Net`) |
+| d: WS upgrade never answered | WS already covered: `net.rs::a_stalled_websocket_upgrade_is_a_temporary_timeout`. WSS moved (was "Not run"): `net_fake::v3_a_stalled_upgrade_over_wss_is_a_temporary_timeout`, `v5_...` |
+| d: trickling payload (cap 60 s) | Moved for TCP and TLS, both versions, `#[ignore]` (60 s): `net_fake::trickle::*`. TLS was "Not run" |
+| d: WS fragmented packet, Ping, Pong, Text | Moved: `net_fake::websocket_frames::*` (WS and WSS, both versions) |
+| d: handler panic after an await | Already covered: `a_handler_panic_after_an_await_fails_the_attempt`, `a_v3_handler_panic_after_an_await_fails_the_attempt` |
+| d: disconnect during a stalled send (graceful, force close) | Moved: `net_fake::disconnect_during_a_blocked_write::*` (8 wires). The v5 TCP case also exists as `net_blocked_write` |
+| d: acknowledgement wait cancelled by close | Moved (was "Not run"): `net_fake::ack_wait_cancelled_by_close::*` (8 wires): `LostOnDisconnect` and `Disconnected` in at most 3 s |
+| d: v5 broker DISCONNECT reason kept | Already covered: `a_broker_disconnect_text_ends_with_the_server_reference` |
+| d: Server Keep Alive 5 s and 0 followed | Moved: `net_fake::v5_server_keep_alive_5_s_is_followed`, `v5_server_keep_alive_0_sends_no_ping` |
+| d: silent CONNACK (v3, v5), stalled TLS | Moved: `net_fake::silent_connack::*`, `stalled_tls::*` (TLS and WSS). Stalled TLS also: `net.rs::tls_handshake_cut_off_is_retried` |
+| d: black-hole dial | Moved (Linux only): `net_fake::black_hole::a_black_hole_dial_ends_with_the_connect_deadline` |
+| d: refused CONNACK (v3 code 5, v5 0x87), version errors as raw bytes | Already covered (S2b): `v3_connack_return_codes_have_plain_text`, `v5_connack_0x84_names_the_protocol_setting`, `a_connack_that_v5_cannot_decode_says_the_reply_is_not_mqtt_5`, `not_authorized_fails_without_retry`, `a_refused_connack_text_ends_with_the_server_reference` |
+| d: first address refuses, stalled DNS | Already covered: `dial::the_next_address_is_tried_when_the_first_refuses`, `cancelled_attempts_keep_one_lookup` |
+| d: black-hole dial cancelled leaves no fd | Moved (Linux only): `net_fd_leak::a_cancelled_black_hole_dial_leaves_no_file_descriptor` (the dial ends by a disconnect, because the deadline is 10 s in production) |
+| "Not run": mTLS over WSS | Moved: `net_fake::v3_mtls_over_wss`, `v5_mtls_over_wss` (the fake serves a WSS listener that needs a client certificate) |
+| "Not run": 1000 queued QoS 1 publishes at Receive Maximum 2 | Moved: `net_fake::a_thousand_publishes_at_receive_maximum_2_keep_to_two_in_flight` (in-flight count and order; no RSS) |
+| S2b open point 5 / S2c deviation 6: lost UNSUBACK and app restart on v3 (D3) | Moved: `net_mosquitto` `v3_a_lost_unsubscribe_is_retried_on_the_resumed_session`, `v3_a_removal_survives_a_restart_with_the_saved_session_filters`, and also `v3_a_removal_after_a_manual_disconnect_reaches_the_next_session`, `v3_a_new_profile_on_a_shared_session_gets_the_cached_set`, `v3_a_clean_session_forgets_the_filters`. The v5 tests keep their names and bodies (now `*_with(protocol)`) |
+
+Not moved, and why:
+
+- (Round 1, finding 9: moved. `net_fake::a_v5_publish_over_the_local_limit_is_sent_when_the_broker_announces_none`.)
+- ka 60 s and 70 s with our publishes (the spike ran 8 cases together). The new ignored tests run without publishes. With publishes, ka 2 s is covered.
+- RSS of the 2 MiB header case, and the overload test (RSS flat): S4 measures memory.
+- A broker that negotiates TLS 1.2 only, an IPv6-only host, the order of `getaddrinfo` for `localhost`: need a host set-up that the repo does not have.
+- The overload test (S2 deviation 9, the plan lists it under S4): not done in S3. Topic alias set and reuse are covered by the Round 1 proxy test; the invalid alias by Round 2 finding 3.
+- The spike also measured the release size and scaled frame-read-rate values. These are numbers of S1 and S4, not tests.
+
+Spike decision: the example stays (`examples/ntex_spike.rs`, `examples/ntex_spike/`, and the `log` dev-dependency). The cases above under "Not moved" are only there. The plan calls the spike throw-away. A later step (S5) can delete it when the owner accepts those gaps.
+
+### Tests changed in S3 (assertions and timing)
+
+No assertion was removed. Round 1 found two checks that were weaker than before: the PING timing bounds (finding 4) and the QoS result check of `Publisher` (finding 6). Both are restored. No timing of an existing test changed otherwise.
+
+| Test | Change | Plan line |
+|---|---|---|
+| `net.rs` `topic_errors_*`, `filter_errors_*` (renamed `*_have_fixed_texts`) | The oracle is a table of the texts of the old client (same cases) instead of a call of the old client. The checks are the same values. | S3 (line 145) and S5 (the old client goes away) |
+| `broker_compat::connack_probe` | Reads `ConnectionDetails` from `Net` instead of the CONNACK of the old client. Kept: clean start gives `session_present` false, retain available, wildcards available. `is_success` has no equivalent: a failed connect never reaches `ConnectionDetails`. The test also asserts the protocol is V5. | Mapping row "`new_client`" (line 114) |
+| `load_ci.rs`, `soak.rs`, `flood.rs` publisher | A second `Net` publishes QoS 0 (was the old client). `load_ci` fails if any publish result is not `Sent`. `soak` counts as `sent` the accepted publishes (Round 1, finding 1: failures are counted apart), and waits while the publisher status is not `Connected` (the old publisher connected again by itself). All rate, drop, RSS and slice assertions are the same. | S3 (line 145) |
+| `net_mosquitto::publish_plain` | Uses `Publisher` (QoS 1, waits for the result `Acknowledged`, asserts exactly one result). | S3 (line 145) |
+| `LIMITS` locks | Removed (see above). | Mapping row `local_limits` (line 116) |
+| `net_mosquitto.rs`, `broker_matrix.rs` | Seven tests now call a `*_with(protocol)` body and keep their name for V5; the V3 twin is new. | S3 (line 145) |
+
+### Mutation checks
+
+Each check changed the product code (or the test input), ran the named tests, and the tests failed. I restored the code after each.
+
+| Mutation | Tests that failed |
+|---|---|
+| No stale UNSUBSCRIBE after the resume (`self.unsubs.pop_front()` replaced) | `a_lost_unsubscribe_is_retried_on_the_resumed_session`, `v3_...` (`s3-mut1.txt`) |
+| v3 CONNECT keep alive set to 0 | `missing_pingresp::v3_tcp` (`s3-mut2.txt`) |
+| Frame read rate check 10 s changed to 40 s | `half_fixed_header::v3_tls` (`s3-mut3.txt`) |
+| Write timeout and `OP_TIMEOUT` 60 s | `stalled_write::v3_wss` (`s3-mut4.txt`) |
+| `PublishResult::LostOnDisconnect` mapped to `TimedOut` | `ack_wait_cancelled_by_close::v3_ws`, `v3_wss` (`s3-mut5.txt`) |
+| v5 keep alive 0 | `half_binary_frame::v5_ws`, `v5_wss` (`s3-mut6.txt`) |
+| `io_outcome` branch for the WebSocket "Timeout" removed | both `*_a_stalled_upgrade_over_wss_is_a_temporary_timeout` (`s3-mut8.txt`) |
+| Client certificate not loaded | `v3_mtls_over_wss`, `v5_mtls_over_wss` (`s3-mut9.txt`) |
+| Packet limits (`max_packet`) times 8 in the codec set-up | the four `big_header` tests (`s3-mut10.txt`) |
+| Outgoing size check `size > max + 1` | `a_v5_publish_over_the_announced_maximum_packet_size_is_refused_before_the_send` (`s3-mut11.txt`) |
+| Receive Maximum 2 changed to 100 in the fake CONNACK | `a_thousand_publishes_at_receive_maximum_2_keep_to_two_in_flight` (`s3-mut12.txt`) |
+| Keep alive 2 s changed to 30 s in the test input | `old_keep_alive_tasks_end` (count 0 after 3 s) |
+
+Mutation checks that could not be made, or did not fail:
+
+- `CLOSE_GRACE` 2 s changed to 60 s did not fail `ack_wait_cancelled_by_close`. The wait for an acknowledgement is cleared at once by the close (S1 finding 11), so the grace time does not matter for it. The test pins the result and the 3 s bound; the `LostOnDisconnect` mutation above fails it. The prompt close of a blocked write is the case that depends on the grace time, and `disconnect_during_a_blocked_write` covers it (not mutation-checked).
+- `net_fd_leak`, `disconnect_during_a_blocked_write`, `websocket_frames`, `half_payload`, `silent_connack`, `stalled_tls`, the v3 matrix tests, the DNS name tests and the 1 MiB tests: not mutation-checked. The first two have no simple way to inject a leak or a slow close. The others check library behaviour or exact texts that the broker or the fake produces.
+- The ka 60 and 70 tests, and the trickle tests: not mutation-checked (long runs).
+
+### Gate (final code)
+
+Mosquitto, EMQX and HiveMQ started with `tests/broker/up.sh` (all 12 listeners answered CONNACK, `s3-up.txt`).
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | ok (`s3-fmt.txt`) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | ok (`s3-clippy.txt`) |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok (`s3-deny.txt`) |
+| `cargo test --workspace` | 420 passed, 0 failed, 9 ignored (`s3-test.txt`). `navigator-core`: 182 unit, 1 `net_blocked_write`, 81 `net_fake` (68.59 s), 1 `net_fd_leak` (24.99 s), 1 `net_keepalive_tasks` (14.06 s). The 9 ignored are 1 older unit test, 4 `trickle`, 4 long keep alive |
+| Full broker suite, run 1 and 2 (`--no-fail-fast -- --test-threads=1`) | each run: 182 unit, 24 `broker_compat`, 37 `broker_matrix`, 1 `load_ci` (about 361 s), 1 `net_blocked_write`, 81 `net_fake` (about 382 s serial), 1 `net_fd_leak`, 1 `net_keepalive_tasks`, 36 `net_mosquitto`; 0 failed; `soak` 1 ignored (`s3-full-1.txt`, `s3-full-2.txt`) |
+| Full broker suite with the default test threads (after the `LIMITS` locks went) | the same counts, 0 failed. `broker_matrix` 8.89 s, `net_mosquitto` 9.85 s, `net_fake` 68.59 s (`s3-full-parallel.txt`) |
+| `net_mosquitto` alone, 10 runs, default test threads | 10 runs of 36 passed, 0 failed (`s3-mosquitto10.txt`) |
+| Ignored tests: `trickle` (4) | 4 passed in 61.16 s (`s3-trickle.txt`). Run before the later tests were added; the trickle code did not change after |
+| Ignored tests: keep alive 60 s and 70 s (4) | 4 passed in 147.72 s (`s3-longka.txt`) |
+| Soak, 10 min | see the next section (`s3-soak.txt`) |
+| `examples/flood.rs`, release, Mosquitto 18830, 10 000 msg/s, 100 topics, 10 s | the last five one-second reports show 9998 to 10004 msg/s; `done: sent 100100, results ok 100100, failed 0` (`s3-flood.txt`) |
+| `cargo +nightly fuzz build` (4 targets) | ok (`s3-fuzz-build.txt`). Plain `cargo fuzz build` fails here (needs the nightly toolchain, as in CI) |
+
+EMQX and HiveMQ are stopped (`docker compose -f tests/broker/compose.yml stop emqx hivemq`). Mosquitto still runs. No image was pruned.
+
+### Soak, 10 minutes
+
+`SOAK_SECS=600 cargo test --release -p navigator-core --features broker-tests --test soak -- --ignored --nocapture` against Mosquitto (`tests/broker/up.sh mosquitto`), 500 msg/s, 2 000 topics, 6 broker restarts. Result: 1 passed in 603.19 s.
+
+```
+soak: 603s sent 295240 received 295240 lost_in_restarts 0 dup 0 restarts 6 windows [1, 1, 1, 3, 3, 1]
+publisher_connects 7 subscribed 7 reconnected 6 net_drops 0 event_drops 0 window_drops 0 store_drops 0/0
+topics 2001 max_used 114551099 B (hard limit 167772160 B) rss_growth 16863232 B (max rss 95 MiB)
+slices 17131 slice_max 368.959us errors_in_windows 0
+```
+
+"Messages flow again" after 1.6 to 3.3 s in the six restarts. RSS was 22 MiB at 60 s, 52 MiB at 180 s, 79 MiB at 300 s (baseline) and 95 MiB at 540 s and 600 s. The RSS number is not comparable with P7: the publisher is now a second `Net` in the same process (it was the old client). S4 does the comparison.
+
+### Deviations and open points
+
+1. The plan says nothing about the test bounds of the fake-broker cases beyond the table. Each new test uses the plan bound (the stalled write 12.5 s, 17 s with keep alive 2 s; the half frame 13 s; the half WS frame 6.5 s; the trickle 68 s; ka 2 x ka x 1.125 + 1 s, +2 s over WS). Every bound also has a lower bound (the end must wait for the timer), so an immediate error cannot pass.
+2. Stalled write on `Net`: the operation timer (10 s from the submit, final) and the write timeout (10 s, temporary) race in `stalled_write`, so that test accepts two ends. The write timeout alone is proven by `write_timeout_alone` (Round 1, finding 3).
+3. A WS or WSS half frame with keep alive 2 s ends with `Reconnecting("The connection timed out.")`, not the general "The connection closed ..." text. The test pins the observed text. A Text frame ends with `Failed("Network error: WebSockets Text frames are not supported")` (final). These are the texts that S2 gives. The plan does not name them. The old client's behaviour for a Text frame was not compared (S1 finding 6).
+4. v5 and Mosquitto: the first copy of a message that Mosquitto forwards to `Net` has 3 more bytes. The first explanation (Subscription Identifier) was wrong. The cause is a Topic Alias property (Round 1, finding 5).
+5. `net_fake` runs in `cargo test --workspace` (no broker needed). Serial it takes about 382 s, so the broker run with `--test-threads=1` is about 16 minutes. The CI broker job passes `--test-threads=1` only for the three broker test files, so its time does not change. `.github/workflows/ci.yml` is not changed: no command or test file name in it changed. The new tests run in the existing `cargo test --workspace` step. The Windows and macOS CI jobs run `net_fake` for the first time (the stalled write fills socket buffers with about 20 MB; loopback buffers differ by OS). `net_fd_leak` is Linux only.
+6. The full broker run was done in the background and polled, not in the foreground: one foreground call is limited to 10 minutes and a run takes about 16.
+7. Ignored tests (more than 30 s): 4 `trickle` (60 s), 4 keep alive 60 s and 70 s (about 2 to 2.5 minutes). The other `net_fake` tests take at most 25 s (the fd test).
+8. `Publisher` makes the publisher a full `Net`. A QoS 0 publish through `Net` needs a command, a result event and a drain. It kept the 10 000 msg/s of `load_ci` and `flood` (9998 to 10004 msg/s). `load_ci` passed with its unchanged assertions (95 % of the rate, no drops, no missing, merge slice p99 and maximum, RSS growth).
+9. Open: delete the spike (S5 decision), the open items under "Not moved", and the Windows and macOS runs of the new tests (CI, S6).
+
+### Round 1 fixes
+
+The Codex review of S3 (round 1) found 10 points. Each point is fixed at its root. No product code changed in `src/` (the two temporary mutations in `src/` were restored). No test found a bug in the product. Logs are in the scratchpad as `s3r1-*.txt`.
+
+| # | Finding | Fix | Evidence |
+|---|---|---|---|
+| 1 | Soak: publisher failures were taken out of `sent`. They could hide loss. | `sent` is the number of accepted publishes again. The publisher thread counts every result that is not `Sent` in `failures`, and in `failures_outside` when it arrives while the main loop says "not in a restart window or its grace time" (a shared flag). The summary line shows `publisher_failures` and `failures_outside_windows`. The test asserts `failures_outside == 0` and `failures <= allowed` (the same allowance as the loss in the restart windows). `lost_in_restarts` (accepted - received) includes every failure. | `soak.rs`. See "Soak after Round 1". |
+| 2 | The blocked-write precondition could pass with no blocked write: the drain stopped at the first event that was not a result. | New helper `drain_until_quiet` takes every event until none comes for 500 ms (it replaces the fixed 500 ms sleep). Fewer results than sends proves that a send waits for the write (the broker reads nothing and QoS 0 gives a result only when the buffer takes the message). All results so far must be `Sent`. After the disconnect or the write timeout, at least one send must report `LostOnDisconnect`. Same fix in `stalled_write` and `disconnect_during_a_blocked_write`. `net_blocked_write.rs` already drained every event. It keeps its fixed 500 ms wait; it only gained the `LostOnDisconnect` check. | `net_fake.rs`, `net_blocked_write.rs` |
+| 3 | The operation timer could hide a broken write timeout. | New tests `v3_write_timeout_alone_is_a_temporary_failure`, `v5_...`. The broker reads nothing. The test sends QoS 0 messages one at a time and waits 4.5 s after each result. The first send with no result in 0.7 s is the blocked one. ntex starts its write timeout when the buffer goes above the high watermark and does not drain (a trace in an exploring run showed `Start write timer` when the last message was taken, and `Write backpressure timeout` 10.01 s later: `s3r1-write-timer-log.txt`; the trace code is not kept). Let T0 be the stall. The write timeout ends the attempt at T0 + 10 s to T0 + 12 s (timer up to 1 s late, then up to 1 s of I/O shutdown). The blocked send comes at about T0 + 4.5 s, so the end is 5.5 s to 7.5 s after it. The operation timer of that send would end it 10 s after it. The test requires: the end comes less than 9.8 s after the blocked send, the state is `Reconnecting` with "The broker did not read our data for 10 s.", and the blocked send reports `LostOnDisconnect` (not `TimedOut`). The first version waited 2 s only; a review of the margin showed that the two ends could overlap, so I raised it. | Mutation: `WRITE_TIMEOUT` changed from `Seconds(10)` to `Seconds(0)` in `src/net/wire.rs`. Both tests failed: the attempt ended 10.00 s after the blocked send with `Failed("The broker did not answer for 10 s. Connect again.")` (`s3r1-mut-write-timeout.txt`, final version of the test). Restored. |
+| 4 | The PING timing checks were weaker than the spike. | `missing_pingresp_full` uses the spike bounds again. First PINGREQ: `ka - 0.2 s` to `ka x 1.125 + 0.5 s` (spike: same). End of the attempt: at least `2 x ka - 0.1 s` (spike: same) and at most the plan bound `2 x ka x 1.125 + 1 s` (+ 1 s over WS and WSS) plus 0.3 s. The 0.1 s and 0.2 s cover the delay between the client event and the test clock. The 0.3 s is the poll step of the test loop that sends publishes. The old limits were `1.5 x ka` and `0.75 x ka`. | `net_fake.rs`. All 8 wires with ka 2 s pass (`s3r1-workspace.txt`). The ka 60 s and 70 s ignored tests passed with the final bounds (`s3r1-longka.txt`, "Gate after Round 1"). |
+| 5 | The v5 1 MiB test used a wrong size adjustment (Subscription Identifier). | I captured the real packets with a raw MQTT 5 client and with a TCP proxy between `Net` and Mosquitto. Mosquitto adds nothing for a client that announces no Topic Alias Maximum (raw client: forwarded size equals sent size, for 1 MiB - 3, 1 MiB - 6 and 1 MiB). `Net` announces Topic Alias Maximum 16 in CONNECT. For the first message on a topic, Mosquitto adds the property Topic Alias (id 0x23 and 2 bytes: 3 bytes; property length 3 instead of 0). For the next message on that topic it sends an empty topic with the same alias. So the copy of the 1 MiB packet is 1 MiB + 3 - 42 (the topic) = 1 048 537 bytes, and it is delivered. The report said that Mosquitto drops this copy. That was wrong. The new test `v5_forwarded_copy_carries_a_topic_alias` puts a proxy in front of Mosquitto and asserts the sizes on the wire: sent 1 MiB - 3 and 1 MiB; first copy exactly 1 MiB with property bytes `03 23 00 01`; second copy topic length 0 and size 1 MiB + 3 - topic length. `one_mib_round_trip` now receives both copies (it had skipped the second). | `broker_matrix.rs`. Raw capture: `sniff.py` output (`s3r1-sniff.txt`) and proxy log (`s3r1-proxy.txt`). |
+| 6 | `Publisher` accepted `Sent` for QoS 1. | `Publisher` keeps the QoS of each open operation. QoS 0 needs `Sent`. QoS 1 needs `Acknowledged`. Any other result, and a result with an unknown ID, goes to `failed`. `publish_plain` (QoS 1) therefore needs a PUBACK. | `tests/common/mod.rs`. `net_mosquitto` `publish_plain` users pass in the broker run. |
+| 7 | `net_keepalive_tasks` depended on the setup speed. | The capture logger records the time of each "start ... keep-alive task" and "stopping keep-alive task" record. Each phase waits (at most 10 s) for 20 starts, then for 20 stops. Each task (sorted start and stop pairs) must live 1.8 s to 4 s: not less than one interval (so a stop before the first tick cannot pass), and not more than the bound. A phase first waits until every earlier start has its stop. | `net_keepalive_tasks.rs`. Passed in the workspace run. |
+| 8 | Fixed sleeps did not synchronize the fake broker. | `big_header`: the fake waits for a `go` message that the test sends after it saw `Connected`. `websocket_frames`: the fake sends the Text frame after `go`, which the test sends after it received the fragmented packet. `disconnect_while_a_half_frame_waits`: `go` after `Connected`, then the fake writes the half frame and sends a `sent` confirmation, and the test disconnects after that. No `sleep` is left in a fake broker handler except the deliberate pacing of the trickle test and `stop_reading`. The client may still process the half frame after the disconnect starts. The disconnect must be prompt in both cases. | `net_fake.rs` |
+| 9 | No regression test for v5 outgoing with no Maximum Packet Size. | New test `a_v5_publish_over_the_local_limit_is_sent_when_the_broker_announces_none`. The CONNACK has no properties. A PUBLISH of `max_packet + 1` bytes and one of `2 x max_packet` are sent whole (the fake measures the packet and sends the PUBACK) and get `Acknowledged`. A message of 256 MiB + 1 byte (the MQTT maximum is 268 435 455 + 5 bytes) is refused before the send with "The message is larger than the MQTT limit (256 MiB)." and the fake sees no third PUBLISH. This is the rule of plan line 34. I did not send a packet of exactly 256 MiB: it needs more than 512 MB of memory. | Mutation: `Net::send` passed `broker_max_packet().or(Some(1 MiB))`. The test failed (the broker got no PUBLISH, `s3r1-mut-v5-nolimit.txt`). Restored. |
+| 10 | The merge timing was not checked: all `load_ci` runs used a debug build. | I ran `LOAD_WARMUP_SECS=10 LOAD_SECS=60 cargo test --release -p navigator-core --features broker-tests --test load_ci -- --nocapture` (release build, where the p99 and maximum checks are active). Result: passed. Sent 700 400 (10 001 msg/s), received 700 400, missing 0, dup 0, drops 0, RSS growth 1 302 528 B in 60 s, 2 002 merge slices, p99 1.65 ms (limit 4 ms), maximum 1.83 ms (limit 8 ms). The 5-minute default run was not made. | `s3r1-load-ci-release.txt` |
+
+### Gate after Round 1
+
+Logs are in the scratchpad (`s3r1-*.txt`). Mosquitto, EMQX and HiveMQ were started with `tests/broker/up.sh` (`s3r1-up.txt`).
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | ok, run again after the last edit (`s3r1-fmt.txt`) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | ok, run again after the last edit (`s3r1-clippy.txt`) |
+| `cargo deny check` | ok (`s3r1-deny.txt`). It ran before the last two edits (`net_fake.rs` pause, `soak.rs` window flag). They change no dependency. |
+| `cargo test --workspace` | 423 passed, 0 failed, 9 ignored. Run twice: before the last two edits (`s3r1-workspace.txt`) and after them (`s3r1-workspace2.txt`). `navigator-core`: 182 unit, 1 `net_blocked_write`, 84 `net_fake` (83.82 s), 1 `net_fd_leak`, 1 `net_keepalive_tasks`. The 9 ignored are 1 older unit test, 4 `trickle`, 4 long keep alive |
+| Full broker suite (`--no-fail-fast -- --test-threads=1`) | 368 passed, 0 failed, 10 ignored (`s3r1-broker.txt`): 182 unit, 24 `broker_compat`, 38 `broker_matrix` (new: the Topic Alias proxy test), 1 `load_ci` (debug, 360.71 s), 1 `net_blocked_write`, 84 `net_fake` (411.24 s serial), 1 `net_fd_leak`, 1 `net_keepalive_tasks`, 36 `net_mosquitto`. The ignored are 1 unit test, 8 `net_fake`, 1 `soak`. This run started before the last two edits (the pause in `write_timeout_alone` 2 s to 4.5 s, and the soak window flag). Neither edit touches a broker test file. `soak` is not in this run |
+| `net_fake` alone, 10 runs, default test threads | 10 runs of 84 passed, 0 failed, 8 ignored, each 83.8 s (`s3r1-netfake-1.txt` to `-10.txt`). These ran after the last edit to `net_fake.rs` |
+| `write_timeout_alone` mutation (`WRITE_TIMEOUT` 0) | both tests fail with the final test (`s3r1-mut-write-timeout.txt`). Restored (`const WRITE_TIMEOUT: Seconds = Seconds(10)` checked) |
+| v5 no-limit mutation (`Net::send` applies 1 MiB when the broker announces none) | the test fails (`s3r1-mut-v5-nolimit.txt`). Restored |
+| `load_ci`, release, `LOAD_WARMUP_SECS=10 LOAD_SECS=60` | passed: 10 001 msg/s, no missing, no drops, merge p99 1.65 ms, max 1.83 ms (`s3r1-load-ci-release.txt`) |
+| Ignored tests: keep alive 60 s and 70 s (4), final bounds | 4 passed in 147.72 s (`s3r1-longka.txt`) |
+| Ignored tests: `trickle` (4) | not run again. The code and bounds of these tests did not change in Round 1 |
+| `examples/flood.rs`, `cargo +nightly fuzz build` | not run again. Round 1 changed neither |
+
+EMQX and HiveMQ are stopped (`docker compose -f tests/broker/compose.yml stop emqx hivemq`). Mosquitto still runs. No image was pruned. The disk became full once during the work (the `target` directory is 26 GB). I deleted `target/debug/incremental` (a cache). Then I found that `net_fake.rs` had been cut short by the full disk, and I rebuilt its end from an earlier copy; the 10 runs and the workspace run above are of the rebuilt file.
+
+### Soak after Round 1
+
+`SOAK_SECS=600 cargo test --release -p navigator-core --features broker-tests --test soak -- --ignored --nocapture` against Mosquitto, 500 msg/s, 2 000 topics, 6 broker restarts (`s3r1-soak.txt`). Result: 1 passed in 603.17 s.
+
+```
+soak: 603s sent 295970 received 295910 lost_in_restarts 60 publisher_failures 0 failures_outside_windows 0
+dup 0 restarts 6 windows [1, 3, 1, 1, 1, 1] publisher_connects 7 subscribed 7 reconnected 6 net_drops 0
+event_drops 0 window_drops 0 store_drops 0/0 topics 2001 max_used 114551099 B (hard limit 167772160 B)
+rss_growth 16769024 B (max rss 95 MiB) slices 17166 slice_max 351.429us errors_in_windows 0
+```
+
+`sent` is now the number of accepted publishes. 60 messages were lost in the restarts (the first run showed 0 because it subtracted failures). No publisher failure was reported, and none came outside a restart window. The allowance for the loss is the same as before.
+
+### Round 2 fixes
+
+Logs are `s3r2-*.txt` in the scratchpad.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | `flood` exited 0 after failed publishes, and counted local rejections in its rate. | The rate and the total use accepted minus failed (after a drain). After `settle`, `flood` exits with an error if `failed` is not empty or `done != accepted`. Run against Mosquitto on 18830, 5 000 msg/s, 8 s: 40 050 accepted, 40 050 ok, 0 failed, exit 0 (`s3r2-flood.txt`). The error path was not run against a failing broker. |
+| 2 | Failures drained in the final `settle` of the soak publisher skipped the outside-window count. | The same accounting (`failures_outside` when the window flag is false) now runs after the final `settle`. Only this accounting changed in `soak.rs`, so I did not run the soak again. It compiled under clippy only. The Round 1 soak result stands for everything else. |
+| 3 | No invalid Topic Alias test. | New test `a_v5_publish_with_an_invalid_topic_alias_is_not_delivered` (fake broker, v5 TCP). The broker sends a valid control PUBLISH (topic `a/ok`, alias 1), which must arrive. Then it sends one invalid PUBLISH per case: alias 0, alias 17 (above our announced 16), and alias 2 with an empty topic (unknown). Each case ends the connection with `Failed("The broker sent data that is not valid MQTT 5.")`, and only `a/ok` is ever in `Net::incoming`. |
+
+Gate: `cargo fmt --check` ok, `cargo clippy --workspace --all-targets --all-features -- -D warnings` ok, `cargo test --workspace` ok (0 failed), `net_fake` 5 runs of 85 passed, 0 failed, 8 ignored, 83.8 s each (`s3r2-netfake-1.txt` to `-5.txt`). The new test was not mutation-checked (no production change to revert).
+
+
+### Round 3 fix
+
+- Codex found that the v5 `half_payload` packet had no property length byte. The decoder read the first payload byte as a property length, so the test stopped in the properties, not in the payload.
+- The test now adds an empty property length (`0x00`) for MQTT 5.
+- `cargo test -p navigator-core --test net_fake half_`: 20 passed, 0 failed (log `s3r3-half.txt`). The v5 `half_payload` tests pass with the read timeout text, so the payload read stall now ends the connection.

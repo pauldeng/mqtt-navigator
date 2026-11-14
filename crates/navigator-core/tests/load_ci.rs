@@ -15,15 +15,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ms_mqtt_client::client::{ClientOptions, ConnectResult, KeepAliveConfig, new_client};
-use ms_mqtt_client::packet::{ConnectProperties, PublishProperties};
-use ms_mqtt_client::topic::TopicName;
-use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::Qos;
 use navigator_core::net::{
     Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Protocol, Transport,
 };
 use navigator_core::store::{Limits, TopicStore};
+
+mod common;
+use common::Publisher;
 
 const PORT: u16 = 18830;
 const RATE: u64 = 10_000;
@@ -75,72 +74,41 @@ fn publisher(
         .build()
         .expect("runtime");
     let result = rt.block_on(async {
-        let (client, connect_handle, mut receiver) = new_client(ClientOptions::default());
-        let connection = match connect_handle
-            .connect(
-                ConnectionTransportConfig {
-                    transport_type: ConnectionTransportType::Tcp {
-                        hostname: "127.0.0.1".into(),
-                        port: PORT,
-                    },
-                    timeout: Some(Duration::from_secs(10)),
-                    proxy: None,
-                    tcp_nodelay: true,
-                },
-                true,
-                KeepAliveConfig::Infinite,
-                None,
-                None,
-                None,
-                ConnectProperties::default(),
-                Some(Duration::from_secs(10)),
-            )
-            .await
-        {
-            ConnectResult::Success(connection, _, _handle) => connection,
-            ConnectResult::Failure(_, e) => return Err(format!("publisher connect: {e:?}")),
-        };
-        let topics: Vec<TopicName> = (0..TOPICS)
-            .map(|i| TopicName::new(format!("load/t{i}")).expect("topic"))
-            .collect();
+        let mut publisher = Publisher::connect("127.0.0.1", PORT).await?;
+        let topics: Vec<String> = (0..TOPICS).map(|i| format!("load/t{i}")).collect();
         let batch = RATE / 100;
-        let sender = async {
-            let mut tick = tokio::time::interval(Duration::from_millis(10));
-            let mut seq = 0u64;
-            let mut last = None;
-            while !stop.load(Ordering::Acquire) && start.elapsed() < hard_cap {
-                tick.tick().await;
-                for _ in 0..batch {
-                    let mut payload = vec![b'x'; SIZE];
-                    payload[..8].copy_from_slice(&seq.to_le_bytes());
-                    // The client queue is bounded, so this waits when the broker is slower.
-                    let token = client
-                        .publish_qos0(
-                            topics[seq as usize % TOPICS].clone(),
-                            Bytes::from(payload),
-                            false,
-                            PublishProperties::default(),
-                        )
-                        .await
-                        .map_err(|e| format!("publish: {e:?}"))?;
-                    last = Some(token);
-                    seq += 1;
-                    sent.store(seq, Ordering::Relaxed);
-                }
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        let mut seq = 0u64;
+        while !stop.load(Ordering::Acquire) && start.elapsed() < hard_cap {
+            tick.tick().await;
+            for _ in 0..batch {
+                let mut payload = vec![b'x'; SIZE];
+                payload[..8].copy_from_slice(&seq.to_le_bytes());
+                // `Net` has a bounded queue, so this waits when the broker is slower.
+                publisher
+                    .send(
+                        &topics[seq as usize % TOPICS],
+                        Bytes::from(payload),
+                        Qos::AtMostOnce,
+                    )
+                    .await
+                    .map_err(|e| format!("publish: {e}"))?;
+                seq += 1;
+                sent.store(seq, Ordering::Relaxed);
             }
-            // Let the client write the queued messages before it closes.
-            if let Some(token) = last {
-                let _ = token.await;
+            if !publisher.connected() {
+                return Err("publisher connection ended".to_owned());
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            Ok::<(), String>(())
-        };
-        // The connection makes progress only while it is polled.
-        tokio::select! {
-            (_, event) = connection.run_until_disconnect() => Err(format!("publisher connection ended: {event:?}")),
-            _ = receiver.recv() => Ok(()),
-            result = sender => result,
         }
+        // Let `Net` write the queued messages before it closes.
+        publisher.settle(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        publisher.drain();
+        if !publisher.failed.is_empty() {
+            return Err(format!("publish results: {:?}", publisher.failed));
+        }
+        publisher.shutdown().await;
+        Ok::<(), String>(())
     });
     done.store(true, Ordering::Release);
     if let Err(e) = result {

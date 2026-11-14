@@ -21,15 +21,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ms_mqtt_client::client::{ClientOptions, ConnectResult, KeepAliveConfig, new_client};
-use ms_mqtt_client::packet::{ConnectProperties, PublishProperties};
-use ms_mqtt_client::topic::TopicName;
-use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::Qos;
 use navigator_core::net::{
     Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Protocol, Transport,
 };
 use navigator_core::store::{Limits, TopicStore};
+
+mod common;
+use common::Publisher;
 
 const PORT: u16 = 18830;
 const TOPICS: usize = 2_000;
@@ -61,87 +60,78 @@ fn rss() -> Option<i64> {
     Some(pages * 4096)
 }
 
-/// Publishes QoS 0 messages at `rate` until `stop` is set. It connects again after each
-/// restart. The first 8 payload bytes are the sequence number. `sent` counts the messages that
-/// the client accepted.
-fn publisher(rate: u64, stop: Arc<AtomicBool>, sent: Arc<AtomicU64>, connects: Arc<AtomicU64>) {
+/// Publishes QoS 0 messages at `rate` until `stop` is set. `Net` connects again after each
+/// restart; the publisher waits while the status is not `Connected`. The first 8 payload bytes
+/// are the sequence number. `sent` counts the messages that `Net` accepted. `failures` counts the
+/// results that are not `Sent`. The test reports them apart and allows them only in restarts:
+/// `failures_outside` counts those that arrive while `in_window` is false.
+fn publisher(
+    rate: u64,
+    stop: Arc<AtomicBool>,
+    sent: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    failures_outside: Arc<AtomicU64>,
+    in_window: Arc<AtomicBool>,
+    connects: Arc<AtomicU64>,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     rt.block_on(async {
-        let topics: Vec<TopicName> = (0..TOPICS)
-            .map(|i| TopicName::new(format!("soak/t{i}")).expect("topic"))
-            .collect();
+        let topics: Vec<String> = (0..TOPICS).map(|i| format!("soak/t{i}")).collect();
         let batch = rate.div_ceil(100);
         let mut seq = 0u64;
-        while !stop.load(Ordering::Acquire) {
-            let (client, connect_handle, mut receiver) = new_client(ClientOptions::default());
-            let connection = match connect_handle
-                .connect(
-                    ConnectionTransportConfig {
-                        transport_type: ConnectionTransportType::Tcp {
-                            hostname: "127.0.0.1".into(),
-                            port: PORT,
-                        },
-                        timeout: Some(Duration::from_secs(5)),
-                        proxy: None,
-                        tcp_nodelay: true,
-                    },
-                    true,
-                    KeepAliveConfig::Infinite,
-                    None,
-                    None,
-                    None,
-                    ConnectProperties::default(),
-                    Some(Duration::from_secs(5)),
-                )
-                .await
-            {
-                ConnectResult::Success(connection, _, _handle) => connection,
-                ConnectResult::Failure(..) => {
-                    // The broker is down. Try again.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-            };
-            connects.fetch_add(1, Ordering::Relaxed);
-            let sender = async {
-                let mut tick = tokio::time::interval(Duration::from_millis(10));
-                let mut last = None;
-                while !stop.load(Ordering::Acquire) {
-                    tick.tick().await;
-                    for _ in 0..batch {
-                        let mut payload = vec![b'x'; SIZE];
-                        payload[..8].copy_from_slice(&seq.to_le_bytes());
-                        let Ok(token) = client
-                            .publish_qos0(
-                                topics[seq as usize % TOPICS].clone(),
-                                Bytes::from(payload),
-                                false,
-                                PublishProperties::default(),
-                            )
-                            .await
-                        else {
-                            return;
-                        };
-                        last = Some(token);
-                        seq += 1;
-                        sent.store(seq, Ordering::Relaxed);
-                    }
-                }
-                // Let the client write the queued messages before it closes.
-                if let Some(token) = last {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), token).await;
-                }
-            };
-            // The connection makes progress only while it is polled.
-            tokio::select! {
-                _ = connection.run_until_disconnect() => {}
-                _ = receiver.recv() => {}
-                () = sender => {}
+        let mut publisher = loop {
+            if stop.load(Ordering::Acquire) {
+                return;
             }
+            match Publisher::connect("127.0.0.1", PORT).await {
+                Ok(p) => break p,
+                // The broker is down. Try again.
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        };
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        let mut counted = 0usize;
+        while !stop.load(Ordering::Acquire) {
+            tick.tick().await;
+            publisher.drain();
+            let new = publisher.failed.len() - counted;
+            if new > 0 && !in_window.load(Ordering::Acquire) {
+                failures_outside.fetch_add(new as u64, Ordering::Relaxed);
+            }
+            counted = publisher.failed.len();
+            connects.store(1 + publisher.reconnects, Ordering::Relaxed);
+            if !publisher.connected() {
+                publisher.drain();
+                continue;
+            }
+            for _ in 0..batch {
+                let mut payload = vec![b'x'; SIZE];
+                payload[..8].copy_from_slice(&seq.to_le_bytes());
+                let topic = &topics[seq as usize % TOPICS];
+                if publisher
+                    .send(topic, Bytes::from(payload), Qos::AtMostOnce)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                seq += 1;
+            }
+            sent.store(publisher.accepted, Ordering::Relaxed);
+            failures.store(publisher.failed.len() as u64, Ordering::Relaxed);
         }
+        // Let `Net` write the queued messages before it closes.
+        publisher.settle(Duration::from_secs(2)).await;
+        let new = publisher.failed.len() - counted;
+        if new > 0 && !in_window.load(Ordering::Acquire) {
+            failures_outside.fetch_add(new as u64, Ordering::Relaxed);
+        }
+        sent.store(publisher.accepted, Ordering::Relaxed);
+        failures.store(publisher.failed.len() as u64, Ordering::Relaxed);
+        publisher.shutdown().await;
     });
 }
 
@@ -203,11 +193,16 @@ fn soak_with_broker_restarts() {
 
         let stop = Arc::new(AtomicBool::new(false));
         let sent = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let failures_outside = Arc::new(AtomicU64::new(0));
+        let in_window_flag = Arc::new(AtomicBool::new(false));
         let connects = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
         let thread = {
-            let (stop, sent, connects) = (stop.clone(), sent.clone(), connects.clone());
-            std::thread::spawn(move || publisher(rate, stop, sent, connects))
+            let (stop, sent, failures, connects) =
+                (stop.clone(), sent.clone(), failures.clone(), connects.clone());
+            let (outside, flag) = (failures_outside.clone(), in_window_flag.clone());
+            std::thread::spawn(move || publisher(rate, stop, sent, failures, outside, flag, connects))
         };
 
         let mut store = TopicStore::new(Limits::default());
@@ -275,6 +270,7 @@ fn soak_with_broker_restarts() {
 
             // Events: the UI drains them in each frame.
             let in_window = window.is_some() || grace_until.is_some_and(|t| Instant::now() < t);
+            in_window_flag.store(in_window, Ordering::Release);
             while let Ok(event) = net.events.try_recv() {
                 match event {
                     Event::Subscribed { result, .. } => match result {
@@ -397,6 +393,8 @@ fn soak_with_broker_restarts() {
         thread.join().expect("publisher");
         let elapsed = start.elapsed();
         let sent = sent.load(Ordering::Relaxed);
+        let failures = failures.load(Ordering::Relaxed);
+        let failures_outside = failures_outside.load(Ordering::Relaxed);
         let missing = sent.saturating_sub(received);
         let stats = store.stats();
         let (net_drops, event_drops) = (
@@ -405,7 +403,7 @@ fn soak_with_broker_restarts() {
         );
         let growth = rss_base.zip(rss_end).map(|(a, b)| b - a);
         println!(
-            "soak: {:.0}s sent {sent} received {received} lost_in_restarts {missing} dup {duplicates} \
+            "soak: {:.0}s sent {sent} received {received} lost_in_restarts {missing} publisher_failures {failures} failures_outside_windows {failures_outside} dup {duplicates} \
              restarts {launched} windows {:?} publisher_connects {} subscribed {subscribed} \
              reconnected {reconnected} net_drops {net_drops} event_drops {event_drops} \
              window_drops {window_drops} store_drops {}/{} topics {} max_used {max_used} B \
@@ -436,6 +434,10 @@ fn soak_with_broker_restarts() {
         // Loss is only allowed while the broker is down.
         let allowed = (rate as f64 * (window_time + GRACE * RESTARTS as u32).as_secs_f64()) as u64;
         assert!(missing <= allowed, "{missing} messages lost, at most {allowed} explained by restarts");
+        // A failed publish is a lost message, so it counts in `missing`. It stays inside the same
+        // allowance, and none may arrive outside a restart window and its grace time.
+        assert!(failures <= allowed, "{failures} publisher failures, at most {allowed} in restarts");
+        assert_eq!(failures_outside, 0, "publisher failures outside the restart windows");
         assert_eq!((stats.drops, stats.topic_drops), (0, 0), "store drops");
         assert!(
             cfg!(not(target_os = "linux")) || secs <= BASELINE_AT || rss_base.is_some(),

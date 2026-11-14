@@ -2,12 +2,9 @@
 //! Run: `tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test
 //! broker_matrix -- --test-threads=1 && tests/broker/down.sh`.
 #![cfg(feature = "broker-tests")]
-// Each test holds `LIMITS` for its whole run. The guard must live across the awaits.
-#![allow(clippy::await_holding_lock)]
 
 use std::path::PathBuf;
 use std::process::Command as Process;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -30,12 +27,11 @@ const WSS: u16 = 18835;
 const EXPIRED: u16 = 18836;
 const WRONG_HOST: u16 = 18837;
 
-/// Every `Net` sets the process-global `ms_mqtt_client::local_limits`. Each test takes this lock.
-static LIMITS: Mutex<()> = Mutex::new(());
-
-fn limits_lock() -> std::sync::MutexGuard<'static, ()> {
-    LIMITS.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// The restart test restarts the broker that the other tests of this file use. It takes the write
+/// side; every other test takes the read side, so a restart never runs beside another test.
+/// Nothing else needs serialization: each test has its own topic prefix and client IDs, and
+/// `Net` has no process-global state.
+static BROKER: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 fn broker_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/broker")
@@ -61,6 +57,14 @@ fn profile(port: u16, transport: Transport, prefix: &str) -> Profile {
         subscriptions: vec![(format!("{prefix}/#"), Qos::AtLeastOnce)],
         protocol: Protocol::V5,
         ..Profile::default()
+    }
+}
+
+/// A profile for the given MQTT version.
+fn profile_with(protocol: Protocol, port: u16, transport: Transport, prefix: &str) -> Profile {
+    Profile {
+        protocol,
+        ..profile(port, transport, prefix)
     }
 }
 
@@ -199,7 +203,7 @@ async fn round_trip_with<C: Into<ConnectConfig>>(
     transport: Transport,
     tweak: impl FnOnce(Profile) -> C,
 ) {
-    let _limits = limits_lock();
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
     let prefix = prefix();
     let mut config: ConnectConfig = tweak(profile(port, transport, &prefix)).into();
@@ -228,7 +232,7 @@ async fn password_tcp() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn wrong_password_fails_without_retry() {
-    let _limits = limits_lock();
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
     let mut p = profile(AUTH, Transport::Tcp, &prefix());
     p.username = Some("test".into());
@@ -284,7 +288,7 @@ async fn v3_password_tcp() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn v3_wrong_password_fails_without_retry() {
-    let _limits = limits_lock();
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
     let mut p = profile(AUTH, Transport::Tcp, &prefix());
     p.username = Some("test".into());
@@ -332,42 +336,81 @@ async fn v3_secure_websocket_with_test_ca() {
     round_trip_with(Protocol::V311, WSS, Transport::Wss, with_ca).await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn tls_without_the_ca_is_not_trusted() {
-    let _limits = limits_lock();
+async fn tls_without_the_ca_is_not_trusted_with(protocol: Protocol) {
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
-    let text = connect_failed(&mut net, profile(TLS, Transport::Tls, &prefix())).await;
+    let text = connect_failed(
+        &mut net,
+        profile_with(protocol, TLS, Transport::Tls, &prefix()),
+    )
+    .await;
     assert_text(&text, &["trusted"]);
-    let text = connect_failed(&mut net, profile(WSS, Transport::Wss, &prefix())).await;
+    let text = connect_failed(
+        &mut net,
+        profile_with(protocol, WSS, Transport::Wss, &prefix()),
+    )
+    .await;
     assert_text(&text, &["trusted"]);
     net.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn tls_expired_certificate() {
-    let _limits = limits_lock();
+async fn tls_without_the_ca_is_not_trusted() {
+    tls_without_the_ca_is_not_trusted_with(Protocol::V5).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_without_the_ca_is_not_trusted() {
+    tls_without_the_ca_is_not_trusted_with(Protocol::V311).await;
+}
+
+async fn tls_expired_certificate_with(protocol: Protocol) {
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
-    let p = with_ca(profile(EXPIRED, Transport::Tls, &prefix()));
+    let p = with_ca(profile_with(protocol, EXPIRED, Transport::Tls, &prefix()));
     let text = connect_failed(&mut net, p).await;
     assert_text(&text, &["expired"]);
     net.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn tls_wrong_host_name() {
-    let _limits = limits_lock();
+async fn tls_expired_certificate() {
+    tls_expired_certificate_with(Protocol::V5).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_expired_certificate() {
+    tls_expired_certificate_with(Protocol::V311).await;
+}
+
+async fn tls_wrong_host_name_with(protocol: Protocol) {
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
-    let p = with_ca(profile(WRONG_HOST, Transport::Tls, &prefix()));
+    let p = with_ca(profile_with(
+        protocol,
+        WRONG_HOST,
+        Transport::Tls,
+        &prefix(),
+    ));
     let text = connect_failed(&mut net, p).await;
     assert_text(&text, &["host name"]);
     net.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn tls_verify_off_accepts_untrusted_certificates() {
+async fn tls_wrong_host_name() {
+    tls_wrong_host_name_with(Protocol::V5).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_wrong_host_name() {
+    tls_wrong_host_name_with(Protocol::V311).await;
+}
+
+async fn tls_verify_off_accepts_untrusted_certificates_with(protocol: Protocol) {
     // No CA file, so the server is not trusted. The expired and wrong-host listeners are bad too.
     for port in [TLS, EXPIRED, WRONG_HOST] {
-        round_trip(port, Transport::Tls, |mut p| {
+        round_trip_with(protocol, port, Transport::Tls, |mut p| {
             p.verify_tls = false;
             p
         })
@@ -376,10 +419,19 @@ async fn tls_verify_off_accepts_untrusted_certificates() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn mtls_without_client_certificate_fails() {
-    let _limits = limits_lock();
+async fn tls_verify_off_accepts_untrusted_certificates() {
+    tls_verify_off_accepts_untrusted_certificates_with(Protocol::V5).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_verify_off_accepts_untrusted_certificates() {
+    tls_verify_off_accepts_untrusted_certificates_with(Protocol::V311).await;
+}
+
+async fn mtls_without_client_certificate_fails_with(protocol: Protocol) {
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
-    let p = with_ca(profile(MTLS, Transport::Tls, &prefix()));
+    let p = with_ca(profile_with(protocol, MTLS, Transport::Tls, &prefix()));
     let text = connect_failed(&mut net, p).await;
     assert!(
         text.to_lowercase().contains("client certificate"),
@@ -389,11 +441,20 @@ async fn mtls_without_client_certificate_fails() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn mtls_mismatched_key_fails() {
-    let _limits = limits_lock();
+async fn mtls_without_client_certificate_fails() {
+    mtls_without_client_certificate_fails_with(Protocol::V5).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_mtls_without_client_certificate_fails() {
+    mtls_without_client_certificate_fails_with(Protocol::V311).await;
+}
+
+async fn mtls_mismatched_key_fails_with(protocol: Protocol) {
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
     let p = with_client_cert(
-        with_ca(profile(MTLS, Transport::Tls, &prefix())),
+        with_ca(profile_with(protocol, MTLS, Transport::Tls, &prefix())),
         "client-mismatch.key",
     );
     let text = connect_failed(&mut net, p).await;
@@ -402,8 +463,18 @@ async fn mtls_mismatched_key_fails() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn mtls_mismatched_key_fails() {
+    mtls_mismatched_key_fails_with(Protocol::V5).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_mtls_mismatched_key_fails() {
+    mtls_mismatched_key_fails_with(Protocol::V311).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn disconnect_stops_incoming() {
-    let _limits = limits_lock();
+    let _broker = BROKER.read().await;
     let mut net = Net::start(NetLimits::default());
     let prefix = prefix();
     let generation = connect(&mut net, profile(ANON, Transport::Tcp, &prefix)).await;
@@ -435,7 +506,7 @@ async fn disconnect_stops_incoming() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn broker_restart_reconnects_and_resubscribes() {
-    let _limits = limits_lock();
+    let _broker = BROKER.write().await;
     let mut net = Net::start(NetLimits::default());
     let prefix = prefix();
     let generation = connect(&mut net, profile(ANON, Transport::Tcp, &prefix)).await;
@@ -476,4 +547,254 @@ async fn broker_restart_reconnects_and_resubscribes() {
     publish_round_trip(&mut net, &prefix, generation).await;
     assert_eq!(net.status.borrow().generation, generation);
     net.shutdown().await;
+}
+
+/// A QoS 1 message with a whole packet of exactly 1 MiB (the default `max_packet`) goes out and
+/// comes back, on every transport and both versions (S1 spike, case group "c"). In MQTT 5
+/// Mosquitto adds a Topic Alias property (id 0x23 and 2 bytes: 3 bytes) to the first copy that it
+/// forwards for a topic. The proxy test `v5_forwarded_copy_carries_a_topic_alias` shows this on
+/// the wire. So a v5 packet of 1 MiB - 3 bytes comes back as exactly 1 MiB. The second packet is
+/// exactly 1 MiB when it goes out. Its copy has an empty topic (the alias is known), so it is
+/// smaller than 1 MiB and arrives too.
+async fn one_mib_round_trip(protocol: Protocol, port: u16, transport: Transport, ca: bool) {
+    const MIB: usize = 1024 * 1024;
+    const TOPIC_ALIAS: usize = 3;
+    let _broker = BROKER.read().await;
+    let mut net = Net::start(NetLimits::default());
+    let prefix = prefix();
+    let topic = format!("{prefix}/mib");
+    let mut p = profile_with(protocol, port, transport, &prefix);
+    p.subscriptions = vec![(topic.clone(), Qos::AtLeastOnce)];
+    if ca {
+        p = with_ca(p);
+    }
+    connect(&mut net, p).await;
+    wait_subscribed(&mut net, WAIT).await;
+    let sends = if protocol == Protocol::V5 {
+        vec![MIB - TOPIC_ALIAS, MIB]
+    } else {
+        vec![MIB]
+    };
+    for (op_id, total) in (1u64..).zip(sends) {
+        net.send(one_mib_message(&topic, protocol, op_id, total))
+            .expect("send");
+        let m = next_incoming(&mut net).await;
+        assert_eq!(m.payload.len(), total - one_mib_overhead(&topic, protocol));
+        match next_event_within(&mut net, WAIT).await {
+            Event::Published {
+                op_id: id, result, ..
+            } => assert_eq!((id, result), (op_id, PublishResult::Acknowledged)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    net.shutdown().await;
+}
+
+/// Fixed header 1, length bytes 3, topic length 2, topic, packet ID 2, and in MQTT 5 one byte
+/// for the empty property list.
+fn one_mib_overhead(topic: &str, protocol: Protocol) -> usize {
+    1 + 3 + 2 + topic.len() + 2 + usize::from(protocol == Protocol::V5)
+}
+
+/// A QoS 1 message whose whole packet is `total` bytes.
+fn one_mib_message(topic: &str, protocol: Protocol, op_id: u64, total: usize) -> Command {
+    Command::Publish(Box::new(Outgoing {
+        op_id,
+        topic: topic.into(),
+        payload: Bytes::from(vec![b'x'; total - one_mib_overhead(topic, protocol)]),
+        qos: Qos::AtLeastOnce,
+        retain: false,
+        props: MsgProps::default(),
+    }))
+}
+
+/// A PUBLISH packet that the proxy saw: the direction, the whole size and the first bytes.
+struct Seen {
+    to_client: bool,
+    total: usize,
+    head: Vec<u8>,
+}
+
+/// A TCP proxy for one connection to `upstream`. It copies the bytes both ways and reports each
+/// PUBLISH packet. Returns the port to dial and the report channel.
+fn sniffing_proxy(upstream: u16) -> (u16, std::sync::mpsc::Receiver<Seen>) {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((client, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(broker) = TcpStream::connect(("127.0.0.1", upstream)) else {
+            return;
+        };
+        let pump = |mut from: TcpStream,
+                    mut to: TcpStream,
+                    to_client: bool,
+                    tx: std::sync::mpsc::Sender<Seen>| {
+            std::thread::spawn(move || {
+                let (mut buf, mut chunk) = (Vec::<u8>::new(), vec![0u8; 65536]);
+                while let Ok(n) = from.read(&mut chunk) {
+                    if n == 0 || to.write_all(&chunk[..n]).is_err() {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Split the buffer into whole packets.
+                    loop {
+                        let (mut len, mut mult, mut i) = (0usize, 1usize, 1usize);
+                        let mut complete = false;
+                        while let Some(&b) = buf.get(i) {
+                            i += 1;
+                            len += usize::from(b & 0x7f) * mult;
+                            mult *= 128;
+                            if b & 0x80 == 0 {
+                                complete = true;
+                                break;
+                            }
+                        }
+                        if !complete || buf.len() < i + len {
+                            break;
+                        }
+                        let packet: Vec<u8> = buf.drain(..i + len).collect();
+                        if packet[0] & 0xf0 == 0x30 {
+                            let _ = tx.send(Seen {
+                                to_client,
+                                total: packet.len(),
+                                head: packet[..packet.len().min(256)].to_vec(),
+                            });
+                        }
+                    }
+                }
+                let _ = to.shutdown(Shutdown::Write);
+            });
+        };
+        pump(
+            client.try_clone().expect("clone"),
+            broker.try_clone().expect("clone"),
+            false,
+            tx.clone(),
+        );
+        pump(broker, client, true, tx);
+    });
+    (port, rx)
+}
+
+/// The packet that Mosquitto forwards to a `Net` subscriber, seen on the wire (this explains the 3
+/// bytes in `one_mib_round_trip`). The client announces a Topic Alias Maximum in CONNECT. For the
+/// first message on a topic the broker adds the property Topic Alias (0x23, 2 bytes: 3 bytes with
+/// the property length 3 instead of 0). For the second message it sends an empty topic and the
+/// same alias. The sizes are asserted from the captured packets.
+#[tokio::test(flavor = "current_thread")]
+async fn v5_forwarded_copy_carries_a_topic_alias() {
+    const MIB: usize = 1024 * 1024;
+    let _broker = BROKER.read().await;
+    let (port, seen) = sniffing_proxy(ANON);
+    let mut net = Net::start(NetLimits::default());
+    let prefix = prefix();
+    let topic = format!("{prefix}/alias");
+    let mut p = profile_with(Protocol::V5, port, Transport::Tcp, &prefix);
+    p.subscriptions = vec![(topic.clone(), Qos::AtLeastOnce)];
+    connect(&mut net, p).await;
+    wait_subscribed(&mut net, WAIT).await;
+    let overhead = one_mib_overhead(&topic, Protocol::V5);
+    for (op_id, total) in [(1u64, MIB - 3), (2, MIB)] {
+        net.send(one_mib_message(&topic, Protocol::V5, op_id, total))
+            .expect("send");
+        let m = next_incoming(&mut net).await;
+        assert_eq!(m.payload.len(), total - overhead);
+        match next_event_within(&mut net, WAIT).await {
+            Event::Published { result, .. } => assert_eq!(result, PublishResult::Acknowledged),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    net.shutdown().await;
+    // The proxy reports a packet after it forwarded it: wait for the four PUBLISH packets.
+    let packets: Vec<Seen> = (0..4)
+        .map(|_| {
+            seen.recv_timeout(WAIT)
+                .expect("a PUBLISH packet at the proxy")
+        })
+        .collect();
+    let sent: Vec<_> = packets.iter().filter(|s| !s.to_client).collect();
+    let copies: Vec<_> = packets.iter().filter(|s| s.to_client).collect();
+    // What we send is exactly the size that the test computes.
+    assert_eq!(
+        sent.iter().map(|s| s.total).collect::<Vec<_>>(),
+        [MIB - 3, MIB]
+    );
+    assert_eq!(copies.len(), 2, "forwarded copies");
+    // First copy: the topic, the packet ID, then property length 3 and Topic Alias (0x23).
+    let first = copies[0];
+    let at = first.head.len().min(1 + 3 + 2 + topic.len() + 2);
+    assert_eq!(
+        &first.head[at..at + 4],
+        &[3, 0x23, 0, 1],
+        "{:02x?}",
+        &first.head[at - 6..at + 4]
+    );
+    assert_eq!(
+        first.total, MIB,
+        "the first copy is 3 bytes larger than the packet we sent"
+    );
+    // Second copy: topic length 0 (the alias is known), so it is smaller than what we sent.
+    let second = copies[1];
+    assert_eq!(&second.head[4..6], &[0, 0], "topic length");
+    assert_eq!(second.total, MIB + 3 - topic.len());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_mib_over_tcp() {
+    one_mib_round_trip(Protocol::V5, ANON, Transport::Tcp, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_mib_over_websocket() {
+    one_mib_round_trip(Protocol::V5, WS, Transport::Ws, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_mib_over_secure_websocket() {
+    one_mib_round_trip(Protocol::V5, WSS, Transport::Wss, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_one_mib_over_websocket() {
+    one_mib_round_trip(Protocol::V311, WS, Transport::Ws, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_one_mib_over_secure_websocket() {
+    one_mib_round_trip(Protocol::V311, WSS, Transport::Wss, true).await;
+}
+
+/// A DNS name (not an IP address) gives SNI, host name verification and the WebSocket authority
+/// (S1 spike, "TLS (localhost)").
+async fn dns_name_round_trip(protocol: Protocol, port: u16, transport: Transport) {
+    round_trip_with(protocol, port, transport, |mut p| {
+        p.host = "localhost".into();
+        with_ca(p)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tls_with_a_dns_name() {
+    dns_name_round_trip(Protocol::V5, TLS, Transport::Tls).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn secure_websocket_with_a_dns_name() {
+    dns_name_round_trip(Protocol::V5, WSS, Transport::Wss).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_with_a_dns_name() {
+    dns_name_round_trip(Protocol::V311, TLS, Transport::Tls).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_secure_websocket_with_a_dns_name() {
+    dns_name_round_trip(Protocol::V311, WSS, Transport::Wss).await;
 }
