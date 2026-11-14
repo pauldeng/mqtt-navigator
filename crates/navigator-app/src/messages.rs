@@ -75,12 +75,71 @@ pub fn status_failed(status: &SendStatus) -> bool {
     )
 }
 
+/// The lines of "Connection details": a label and a value for each fact that the CONNACK
+/// carries. MQTT 3.1.1 has the session flag only. A property that the broker did not send has
+/// no line, except the keep alive, which always has one ("off" when it is 0).
+pub fn details_lines(d: &navigator_core::net::ConnectionDetails) -> Vec<(&'static str, String)> {
+    let yes_no = |b: bool| if b { "Yes" } else { "No" }.to_owned();
+    let mut out = vec![("Session present", yes_no(d.session_present))];
+    let Some(v) = &d.v5 else {
+        return out;
+    };
+    if let Some(id) = &v.assigned_client_id {
+        out.push(("Assigned client ID", id.clone()));
+    }
+    let keep_alive = match (v.keep_alive_secs, v.server_keep_alive_secs) {
+        (0, _) => "off".to_owned(),
+        (n, Some(_)) => format!("{n} s (set by the broker)"),
+        (n, None) => format!("{n} s"),
+    };
+    out.push(("Keep alive", keep_alive));
+    out.push(("Receive maximum", v.receive_max.to_string()));
+    if let Some(n) = v.max_packet_size {
+        out.push((
+            "Maximum packet size",
+            format!("{} bytes", group_digits(u64::from(n))),
+        ));
+    }
+    out.push(("Maximum QoS", v.max_qos.to_string()));
+    out.push(("Retained messages", yes_no(v.retain_available)));
+    out.push(("Wildcard subscriptions", yes_no(v.wildcard_subscriptions)));
+    out.push(("Shared subscriptions", yes_no(v.shared_subscriptions)));
+    out.push(("Subscription identifiers", yes_no(v.subscription_ids)));
+    out.push(("Topic alias maximum", v.topic_alias_max.to_string()));
+    for (label, value) in [
+        ("Server reference", &v.server_reference),
+        ("Response information", &v.response_info),
+        ("Reason string", &v.reason_string),
+    ] {
+        if let Some(text) = value {
+            out.push((label, text.clone()));
+        }
+    }
+    out
+}
+
+/// A short text for the tooltip of the "Options" button of a subscription.
+pub fn options_text(o: &navigator_core::net::SubOptions) -> String {
+    use navigator_core::net::RetainHandling;
+    let handling = match o.retain_handling {
+        RetainHandling::OnSubscribe => "Send retained messages at each subscribe",
+        RetainHandling::OnNewSubscription => "Send retained messages only for a new subscription",
+        RetainHandling::Never => "Do not send retained messages",
+    };
+    format!(
+        "No Local: {}. Retain As Published: {}. {handling}.",
+        if o.no_local { "on" } else { "off" },
+        if o.retain_as_published { "on" } else { "off" },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::{
-        colour_slot, format_time, granted_text, group_digits, status_from_result, status_text,
+        colour_slot, details_lines, format_time, granted_text, group_digits, options_text,
+        status_from_result, status_text,
     };
     use navigator_core::net::PublishResult;
     use navigator_core::store::SendStatus;
@@ -139,6 +198,118 @@ mod tests {
         assert_eq!(
             status_text(&status_from_result(PublishResult::LostOnDisconnect)),
             "Not sent: the connection closed."
+        );
+    }
+
+    fn v5_details() -> navigator_core::net::V5Details {
+        navigator_core::net::V5Details {
+            assigned_client_id: None,
+            keep_alive_secs: 30,
+            server_keep_alive_secs: None,
+            receive_max: 20,
+            max_packet_size: None,
+            max_qos: 1,
+            retain_available: true,
+            wildcard_subscriptions: true,
+            shared_subscriptions: false,
+            subscription_ids: true,
+            topic_alias_max: 0,
+            server_reference: None,
+            response_info: None,
+            reason_string: None,
+        }
+    }
+
+    fn details(
+        v5: Option<navigator_core::net::V5Details>,
+    ) -> navigator_core::net::ConnectionDetails {
+        navigator_core::net::ConnectionDetails {
+            protocol: if v5.is_some() {
+                navigator_core::net::Protocol::V5
+            } else {
+                navigator_core::net::Protocol::V311
+            },
+            session_present: true,
+            v5,
+        }
+    }
+
+    #[test]
+    fn mqtt_311_details_show_the_session_flag_only() {
+        assert_eq!(
+            details_lines(&details(None)),
+            [("Session present", "Yes".to_owned())]
+        );
+    }
+
+    #[test]
+    fn details_show_keep_alive_off_when_it_is_0() {
+        for (keep, server, want) in [
+            (0, Some(0), "off"),
+            (0, None, "off"),
+            (30, None, "30 s"),
+            (15, Some(15), "15 s (set by the broker)"),
+        ] {
+            let mut v = v5_details();
+            (v.keep_alive_secs, v.server_keep_alive_secs) = (keep, server);
+            let lines = details_lines(&details(Some(v)));
+            let line = lines
+                .iter()
+                .find(|(l, _)| *l == "Keep alive")
+                .expect("line");
+            assert_eq!(line.1, want, "keep {keep} server {server:?}");
+        }
+    }
+
+    #[test]
+    fn details_list_each_connack_fact_once_and_skip_absent_ones() {
+        let mut v = v5_details();
+        assert_eq!(
+            details_lines(&details(Some(v.clone()))),
+            [
+                ("Session present", "Yes".to_owned()),
+                ("Keep alive", "30 s".to_owned()),
+                ("Receive maximum", "20".to_owned()),
+                ("Maximum QoS", "1".to_owned()),
+                ("Retained messages", "Yes".to_owned()),
+                ("Wildcard subscriptions", "Yes".to_owned()),
+                ("Shared subscriptions", "No".to_owned()),
+                ("Subscription identifiers", "Yes".to_owned()),
+                ("Topic alias maximum", "0".to_owned()),
+            ]
+        );
+        v.assigned_client_id = Some("srv-1".into());
+        v.max_packet_size = Some(1_048_576);
+        v.server_reference = Some("alt:1883".into());
+        v.response_info = Some("resp/".into());
+        v.reason_string = Some("hi".into());
+        let lines = details_lines(&details(Some(v)));
+        assert_eq!(lines[1], ("Assigned client ID", "srv-1".to_owned()));
+        assert!(lines.contains(&("Maximum packet size", "1 048 576 bytes".to_owned())));
+        assert_eq!(
+            lines[lines.len() - 3..],
+            [
+                ("Server reference", "alt:1883".to_owned()),
+                ("Response information", "resp/".to_owned()),
+                ("Reason string", "hi".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_options_tooltip_names_each_option() {
+        use navigator_core::net::{RetainHandling, SubOptions};
+        assert_eq!(
+            options_text(&SubOptions::default()),
+            "No Local: off. Retain As Published: off. Send retained messages at each subscribe."
+        );
+        assert_eq!(
+            options_text(&SubOptions {
+                no_local: true,
+                retain_as_published: true,
+                retain_handling: RetainHandling::Never
+            }),
+            "No Local: on. Retain As Published: on. Do not send retained messages."
         );
     }
 }

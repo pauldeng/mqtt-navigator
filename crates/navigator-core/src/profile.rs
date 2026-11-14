@@ -1,7 +1,7 @@
 //! Connection profiles. A profile has no secrets: passwords and key passphrases live in the OS
 //! keyring (the app) or in memory (`net::ConnectConfig`). Certificates are stored as paths.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,41 @@ mod hex {
     }
 }
 
+/// MQTT 5 Retain Handling of a subscription: when the broker sends retained messages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetainHandling {
+    /// Option 0: send retained messages at each subscribe. This is the MQTT 3.1.1 behaviour.
+    #[default]
+    OnSubscribe,
+    /// Option 1: send retained messages only if the subscription is new.
+    OnNewSubscription,
+    /// Option 2: never send retained messages at subscribe.
+    Never,
+}
+
+/// MQTT 5 subscription options. The default is the behaviour of MQTT 3.1.1, so a profile
+/// without options behaves as before. MQTT 3.1.1 never sends them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubOptions {
+    /// The broker does not send us the messages that we publish.
+    pub no_local: bool,
+    /// The broker keeps the retain flag of a message when it forwards it.
+    pub retain_as_published: bool,
+    pub retain_handling: RetainHandling,
+}
+
+impl SubOptions {
+    /// `Err` is the text for the user: MQTT 5 does not allow No Local on a shared subscription.
+    pub fn check(&self, filter: &str) -> Result<(), &'static str> {
+        if self.no_local && topic::is_shared(filter) {
+            return Err("No Local is not allowed on a shared subscription ($share/...).");
+        }
+        Ok(())
+    }
+}
+
 /// One saved connection. Missing JSON fields take their defaults.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -115,6 +150,10 @@ pub struct Profile {
     pub will: Option<Will>,
     /// Filters to subscribe after each connect.
     pub subscriptions: Vec<(String, Qos)>,
+    /// MQTT 5 options of the filters above. A filter that is not here has the default options.
+    /// Old files have no such field, so they load as before. Only MQTT 5 sends them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscription_options: BTreeMap<String, SubOptions>,
     /// Filters that the broker may still hold for this profile's persistent session (session
     /// expiry above 0). The net thread reports them (`Event::SessionFilters`). The app saves them
     /// and gives them back at the next start, so a removal is not lost across a restart. It is
@@ -174,8 +213,17 @@ impl Profile {
             keepalive_secs: 60,
             will: None,
             subscriptions: vec![("#".into(), Qos::AtMostOnce)],
+            subscription_options: BTreeMap::new(),
             session_filters: Vec::new(),
         }
+    }
+
+    /// The options of `filter`: the saved ones, or the default.
+    pub fn options_of(&self, filter: &str) -> SubOptions {
+        self.subscription_options
+            .get(filter)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Takes `session_filters` from `old`, the saved version of this profile. A change of host,
@@ -453,6 +501,53 @@ mod tests {
         assert_eq!(q.protocol, Protocol::V311);
         let json = serde_json::to_string(&Profile::new()).expect("json");
         assert!(json.contains("\"protocol\":\"v311\""));
+    }
+
+    /// The options field is additive: an old file loads with the default options (no schema
+    /// bump), a profile without options writes no field, and options survive a round trip.
+    #[test]
+    fn subscription_options_are_additive_and_round_trip() {
+        let old: Profile =
+            serde_json::from_str(r##"{"subscriptions":[["a/#",0]]}"##).expect("old file");
+        assert!(old.subscription_options.is_empty());
+        assert_eq!(old.options_of("a/#"), SubOptions::default());
+        assert_eq!(
+            SubOptions::default(),
+            SubOptions {
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: RetainHandling::OnSubscribe
+            }
+        );
+        let json = serde_json::to_string(&Profile::new()).expect("json");
+        assert!(!json.contains("subscription_options"));
+        let mut p = Profile::new();
+        let o = SubOptions {
+            no_local: true,
+            retain_as_published: false,
+            retain_handling: RetainHandling::OnNewSubscription,
+        };
+        p.subscription_options.insert("#".into(), o);
+        let json = serde_json::to_string(&p).expect("json");
+        assert!(json.contains(r#""subscription_options":{"#.to_owned().as_str()));
+        assert!(json.contains(r#""retain_handling":"on_new_subscription""#));
+        let back: Profile = serde_json::from_str(&json).expect("back");
+        assert_eq!(back.options_of("#"), o);
+        assert_eq!(back.options_of("other"), SubOptions::default());
+    }
+
+    #[test]
+    fn no_local_is_refused_on_a_shared_filter_only() {
+        let o = SubOptions {
+            no_local: true,
+            ..SubOptions::default()
+        };
+        assert_eq!(
+            o.check("$share/g/a"),
+            Err("No Local is not allowed on a shared subscription ($share/...).")
+        );
+        assert_eq!(o.check("a/$share/b"), Ok(()));
+        assert_eq!(SubOptions::default().check("$share/g/a"), Ok(()));
     }
 
     #[test]

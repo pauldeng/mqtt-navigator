@@ -25,7 +25,11 @@ mod wire;
 use crate::topic::filter_error;
 use wire::{Connected, Params, UnsubFail, Wire};
 
-pub use crate::profile::{Profile, Transport, Will};
+pub use crate::profile::{Profile, RetainHandling, SubOptions, Transport, Will};
+
+/// A filter that the broker must have: the filter, its QoS, its MQTT 5 options and the request
+/// ID of the SUBSCRIBE that set them (0 for a filter from the profile).
+type Want = (String, Qos, SubOptions, u64);
 
 /// The MQTT version of a connection. In JSON: `"v311"` or `"v5"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -113,8 +117,18 @@ pub struct Outgoing {
 #[derive(Clone, Debug)]
 pub enum Command {
     Connect(Box<ConnectConfig>),
-    Subscribe { filter: String, qos: Qos },
-    Unsubscribe { filter: String },
+    /// `options` are MQTT 5 only. MQTT 3.1.1 never sends them. `req` is a request ID of the
+    /// caller. Every `Subscribed` result for the filter has the `req` of the latest accepted
+    /// Subscribe, also the result of an automatic resubscribe.
+    Subscribe {
+        filter: String,
+        qos: Qos,
+        options: SubOptions,
+        req: u64,
+    },
+    Unsubscribe {
+        filter: String,
+    },
     Publish(Box<Outgoing>),
 }
 
@@ -142,6 +156,9 @@ pub enum ConnState {
 pub struct Status {
     pub generation: u64,
     pub state: ConnState,
+    /// The attempt that is `Connected`: it tells the attempts of one generation apart. 0 in
+    /// every other state. [`Event::ConnectionDetails`] has the same number.
+    pub attempt: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +185,10 @@ pub enum Event {
     Subscribed {
         generation: u64,
         filter: String,
+        /// The `req` of the Subscribe that this result answers. The automatic resubscribe uses
+        /// the `req` of the latest accepted Subscribe of the filter (0 for a filter from the
+        /// profile). A result with an older `req` belongs to an older state of the filter.
+        req: u64,
         result: Result<Qos, String>,
     },
     /// UNSUBSCRIBE result for `filter`. `Ok` also when the net thread removed the filter while
@@ -190,8 +211,51 @@ pub enum Event {
         generation: u64,
         filters: Vec<String>,
     },
+    /// What the CONNACK of this connection says. It comes once for each successful connect,
+    /// after the status `Connected`.
+    ConnectionDetails {
+        generation: u64,
+        /// The attempt of these details: [`Status::attempt`] of the matching `Connected` status.
+        /// An older attempt of the same generation can still have an event in the log.
+        attempt: u64,
+        details: Box<ConnectionDetails>,
+    },
     /// An error the user must see, for example an invalid filter.
     Error { generation: u64, message: String },
+}
+
+/// The facts of a CONNACK, for the "Connection details" view. MQTT 3.1.1 has only
+/// `session_present`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionDetails {
+    pub protocol: Protocol,
+    pub session_present: bool,
+    /// `None` for MQTT 3.1.1.
+    pub v5: Option<V5Details>,
+}
+
+/// The MQTT 5 CONNACK properties. A text from the broker has gone through `display_safe`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V5Details {
+    pub assigned_client_id: Option<String>,
+    /// The keep alive in use: the Server Keep Alive if the CONNACK has one, else the profile's.
+    /// 0 means off.
+    pub keep_alive_secs: u16,
+    /// The Server Keep Alive property, if the CONNACK has it.
+    pub server_keep_alive_secs: Option<u16>,
+    pub receive_max: u16,
+    /// `None`: the broker announced no limit.
+    pub max_packet_size: Option<u32>,
+    /// The highest QoS of the broker (0, 1 or 2). This app uses at most 1.
+    pub max_qos: u8,
+    pub retain_available: bool,
+    pub wildcard_subscriptions: bool,
+    pub shared_subscriptions: bool,
+    pub subscription_ids: bool,
+    pub topic_alias_max: u16,
+    pub server_reference: Option<String>,
+    pub response_info: Option<String>,
+    pub reason_string: Option<String>,
 }
 
 /// Counters shared with the UI.
@@ -379,6 +443,7 @@ impl Net {
                     queued_bytes,
                     broker_max_packet,
                     drained,
+                    details: RefCell::default(),
                     limits,
                     active: Cell::new(0),
                 });
@@ -407,6 +472,7 @@ impl Net {
             status_tx.send_replace(Status {
                 generation: 0,
                 state: ConnState::Failed(format!("Cannot start the network thread: {e}")),
+                attempt: 0,
             });
         }
         Self {
@@ -571,6 +637,9 @@ struct Shared {
     queued_bytes: Arc<AtomicUsize>,
     /// Maximum Packet Size of the broker from the last CONNACK. 0: not known.
     broker_max_packet: Arc<AtomicU32>,
+    /// The `ConnectionDetails` of the latest connection that the UI has not got yet. A newer
+    /// connection replaces it. `Resub::feed` sends it when the event log has room.
+    details: RefCell<Option<(u64, u64, Box<ConnectionDetails>)>>,
     /// The UI signals here when it took events out of the log (see [`Net::recv_event`]).
     drained: Arc<Notify>,
     limits: NetLimits,
@@ -582,7 +651,11 @@ struct Shared {
 
 impl Shared {
     fn set_status(&self, generation: u64, state: ConnState) {
-        self.status.send_replace(Status { generation, state });
+        self.status.send_replace(Status {
+            generation,
+            state,
+            attempt: 0,
+        });
     }
 
     /// Connecting or Reconnecting to Connected. Does nothing if `token` is not the active
@@ -599,6 +672,7 @@ impl Shared {
                 );
             if ok {
                 s.state = ConnState::Connected;
+                s.attempt = token;
             }
             ok
         })
@@ -653,7 +727,7 @@ struct AttemptCtx {
     /// The attempt follows a lost connection.
     reconnect: bool,
     /// The filters to subscribe. The attempt reads them at the CONNACK.
-    desired: Rc<RefCell<Vec<(String, Qos)>>>,
+    desired: Rc<RefCell<Vec<Want>>>,
     /// The attempt sets this at the CONNACK. From then on, the supervisor sends it every
     /// subscribe and unsubscribe. Before, the attempt takes them from `desired`.
     up: Rc<Cell<bool>>,
@@ -747,7 +821,7 @@ struct Current {
     config: Rc<ConnectConfig>,
     /// Filters that the broker must have: the profile's, plus live subscribes, minus live
     /// unsubscribes. Changes while we are not connected count too.
-    desired: Rc<RefCell<Vec<(String, Qos)>>>,
+    desired: Rc<RefCell<Vec<Want>>>,
     /// The filters of the broker session of this connect. It outlives the connect.
     maybe: SessionSubs,
     /// See [`AttemptCtx::announced`].
@@ -842,7 +916,14 @@ impl Sup {
         let mut current = Current {
             generation,
             epoch,
-            desired: Rc::new(RefCell::new(config.profile.subscriptions.clone())),
+            desired: Rc::new(RefCell::new(
+                config
+                    .profile
+                    .subscriptions
+                    .iter()
+                    .map(|(f, q)| (f.clone(), *q, config.profile.options_of(f), 0))
+                    .collect(),
+            )),
             maybe: self.session_subs(&config),
             announced: Rc::default(),
             tls: Rc::default(),
@@ -976,32 +1057,50 @@ impl Sup {
         };
         let up = c.attempt.as_ref().filter(|a| a.up.get());
         match command {
-            Command::Subscribe { filter, qos } => {
+            Command::Subscribe {
+                filter,
+                qos,
+                options,
+                req,
+            } => {
                 if let Some(e) = filter_error(&filter) {
                     let why = format!("Invalid topic filter: {e}");
                     reject(
                         &self.shared,
                         generation,
-                        Command::Subscribe { filter, qos },
+                        Command::Subscribe {
+                            filter,
+                            qos,
+                            options,
+                            req,
+                        },
                         &why,
                     );
                     return;
                 }
                 let mut desired = c.desired.borrow_mut();
-                match desired.iter_mut().find(|(f, _)| *f == filter) {
-                    Some(entry) => entry.1 = qos,
-                    None => desired.push((filter.clone(), qos)),
+                match desired.iter_mut().find(|(f, ..)| *f == filter) {
+                    Some(entry) => (entry.1, entry.2, entry.3) = (qos, options, req),
+                    None => desired.push((filter.clone(), qos, options, req)),
                 }
                 drop(desired);
 
                 // Not up yet: the attempt reads `desired` at the CONNACK. After a loss the
                 // next attempt does the same.
                 if let Some(a) = up {
-                    self.forward(a, Command::Subscribe { filter, qos });
+                    self.forward(
+                        a,
+                        Command::Subscribe {
+                            filter,
+                            qos,
+                            options,
+                            req,
+                        },
+                    );
                 }
             }
             Command::Unsubscribe { filter } => {
-                c.desired.borrow_mut().retain(|(f, _)| *f != filter);
+                c.desired.borrow_mut().retain(|(f, ..)| *f != filter);
                 match up {
                     Some(a) => self.forward(a, Command::Unsubscribe { filter }),
                     // The connection is down, so there is nothing to send now. The filter stays
@@ -1132,9 +1231,10 @@ fn reject(shared: &Shared, generation: u64, command: Command, why: &str) {
             op_id: o.op_id,
             result: PublishResult::Rejected(why.into()),
         }),
-        Command::Subscribe { filter, .. } => shared.event(Event::Subscribed {
+        Command::Subscribe { filter, req, .. } => shared.event(Event::Subscribed {
             generation,
             filter,
+            req,
             result: Err(why.into()),
         }),
         Command::Unsubscribe { filter } => shared.event(Event::Unsubscribed {
@@ -1209,6 +1309,7 @@ async fn session(
     let Connected {
         wire,
         session_present,
+        details,
         broker_max_packet,
         mut driver,
     } = match result {
@@ -1228,7 +1329,7 @@ async fn session(
     let removed: VecDeque<String> = {
         let mut maybe = ctx.maybe.borrow_mut();
         let removed: VecDeque<String> = if session_present {
-            let desired: HashSet<&str> = filters.iter().map(|(d, _)| d.as_str()).collect();
+            let desired: HashSet<&str> = filters.iter().map(|(d, ..)| d.as_str()).collect();
             maybe
                 .filters
                 .iter()
@@ -1256,6 +1357,11 @@ async fn session(
     if shared.set_connected(generation, ctx.token) {
         tracing::info!(generation, reconnect = ctx.reconnect, "connected");
         resub.announce = ctx.reconnect;
+        // The app keeps only the details of the latest connection. They wait here, outside
+        // the attempt, for room in the event log. A newer connection replaces them.
+        shared
+            .details
+            .replace(Some((generation, ctx.token, Box::new(details))));
     }
 
     let mut ops = JoinSet::new();
@@ -1299,7 +1405,7 @@ async fn session(
                     // A newer command for a filter replaces its queued re-subscribe.
                     match &command {
                         Command::Subscribe { filter, .. } | Command::Unsubscribe { filter } => {
-                            resub.pending.retain(|(f, _)| f != filter);
+                            resub.pending.retain(|(f, ..)| f != filter);
                             resub.unsubs.retain(|f| f != filter);
                         }
                         _ => {}
@@ -1363,7 +1469,7 @@ async fn session(
 /// subscribe of every desired filter.
 struct Resub {
     announce: bool,
-    pending: VecDeque<(String, Qos)>,
+    pending: VecDeque<Want>,
     /// Filters to remove from a resumed session (see [`SessionSubs`]).
     unsubs: VecDeque<String>,
     /// The last `feed` stopped because the event log has no room. It waits for the drain signal.
@@ -1385,6 +1491,19 @@ impl Resub {
     ) {
         let generation = ctx.generation;
         self.blocked = false;
+        if shared.details.borrow().is_some() {
+            if !shared.has_room() {
+                self.blocked = true;
+                return;
+            }
+            if let Some((generation, attempt, details)) = shared.details.take() {
+                shared.event(Event::ConnectionDetails {
+                    generation,
+                    attempt,
+                    details,
+                });
+            }
+        }
         if self.announce {
             if !shared.has_room() {
                 self.blocked = true;
@@ -1413,8 +1532,13 @@ impl Resub {
                 self.blocked = true;
                 return;
             }
-            if let Some((filter, qos)) = self.pending.pop_front() {
-                let subscribe = Command::Subscribe { filter, qos };
+            if let Some((filter, qos, options, req)) = self.pending.pop_front() {
+                let subscribe = Command::Subscribe {
+                    filter,
+                    qos,
+                    options,
+                    req,
+                };
                 dispatch(wire, subscribe, ctx, shared, expired, ops);
             }
         }
@@ -1481,9 +1605,19 @@ fn dispatch(
     }
     let (wire, shared, expired) = (wire.clone(), shared.clone(), expired.clone());
     match command {
-        Command::Subscribe { filter, qos } => {
+        Command::Subscribe {
+            filter,
+            qos,
+            options,
+            req,
+        } => {
             ops.spawn_local(subscribe_op(
-                wire, filter, qos, generation, maybe, shared, expired,
+                wire,
+                (filter, qos, options, req),
+                generation,
+                maybe,
+                shared,
+                expired,
             ));
         }
         Command::Unsubscribe { filter } => {
@@ -1500,8 +1634,7 @@ fn dispatch(
 
 async fn subscribe_op(
     wire: Wire,
-    filter: String,
-    qos: Qos,
+    (filter, qos, options, req): Want,
     generation: u64,
     maybe: SessionSubs,
     shared: Rc<Shared>,
@@ -1511,9 +1644,15 @@ async fn subscribe_op(
         if let Some(e) = filter_error(&filter) {
             return Err(format!("Invalid topic filter: {e}"));
         }
+        // Only MQTT 5 sends the options, so only MQTT 5 can refuse them.
+        if wire.sends_options()
+            && let Err(why) = options.check(&filter)
+        {
+            return Err(why.to_owned());
+        }
         // From the moment of the send, the broker may hold the filter.
         maybe.borrow_mut().insert(&filter);
-        wire.subscribe(&filter, qos).await
+        wire.subscribe(&filter, qos, options).await
     })
     .await
     .unwrap_or_else(|_| {
@@ -1528,6 +1667,7 @@ async fn subscribe_op(
     shared.event(Event::Subscribed {
         generation,
         filter,
+        req,
         result,
     });
 }
@@ -1537,7 +1677,7 @@ async fn unsubscribe_op(
     filter: String,
     generation: u64,
     maybe: SessionSubs,
-    desired: Rc<RefCell<Vec<(String, Qos)>>>,
+    desired: Rc<RefCell<Vec<Want>>>,
     shared: Rc<Shared>,
     expired: Rc<Notify>,
 ) {
@@ -1568,8 +1708,8 @@ async fn unsubscribe_op(
 
 /// The broker no longer holds `filter`: drop it from the session set. A filter that is desired
 /// again stays (the user subscribed to it after the UNSUBSCRIBE was sent).
-fn forget(maybe: &SessionSubs, desired: &Rc<RefCell<Vec<(String, Qos)>>>, filter: &str) {
-    if !desired.borrow().iter().any(|(f, _)| f == filter) {
+fn forget(maybe: &SessionSubs, desired: &Rc<RefCell<Vec<Want>>>, filter: &str) {
+    if !desired.borrow().iter().any(|(f, ..)| f == filter) {
         maybe.borrow_mut().remove(filter);
     }
 }
@@ -1581,7 +1721,7 @@ async fn stale_unsubscribe_op(
     wire: Wire,
     filter: String,
     maybe: SessionSubs,
-    desired: Rc<RefCell<Vec<(String, Qos)>>>,
+    desired: Rc<RefCell<Vec<Want>>>,
     expired: Rc<Notify>,
 ) {
     let sent = tokio::time::timeout(OP_TIMEOUT, async {
@@ -1771,6 +1911,7 @@ mod tests {
             queued_bytes: Arc::default(),
             broker_max_packet: Arc::default(),
             drained: Arc::default(),
+            details: RefCell::default(),
             limits: NetLimits::default(),
             active: Cell::new(0),
         });
@@ -1795,6 +1936,8 @@ mod tests {
         let subscribe = Command::Subscribe {
             filter: "a/b".into(),
             qos: Qos::AtMostOnce,
+            options: Default::default(),
+            req: 0,
         };
         cmd_tx
             .try_send((0, subscribe.clone()))
@@ -2101,7 +2244,18 @@ mod tests {
             .clone()
     }
 
+    /// The next event, with `ConnectionDetails` (new in S2d, one for each connect) left out:
+    /// the older tests do not look at it. `next_event_any` keeps it.
     async fn next_event(net: &mut Net) -> Event {
+        loop {
+            match next_event_any(net).await {
+                Event::ConnectionDetails { .. } => {}
+                other => return other,
+            }
+        }
+    }
+
+    async fn next_event_any(net: &mut Net) -> Event {
         tokio::time::timeout(Duration::from_secs(5), net.events.recv())
             .await
             .expect("event timeout")
@@ -2148,6 +2302,8 @@ mod tests {
         net.send(Command::Subscribe {
             filter: "live/x".into(),
             qos: Qos::AtMostOnce,
+            options: Default::default(),
+            req: 0,
         })
         .expect("send");
         assert!(matches!(
@@ -2178,6 +2334,7 @@ mod tests {
                     generation,
                     filter,
                     result: Ok(_),
+                    ..
                 } => {
                     assert_eq!(generation, first.generation);
                     filters.push(filter);
@@ -2234,6 +2391,8 @@ mod tests {
         net.send(Command::Subscribe {
             filter: "c".into(),
             qos: Qos::AtMostOnce,
+            options: Default::default(),
+            req: 0,
         })
         .expect("send");
         net.send(Command::Unsubscribe { filter: "a".into() })
@@ -2546,6 +2705,7 @@ mod tests {
             queued_bytes: Arc::default(),
             broker_max_packet: Arc::default(),
             drained: Arc::default(),
+            details: RefCell::default(),
             limits: NetLimits::default(),
             active: Cell::new(0),
         });
@@ -3847,5 +4007,809 @@ mod tests {
             (0xe0, 2)
         );
         assert!(rx.try_recv().is_err(), "no other packet");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // S2d: subscription options, connection details, server reference.
+    // -----------------------------------------------------------------------------------------
+
+    /// A v5 string property: id, 2-byte length, bytes.
+    fn prop_str(id: u8, s: &str) -> Vec<u8> {
+        let mut p = vec![id];
+        p.extend((s.len() as u16).to_be_bytes());
+        p.extend(s.as_bytes());
+        p
+    }
+
+    /// Reads the CONNECT and answers with a v5 CONNACK that has the properties `props`.
+    fn accept_v5_with(sock: &mut TcpStream, flags: u8, reason: u8, props: &[u8]) -> bool {
+        match read_packet(sock) {
+            Some((0x10, _)) => {}
+            _ => return false,
+        }
+        let mut body = vec![flags, reason, props.len() as u8];
+        body.extend(props);
+        let mut packet = vec![0x20, body.len() as u8];
+        packet.extend(body);
+        sock.write_all(&packet).is_ok()
+    }
+
+    /// The filters of a v5 SUBSCRIBE body with the whole options byte of each.
+    fn subscribe_option_bytes(body: &[u8]) -> Vec<(String, u8)> {
+        let mut i = 3; // packet ID and the property length (0)
+        let mut out = vec![];
+        while i + 2 <= body.len() {
+            let n = usize::from(u16::from_be_bytes([body[i], body[i + 1]]));
+            let end = i + 2 + n;
+            out.push((
+                String::from_utf8_lossy(&body[i + 2..end]).into_owned(),
+                body[end],
+            ));
+            i = end + 1;
+        }
+        out
+    }
+
+    fn all_options() -> SubOptions {
+        SubOptions {
+            no_local: true,
+            retain_as_published: true,
+            retain_handling: RetainHandling::Never,
+        }
+    }
+
+    /// v5: the options go into the options byte of each SUBSCRIBE: QoS in bits 0-1, No Local
+    /// bit 2, Retain As Published bit 3, Retain Handling bits 4-5 (MQTT 5, 3.8.3.1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn v5_subscribe_sends_the_options_byte() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(String, u8)>>();
+        let tx = std::sync::Mutex::new(tx);
+        let broker = Fake::start(move |_, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                if kind == 0x82 {
+                    tx.lock()
+                        .expect("lock")
+                        .send(subscribe_option_bytes(&body))
+                        .expect("send");
+                    answer_subscribe(&mut sock, &body);
+                }
+            }
+        });
+        let mut profile = tcp_profile(broker.port, &["a/b"]);
+        profile
+            .subscription_options
+            .insert("a/b".into(), all_options());
+        let net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
+            .expect("send");
+        // QoS 0 | No Local 0x04 | Retain As Published 0x08 | Retain Handling 2 (0x20).
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("SUBSCRIBE"),
+            [("a/b".to_owned(), 0x2C)]
+        );
+        for (filter, qos, options, want) in [
+            ("c", Qos::AtLeastOnce, SubOptions::default(), 0x01),
+            (
+                "d",
+                Qos::AtMostOnce,
+                SubOptions {
+                    retain_handling: RetainHandling::OnNewSubscription,
+                    ..SubOptions::default()
+                },
+                0x10,
+            ),
+            (
+                "e",
+                Qos::AtLeastOnce,
+                SubOptions {
+                    no_local: true,
+                    ..SubOptions::default()
+                },
+                0x05,
+            ),
+        ] {
+            net.send(Command::Subscribe {
+                filter: filter.into(),
+                qos,
+                options,
+                req: 0,
+            })
+            .expect("send");
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).expect("SUBSCRIBE"),
+                [(filter.to_owned(), want)],
+                "filter {filter}"
+            );
+        }
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// v3: the SUBSCRIBE has the filter and one QoS byte. No option bit is set, whatever the
+    /// profile holds, and the SUBSCRIBE has no property length.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_subscribe_never_sends_options() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let tx = std::sync::Mutex::new(tx);
+        let broker = Fake::start(move |_, mut sock| {
+            if accept_v3(&mut sock, 0).is_none() {
+                return;
+            }
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                if kind == 0x82 {
+                    tx.lock().expect("lock").send(body.clone()).expect("send");
+                    let _ = sock.write_all(&[0x90, 0x03, body[0], body[1], 0x00]);
+                }
+            }
+        });
+        let mut profile = tcp_profile(broker.port, &["a/b"]);
+        profile
+            .subscription_options
+            .insert("a/b".into(), all_options());
+        let mut net = Net::start(NetLimits::default());
+        connect_v3_to(&mut net, profile).await;
+        let first = rx.recv_timeout(Duration::from_secs(5)).expect("SUBSCRIBE");
+        // Packet ID (2 bytes), filter length (2), "a/b", options byte.
+        assert_eq!(&first[2..], [0, 3, b'a', b'/', b'b', 0x00]);
+        // A shared filter with No Local is sent as a plain filter: v3 has no No Local.
+        net.send(Command::Subscribe {
+            filter: "$share/g/t".into(),
+            qos: Qos::AtLeastOnce,
+            options: all_options(),
+            req: 0,
+        })
+        .expect("send");
+        let second = rx.recv_timeout(Duration::from_secs(5)).expect("SUBSCRIBE");
+        assert_eq!(
+            &second[2..],
+            [&[0, 10][..], b"$share/g/t", &[0x01]].concat()
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// The subscribe after a reconnect keeps the options: the ones from the profile and the
+    /// ones of a live subscribe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resubscribe_keeps_the_options() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(String, u8)>>();
+        let tx = std::sync::Mutex::new(tx);
+        let broker = Fake::start(move |n, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                if kind != 0x82 {
+                    continue;
+                }
+                let seen = subscribe_option_bytes(&body);
+                answer_subscribe(&mut sock, &body);
+                tx.lock().expect("lock").send(seen.clone()).expect("send");
+                if n == 0 && seen[0].0 == "live/x" {
+                    std::thread::sleep(Duration::from_millis(50));
+                    return;
+                }
+            }
+        });
+        let mut profile = tcp_profile(broker.port, &["base/#"]);
+        profile
+            .subscription_options
+            .insert("base/#".into(), all_options());
+        let net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
+            .expect("send");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("first"),
+            [("base/#".to_owned(), 0x2C)]
+        );
+        net.send(Command::Subscribe {
+            filter: "live/x".into(),
+            qos: Qos::AtLeastOnce,
+            options: SubOptions {
+                no_local: true,
+                ..SubOptions::default()
+            },
+            req: 0,
+        })
+        .expect("send");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("live"),
+            [("live/x".to_owned(), 0x05)]
+        );
+        // After the drop the same two filters come again with the same bytes.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("again 1"),
+            [("base/#".to_owned(), 0x2C)]
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("again 2"),
+            [("live/x".to_owned(), 0x05)]
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// MQTT 5 forbids No Local on a shared subscription. The net thread refuses it with a
+    /// text, and nothing goes to the broker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_local_on_a_shared_subscription_is_refused_locally() {
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        let tx = std::sync::Mutex::new(tx);
+        let broker = Fake::start(move |_, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            while let Some((kind, _)) = read_packet(&mut sock) {
+                tx.lock().expect("lock").send(kind).expect("send");
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        net.send(Command::Subscribe {
+            filter: "$share/g/t".into(),
+            qos: Qos::AtMostOnce,
+            options: SubOptions {
+                no_local: true,
+                ..SubOptions::default()
+            },
+            req: 0,
+        })
+        .expect("send");
+        match next_event(&mut net).await {
+            Event::Subscribed { filter, result, .. } => assert_eq!(
+                (filter.as_str(), result),
+                (
+                    "$share/g/t",
+                    Err(
+                        "No Local is not allowed on a shared subscription ($share/...).".to_owned()
+                    )
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        net.disconnect();
+        net.shutdown().await;
+        // The broker saw only the DISCONNECT (0xE0).
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).expect("DISCONNECT"),
+            0xE0
+        );
+        assert!(rx.try_recv().is_err(), "no SUBSCRIBE");
+    }
+
+    /// A v5 CONNACK with properties gives `ConnectionDetails` with exactly those values. The
+    /// Server Keep Alive 0 wins over the 60 s of the profile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_details_come_from_the_connack() {
+        let broker = Fake::start(|_, mut sock| {
+            let mut props = vec![0x13, 0x00, 0x00]; // Server Keep Alive 0
+            props.extend([0x21, 0x00, 0x0A]); // Receive Maximum 10
+            props.extend([0x24, 0x01]); // Maximum QoS 1
+            props.extend([0x25, 0x00]); // Retain Available 0
+            props.extend([0x27, 0x00, 0x00, 0x10, 0x00]); // Maximum Packet Size 4096
+            props.extend([0x22, 0x00, 0x05]); // Topic Alias Maximum 5
+            props.extend([0x28, 0x00, 0x29, 0x00, 0x2A, 0x00]); // wildcard, sub IDs, shared: off
+            props.extend(prop_str(0x12, "srv-id"));
+            props.extend(prop_str(0x1A, "resp/"));
+            props.extend(prop_str(0x1C, "alt.example:1883"));
+            props.extend(prop_str(0x1F, "hello"));
+            if accept_v5_with(&mut sock, 0x01, 0x00, &props) {
+                while read_packet(&mut sock).is_some() {}
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        let connected = wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        let generation = connected.generation;
+        assert_ne!(connected.attempt, 0);
+        match next_event_any(&mut net).await {
+            Event::ConnectionDetails {
+                generation: g,
+                attempt,
+                details,
+            } => {
+                assert_eq!(g, generation);
+                assert_eq!(
+                    attempt, connected.attempt,
+                    "the attempt of the Connected status"
+                );
+                assert_eq!(
+                    *details,
+                    ConnectionDetails {
+                        protocol: Protocol::V5,
+                        session_present: true,
+                        v5: Some(V5Details {
+                            assigned_client_id: Some("srv-id".into()),
+                            keep_alive_secs: 0,
+                            server_keep_alive_secs: Some(0),
+                            receive_max: 10,
+                            max_packet_size: Some(4096),
+                            max_qos: 1,
+                            retain_available: false,
+                            wildcard_subscriptions: false,
+                            shared_subscriptions: false,
+                            subscription_ids: false,
+                            topic_alias_max: 5,
+                            server_reference: Some("alt.example:1883".into()),
+                            response_info: Some("resp/".into()),
+                            reason_string: Some("hello".into()),
+                        }),
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// Without Server Keep Alive the effective keep alive is the one of the profile (60 s). A
+    /// bare CONNACK has the MQTT defaults.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_details_use_the_profile_keep_alive_without_a_server_one() {
+        let broker = Fake::start(|_, mut sock| {
+            if accept_connect(&mut sock, 0) {
+                while read_packet(&mut sock).is_some() {}
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        match next_event_any(&mut net).await {
+            Event::ConnectionDetails { details, .. } => {
+                let v5 = details.v5.expect("v5 details");
+                assert_eq!(
+                    (
+                        details.session_present,
+                        v5.keep_alive_secs,
+                        v5.server_keep_alive_secs
+                    ),
+                    (false, 60, None)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// v3: the details have the session present flag and nothing else.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_connection_details_have_only_the_session_flag() {
+        let broker = Fake::start(|_, mut sock| {
+            if accept_v3(&mut sock, 0).is_some() {
+                while read_packet(&mut sock).is_some() {}
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        match next_event_any(&mut net).await {
+            Event::ConnectionDetails { details, .. } => assert_eq!(
+                *details,
+                ConnectionDetails {
+                    protocol: Protocol::V311,
+                    session_present: false,
+                    v5: None
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// A refused v5 CONNACK with a server reference: the old text stays, and the reference
+    /// follows it (plan, "Server reference", D8).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_connack_text_ends_with_the_server_reference() {
+        let broker = Fake::start(|_, mut sock| {
+            let mut props = prop_str(0x1C, "alt.example:1883");
+            props.extend(prop_str(0x1F, "moved"));
+            let _ = accept_v5_with(&mut sock, 0x00, 0x9C, &props);
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        let s = wait_status(&mut net, |s| {
+            matches!(
+                s.state,
+                ConnState::Reconnecting { .. } | ConnState::Failed(_)
+            )
+        })
+        .await;
+        assert_eq!(
+            s.state,
+            ConnState::Failed(
+                "The broker rejected the connection: use another server (moved). Server reference: alt.example:1883."
+                    .into()
+            )
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// A broker DISCONNECT with a server reference: the reference follows the old text.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_broker_disconnect_text_ends_with_the_server_reference() {
+        let broker = Fake::start(|_, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            // DISCONNECT: reason 0x9D (server moved), properties: Server Reference.
+            let props = prop_str(0x1C, "alt.example:1883");
+            let mut body = vec![0x9D, props.len() as u8];
+            body.extend(props);
+            let mut packet = vec![0xE0, body.len() as u8];
+            packet.extend(body);
+            let _ = sock.write_all(&packet);
+            while read_packet(&mut sock).is_some() {}
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        let s = wait_status(&mut net, |s| {
+            matches!(
+                s.state,
+                ConnState::Reconnecting { .. } | ConnState::Failed(_)
+            )
+        })
+        .await;
+        assert_eq!(
+            s.state,
+            ConnState::Failed(
+                "The broker closed the connection: ServerMoved. Server reference: alt.example:1883."
+                    .into()
+            )
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// The user changes the options of a subscription that exists. The new options replace the
+    /// old ones in the wanted set: after a reconnect the filter comes with them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_options_stay_after_a_reconnect() {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, u8)>();
+        let tx = std::sync::Mutex::new(tx);
+        let broker = Fake::start(move |n, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            let mut seen = 0;
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                if kind != 0x82 {
+                    continue;
+                }
+                answer_subscribe(&mut sock, &body);
+                seen += 1;
+                for item in subscribe_option_bytes(&body) {
+                    tx.lock().expect("lock").send(item).expect("send");
+                }
+                if n == 0 && seen == 2 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    return;
+                }
+            }
+        });
+        let net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &["a"]),
+        ))))
+        .expect("send");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("first"),
+            ("a".to_owned(), 0x00)
+        );
+        net.send(Command::Subscribe {
+            filter: "a".into(),
+            qos: Qos::AtMostOnce,
+            options: SubOptions {
+                no_local: true,
+                ..SubOptions::default()
+            },
+            req: 0,
+        })
+        .expect("send");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("changed"),
+            ("a".to_owned(), 0x04)
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("again"),
+            ("a".to_owned(), 0x04)
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// With a nearly full event log, a reconnect adds no event until the UI reads: the
+    /// `ConnectionDetails` of the new connection waits for room like `Reconnected`, and it comes
+    /// after the drain, once for each connect and with the generation of the connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_details_wait_for_room_in_a_full_log_and_are_not_lost() {
+        let broker = Fake::start(|n, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            if n == 0 {
+                // Time to fill the log, then the connection drops.
+                std::thread::sleep(Duration::from_millis(2500));
+                return;
+            }
+            while read_packet(&mut sock).is_some() {}
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        let generation = wait_status(&mut net, |s| s.state == ConnState::Connected)
+            .await
+            .generation;
+        // Each invalid filter makes one `Subscribed` error event. Stop when the log is at its
+        // reserve: `send` then answers `Full` also after a pause.
+        let bad = || Command::Subscribe {
+            filter: "a/#/b".into(),
+            qos: Qos::AtMostOnce,
+            options: Default::default(),
+            req: 0,
+        };
+        loop {
+            match net.send(bad()) {
+                Ok(()) => {}
+                Err(SendError::Full) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if matches!(net.send(bad()), Err(SendError::Full)) {
+                        break;
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let filled = net.events.len();
+        wait_status(&mut net, |s| {
+            matches!(s.state, ConnState::Reconnecting { .. })
+        })
+        .await;
+        let back = wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        assert_eq!(back.generation, generation);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            net.events.len(),
+            filled,
+            "no event is added while the log is full"
+        );
+
+        // The UI reads: the events of the new connection come now.
+        let mut order = vec![];
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(700), net.recv_event()).await
+        {
+            match event {
+                Event::ConnectionDetails {
+                    generation: g,
+                    attempt,
+                    ..
+                } => order.push(format!("details {g} {}", attempt == back.attempt)),
+                Event::Reconnected { generation: g, .. } => order.push(format!("reconnected {g}")),
+                // The filler of the log.
+                Event::Subscribed { result: Err(_), .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // The first connection's details were in the log before the fill (an older attempt).
+        // After them: the details of the new attempt, then `Reconnected`.
+        assert_eq!(
+            order,
+            [
+                format!("details {generation} false"),
+                format!("details {generation} true"),
+                format!("reconnected {generation}"),
+            ]
+        );
+        assert_eq!(net.stats.event_drops.load(Ordering::Relaxed), 0);
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// The app keeps only the details of the latest connection. The log is full, a second
+    /// Connect replaces the first one, and its connection drops twice. After the drain the UI
+    /// has the details of the last connection once, with the newest generation, and no
+    /// details of the dropped attempts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_log_keeps_only_the_details_of_the_latest_connection() {
+        // Each attempt has its own Receive Maximum: 10, 11, 12, 13.
+        let broker = Fake::start(|n, mut sock| {
+            let props = [0x21, 0x00, 10 + n as u8];
+            if !accept_v5_with(&mut sock, 0x00, 0x00, &props) {
+                return;
+            }
+            match n {
+                0 => std::thread::sleep(Duration::from_secs(8)),
+                1 | 2 => std::thread::sleep(Duration::from_millis(300)),
+                _ => while read_packet(&mut sock).is_some() {},
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        let config = || ConnectConfig::from(tcp_profile(broker.port, &[]));
+        let g1 = net.connect(config()).expect("connect");
+        let first_attempt = wait_status(&mut net, |s| s.state == ConnState::Connected)
+            .await
+            .attempt;
+        let bad = || Command::Subscribe {
+            filter: "a/#/b".into(),
+            qos: Qos::AtMostOnce,
+            options: Default::default(),
+            req: 0,
+        };
+        loop {
+            match net.send(bad()) {
+                Ok(()) => {}
+                Err(SendError::Full) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if matches!(net.send(bad()), Err(SendError::Full)) {
+                        break;
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The second Connect: attempt 1 drops, attempt 2 drops, attempt 3 stays.
+        let g2 = net.connect(config()).expect("connect");
+        assert!(g2 > g1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        let last = loop {
+            let s = net.status.borrow().clone();
+            if broker.accepts() == 4 && s.generation == g2 && s.state == ConnState::Connected {
+                break s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no third connection: {s:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut order = vec![];
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(700), net.recv_event()).await
+        {
+            match event {
+                Event::ConnectionDetails {
+                    generation,
+                    attempt,
+                    details,
+                } => {
+                    let receive_max = details.v5.expect("v5").receive_max;
+                    order.push(format!("details {generation} {receive_max} {attempt}"));
+                }
+                Event::Reconnected { generation, .. } => {
+                    order.push(format!("reconnected {generation}"));
+                }
+                // The filler of the log.
+                Event::Subscribed { result: Err(_), .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // g1: its details were in the log before the fill (Receive Maximum 10). g2: one, with
+        // the values of the last attempt (13) and the attempt of the final Connected status,
+        // then `Reconnected`. The dropped attempts (11, 12) left nothing.
+        assert_eq!(
+            order,
+            [
+                format!("details {g1} 10 {}", first_attempt),
+                format!("details {g2} 13 {}", last.attempt),
+                format!("reconnected {g2}"),
+            ]
+        );
+        assert_eq!(net.stats.event_drops.load(Ordering::Relaxed), 0);
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// Each `Subscribed` result has the `req` of the latest accepted Subscribe of its filter:
+    /// the first subscribe from the profile (0), live subscribes, a local refusal, and the
+    /// automatic resubscribe after a reconnect, which uses the stored `req`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribed_results_echo_the_req_also_on_resubscribe() {
+        let broker = Fake::start(|n, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                if kind != 0x82 {
+                    continue;
+                }
+                let filters = answer_subscribe(&mut sock, &body);
+                if n == 0 && filters == ["b"] {
+                    std::thread::sleep(Duration::from_millis(50));
+                    return;
+                }
+            }
+        });
+        let y = SubOptions {
+            no_local: true,
+            ..SubOptions::default()
+        };
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &["a"]),
+        ))))
+        .expect("send");
+        let next = async |net: &mut Net| loop {
+            match next_event(net).await {
+                Event::Subscribed {
+                    filter,
+                    req,
+                    result,
+                    ..
+                } => return (filter, req, result.is_ok()),
+                // One after the reconnect.
+                Event::Reconnected { .. } => {}
+                other => panic!("expected Subscribed, got {other:?}"),
+            }
+        };
+        let live = |net: &Net, filter: &str, options, req| {
+            net.send(Command::Subscribe {
+                filter: filter.into(),
+                qos: Qos::AtMostOnce,
+                options,
+                req,
+            })
+            .expect("send");
+        };
+        let mut seen = vec![next(&mut net).await];
+        live(&net, "$share/g/t", y, 7);
+        seen.push(next(&mut net).await);
+        // The same filter twice with the same options: each result has its own req.
+        live(&net, "a", SubOptions::default(), 11);
+        seen.push(next(&mut net).await);
+        live(&net, "a", SubOptions::default(), 12);
+        seen.push(next(&mut net).await);
+        live(&net, "b", y, 9);
+        seen.push(next(&mut net).await);
+        // The connection drops. The resubscribe of the wanted set follows ("$share/g/t" is
+        // refused again, locally). Each filter has the req of its latest accepted Subscribe.
+        for _ in 0..3 {
+            seen.push(next(&mut net).await);
+        }
+        // The local refusal and the SUBACKs of the resubscribe come in any order.
+        seen[5..].sort_by(|l, r| l.0.cmp(&r.0));
+        assert_eq!(
+            seen,
+            [
+                ("a".to_owned(), 0, true),
+                ("$share/g/t".to_owned(), 7, false),
+                ("a".to_owned(), 11, true),
+                ("a".to_owned(), 12, true),
+                ("b".to_owned(), 9, true),
+                ("$share/g/t".to_owned(), 7, false),
+                ("a".to_owned(), 12, true),
+                ("b".to_owned(), 9, true),
+            ]
+        );
+        net.disconnect();
+        net.shutdown().await;
     }
 }

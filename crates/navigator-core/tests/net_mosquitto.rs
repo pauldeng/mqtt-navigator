@@ -18,7 +18,7 @@ use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportTy
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
     Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
-    PublishResult, Transport, queue_cost,
+    PublishResult, RetainHandling, SubOptions, Transport, queue_cost,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -91,6 +91,15 @@ async fn next_event(net: &mut Net) -> Event {
     loop {
         match next_event_raw(net).await {
             Event::SessionFilters { .. } => {}
+            // The skipped details must belong to a connection that exists. The lifecycle test
+            // `connection_details_come_once_for_each_connect` reads them raw.
+            Event::ConnectionDetails { generation, .. } => {
+                let latest = net.status.borrow().generation;
+                assert!(
+                    generation >= 1 && generation <= latest,
+                    "{generation} of {latest}"
+                );
+            }
             other => return other,
         }
     }
@@ -168,6 +177,7 @@ async fn subscribe_publish_receive_and_disconnect() {
                 generation,
                 filter,
                 result,
+                ..
             } => {
                 assert_eq!(generation, gen1);
                 results.push((filter, result));
@@ -541,6 +551,8 @@ async fn pending_operations_are_capped() {
                 result: PublishResult::Rejected(t),
                 ..
             })) => texts.push(t),
+            // One for each connect (S2d).
+            Ok(Some(Event::ConnectionDetails { .. })) => {}
             other => panic!("unexpected {other:?} after {} rejections", texts.len()),
         }
     }
@@ -583,6 +595,8 @@ async fn slow_ui_still_gets_every_publish_result() {
             seen[op_id as usize] += 1;
             *got += 1;
         }
+        // One for each connect (S2d).
+        Event::ConnectionDetails { .. } => {}
         other => panic!("unexpected {other:?}"),
     };
     for i in 0..N {
@@ -650,6 +664,8 @@ async fn many_filters_and_a_slow_ui_lose_no_result() {
                 result: PublishResult::Rejected(why),
                 ..
             } if why.contains("Too many") => pubs[op_id as usize] += 1,
+            // One for each connect (S2d).
+            Event::ConnectionDetails { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     };
@@ -927,6 +943,8 @@ async fn a_replaced_connect_never_uses_the_new_generation() {
     net.send(Command::Subscribe {
         filter: "a/only".into(),
         qos: Qos::AtMostOnce,
+        options: Default::default(),
+        req: 0,
     })
     .expect("subscribe for A");
     // The user switches to B before A has published anything.
@@ -954,6 +972,7 @@ async fn a_replaced_connect_never_uses_the_new_generation() {
             | Event::Unsubscribed { generation, .. }
             | Event::Published { generation, .. }
             | Event::SessionFilters { generation, .. }
+            | Event::ConnectionDetails { generation, .. }
             | Event::Error { generation, .. } => *generation,
         };
         if g != gb {
@@ -1175,6 +1194,8 @@ async fn a_clean_session_forgets_the_filters() {
     net.send(Command::Subscribe {
         filter: topic.clone(),
         qos: Qos::AtLeastOnce,
+        options: Default::default(),
+        req: 0,
     })
     .expect("subscribe");
     assert!(matches!(
@@ -1491,4 +1512,272 @@ async fn v3_an_incoming_packet_over_the_limit_ends_the_session() {
     );
     publisher.shutdown().await;
     sub.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// S2d: MQTT 5 subscription options (plan, "MQTT 5 features"). Mosquitto applies them.
+// ---------------------------------------------------------------------------------------------
+
+/// A v5 profile whose subscriptions (QoS 1) have the given options.
+fn profile_with_options(subs: &[(&str, SubOptions)]) -> Profile {
+    let mut p = profile(&[]);
+    for (filter, options) in subs {
+        p.subscriptions
+            .push(((*filter).to_owned(), Qos::AtLeastOnce));
+        p.subscription_options
+            .insert((*filter).to_owned(), *options);
+    }
+    p
+}
+
+/// Waits for `n` results of SUBSCRIBE. Each must be granted QoS 1.
+async fn subscribed(net: &mut Net, n: usize) {
+    for _ in 0..n {
+        match next_event(net).await {
+            Event::Subscribed { result, .. } => assert_eq!(result, Ok(Qos::AtLeastOnce)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+fn retained(op_id: u64, topic: &str, payload: &'static [u8]) -> Command {
+    Command::Publish(Box::new(Outgoing {
+        op_id,
+        topic: topic.into(),
+        payload: Bytes::from_static(payload),
+        qos: Qos::AtLeastOnce,
+        retain: true,
+        props: MsgProps::default(),
+    }))
+}
+
+/// No message arrives within a short time.
+async fn nothing_arrives(net: &mut Net) {
+    let got = tokio::time::timeout(Duration::from_millis(700), net.incoming.recv()).await;
+    assert!(
+        got.is_err(),
+        "a message arrived: {:?}",
+        got.map(|m| m.map(|m| m.topic))
+    );
+}
+
+/// No Local: the broker does not send our own publish back. A second subscription without it
+/// gets the same publish (the control), and a publish of another client reaches both.
+#[tokio::test(flavor = "current_thread")]
+async fn no_local_hides_our_own_publish() {
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let (hidden, shown) = (format!("{p}/nl"), format!("{p}/plain"));
+    let no_local = SubOptions {
+        no_local: true,
+        ..SubOptions::default()
+    };
+    let mut net = Net::start(NetLimits::default());
+    connect(
+        &mut net,
+        profile_with_options(&[(&hidden, no_local), (&shown, SubOptions::default())]),
+    )
+    .await;
+    subscribed(&mut net, 2).await;
+    net.send(out(1, &hidden, b"own", Qos::AtLeastOnce))
+        .expect("send");
+    assert_eq!(published(&mut net, 1).await, PublishResult::Acknowledged);
+    net.send(out(2, &shown, b"own", Qos::AtLeastOnce))
+        .expect("send");
+    assert_eq!(published(&mut net, 2).await, PublishResult::Acknowledged);
+    // Only the plain subscription gets our own message.
+    let m = next_incoming(&mut net).await;
+    assert_eq!((&*m.topic, &m.payload[..]), (shown.as_str(), &b"own"[..]));
+    nothing_arrives(&mut net).await;
+
+    // Another client publishes to the topic with No Local: it arrives.
+    let mut other = Net::start(NetLimits::default());
+    connect(&mut other, profile(&[])).await;
+    other
+        .send(out(1, &hidden, b"theirs", Qos::AtLeastOnce))
+        .expect("send");
+    assert_eq!(published(&mut other, 1).await, PublishResult::Acknowledged);
+    let m = next_incoming(&mut net).await;
+    assert_eq!(
+        (&*m.topic, &m.payload[..]),
+        (hidden.as_str(), &b"theirs"[..])
+    );
+    other.disconnect();
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+}
+
+/// Retain Handling 2: no retained message at subscribe. Handling 0 gets it (the control), and
+/// handling 1 gets it for a new subscription.
+#[tokio::test(flavor = "current_thread")]
+async fn retain_handling_decides_whether_a_retained_message_comes_at_subscribe() {
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let topic = format!("{p}/ret");
+    let mut publisher = Net::start(NetLimits::default());
+    connect(&mut publisher, profile(&[])).await;
+    publisher.send(retained(1, &topic, b"kept")).expect("send");
+    assert_eq!(
+        published(&mut publisher, 1).await,
+        PublishResult::Acknowledged
+    );
+
+    for (handling, arrives) in [
+        (RetainHandling::Never, false),
+        (RetainHandling::OnSubscribe, true),
+        (RetainHandling::OnNewSubscription, true),
+    ] {
+        let options = SubOptions {
+            retain_handling: handling,
+            ..SubOptions::default()
+        };
+        let mut net = Net::start(NetLimits::default());
+        connect(&mut net, profile_with_options(&[(&topic, options)])).await;
+        subscribed(&mut net, 1).await;
+        if arrives {
+            let m = next_incoming(&mut net).await;
+            assert_eq!(
+                (&*m.topic, &m.payload[..], m.retain),
+                (topic.as_str(), &b"kept"[..], true)
+            );
+        } else {
+            nothing_arrives(&mut net).await;
+        }
+        net.disconnect();
+        wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    }
+    // Clear the retained message.
+    publisher.send(retained(2, &topic, b"")).expect("send");
+    assert_eq!(
+        published(&mut publisher, 2).await,
+        PublishResult::Acknowledged
+    );
+    publisher.disconnect();
+}
+
+/// Retain As Published: a live message keeps its retain flag. Without the option the broker
+/// clears the flag on a live message.
+#[tokio::test(flavor = "current_thread")]
+async fn retain_as_published_keeps_the_retain_flag_of_a_live_message() {
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let (kept, cleared) = (format!("{p}/rap"), format!("{p}/norap"));
+    let rap = SubOptions {
+        retain_as_published: true,
+        ..SubOptions::default()
+    };
+    let mut net = Net::start(NetLimits::default());
+    connect(
+        &mut net,
+        profile_with_options(&[(&kept, rap), (&cleared, SubOptions::default())]),
+    )
+    .await;
+    subscribed(&mut net, 2).await;
+    let mut publisher = Net::start(NetLimits::default());
+    connect(&mut publisher, profile(&[])).await;
+    publisher.send(retained(1, &kept, b"x")).expect("send");
+    assert_eq!(
+        published(&mut publisher, 1).await,
+        PublishResult::Acknowledged
+    );
+    publisher.send(retained(2, &cleared, b"x")).expect("send");
+    assert_eq!(
+        published(&mut publisher, 2).await,
+        PublishResult::Acknowledged
+    );
+    let mut seen = vec![];
+    for _ in 0..2 {
+        let m = next_incoming(&mut net).await;
+        seen.push((m.topic.to_string(), m.retain));
+    }
+    seen.sort();
+    assert_eq!(seen, [(cleared.clone(), false), (kept.clone(), true)]);
+    // Clear both retained messages.
+    publisher.send(retained(3, &kept, b"")).expect("send");
+    publisher.send(retained(4, &cleared, b"")).expect("send");
+    assert_eq!(
+        published(&mut publisher, 3).await,
+        PublishResult::Acknowledged
+    );
+    assert_eq!(
+        published(&mut publisher, 4).await,
+        PublishResult::Acknowledged
+    );
+    publisher.disconnect();
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+}
+
+/// No event comes within a short time.
+async fn no_event(net: &mut Net) {
+    let got = tokio::time::timeout(Duration::from_millis(500), net.events.recv()).await;
+    assert!(got.is_err(), "unexpected event: {got:?}");
+}
+
+/// Reads the next raw event and requires `ConnectionDetails` of `generation`. The status must
+/// already be Connected: the details never come before it.
+async fn expect_details(net: &mut Net, generation: u64) {
+    match next_event_raw(net).await {
+        Event::ConnectionDetails {
+            generation: g,
+            attempt,
+            details,
+        } => {
+            assert_eq!(g, generation);
+            let status = net.status.borrow().clone();
+            assert_eq!(status.state, ConnState::Connected);
+            // These are the details of the connected attempt, not of an older one.
+            assert_eq!(attempt, status.attempt);
+            assert_eq!(details.protocol, Protocol::V5);
+            assert!(!details.session_present);
+        }
+        other => panic!("expected ConnectionDetails, got {other:?}"),
+    }
+}
+
+/// One `ConnectionDetails` for each connect, in raw event order, with the right generation:
+/// the first connect, a reconnect of the same generation (the way to the broker is cut), and a
+/// replacement by a second Connect. A reconnect has `Reconnected` after the details.
+#[tokio::test(flavor = "current_thread")]
+async fn connection_details_come_once_for_each_connect() {
+    let _limits = limits_lock();
+    require_broker();
+    let proxy = CuttableProxy::start();
+    let port = proxy.port;
+    let mut p = profile(&[]);
+    p.port = port;
+    let mut net = Net::start(NetLimits::default());
+    let g1 = connect(&mut net, p.clone()).await;
+    expect_details(&mut net, g1).await;
+    no_event(&mut net).await;
+
+    proxy.cut();
+    wait_state(&mut net, |s| matches!(s, ConnState::Reconnecting { .. })).await;
+    let _proxy2 = CuttableProxy::start_on(port);
+    tokio::time::timeout(
+        WAIT * 2,
+        net.status
+            .wait_for(|s| s.generation == g1 && s.state == ConnState::Connected),
+    )
+    .await
+    .expect("reconnects")
+    .expect("status");
+    expect_details(&mut net, g1).await;
+    assert!(matches!(
+        next_event_raw(&mut net).await,
+        Event::Reconnected { generation, .. } if generation == g1
+    ));
+    no_event(&mut net).await;
+
+    // A second Connect replaces the session: one new details, with the new generation.
+    let g2 = connect(&mut net, profile(&[])).await;
+    assert!(g2 > g1);
+    expect_details(&mut net, g2).await;
+    no_event(&mut net).await;
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    net.shutdown().await;
 }

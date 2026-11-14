@@ -34,6 +34,7 @@ fn same_connection(a: &Profile, b: &Profile) -> bool {
     let strip = |p: &Profile| Profile {
         name: String::new(),
         subscriptions: Vec::new(),
+        subscription_options: std::collections::BTreeMap::new(),
         session_filters: Vec::new(),
         ..p.clone()
     };
@@ -245,7 +246,7 @@ impl Navigator {
 
     /// Makes `profile` the active one and shows its subscriptions. It starts no connection.
     fn set_active(&mut self, profile: Option<Profile>) {
-        self.subs = Subs::from_profile(profile.as_ref().map_or(&[], |p| &p.subscriptions));
+        self.subs = Subs::of_profile(profile.as_ref());
         self.profile = profile;
     }
 
@@ -284,11 +285,12 @@ impl Navigator {
         if self.session.as_ref().is_some_and(|s| s.id == id) {
             return;
         }
-        let wanted = self.subs.wanted();
+        let (wanted, options) = (self.subs.wanted(), self.subs.wanted_options());
         if let Some(saved) = self.settings.profiles.iter_mut().find(|p| p.id == id)
-            && saved.subscriptions != wanted
+            && (saved.subscriptions != wanted || saved.subscription_options != options)
         {
             saved.subscriptions = wanted;
+            saved.subscription_options = options;
             self.persist();
         }
     }
@@ -588,6 +590,7 @@ impl Navigator {
                 // The sheet does not edit the subscriptions. Keep the ones that the user
                 // changed while connected.
                 profile.subscriptions = slot.subscriptions.clone();
+                profile.subscription_options = slot.subscription_options.clone();
                 profile.carry_session_from(slot);
                 *slot = profile.clone();
             }
@@ -607,7 +610,7 @@ impl Navigator {
                     runtime.name = profile.name.clone();
                 }
             } else {
-                profile.subscriptions = self.subs.wanted();
+                self.subs.write_to(&mut profile);
                 self.profile = Some(profile);
                 self.reconnect_pending = false;
             }

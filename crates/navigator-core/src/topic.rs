@@ -91,6 +91,11 @@ pub fn filter_error(filter: &str) -> Option<String> {
     None
 }
 
+/// True for a shared subscription filter (`$share/<group>/<filter>`).
+pub fn is_shared(filter: &str) -> bool {
+    filter.starts_with("$share/")
+}
+
 /// True if `filter` is a valid MQTT 5 topic filter.
 ///
 /// - It has 1 to 65 535 bytes and no NUL.

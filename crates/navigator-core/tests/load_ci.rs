@@ -179,9 +179,13 @@ fn ten_thousand_messages_per_second_through_net_and_store() {
         .expect("connect timeout")
         .expect("status")
         .generation;
-        match tokio::time::timeout(Duration::from_secs(10), net.events.recv()).await {
-            Ok(Some(Event::Subscribed { result: Ok(_), .. })) => {}
-            other => panic!("subscribe failed: {other:?}"),
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), net.events.recv()).await {
+                Ok(Some(Event::Subscribed { result: Ok(_), .. })) => break,
+                // One for each connect (S2d). This test does not use it.
+                Ok(Some(Event::ConnectionDetails { .. })) => {}
+                other => panic!("subscribe failed: {other:?}"),
+            }
         }
 
         let (sent, done) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));

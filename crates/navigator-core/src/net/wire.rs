@@ -42,10 +42,11 @@ use ntex_util::time::{Millis, Seconds};
 
 use super::dial::{Dialer, Target};
 use super::{
-    CONNECT_TIMEOUT, ConnectConfig, Ingest, NetLimits, Outcome, Outgoing, PANIC_TEXT, Protocol,
-    PublishResult, Transport, io_outcome,
+    CONNECT_TIMEOUT, ConnectConfig, ConnectionDetails, Ingest, NetLimits, Outcome, Outgoing,
+    PANIC_TEXT, Protocol, PublishResult, Transport, V5Details, io_outcome,
 };
 use crate::model::{Incoming, MsgProps, Qos};
+use crate::profile::SubOptions;
 pub(super) use crate::publish::v3_max_remaining;
 use crate::text::display_safe;
 use crate::tls::TlsDiag;
@@ -150,9 +151,19 @@ impl Wire {
         }
     }
 
-    pub(super) async fn subscribe(&self, filter: &str, qos: Qos) -> Result<Qos, String> {
+    /// True when the connection sends subscription options (MQTT 5).
+    pub(super) fn sends_options(&self) -> bool {
+        matches!(self, Self::V5(_))
+    }
+
+    pub(super) async fn subscribe(
+        &self,
+        filter: &str,
+        qos: Qos,
+        options: SubOptions,
+    ) -> Result<Qos, String> {
         match self {
-            Self::V5(s) => subscribe_v5(s, filter, qos).await,
+            Self::V5(s) => subscribe_v5(s, filter, qos, options).await,
             Self::V3(s, _) => subscribe_v3(s, filter, qos).await,
         }
     }
@@ -281,13 +292,13 @@ fn send_failure(e: SendPacketError) -> PublishResult {
     }
 }
 
-async fn subscribe_v5(sink: &MqttSink, filter: &str, qos: Qos) -> Result<Qos, String> {
-    let options = SubscriptionOptions {
-        qos: wire_qos(qos),
-        no_local: false,
-        retain_as_published: false,
-        retain_handling: RetainHandling::AtSubscribe,
-    };
+async fn subscribe_v5(
+    sink: &MqttSink,
+    filter: &str,
+    qos: Qos,
+    options: SubOptions,
+) -> Result<Qos, String> {
+    let options = wire_options(qos, options);
     let ack = sink
         .subscribe(None)
         .topic_filter(ByteString::from(filter.to_owned()), options)
@@ -298,6 +309,20 @@ async fn subscribe_v5(sink: &MqttSink, filter: &str, qos: Qos) -> Result<Qos, St
             other => other.to_string(),
         })?;
     subscribe_result(&ack)
+}
+
+/// The MQTT 5 subscription options on the wire.
+pub(super) fn wire_options(qos: Qos, o: SubOptions) -> SubscriptionOptions {
+    SubscriptionOptions {
+        qos: wire_qos(qos),
+        no_local: o.no_local,
+        retain_as_published: o.retain_as_published,
+        retain_handling: match o.retain_handling {
+            crate::profile::RetainHandling::OnSubscribe => RetainHandling::AtSubscribe,
+            crate::profile::RetainHandling::OnNewSubscription => RetainHandling::AtSubscribeNew,
+            crate::profile::RetainHandling::Never => RetainHandling::NoAtSubscribe,
+        },
+    }
 }
 
 /// The result of one SUBSCRIBE from its SUBACK. A refusal keeps the reason text and adds the
@@ -376,6 +401,8 @@ pub(super) fn suback_text(r: SubscribeAckReason) -> String {
 pub(super) struct Connected {
     pub wire: Wire,
     pub session_present: bool,
+    /// What the CONNACK says, for the "Connection details" view.
+    pub details: ConnectionDetails,
     /// The Maximum Packet Size that the broker announced. `None`: no limit announced.
     pub broker_max_packet: Option<u32>,
     pub driver: Pin<Box<dyn Future<Output = Outcome>>>,
@@ -575,6 +602,7 @@ async fn connect_v5(
 
     let ack = client.packet();
     let (session_present, broker_max_packet) = (ack.session_present, ack.max_packet_size);
+    let details = details_v5(ack, profile.keepalive_secs);
     let sink = client.sink();
     let flags = Rc::new(Flags::default());
     let handler = Handler {
@@ -600,6 +628,7 @@ async fn connect_v5(
     Ok(Connected {
         wire: Wire::V5(sink),
         session_present,
+        details,
         broker_max_packet,
         driver,
     })
@@ -694,6 +723,11 @@ async fn connect_v3(
     Ok(Connected {
         wire: Wire::V3(sink, p.limits.max_packet),
         session_present,
+        details: ConnectionDetails {
+            protocol: Protocol::V311,
+            session_present,
+            v5: None,
+        },
         // MQTT 3.1.1 has no Maximum Packet Size in the CONNACK.
         broker_max_packet: None,
         driver,
@@ -744,13 +778,16 @@ enum HandlerError {
     Payload,
 }
 
+/// Reason, reason string and server reference of a broker DISCONNECT.
+type BrokerDisconnect = (DisconnectReasonCode, Option<String>, Option<String>);
+
 /// What the callbacks learned. `stop_outcome` reads it when the connection has ended.
 #[derive(Default)]
 struct Flags {
     qos2: Cell<bool>,
     panicked: Cell<bool>,
-    /// The DISCONNECT of the broker: reason and reason string. Kept before the close completes.
-    broker_disconnect: RefCell<Option<(DisconnectReasonCode, Option<String>)>>,
+    /// The DISCONNECT of the broker: reason, reason string and server reference. Kept before the close completes.
+    broker_disconnect: RefCell<Option<BrokerDisconnect>>,
     /// The stop reason that the control service got.
     stop: RefCell<Option<Reason<HandlerError>>>,
 }
@@ -816,6 +853,7 @@ impl Handler {
                 *self.flags.broker_disconnect.borrow_mut() = Some((
                     pkt.reason_code,
                     pkt.reason_string.as_ref().map(|s| s.to_string()),
+                    pkt.server_reference.as_ref().map(|s| s.to_string()),
                 ));
                 Ok(d.ack())
             }
@@ -1019,6 +1057,36 @@ fn connect_outcome<T: std::fmt::Debug>(
     }
 }
 
+/// The facts of a v5 CONNACK. The effective keep alive is the Server Keep Alive when the
+/// CONNACK has one (also 0), else the keep alive of the profile.
+fn details_v5(ack: &ConnectAck, profile_keep_alive: u16) -> ConnectionDetails {
+    let text = |s: &Option<ByteString>| s.as_deref().map(|s| display_safe(s).into_owned());
+    ConnectionDetails {
+        protocol: Protocol::V5,
+        session_present: ack.session_present,
+        v5: Some(V5Details {
+            assigned_client_id: text(&ack.assigned_client_id),
+            keep_alive_secs: ack.server_keepalive_sec.unwrap_or(profile_keep_alive),
+            server_keep_alive_secs: ack.server_keepalive_sec,
+            receive_max: ack.receive_max.get(),
+            max_packet_size: ack.max_packet_size,
+            max_qos: match ack.max_qos {
+                WireQos::AtMostOnce => 0,
+                WireQos::AtLeastOnce => 1,
+                WireQos::ExactlyOnce => 2,
+            },
+            retain_available: ack.retain_available,
+            wildcard_subscriptions: ack.wildcard_subscription_available,
+            shared_subscriptions: ack.shared_subscription_available,
+            subscription_ids: ack.subscription_identifiers_available,
+            topic_alias_max: ack.topic_alias_max,
+            server_reference: text(&ack.server_reference),
+            response_info: text(&ack.response_info),
+            reason_string: text(&ack.reason_string),
+        }),
+    }
+}
+
 fn connack_outcome(ack: &ConnectAck) -> Outcome {
     let text = connack_text(ack);
     if connack_is_temporary(ack.reason_code) {
@@ -1082,8 +1150,8 @@ fn stop_outcome(f: &Flags, protocol: Protocol) -> Outcome {
     if f.panicked.get() {
         return Outcome::Failed(PANIC_TEXT.into());
     }
-    if let Some((reason, text)) = f.broker_disconnect.take() {
-        return disconnect_outcome(reason, text.as_deref());
+    if let Some((reason, text, server)) = f.broker_disconnect.take() {
+        return disconnect_outcome(reason, text.as_deref(), server.as_deref());
     }
     match f.stop.take() {
         Some(Reason::Protocol(e)) => protocol_outcome_for(e.get_ref(), protocol),
@@ -1127,9 +1195,16 @@ pub(super) fn disconnect_is_temporary(reason: DisconnectReasonCode) -> bool {
     )
 }
 
-pub(super) fn disconnect_outcome(reason: DisconnectReasonCode, text: Option<&str>) -> Outcome {
+pub(super) fn disconnect_outcome(
+    reason: DisconnectReasonCode,
+    text: Option<&str>,
+    server_reference: Option<&str>,
+) -> Outcome {
     let shown = text.map_or_else(|| format!("{reason:?}"), |s| display_safe(s).into_owned());
-    let text = format!("The broker closed the connection: {shown}.");
+    let text = format!(
+        "The broker closed the connection: {shown}.{}",
+        server_reference_text(server_reference)
+    );
     if disconnect_is_temporary(reason) {
         Outcome::Retry(text)
     } else {
@@ -1137,7 +1212,20 @@ pub(super) fn disconnect_outcome(reason: DisconnectReasonCode, text: Option<&str
     }
 }
 
+/// The text that names another server. The broker chooses it, so it goes through
+/// `display_safe`. Empty when the packet has no server reference.
+fn server_reference_text(server: Option<&str>) -> String {
+    server.map_or_else(String::new, |s| {
+        format!(" Server reference: {}.", display_safe(s))
+    })
+}
+
 fn connack_text(ack: &ConnectAck) -> String {
+    let more = server_reference_text(ack.server_reference.as_deref());
+    format!("{}{more}", connack_text_base(ack))
+}
+
+fn connack_text_base(ack: &ConnectAck) -> String {
     if ack.reason_code == ConnectAckReason::UnsupportedProtocolVersion {
         return NO_V5_TEXT.into();
     }

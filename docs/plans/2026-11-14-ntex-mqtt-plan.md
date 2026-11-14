@@ -61,7 +61,7 @@ Keep alive 0 (from the profile, or a v5 Server Keep Alive of 0) turns off dead-p
 
 ## Decisions
 
-- **D1. Keep the boundary.** Only `navigator-core/src/net.rs` (and its new submodules), the test helpers and `examples/flood.rs` use ntex. The public API of `navigator_core::net` gets additive changes only: `protocol` in the profile, subscription options, the `ConnectionDetails` event.
+- **D1. Keep the boundary.** Only `navigator-core/src/net.rs` (and its new submodules), the test helpers and `examples/flood.rs` use ntex. The public API of `navigator_core::net` has these allowed changes (the only caller is our app): the `protocol` field in the profile, `options` and `req` fields on `Command::Subscribe`, a `req` field on the `Subscribed` result (the ID of the Subscribe that it answers), an `attempt` field on `Status`, and the `ConnectionDetails` event with its `attempt`.
 - **D2. Keep OpenSSL.** `tls.rs` keeps the material, the verify callback and the diagnostics. It returns an `openssl::ssl::SslConnector`. `net.rs` wraps it with `ntex-tls`.
 - **D3. Our supervisor owns reconnect.** One `MqttConnector` call and one `Client` for each attempt. ntex-mqtt has no reconnect of its own, so there is no conflict. Backoff, retry rules, cancel, generations and the desired-subscription set stay as they are. "The session persists" is decided per version: v5 when `session_expiry_secs > 0`; v3 when Clean Session is off. That one function replaces `session_expiry_secs > 0` in `AttemptCtx` (`net.rs:853`). The session-filter tests (resume, offline removal, lost UNSUBACK, app restart) run on both versions.
 - **D4. Exact pin.** `ntex-mqtt = "=10.0.0"`. Add `ntex-tls` (`openssl`), `ntex-net` (`tokio`), and `ntex` with `default-features = false, features = ["tokio", "ws"]` for WebSocket only. Remove `ms-mqtt-client` and the vendor copy in S5, after the last user is ported.
@@ -85,7 +85,7 @@ Moved here from the rumqttc-next plan, unchanged. "Have" means v0.1.x has it; it
 | Incoming topic aliases | Keep. Set CONNECT `topic_alias_max` to 16 (the client dispatcher limit, `v5/client/connection.rs:189`). Test alias set, reuse and an invalid alias. |
 | Shared subscriptions | Keep |
 | **Subscription options: No Local, Retain As Published, Retain Handling** | **Add.** "Options" on the subscription row; stored in the profile. ntex: `SubscriptionOptions`. |
-| **Connection details from CONNACK** | **Add.** A "Connection details" popover from the status bar. ntex: `Client::packet()`. |
+| **Connection details from CONNACK** | **Add.** A "Connection details" popover from the status bar. ntex: `Client::packet()`. The app keeps only the details of the latest connection. |
 | Server reference | Show it in the error text only |
 | Subscription identifiers, outgoing topic aliases, user properties on CONNECT/SUBSCRIBE/UNSUBSCRIBE/DISCONNECT, enhanced auth, request-problem/response-information flags | Skip |
 

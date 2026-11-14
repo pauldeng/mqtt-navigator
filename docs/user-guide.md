@@ -172,7 +172,27 @@ Rules:
 - The colour dot is not a control. The colour comes from the position of the row and repeats after 10 rows. If you remove a row, the rows below it move up and change colour. A message takes the colour of the first subscription (from the top) that matches its topic. A message that matches no subscription has an empty dot.
 - Shared subscriptions (`$share/group/filter`) work.
 
+#### Subscription options (MQTT 5)
+
+With MQTT 5, each row has an **Options** button. MQTT 3.1.1 has no such options, so the button is not there.
+
+- **No Local:** the broker does not send you the messages that you publish yourself. MQTT 5 does not allow this option on a shared subscription. The app shows "No Local is not allowed on a shared subscription ($share/...)." and does not send the change.
+- **Retain As Published:** the broker keeps the retain flag of a message when it forwards it. Without this option, the broker clears the flag on a live message.
+- **Retained messages at subscribe:** "Always" sends the retained message each time you subscribe. "If new" sends it only if the subscription did not exist. "Never" does not send it.
+
+Each change sends the subscription again, and the row shows "Subscribing…". Retain handling acts when the broker takes the SUBSCRIBE. To skip the retained message of a topic, set "Never" on its row. The app saves the options with the subscription. The app sends the saved options again after each reconnect. The add input has no options: add the row, then set the options.
+
 The app saves the subscriptions in the connection.
+
+## Connection details
+
+While you are connected, the status bar has a **Connection details** button. It opens a list of the facts that the broker sent in its CONNACK.
+
+- MQTT 3.1.1: "Session present" only.
+- MQTT 5: "Session present", "Assigned client ID", "Keep alive", "Receive maximum", "Maximum packet size", "Maximum QoS", "Retained messages", "Wildcard subscriptions", "Shared subscriptions", "Subscription identifiers", "Topic alias maximum", "Server reference", "Response information" and "Reason string".
+- A line shows only when the broker sent the value. "Keep alive" always shows. It is the keep alive in use: the value of the broker (Server Keep Alive) if the broker sent one, else your value. "Keep alive: off" means 0. With keep alive off, the app finds a lost connection only when an operation times out or the system reports an error.
+
+If a broker refuses the connection or closes it with a server reference, the error text ends with "Server reference: …". The reference names another server. The app does not connect to it by itself.
 
 ## View messages
 

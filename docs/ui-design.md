@@ -65,6 +65,7 @@ The window has one place for each job:
   - A new row shows "Subscribing…" until the SUBACK arrives. Then it shows "Granted QoS 0" or "Granted QoS 1". The Q0 or Q1 tag is the QoS that you asked for. A row has no message count.
   - A rejected row shows the reason in text (for example "Not authorized to subscribe."), with **Retry** and **Remove**.
   - The rows are `ListItem`s on a virtual list. Each subscription gets a colour from its row position. The colours repeat after 10 rows. A message takes the colour of the **first** subscription in the list that matches its topic. The colour dot is not a control.
+  - **Options** (MQTT 5 only; hidden for MQTT 3.1.1): a ghost `Button` on the row opens a `Popover` with two `Switch`es (No Local, Retain As Published) and a `ToggleGroup` for Retain Handling (Always, If new, Never). A change sends a new SUBSCRIBE and the row shows "Subscribing…" again. The tooltip of the button lists the options. The app refuses No Local on a shared filter (`$share/...`) with a text under the input. The options are saved with the subscription. The add input has no options: add the row, then set its options.
   - **Show only**: click a subscription to show only its messages, and click again to show all. This changes the view only. It does not unsubscribe. Remove (×) unsubscribes.
   - A new profile starts with the subscription `#`, so messages appear at once.
     - When you add a narrower filter while `#` exists, a hint asks "Remove # to receive only your filters?" with a **Remove #** button.
@@ -108,7 +109,7 @@ The window has one place for each job:
   - **Clear retained** shows only for a topic that has a retained message. It sits apart from the other actions and asks for confirmation. The store tracks the broker state for each topic: a retained message with a payload sets it, a retained message with an empty payload or our own acknowledged Clear ends it, and the Message Expiry Interval of the retained message ends it. A message without the Retain flag changes nothing.
   - The pane header has a close button. The pane stays closed until you open it again (button in the centre header, or the command palette).
   - When the window is narrower than 1 100 px, the details open as a right-side sheet.
-- **Status bar:** URL, msg/s, topics, memory used against the budget, and drops (red with text when above 0). A `Tag::warning()` shows "Not encrypted" for TCP and WS, and "Insecure TLS" when TLS verification is off.
+- **Status bar:** URL, a "Connection details" button while connected (a `Popover` with the facts of the CONNACK, see the user guide), msg/s, topics, memory used against the budget, and drops (red with text when above 0). A `Tag::warning()` shows "Not encrypted" for TCP and WS, and "Insecure TLS" when TLS verification is off.
 - **Panes:** the three panes (subscriptions, centre, details) are resizable. Each side pane has a least and a most width in rem, and the centre keeps at least 22.5 rem. The app saves the two side widths (`ui.pane_widths`) and clamps them when it loads them. "Expand" widens the details pane. The expanded width is not saved. "Reset layout" restores the default widths (16.25 rem and 22.5 rem).
 
 ### 3.1 Connection sheet
@@ -163,7 +164,7 @@ This table lists what the app uses now.
 | Title bar | `TitleBar` with `Select` (profiles), `Input` with a search icon prefix, `Button` (commands, theme menu, connect) |
 | Theme menu | `Button::dropdown_menu` with a `PopupMenu`: section "Appearance" and section "Theme", each with a checked item |
 | Three panes | `h_resizable` with `resizable_panel().size(saved).size_range(..)`. The side panels are `.fixed()`. We save the widths in `on_resize`. |
-| Subscriptions list | `ListItem` rows (selected state = "Show only") in a `uniform_list`; a colour chip (`div` with a theme `chart_1`…`chart_5` colour); `Tag` (QoS); `Button::ghost().xsmall().icon(..)` (remove); `Input` with `InputEvent::PressEnter` and a `ToggleGroup` for the QoS |
+| Subscriptions list | `ListItem` rows (selected state = "Show only") in a `uniform_list`; a colour chip (`div` with a theme `chart_1`…`chart_5` colour); `Tag` (QoS); `Button::ghost().xsmall().icon(..)` (remove); `Input` with `InputEvent::PressEnter` and a `ToggleGroup` for the QoS; `Popover` with `Switch` and `ToggleGroup` for the options (MQTT 5) |
 | Messages / Tree switch, All / Received / Sent filter | `TabBar::segmented()` |
 | Follow | `Toggle` |
 | Filter chips, status warnings | `Tag`, `Tag::warning()` |
@@ -183,7 +184,7 @@ This table lists what the app uses now.
 | Messages to the user | `push_notification`. Errors stay until the user closes them. |
 | Command palette | `Command` in `open_dialog` |
 | Empty states | `Empty` with `EmptyHeader`, `EmptyTitle`, `EmptyDescription` and `EmptyContent` |
-| Status bar | `StatusBar` with `.left()` and `.right()` |
+| Status bar | `StatusBar` with `.left()` and `.right()`; `Popover` with a ghost `Button` trigger for Connection details |
 | Icons | Lucide icons from `gpui_kit::assets::Assets`. Use one icon set only. Use icons, not text glyphs (chevrons, arrows, check marks). |
 
 Not used yet: `Spinner`, `Button::loading`, `Popover` with `TextView` (update notes), `Kbd`.

@@ -147,7 +147,7 @@ async fn wait_subscribed(net: &mut Net, wait: Duration) {
                 assert_eq!(result, Ok(Qos::AtLeastOnce));
                 return;
             }
-            Event::Reconnected { .. } => {}
+            Event::Reconnected { .. } | Event::ConnectionDetails { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     }

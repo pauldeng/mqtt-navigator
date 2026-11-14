@@ -126,7 +126,9 @@ async fn wait_subscribed(net: &mut Net, wait: Duration) {
                 assert_eq!(result, Ok(Qos::AtLeastOnce));
                 return;
             }
-            Event::Reconnected { .. } | Event::SessionFilters { .. } => {}
+            Event::Reconnected { .. }
+            | Event::SessionFilters { .. }
+            | Event::ConnectionDetails { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -139,7 +141,9 @@ async fn wait_published(net: &mut Net, op_id: u64) -> PublishResult {
             Event::Published {
                 op_id: id, result, ..
             } if id == op_id => return result,
-            Event::Reconnected { .. } | Event::SessionFilters { .. } => {}
+            Event::Reconnected { .. }
+            | Event::SessionFilters { .. }
+            | Event::ConnectionDetails { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     }

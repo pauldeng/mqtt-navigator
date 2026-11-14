@@ -19,9 +19,11 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::TabBar;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
@@ -32,7 +34,8 @@ use gpui_kit::*;
 use navigator_core::Qos;
 use navigator_core::decode::preview;
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Protocol, SendError, Status,
+    Command, ConnState, ConnectConfig, ConnectionDetails, Event, Net, NetLimits, Profile, Protocol,
+    RetainHandling, SendError, Status, SubOptions,
 };
 use navigator_core::settings::{Load, RowHeight, Settings, ThemeMode, ViewMode};
 use navigator_core::store::{
@@ -44,8 +47,8 @@ use uuid::Uuid;
 
 use crate::connections::{Choice, ConnectionSheet, ProfileItem, SheetEvent};
 use crate::messages::{
-    colour_slot, format_time, granted_text, group_digits, status_failed, status_from_result,
-    status_text,
+    colour_slot, details_lines, format_time, granted_text, group_digits, options_text,
+    status_failed, status_from_result, status_text,
 };
 use crate::palette::Cmd;
 use crate::persist::Writer;
@@ -259,9 +262,52 @@ struct Sub {
     /// Cheap to clone: the row, the index and the element ids share it.
     filter: SharedString,
     qos: Qos,
+    /// MQTT 5 options. MQTT 3.1.1 does not send them.
+    options: SubOptions,
     state: SubState,
+    /// The request ID of the latest Subscribe that the net thread accepted for this row. A
+    /// `Subscribed` result changes the row only if it has this ID. 0: the filter came from the
+    /// profile, or the connection is new (the net thread subscribes with ID 0 then).
+    req: u64,
     /// Rises with each push, so `rows` stays sorted by it. The index stores it, not a position.
     seq: u64,
+}
+
+/// The details of the latest connection, as the UI got them. The log can still hold the
+/// details of an older attempt (same generation) when a newer attempt is already `Connected`.
+/// So the popover shows the details only while their attempt is the one of the status.
+#[derive(Default)]
+struct DetailsCache {
+    latest: Option<(u64, Box<ConnectionDetails>)>,
+}
+
+impl DetailsCache {
+    /// The newest event wins: the log keeps the order.
+    fn offer(&mut self, attempt: u64, details: Box<ConnectionDetails>) {
+        self.latest = Some((attempt, details));
+    }
+
+    /// The status left `Connected`, or the UI started or cancelled a connection.
+    fn clear(&mut self) {
+        self.latest = None;
+    }
+
+    /// The details to show: the status must be `Connected`, and the attempt must match.
+    fn current(&self, status: &Status) -> Option<&ConnectionDetails> {
+        let (attempt, details) = self.latest.as_ref()?;
+        (status.state == ConnState::Connected && *attempt == status.attempt).then_some(&**details)
+    }
+}
+
+/// The answer to a change of subscription options (see `Subs::check_options_change`).
+#[derive(Debug, PartialEq, Eq)]
+enum OptionsChange {
+    /// Nothing to do: no such row, the row is being removed, or the same options.
+    Ignore,
+    /// The options are not allowed. The text is for the user.
+    Refused(&'static str),
+    /// The row has the new options. Send a SUBSCRIBE with this QoS.
+    Go(Qos),
 }
 
 /// The subscription rows. Free of gpui types, so that tests can run it.
@@ -273,6 +319,9 @@ struct Subs {
     rows: Vec<Sub>,
     index: HashMap<SharedString, u64>,
     next_seq: u64,
+    /// The last request ID that `new_req` gave out. IDs are never reused, so the result of an
+    /// older row with the same filter cannot match a new row.
+    last_req: u64,
     /// The rows changed since the store got the filters (see `Navigator::sync_subs`).
     dirty: bool,
     /// Rises when a row, or its state, may have changed. The subscription list redraws on it.
@@ -289,6 +338,67 @@ impl Subs {
         subs
     }
 
+    /// The rows of the active profile (none without a profile), with their saved options.
+    fn of_profile(profile: Option<&Profile>) -> Self {
+        let Some(p) = profile else {
+            return Self::default();
+        };
+        let mut subs = Self::from_profile(&p.subscriptions);
+        for s in &mut subs.rows {
+            s.options = p.options_of(&s.filter);
+        }
+        subs
+    }
+
+    /// Writes the rows that the user sees into `p`. A default option is not stored.
+    fn write_to(&self, p: &mut Profile) {
+        p.subscriptions = self.wanted();
+        p.subscription_options = self.wanted_options();
+    }
+
+    /// A new request ID for a Subscribe.
+    fn new_req(&mut self) -> u64 {
+        self.last_req += 1;
+        self.last_req
+    }
+
+    /// Checks a change of options. It changes nothing: the row takes the options only when the
+    /// net thread accepted the Subscribe (`commit_options`), so the row and the net thread
+    /// agree. A row that is being removed does not change.
+    fn check_options_change(&mut self, filter: &str, options: SubOptions) -> OptionsChange {
+        let Some(sub) = self.row(filter) else {
+            return OptionsChange::Ignore;
+        };
+        if sub.state.removal_accepted() || sub.options == options {
+            return OptionsChange::Ignore;
+        }
+        match options.check(filter) {
+            Err(text) => OptionsChange::Refused(text),
+            Ok(()) => OptionsChange::Go(sub.qos),
+        }
+    }
+
+    /// The row takes `options`. `req`: the ID of the Subscribe that the net thread accepted,
+    /// and the row waits for its result. `None`: nothing was sent (no connection).
+    fn commit_options(&mut self, filter: &str, options: SubOptions, req: Option<u64>) {
+        if let Some(s) = self.row(filter) {
+            s.options = options;
+            if let Some(req) = req {
+                s.req = req;
+                s.state = SubState::Pending;
+            }
+        }
+    }
+
+    /// The options that differ from the default, for the rows that are wanted.
+    fn wanted_options(&self) -> std::collections::BTreeMap<String, SubOptions> {
+        self.rows
+            .iter()
+            .filter(|s| !s.state.removal_accepted() && s.options != SubOptions::default())
+            .map(|s| (s.filter.to_string(), s.options))
+            .collect()
+    }
+
     /// Adds a Pending row. A known filter changes nothing.
     fn push(&mut self, filter: &str, qos: Qos) {
         if self.index.contains_key(filter) {
@@ -299,7 +409,9 @@ impl Subs {
         self.rows.push(Sub {
             filter,
             qos,
+            options: SubOptions::default(),
             state: SubState::Pending,
+            req: 0,
             seq: self.next_seq,
         });
         self.next_seq += 1;
@@ -362,8 +474,20 @@ impl Subs {
         }
     }
 
-    fn on_subscribed(&mut self, filter: &str, result: Result<Qos, String>) {
+    /// A new connection: the net thread builds its wanted set from the profile, with ID 0.
+    fn new_connection(&mut self) {
+        self.connection_reset();
+        for s in &mut self.rows {
+            s.req = 0;
+        }
+    }
+
+    /// A SUBSCRIBE result. `req` is the ID of the Subscribe that it answers. A result with
+    /// another ID belongs to an older state of the filter (an older change, or an older row of
+    /// the same filter) and changes nothing.
+    fn on_subscribed(&mut self, filter: &str, req: u64, result: Result<Qos, String>) {
         if let Some(s) = self.row(filter)
+            && s.req == req
             && !s.state.removal_accepted()
         {
             s.state = result.map_or_else(SubState::Failed, SubState::Active);
@@ -617,6 +741,8 @@ pub struct Navigator {
     sub_error: Option<String>,
     /// Set when the connection came back by itself. Cleared when the connection ends again.
     reconnected_at: Option<std::time::SystemTime>,
+    /// The CONNACK facts of the live connection, for "Connection details".
+    details: DetailsCache,
     sub_qos: Qos,
     next_op: u64,
     last_result: Option<(u64, String)>,
@@ -739,7 +865,7 @@ impl Navigator {
         let root_focus = cx.focus_handle();
         root_focus.focus(window, cx);
 
-        let subs = Subs::from_profile(profile.as_ref().map_or(&[], |p| &p.subscriptions));
+        let subs = Subs::of_profile(profile.as_ref());
         let (writer_errors, writer_errors_rx) = tokio::sync::mpsc::channel(4);
         let writer = crate::persist::settings_path().map(|p| Writer::start(p, writer_errors));
         let mut this = Self {
@@ -805,6 +931,7 @@ impl Navigator {
             sub_input,
             sub_error: None,
             reconnected_at: None,
+            details: DetailsCache::default(),
             sub_qos: Qos::AtMostOnce,
             next_op: 1,
             last_result: None,
@@ -881,6 +1008,7 @@ impl Navigator {
         // The gate drops the later statuses of the old connection. Its last status must not
         // stay on screen as "Connected".
         self.status = Status::default();
+        self.details.clear();
         self.secret_req = None;
         self.reconnect_pending = false;
     }
@@ -893,7 +1021,7 @@ impl Navigator {
             return Ok(());
         };
         // The subscription list is what the user sees now, not what the profile has saved.
-        profile.subscriptions = self.subs.wanted();
+        self.subs.write_to(&mut profile);
         let secrets = self
             .secret_cache
             .get(&profile.id)
@@ -909,6 +1037,7 @@ impl Navigator {
         // A settings file or an old version can hold a value that panics the MQTT library.
         config.validate()?;
         self.reconnect_pending = false;
+        self.details.clear();
         self.conn_protocol = config.protocol;
         tracing::info!(url = %self.url(), "Connect");
         match self.net.connect(config) {
@@ -918,7 +1047,7 @@ impl Navigator {
                 let extra = self.connect_owners.len().saturating_sub(16);
                 self.connect_owners.drain(..extra);
                 // The broker forgets the subscriptions of the old connection.
-                self.subs.connection_reset();
+                self.subs.new_connection();
                 Ok(())
             }
             // ponytail: the command queue (64) is full only under extreme UI spam.
@@ -943,7 +1072,8 @@ impl Navigator {
         }
         let qos = self.sub_qos;
         // No row and no input reset if the queue refuses the command.
-        if let Err(e) = self.send_subscribe(&filter, qos) {
+        let req = self.subs.new_req();
+        if let Err(e) = self.send_subscribe(&filter, qos, SubOptions::default(), req) {
             self.sub_error = Some(send_error_text(e).into());
             cx.notify();
             return;
@@ -952,6 +1082,9 @@ impl Navigator {
         self.sub_input
             .update(cx, |i, cx| i.set_value("", window, cx));
         self.subs.push(&filter, qos);
+        if let Some(s) = self.subs.row(&filter) {
+            s.req = req;
+        }
         self.persist_subs();
         cx.notify();
     }
@@ -970,22 +1103,68 @@ impl Navigator {
         }
     }
 
-    fn send_subscribe(&mut self, filter: &str, qos: Qos) -> Result<(), SendError> {
+    fn send_subscribe(
+        &mut self,
+        filter: &str,
+        qos: Qos,
+        options: SubOptions,
+        req: u64,
+    ) -> Result<(), SendError> {
         self.net.send(Command::Subscribe {
             filter: filter.to_string(),
             qos,
+            options,
+            req,
         })
     }
 
+    /// The user changed the options of a row. MQTT 5 only. While a connection or an attempt is
+    /// live, the change is sent as a new SUBSCRIBE with a new request ID: the broker replaces
+    /// the old options. The row takes the options and the ID only when the net thread accepted
+    /// the command. If it did not (queue full), the row keeps the options that the net thread
+    /// holds, and shows the failure. With no connection, only the row and the profile change;
+    /// the next Connect subscribes with them.
+    fn set_sub_options(&mut self, filter: &str, options: SubOptions, cx: &mut Context<Self>) {
+        let qos = match self.subs.check_options_change(filter, options) {
+            OptionsChange::Ignore => return,
+            OptionsChange::Refused(text) => {
+                self.sub_error = Some(text.into());
+                cx.notify();
+                return;
+            }
+            OptionsChange::Go(qos) => qos,
+        };
+        self.sub_error = None;
+        if self.is_live() {
+            let req = self.subs.new_req();
+            match self.send_subscribe(filter, qos, options, req) {
+                Ok(()) => self.subs.commit_options(filter, options, Some(req)),
+                Err(e) => {
+                    if let Some(s) = self.subs.row(filter) {
+                        s.state = SubState::Failed(send_error_text(e).into());
+                    }
+                }
+            }
+        } else {
+            self.subs.commit_options(filter, options, None);
+        }
+        self.persist_subs();
+        cx.notify();
+    }
+
     fn retry_sub(&mut self, filter: &str, cx: &mut Context<Self>) {
-        let Some(qos) = self.subs.row(filter).map(|s| s.qos) else {
+        let Some((qos, options)) = self.subs.row(filter).map(|s| (s.qos, s.options)) else {
             return;
         };
-        let state = match self.send_subscribe(filter, qos) {
+        let req = self.subs.new_req();
+        let state = match self.send_subscribe(filter, qos, options, req) {
             Ok(()) => SubState::Pending,
             Err(e) => SubState::Failed(send_error_text(e).into()),
         };
         if let Some(s) = self.subs.row(filter) {
+            if state == SubState::Pending {
+                s.req = req;
+            }
             s.state = state;
         }
         cx.notify();
@@ -1331,6 +1510,7 @@ impl Navigator {
             | Event::Unsubscribed { generation, .. }
             | Event::Published { generation, .. }
             | Event::SessionFilters { generation, .. }
+            | Event::ConnectionDetails { generation, .. }
             | Event::Error { generation, .. } => *generation,
         };
         // The filters belong to the profile of the connection, also after a switch.
@@ -1361,12 +1541,20 @@ impl Navigator {
                 self.store.mark_reconnected(at);
                 self.restore_anchor();
             }
-            Event::Subscribed { filter, result, .. } => {
+            Event::Subscribed {
+                filter,
+                req,
+                result,
+                ..
+            } => {
                 if let Err(why) = &result {
                     tracing::warn!(%why, "Subscribe failed");
                 }
-                self.subs.on_subscribed(&filter, result);
+                self.subs.on_subscribed(&filter, req, result);
             }
+            Event::ConnectionDetails {
+                attempt, details, ..
+            } => self.details.offer(attempt, details),
             Event::Published { .. } | Event::SessionFilters { .. } => {}
             Event::Error { message, .. } => self.last_result = Some((0, message)),
             // An UNSUBSCRIBE result shows on its row, not in the publish line.
@@ -1390,6 +1578,7 @@ impl Navigator {
                             v.reconnected_at = None;
                             // The broker forgets the subscriptions. Results come again.
                             v.subs.connection_reset();
+                            v.details.clear();
                         }
                         v.status = status;
                         cx.notify();
@@ -1810,6 +1999,10 @@ impl Navigator {
                 Qos::AtMostOnce => "Q0",
                 Qos::AtLeastOnce => "Q1",
             }))
+            .when(self.composer_protocol() == Protocol::V5, |d| {
+                let locked = s.state.removal_accepted();
+                d.child(self.options_button(&row_id, &s.filter, s.options, locked, cx))
+            })
             .child(
                 Button::new((row_id.clone(), "remove"))
                     .ghost()
@@ -1867,6 +2060,163 @@ impl Navigator {
             .on_click(cx.listener(move |v, _, _, cx| v.toggle_show_only(&pick, cx)))
             .child(v_flex().w_full().child(line).child(status))
             .into_any_element()
+    }
+
+    /// The "Options" popover of a subscription row (MQTT 5): No Local, Retain As Published and
+    /// Retain Handling. Each change sends a new SUBSCRIBE (`set_sub_options`).
+    fn options_button(
+        &self,
+        row_id: &ElementId,
+        filter: &SharedString,
+        options: SubOptions,
+        locked: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+        let filter = filter.clone();
+        // A click on the button must not toggle "Show only" on the row.
+        div()
+            .id((row_id.clone(), "options-wrap"))
+            .flex_none()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                Popover::new((row_id.clone(), "options"))
+                    .trigger(
+                        Button::new((row_id.clone(), "options-button"))
+                            .ghost()
+                            .xsmall()
+                            .label("Options")
+                            .tooltip(options_text(&options)),
+                    )
+                    .content(move |_, _, _| {
+                        let id = ElementId::from(filter.clone());
+                        let change = {
+                            let (weak, filter) = (weak.clone(), filter.clone());
+                            move |next: SubOptions, cx: &mut App| {
+                                weak.update(cx, |v, cx| v.set_sub_options(&filter, next, cx))
+                                    .ok();
+                            }
+                        };
+                        let (on_nl, on_rap, on_rh) =
+                            (change.clone(), change.clone(), change.clone());
+                        v_flex()
+                            .gap_2()
+                            .p_1()
+                            .w(ui(280.))
+                            .child(
+                                Switch::new((id.clone(), "no-local"))
+                                    .checked(options.no_local)
+                                    .disabled(locked)
+                                    .label("No Local")
+                                    .on_click(move |on: &bool, _, cx| {
+                                        on_nl(
+                                            SubOptions {
+                                                no_local: *on,
+                                                ..options
+                                            },
+                                            cx,
+                                        );
+                                    }),
+                            )
+                            .child(
+                                Switch::new((id.clone(), "rap"))
+                                    .checked(options.retain_as_published)
+                                    .disabled(locked)
+                                    .label("Retain As Published")
+                                    .on_click(move |on: &bool, _, cx| {
+                                        on_rap(
+                                            SubOptions {
+                                                retain_as_published: *on,
+                                                ..options
+                                            },
+                                            cx,
+                                        );
+                                    }),
+                            )
+                            .child(div().text_xs().child("Retained messages at subscribe"))
+                            .child(
+                                ToggleGroup::new((id.clone(), "rh"))
+                                    .segmented()
+                                    .single()
+                                    .small()
+                                    .disabled(locked)
+                                    .child(
+                                        Toggle::new((id.clone(), "rh-0")).label("Always").checked(
+                                            options.retain_handling == RetainHandling::OnSubscribe,
+                                        ),
+                                    )
+                                    .child(
+                                        Toggle::new((id.clone(), "rh-1")).label("If new").checked(
+                                            options.retain_handling
+                                                == RetainHandling::OnNewSubscription,
+                                        ),
+                                    )
+                                    .child(
+                                        Toggle::new((id, "rh-2")).label("Never").checked(
+                                            options.retain_handling == RetainHandling::Never,
+                                        ),
+                                    )
+                                    .on_click(move |checks: &Vec<bool>, _, cx| {
+                                        let Some(ix) = checks.iter().position(|c| *c) else {
+                                            return;
+                                        };
+                                        let retain_handling = [
+                                            RetainHandling::OnSubscribe,
+                                            RetainHandling::OnNewSubscription,
+                                            RetainHandling::Never,
+                                        ][ix.min(2)];
+                                        on_rh(
+                                            SubOptions {
+                                                retain_handling,
+                                                ..options
+                                            },
+                                            cx,
+                                        );
+                                    }),
+                            )
+                            .into_any_element()
+                    }),
+            )
+    }
+
+    /// "Connection details" in the status bar: a popover with the facts of the CONNACK.
+    fn details_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let details = self.details.current(&self.status)?;
+        let lines = details_lines(details);
+        let theme = cx.theme();
+        let (muted, mono) = (theme.muted_foreground, theme.mono_font_family.clone());
+        Some(
+            Popover::new("connection-details")
+                .trigger(
+                    Button::new("connection-details-button")
+                        .xsmall()
+                        .ghost()
+                        .label("Connection details"),
+                )
+                .content(move |_, _, _| {
+                    let rows = lines.iter().map(|(label, value)| {
+                        h_flex()
+                            .gap_3()
+                            .text_xs()
+                            .child(div().w(ui(170.)).text_color(muted).child(*label))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_family(mono.clone())
+                                    .child(value.clone()),
+                            )
+                    });
+                    v_flex()
+                        .gap_1()
+                        .p_1()
+                        .w(ui(380.))
+                        .child(div().text_sm().child("Connection details"))
+                        .children(rows)
+                        .into_any_element()
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_subs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1969,6 +2319,7 @@ impl Navigator {
             self.subs.rev,
             &self.show_only,
             self.connected(),
+            self.composer_protocol() == Protocol::V5,
             self.rem.to_bits(),
             theme.theme_name(),
         )
@@ -2677,6 +3028,7 @@ impl Navigator {
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.store.stats();
         let memory = self.render_memory(s.used_bytes, cx.entity().downgrade());
+        let details_button = self.details_button(cx);
         let drops = s.drops
             + s.topic_drops
             + self
@@ -2695,6 +3047,9 @@ impl Navigator {
         }
         if self.reconnected_at.is_some() {
             left = left.child("Reconnected");
+        }
+        if let Some(button) = details_button {
+            left = left.child(button);
         }
         if self.reconnect_pending && self.is_live() {
             let id = self.profile.as_ref().map(|p| p.id);
@@ -3027,9 +3382,9 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
-        COALESCE, FRAME_BUDGET, GenGate, SubState, Subs, WORK_RESERVE, coalesce_wait,
-        connection_live, merge_budget, scroll_top_of, send_error_text, top_row, ui,
-        validate_filter,
+        COALESCE, ConnState, ConnectionDetails, DetailsCache, FRAME_BUDGET, GenGate, Protocol,
+        Status, SubState, Subs, WORK_RESERVE, coalesce_wait, connection_live, merge_budget,
+        scroll_top_of, send_error_text, top_row, ui, validate_filter,
     };
     use gpui_kit::{px, rems};
     use navigator_core::Qos;
@@ -3157,6 +3512,322 @@ mod tests {
         assert_eq!(top_row(0., 40.), (0, 0.));
     }
 
+    /// The rows take the options of the profile, and the profile takes only the options that
+    /// differ from the default. A row whose removal was accepted writes nothing.
+    #[test]
+    fn subscription_rows_keep_their_options_and_write_only_non_default_ones() {
+        let mut p = navigator_core::net::Profile::new();
+        p.subscriptions = vec![
+            ("a".into(), Qos::AtMostOnce),
+            ("b".into(), Qos::AtLeastOnce),
+            ("c".into(), Qos::AtMostOnce),
+        ];
+        let no_local = navigator_core::net::SubOptions {
+            no_local: true,
+            ..navigator_core::net::SubOptions::default()
+        };
+        let never = navigator_core::net::SubOptions {
+            retain_handling: navigator_core::net::RetainHandling::Never,
+            ..navigator_core::net::SubOptions::default()
+        };
+        p.subscription_options.insert("a".into(), no_local);
+        p.subscription_options.insert("c".into(), never);
+        let mut s = Subs::of_profile(Some(&p));
+        let options: Vec<_> = s
+            .rows
+            .iter()
+            .map(|r| (r.filter.to_string(), r.options))
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("a".to_owned(), no_local),
+                ("b".to_owned(), navigator_core::net::SubOptions::default()),
+                ("c".to_owned(), never)
+            ]
+        );
+        s.begin_remove("c");
+        s.row("b").expect("row b").options = no_local;
+        s.row("a").expect("row a").options = navigator_core::net::SubOptions::default();
+        let mut out = navigator_core::net::Profile::new();
+        s.write_to(&mut out);
+        assert_eq!(
+            out.subscriptions,
+            [
+                ("a".to_owned(), Qos::AtMostOnce),
+                ("b".to_owned(), Qos::AtLeastOnce)
+            ]
+        );
+        assert_eq!(
+            out.subscription_options.into_iter().collect::<Vec<_>>(),
+            [("b".to_owned(), no_local)]
+        );
+        assert!(Subs::of_profile(None).rows.is_empty());
+    }
+
+    fn opts(no_local: bool, rap: bool) -> navigator_core::net::SubOptions {
+        navigator_core::net::SubOptions {
+            no_local,
+            retain_as_published: rap,
+            ..Default::default()
+        }
+    }
+
+    /// The UI does what `set_sub_options` does when the net thread accepts a change.
+    fn accepted(s: &mut Subs, filter: &str, options: navigator_core::net::SubOptions) -> u64 {
+        use super::OptionsChange;
+        assert!(matches!(
+            s.check_options_change(filter, options),
+            OptionsChange::Go(_)
+        ));
+        let req = s.new_req();
+        s.commit_options(filter, options, Some(req));
+        req
+    }
+
+    /// A, B accepted; then A again fails to enqueue. The row keeps B and B's ID (what the net
+    /// thread holds) and shows the failure. Only the result with B's ID changes it.
+    #[test]
+    fn a_failed_enqueue_leaves_the_row_with_what_core_holds() {
+        use super::OptionsChange;
+        let (a, b) = (opts(true, false), opts(false, true));
+        let mut s = Subs::default();
+        s.push("t", Qos::AtLeastOnce);
+        let r1 = accepted(&mut s, "t", a);
+        let r2 = accepted(&mut s, "t", b);
+        // A again: the check passes, the send fails, the row gets only the failure text.
+        assert_eq!(
+            s.check_options_change("t", a),
+            OptionsChange::Go(Qos::AtLeastOnce)
+        );
+        let failure = SubState::Failed("The queue is full.".into());
+        s.row("t").expect("row").state = failure.clone();
+        let row = s.row("t").expect("row");
+        assert_eq!((row.options, row.req, row.state.clone()), (b, r2, failure));
+        // The old result does not change the row. The result of the accepted B does.
+        s.on_subscribed("t", r1, Ok(Qos::AtLeastOnce));
+        assert!(matches!(
+            s.row("t").expect("row").state,
+            SubState::Failed(_)
+        ));
+        s.on_subscribed("t", r2, Ok(Qos::AtLeastOnce));
+        assert_eq!(
+            s.row("t").expect("row").state,
+            SubState::Active(Qos::AtLeastOnce)
+        );
+    }
+
+    /// A, B, A are all accepted: three IDs. The results of the first two do not decide the row,
+    /// although the last options equal the first. A late "lost" with an old ID is ignored.
+    #[test]
+    fn repeated_values_are_told_apart_by_the_request_id() {
+        let (a, b) = (opts(true, false), opts(false, true));
+        let mut s = Subs::default();
+        s.push("t", Qos::AtLeastOnce);
+        let r1 = accepted(&mut s, "t", a);
+        let r2 = accepted(&mut s, "t", b);
+        let r3 = accepted(&mut s, "t", a);
+        assert!(r1 < r2 && r2 < r3);
+        s.on_subscribed("t", r1, Ok(Qos::AtLeastOnce));
+        s.on_subscribed("t", r2, Ok(Qos::AtLeastOnce));
+        assert_eq!(s.row("t").expect("row").state, SubState::Pending);
+        s.on_subscribed("t", r3, Ok(Qos::AtMostOnce));
+        assert_eq!(
+            s.row("t").expect("row").state,
+            SubState::Active(Qos::AtMostOnce)
+        );
+        s.on_subscribed("t", r1, Err("The connection closed.".into()));
+        assert_eq!(
+            s.row("t").expect("row").state,
+            SubState::Active(Qos::AtMostOnce)
+        );
+        assert_eq!(s.row("t").expect("row").options, a);
+    }
+
+    /// A failed enqueue, then a reconnect: the row wants what core holds. The net thread
+    /// resubscribes with the stored ID, so the resubscribe result resolves the row.
+    #[test]
+    fn a_failed_enqueue_then_a_reconnect_resolves_with_the_resubscribe_result() {
+        let a = opts(true, false);
+        let mut s = Subs::default();
+        s.push("t", Qos::AtLeastOnce);
+        let r1 = accepted(&mut s, "t", a);
+        s.on_subscribed("t", r1, Ok(Qos::AtLeastOnce));
+        // B fails to enqueue: only the failure text changes.
+        s.row("t").expect("row").state = SubState::Failed("The queue is full.".into());
+        // The connection is lost (Reconnecting): the row waits again.
+        s.connection_reset();
+        assert_eq!(s.row("t").expect("row").state, SubState::Pending);
+        assert_eq!(s.row("t").expect("row").options, a);
+        // The resubscribe of the net thread echoes r1 (A).
+        s.on_subscribed("t", r1, Ok(Qos::AtLeastOnce));
+        assert_eq!(
+            s.row("t").expect("row").state,
+            SubState::Active(Qos::AtLeastOnce)
+        );
+    }
+
+    /// A removed filter that is added again is a new row with a new ID: results of the earlier
+    /// row are ignored. A new connection sets every ID to 0 (the net thread subscribes from the
+    /// profile), and an older ID is then ignored.
+    #[test]
+    fn an_older_row_or_connection_cannot_decide_a_new_row() {
+        let mut s = Subs::default();
+        s.push("t", Qos::AtLeastOnce);
+        let first = s.new_req();
+        s.row("t").expect("row").req = first;
+        s.begin_remove("t");
+        s.on_unsubscribed("t", Ok(()));
+        assert!(!s.contains("t"));
+        s.push("t", Qos::AtLeastOnce);
+        let second = s.new_req();
+        s.row("t").expect("row").req = second;
+        assert_ne!(first, second);
+        s.on_subscribed("t", first, Ok(Qos::AtLeastOnce));
+        assert_eq!(s.row("t").expect("row").state, SubState::Pending);
+        s.on_subscribed("t", second, Ok(Qos::AtLeastOnce));
+        assert_eq!(
+            s.row("t").expect("row").state,
+            SubState::Active(Qos::AtLeastOnce)
+        );
+        // A new connection: ID 0 for every row.
+        s.new_connection();
+        assert_eq!(s.row("t").expect("row").req, 0);
+        s.on_subscribed("t", second, Ok(Qos::AtLeastOnce));
+        assert_eq!(s.row("t").expect("row").state, SubState::Pending);
+        s.on_subscribed("t", 0, Ok(Qos::AtMostOnce));
+        assert_eq!(
+            s.row("t").expect("row").state,
+            SubState::Active(Qos::AtMostOnce)
+        );
+    }
+
+    /// An edit with no connection changes the row only: the ID stays. The next Connect reads
+    /// the options from the rows through `write_to`: they reach the profile, and the core test
+    /// `v5_subscribe_sends_the_options_byte` shows that the first SUBSCRIBE of a connection
+    /// sends the options of the profile.
+    #[test]
+    fn an_edit_without_a_connection_reaches_the_profile_of_the_next_connect() {
+        use navigator_core::net::{ConnectConfig, Profile};
+        let o = opts(true, true);
+        let mut s = Subs::default();
+        s.push("t", Qos::AtLeastOnce);
+        assert!(matches!(
+            s.check_options_change("t", o),
+            super::OptionsChange::Go(Qos::AtLeastOnce)
+        ));
+        s.commit_options("t", o, None);
+        assert_eq!(s.row("t").expect("row").req, 0);
+        let mut p = Profile::new();
+        s.write_to(&mut p);
+        let config = ConnectConfig::from(p);
+        assert_eq!(config.profile.options_of("t"), o);
+        assert_eq!(
+            config.profile.subscriptions,
+            [("t".to_owned(), Qos::AtLeastOnce)]
+        );
+    }
+
+    /// A row that is being removed does not change its options. A shared filter refuses No
+    /// Local.
+    #[test]
+    fn a_row_in_removal_keeps_its_options() {
+        use super::OptionsChange;
+        let mut s = Subs::default();
+        s.push("t", Qos::AtLeastOnce);
+        s.begin_remove("t");
+        assert_eq!(
+            s.check_options_change("t", opts(true, false)),
+            OptionsChange::Ignore
+        );
+        assert_eq!(s.row("t").expect("row").options, opts(false, false));
+        s.push("$share/g/t", Qos::AtMostOnce);
+        assert!(matches!(
+            s.check_options_change("$share/g/t", opts(true, false)),
+            OptionsChange::Refused(_)
+        ));
+        assert_eq!(
+            s.check_options_change("x", opts(true, false)),
+            OptionsChange::Ignore
+        );
+    }
+
+    fn status(state: ConnState, attempt: u64) -> Status {
+        Status {
+            generation: 1,
+            state,
+            attempt,
+        }
+    }
+
+    fn details_with(receive_max: u16) -> Box<ConnectionDetails> {
+        use navigator_core::net::V5Details;
+        Box::new(ConnectionDetails {
+            protocol: Protocol::V5,
+            session_present: false,
+            v5: Some(V5Details {
+                assigned_client_id: None,
+                keep_alive_secs: 60,
+                server_keep_alive_secs: None,
+                receive_max,
+                max_packet_size: None,
+                max_qos: 1,
+                retain_available: true,
+                wildcard_subscriptions: true,
+                shared_subscriptions: true,
+                subscription_ids: true,
+                topic_alias_max: 0,
+                server_reference: None,
+                response_info: None,
+                reason_string: None,
+            }),
+        })
+    }
+
+    fn shown(c: &DetailsCache, s: &Status) -> Option<u16> {
+        c.current(s)
+            .and_then(|d| d.v5.as_ref())
+            .map(|v| v.receive_max)
+    }
+
+    /// Reconnects with other CONNACK values and a late delivery: the popover never shows the
+    /// values of an older attempt, and it shows nothing until the details of the current
+    /// attempt arrive.
+    #[test]
+    fn the_details_cache_never_shows_an_older_attempt() {
+        let mut c = DetailsCache::default();
+        let up = |attempt| status(ConnState::Connected, attempt);
+        let lost = status(
+            ConnState::Reconnecting {
+                attempt: 1,
+                reason: "lost".into(),
+            },
+            0,
+        );
+        // Attempt 5 connects. Its details come.
+        c.offer(5, details_with(10));
+        assert_eq!(shown(&c, &up(5)), Some(10));
+        // The connection is lost: the cache clears, and nothing shows while not connected.
+        c.clear();
+        assert_eq!(shown(&c, &lost), None);
+        // Attempt 6 is Connected, but the event of attempt 5 is still in the log and comes
+        // first: it must not show.
+        c.offer(5, details_with(10));
+        assert_eq!(shown(&c, &up(6)), None);
+        // The details of attempt 6 come (other values): they show.
+        c.offer(6, details_with(20));
+        assert_eq!(shown(&c, &up(6)), Some(20));
+        // Delivery before the status: the details of attempt 7 arrive while the status still
+        // says Reconnecting, and show when attempt 7 is Connected.
+        c.clear();
+        c.offer(7, details_with(30));
+        assert_eq!(shown(&c, &lost), None);
+        assert_eq!(shown(&c, &up(7)), Some(30));
+        // A status that skipped the Reconnecting state (attempt 8, no clear): attempt 7
+        // details do not show.
+        assert_eq!(shown(&c, &up(8)), None);
+    }
+
     #[test]
     fn filter_validation() {
         for ok in ["a", "a/b", "#", "a/#", "+", "a/+/b", "+/#", "/", "a//b"] {
@@ -3231,10 +3902,10 @@ mod tests {
     fn suback_does_not_revive_a_removed_row() {
         let mut s = subs(&["a"]);
         s.begin_remove("a");
-        s.on_subscribed("a", Ok(Qos::AtLeastOnce));
+        s.on_subscribed("a", Default::default(), Ok(Qos::AtLeastOnce));
         assert_eq!(state(&mut s, "a"), Some(SubState::Removing));
         let mut s = subs(&["a"]);
-        s.on_subscribed("a", Err("no".into()));
+        s.on_subscribed("a", Default::default(), Err("no".into()));
         assert_eq!(state(&mut s, "a"), Some(SubState::Failed("no".into())));
     }
 
@@ -3284,7 +3955,7 @@ mod tests {
         assert_eq!(s.rows.len(), 1);
         assert!(s.take_dirty() && !s.take_dirty());
         // A state change is not a change of the filter list.
-        s.on_subscribed("a/#", Ok(Qos::AtMostOnce));
+        s.on_subscribed("a/#", Default::default(), Ok(Qos::AtMostOnce));
         assert!(!s.take_dirty());
         s.begin_remove("a/#");
         s.connection_reset();
