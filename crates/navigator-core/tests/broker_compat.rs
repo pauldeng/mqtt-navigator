@@ -21,7 +21,8 @@ use ms_mqtt_client::packet::{ConnectProperties, SessionExpiryInterval};
 use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
-    Command, ConnState, Event, Net, NetLimits, Outgoing, Profile, PublishResult, Transport,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
+    PublishResult, Transport,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -77,9 +78,14 @@ fn profile(port: u16, transport: Transport, prefix: &str) -> Profile {
 }
 
 async fn connect(net: &mut Net, p: Profile) -> u64 {
+    connect_with(net, p, Protocol::V5).await
+}
+
+async fn connect_with(net: &mut Net, p: Profile, protocol: Protocol) -> u64 {
     let previous = net.status.borrow().generation;
-    net.send(Command::Connect(Box::new(p.into())))
-        .expect("send");
+    let mut config = ConnectConfig::from(p);
+    config.protocol = protocol;
+    net.send(Command::Connect(Box::new(config))).expect("send");
     wait_connected(net, previous).await
 }
 
@@ -203,16 +209,45 @@ async fn tcp_and_ws_round_trip(b: Broker) {
     }
 }
 
+/// MQTT 3.1.1: QoS 0 and QoS 1 round trip on TCP and WebSocket. There are no properties.
+async fn v3_tcp_and_ws_round_trip(b: Broker) {
+    let _limits = limits_lock();
+    for (port, transport) in [(b.tcp, Transport::Tcp), (b.ws, Transport::Ws)] {
+        let mut net = Net::start(NetLimits::default());
+        let prefix = prefix();
+        let generation =
+            connect_with(&mut net, profile(port, transport, &prefix), Protocol::V311).await;
+        wait_subscribed(&mut net, WAIT).await;
+        for (id, qos, expect) in [
+            (1, Qos::AtMostOnce, PublishResult::Sent),
+            (2, Qos::AtLeastOnce, PublishResult::Acknowledged),
+        ] {
+            let topic = format!("{prefix}/x{id}");
+            net.send(out(id, &topic, b"v3", qos, false)).expect("send");
+            let m = next_incoming(&mut net, WAIT).await;
+            assert_eq!((&*m.topic, &m.payload[..]), (&*topic, &b"v3"[..]));
+            assert_eq!(m.generation, generation);
+            assert_eq!(m.props, MsgProps::default());
+            assert_eq!(wait_published(&mut net, id).await, expect);
+        }
+        net.shutdown().await;
+    }
+}
+
 /// A retained message reaches a new subscriber with the retain flag. An empty retained message
 /// clears it.
 async fn retained(b: Broker) {
+    retained_with(b, Protocol::V5).await;
+}
+
+async fn retained_with(b: Broker, protocol: Protocol) {
     let _limits = limits_lock();
     let prefix = prefix();
     let topic = format!("{prefix}/r");
     let mut publisher = Net::start(NetLimits::default());
     let mut p = profile(b.tcp, Transport::Tcp, &prefix);
     p.subscriptions.clear();
-    connect(&mut publisher, p).await;
+    connect_with(&mut publisher, p, protocol).await;
     publisher
         .send(out(1, &topic, b"kept", Qos::AtLeastOnce, true))
         .expect("send");
@@ -222,7 +257,8 @@ async fn retained(b: Broker) {
     );
 
     let mut late = Net::start(NetLimits::default());
-    let generation = connect(&mut late, profile(b.tcp, Transport::Tcp, &prefix)).await;
+    let generation =
+        connect_with(&mut late, profile(b.tcp, Transport::Tcp, &prefix), protocol).await;
     wait_subscribed(&mut late, WAIT).await;
     let m = next_incoming(&mut late, WAIT).await;
     assert_eq!(
@@ -242,7 +278,12 @@ async fn retained(b: Broker) {
     publisher.shutdown().await;
 
     let mut after = Net::start(NetLimits::default());
-    connect(&mut after, profile(b.tcp, Transport::Tcp, &prefix)).await;
+    connect_with(
+        &mut after,
+        profile(b.tcp, Transport::Tcp, &prefix),
+        protocol,
+    )
+    .await;
     wait_subscribed(&mut after, WAIT).await;
     let nothing = tokio::time::timeout(Duration::from_millis(1500), after.incoming.recv()).await;
     assert!(
@@ -255,6 +296,11 @@ async fn retained(b: Broker) {
 /// A persistent session (clean start off, expiry 60 s) keeps a QoS 1 message while the client is
 /// away.
 async fn persistent_session(b: Broker) {
+    persistent_session_with(b, Protocol::V5).await;
+}
+
+/// MQTT 3.1.1: Clean Session off is the persistent session. The profile expiry does not matter.
+async fn persistent_session_with(b: Broker, protocol: Protocol) {
     let _limits = limits_lock();
     let prefix = prefix();
     let mut p = profile(b.tcp, Transport::Tcp, &prefix);
@@ -262,14 +308,14 @@ async fn persistent_session(b: Broker) {
     p.session_expiry_secs = 60;
 
     let mut first = Net::start(NetLimits::default());
-    connect(&mut first, p.clone()).await;
+    connect_with(&mut first, p.clone(), protocol).await;
     wait_subscribed(&mut first, WAIT).await;
     first.shutdown().await;
 
     let mut other = Net::start(NetLimits::default());
     let mut q = profile(b.tcp, Transport::Tcp, &prefix);
     q.subscriptions.clear();
-    connect(&mut other, q).await;
+    connect_with(&mut other, q, protocol).await;
     other
         .send(out(
             1,
@@ -286,7 +332,7 @@ async fn persistent_session(b: Broker) {
     other.shutdown().await;
 
     let mut again = Net::start(NetLimits::default());
-    connect(&mut again, p).await;
+    connect_with(&mut again, p, protocol).await;
     let m = next_incoming(&mut again, WAIT).await;
     assert_eq!(&m.payload[..], b"queued");
     again.shutdown().await;
@@ -431,6 +477,21 @@ macro_rules! broker_tests {
             #[tokio::test(flavor = "current_thread")]
             async fn persistent_session_keeps_queued_message() {
                 persistent_session($broker).await;
+            }
+
+            #[tokio::test(flavor = "current_thread")]
+            async fn v3_tcp_and_websocket_round_trip() {
+                v3_tcp_and_ws_round_trip($broker).await;
+            }
+
+            #[tokio::test(flavor = "current_thread")]
+            async fn v3_retained_delivery_and_clear() {
+                retained_with($broker, Protocol::V311).await;
+            }
+
+            #[tokio::test(flavor = "current_thread")]
+            async fn v3_persistent_session_keeps_queued_message() {
+                persistent_session_with($broker, Protocol::V311).await;
             }
 
             #[tokio::test(flavor = "current_thread")]

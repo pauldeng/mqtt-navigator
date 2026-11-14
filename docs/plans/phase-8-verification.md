@@ -432,3 +432,78 @@ EMQX and HiveMQ are stopped. `git diff crates/navigator-app` is empty.
 3. The listener count is 12, not 14 (8 Mosquitto, 2 EMQX, 2 HiveMQ). Corrected above.
 
 Runs after the fixes (`s2r2-*.txt`): fmt ok; clippy `--all-features -D warnings` ok; `cargo deny check` ok; `cargo test --workspace` 277 passed, 0 failed, 1 ignored; `net_mosquitto` 21 passed and `net_blocked_write` 1 passed against Mosquitto on 18830.
+
+## S2b V3 adapter (MQTT 3.1.1)
+
+Date: 2026-11-15. Branch `feat/ntex-mqtt`, base commit d150889. Nothing is committed. Logs: `s2b-*.txt` in the scratchpad (`ntex/`).
+
+### What changed
+
+- `net.rs`: new `Protocol` (`V311`, `V5`) and field `ConnectConfig::protocol`. `ConnectConfig::from(Profile)` gives `V5`, so the app keeps MQTT 5 until S2c. New `session_persists`: v5 with a session expiry, v3 with Clean Session off (D3). It replaces `session_expiry_secs > 0` in `AttemptCtx`.
+- `net/wire.rs`:
+  - `Wire::V3(sink, max_packet)`, `connect_v3`, `HandlerV3`, `publish_v3`, `subscribe_v3`, `unsubscribe_v3`. The v3 CONNECT uses the profile `clean_start` as Clean Session. A v3 password is sent only with a user name.
+  - The transport (our dialer, WS upgrade) is one function, `transport`. V3 and V5 use it. Timers, write timeout, frame read rate, `start_with_control`, `catch_unwind` (`contained`) and the disconnect path are shared; the v3 handler and the v5 handler call the same `contained`.
+  - `v3_max_remaining`: one function for the largest `r` with `1 + varint_len(r) + r <= max_packet`. `shared_cfg` calls `set_max_size(r)` for v3. The v3 publish check uses the same `r` and gives "MQTT 3.1.1 messages can be at most 1 MiB in this app." before the send.
+  - v3 CONNACK return codes 1 to 5 have plain texts. Only code 3 is temporary.
+  - v5 version errors: 0x84, an undecodable CONNACK (`Decode` error before the CONNACK) and a close before the CONNACK have the texts of the plan.
+  - v3 QoS 2: the handler returns an error and sets the QoS 2 flag. The session ends with `QOS2_TEXT`.
+  - A v3 protocol error says "not valid MQTT 3.1.1". The v5 text is unchanged.
+  - A v3 Will message over 65 535 bytes fails the connect with a text (the CONNECT field has a 16-bit length). A v3 Will has no delay and no properties.
+- Tests: `net.rs` (unit tests with a fake broker), `tests/broker_matrix.rs`, `tests/net_mosquitto.rs`, `tests/broker_compat.rs`. `git diff crates/navigator-app` is empty.
+
+### Tests added
+
+Unit tests (`net.rs`; each was checked by breaking the code, see below):
+`the_largest_remaining_length_is_exact_at_the_varint_boundaries` (hand values at 127, 16 383 and 2 097 151 and a brute-force comparison), `a_session_persists_by_version`, `the_v3_connect_packet_has_level_4_and_the_clean_session_flag`, `v3_connack_return_codes_have_plain_text` (codes 1 to 5, exact state and text), `v5_connack_0x84_names_the_protocol_setting`, `a_connack_that_v5_cannot_decode_says_the_reply_is_not_mqtt_5` (raw bytes `20 02 00 01`), `a_close_before_the_connack_does_not_claim_a_version` (v3 and v5), `v3_suback_codes_become_results`, `v3_unsuback_means_done`, `v3_publish_results` (Sent, Acknowledged, Lost on disconnect, Timed out), `v3_qos2_closes_without_pubrec` (the only packet from the client is the DISCONNECT 0xE0 of the close; no PUBREC), `a_v3_handler_panic_after_an_await_fails_the_attempt`, `an_incoming_packet_of_max_packet_passes_and_one_more_byte_fails` (v3 and v5, whole packet of exactly 1024 and 1025 bytes), `v3_non_minimal_length_encoding_is_checked_by_remaining_length`, `a_v3_publish_of_max_packet_is_sent_and_one_more_byte_is_refused` (1 MiB passes; +1 is refused with the exact text; the broker sees only the DISCONNECT).
+
+Broker tests against the compose brokers:
+
+- Mosquitto 18830 (`net_mosquitto.rs`): `v3_subscribe_publish_receive_and_disconnect`, `v3_persistent_session_resumes_with_the_queued_message`, `v3_clean_session_keeps_nothing`, `v3_a_packet_of_one_mib_round_trips_and_one_byte_more_is_refused`, `v3_an_incoming_packet_over_the_limit_ends_the_session`, `v3_a_removal_while_offline_reaches_a_resumed_session`. The last one shares its body with the V5 test (`removal_while_offline(protocol)`); the V5 test calls it with `V5` and has the same assertions.
+- `broker_matrix.rs`: v3 round trip over TCP, password TCP, TLS, mTLS, WS and WSS, and a v3 wrong-password test.
+- `broker_compat.rs`: for Mosquitto, EMQX and HiveMQ: v3 TCP and WS round trip, v3 retained delivery and clear, v3 persistent session with a queued message.
+
+Mutation checks (each made a test fail, then I restored the code): no `Decode` arm for v5 (the not-MQTT-5 test failed); no v3 publish size check (the outgoing test failed); no `set_max_size` for v3 (both incoming v3 tests failed); `Failure` text changed (SUBACK test failed); no QoS 2 branch in `HandlerV3` (QoS 2 test failed); `session_persists` always false for v3 and Clean Session always on (the persistent session test failed in both cases).
+
+### Gate (final code)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | ok (`s2b-fmt.txt`) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | ok (`s2b-clippy.txt`) |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok (`s2b-deny.txt`) |
+| `cargo test --workspace` | 292 passed, 0 failed, 1 ignored (159 unit tests in `navigator-core`) (`s2b-test.txt`) |
+| `tests/broker/up.sh` | all 12 listeners of the three brokers answered CONNACK (`s2b-up.txt`) |
+| Full broker suite, run 1 and 2 (`--no-fail-fast -- --test-threads=1`) | each run: 159 unit, 24 `broker_compat`, 22 `broker_matrix`, 1 `load_ci` (about 361 s), 1 `net_blocked_write`, 27 `net_mosquitto`; 0 failed; `soak` 1 ignored (`s2b-full-1.txt`, `s2b-full-2.txt`) |
+| `net_mosquitto` alone, 10 runs | 10 runs of 27 passed, 0 failed (`s2b-mosquitto10.txt`). I ran the test binary with `--test-threads=4`; every test takes the `LIMITS` lock, so the tests still run one after another. |
+
+EMQX and HiveMQ are stopped. Mosquitto still runs.
+
+### Changed expectations in existing tests
+
+None of the assertions of an existing test changed. The old text "the broker does not support MQTT 5" had no test. Two pre-existing tests that run the same code were not changed. The `removal_while_offline` split keeps the assertions and the timing of `a_removal_while_offline_reaches_a_resumed_session`. The broker_compat and broker_matrix helpers got a `protocol` parameter with a wrapper that keeps the old signature and V5.
+
+New texts (plan "Version errors", plan lines 100-105 of the "MQTT 3.1.1 in the app" section; the S2 report deviation 5 deferred them):
+
+- v5 CONNACK 0x84: "This broker does not support MQTT 5. Set Protocol to MQTT 3.1.1."
+- v5 undecodable CONNACK: "The broker sent a reply that is not MQTT 5. If the broker supports only MQTT 3.1.1, set Protocol to MQTT 3.1.1."
+- A close before the CONNACK (both versions): "The broker closed the connection before it accepted it. Check the address, the TLS settings and the Protocol."
+- v3 code 1: "This broker does not support MQTT 3.1.1. Set Protocol to MQTT 5."
+
+### Deviations and open points
+
+1. A v3 close with a QoS 2 message sends a DISCONNECT (0xE0) before the close. The plan says "close without PUBREC". There is no PUBREC. The test pins the DISCONNECT.
+2. Mosquitto answers a wrong password with return code 5 ("not authorized"), not 4. The broker test expects that; code 4 has a fake-broker test.
+3. The transport for TCP, TLS, WS and WSS is now one boxed closure (`ConnFuture`), shared by both versions. It adds one boxed future for each connect. This is not on a hot path.
+4. Not tested for v3 (the code is shared with v5 and S2 tested it for v5): the write timeout, keep alive, frame read rate, and the disconnect with `force_close`. The v3 stalled-write and missing-PINGRESP cases from the S1 spike are in the spike only. S3 moves the fake-broker cases to `tests/`.
+5. The plan asks for the session-filter tests (resume, offline removal, lost UNSUBACK, app restart) on both versions. S2b runs the offline removal and the resume on v3. The lost UNSUBACK and the app restart cases are not run on v3. S3 or S2c can add them.
+6. The v3 Will has no properties and no delay. The profile `will.delay_secs` is ignored for v3. S2c hides it in the UI.
+7. `broker_max_packet` for v3 is `None`, as the CONNACK has no limit.
+8. The v3 TLS cases with bad certificates, the stalled WS upgrade and other transport cases are the same code as V5 and were not repeated for v3.
+
+### S2b Codex round 1: three defects fixed
+
+1. The v3 panic test sent one PUBLISH, so the first call ran in the attempt task and the test passed without `contained()`. `HandlerV3` now has the test-only `__handler_hold__` branch of V5. The test sends a held call and then a call that panics after an await. It checks `Failed(PANIC_TEXT)` (bounded by the 5 s status wait), one accept, and that a new connect reaches `Connected`. Checked: with `contained()` removed from `HandlerV3::call`, the test times out. The V5 test already used the hold and panic pair: no change.
+2. An empty client ID with Clean Session off is refused in `connect_v3` before the dial: `Failed("MQTT 3.1.1 needs a client ID when Clean session is off. Enter a client ID, or turn on Clean session.")`. Test `v3_empty_client_id_needs_clean_session` (also checks that the broker got no connection). Checked: without the check the state is `Failed("The broker sent data that is not valid MQTT 3.1.1.")`.
+3. `Disconnected(Some(io))` with kind EOF, reset, abort or broken pipe during the handshake now gives the close-before-CONNACK text (temporary), unless a TLS diagnosis exists. The test `a_close_before_the_connack_does_not_claim_a_version` covers a clean close and a reset (the fake closes with unread data, which sends a RST) on v3 and v5. Checked: without the mapping the reset case gives "The broker closed the connection.".
+
+Runs (`s2br1-*.txt`): fmt ok; clippy `--all-features -D warnings` ok; `cargo deny check` ok; `cargo test --workspace` 293 passed, 0 failed, 1 ignored (161 unit tests); `net_mosquitto` once against Mosquitto 18830: 27 passed. `git diff crates/navigator-app` is empty. Not rerun: the full broker suite (the change touches the connect error path and one test-only branch).

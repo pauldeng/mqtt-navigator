@@ -13,8 +13,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, PublishResult,
-    Transport,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
+    PublishResult, Transport,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -188,10 +188,22 @@ async fn round_trip<C: Into<ConnectConfig>>(
     transport: Transport,
     tweak: impl FnOnce(Profile) -> C,
 ) {
+    round_trip_with(Protocol::V5, port, transport, tweak).await;
+}
+
+/// The same round trip with the given MQTT version.
+async fn round_trip_with<C: Into<ConnectConfig>>(
+    protocol: Protocol,
+    port: u16,
+    transport: Transport,
+    tweak: impl FnOnce(Profile) -> C,
+) {
     let _limits = limits_lock();
     let mut net = Net::start(NetLimits::default());
     let prefix = prefix();
-    let generation = connect(&mut net, tweak(profile(port, transport, &prefix))).await;
+    let mut config: ConnectConfig = tweak(profile(port, transport, &prefix)).into();
+    config.protocol = protocol;
+    let generation = connect(&mut net, config).await;
     wait_subscribed(&mut net, WAIT).await;
     publish_round_trip(&mut net, &prefix, generation).await;
     net.shutdown().await;
@@ -250,6 +262,73 @@ async fn websocket() {
 #[tokio::test(flavor = "current_thread")]
 async fn secure_websocket_with_test_ca() {
     round_trip(WSS, Transport::Wss, with_ca).await;
+}
+
+/// MQTT 3.1.1 over every listener that the V5 round trips use.
+#[tokio::test(flavor = "current_thread")]
+async fn v3_anonymous_tcp() {
+    round_trip_with(Protocol::V311, ANON, Transport::Tcp, |p| p).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_password_tcp() {
+    round_trip_with(Protocol::V311, AUTH, Transport::Tcp, |p| {
+        let mut c = ConnectConfig::from(p);
+        c.profile.username = Some("test".into());
+        c.password = Some("test-pass".into());
+        c
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_wrong_password_fails_without_retry() {
+    let _limits = limits_lock();
+    let mut net = Net::start(NetLimits::default());
+    let mut p = profile(AUTH, Transport::Tcp, &prefix());
+    p.username = Some("test".into());
+    let mut c = ConnectConfig::from(p);
+    c.protocol = Protocol::V311;
+    c.password = Some("wrong".into());
+    let text = connect_failed(&mut net, c).await;
+    // Mosquitto answers a wrong password with "not authorized" (return code 5). Return code 4
+    // has a fake-broker test in `net.rs`.
+    assert_eq!(
+        text,
+        "The broker rejected the connection: this client is not authorized."
+    );
+    // No credentials at all: the same answer.
+    let mut c = ConnectConfig::from(profile(AUTH, Transport::Tcp, &prefix()));
+    c.protocol = Protocol::V311;
+    let text = connect_failed(&mut net, c).await;
+    assert_eq!(
+        text,
+        "The broker rejected the connection: this client is not authorized."
+    );
+    net.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_with_test_ca() {
+    round_trip_with(Protocol::V311, TLS, Transport::Tls, with_ca).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_mtls_with_client_certificate() {
+    round_trip_with(Protocol::V311, MTLS, Transport::Tls, |p| {
+        with_client_cert(with_ca(p), "client.key")
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_websocket() {
+    round_trip_with(Protocol::V311, WS, Transport::Ws, |p| p).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_secure_websocket_with_test_ca() {
+    round_trip_with(Protocol::V311, WSS, Transport::Wss, with_ca).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

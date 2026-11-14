@@ -27,10 +27,23 @@ use wire::{Connected, Params, UnsubFail, Wire};
 
 pub use crate::profile::{Profile, Transport, Will};
 
+/// The MQTT version of a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    /// MQTT 3.1.1. The profile's `clean_start` is the Clean Session flag. Session expiry, will
+    /// delay and properties do not exist in this version.
+    V311,
+    /// MQTT 5.
+    V5,
+}
+
 /// One connect: the saved profile plus the secrets. The secrets live in memory only.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectConfig {
     pub profile: Profile,
+    /// The MQTT version. Until the profile has its own field, [`ConnectConfig::from`] gives
+    /// [`Protocol::V5`].
+    pub protocol: Protocol,
     pub password: Option<String>,
     /// Decrypts an encrypted client key. Never prompted for.
     pub key_passphrase: Option<String>,
@@ -48,6 +61,7 @@ impl From<Profile> for ConnectConfig {
     fn from(profile: Profile) -> Self {
         Self {
             profile,
+            protocol: Protocol::V5,
             password: None,
             key_passphrase: None,
             generation: 0,
@@ -61,6 +75,7 @@ impl std::fmt::Debug for ConnectConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectConfig")
             .field("profile", &self.profile)
+            .field("protocol", &self.protocol)
             .field("generation", &self.generation)
             .field("session_filters", &self.session_filters)
             .field("password", &self.password.as_ref().map(|_| "<hidden>"))
@@ -69,6 +84,15 @@ impl std::fmt::Debug for ConnectConfig {
                 &self.key_passphrase.as_ref().map(|_| "<hidden>"),
             )
             .finish()
+    }
+}
+
+/// The broker keeps the session after the connection ends (D3): MQTT 5 with a session expiry,
+/// MQTT 3.1.1 with Clean Session off.
+fn session_persists(c: &ConnectConfig) -> bool {
+    match c.protocol {
+        Protocol::V311 => !c.profile.clean_start,
+        Protocol::V5 => c.profile.session_expiry_secs > 0,
     }
 }
 
@@ -846,7 +870,7 @@ impl Sup {
             desired: c.desired.clone(),
             up: up.clone(),
             maybe: c.maybe.clone(),
-            report: c.config.profile.session_expiry_secs > 0,
+            report: session_persists(&c.config),
             announced: c.announced.clone(),
             tls: c.tls.clone(),
         };
@@ -3107,5 +3131,711 @@ mod tests {
                 f.chars().take(20).collect::<String>()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Tests of the MQTT 3.1.1 adapter (S2b)
+    // -----------------------------------------------------------------------------------------
+
+    use super::wire::v3_max_remaining;
+
+    fn v3_config(p: Profile) -> ConnectConfig {
+        ConnectConfig {
+            protocol: Protocol::V311,
+            ..ConnectConfig::from(p)
+        }
+    }
+
+    async fn connect_v3_to(net: &mut Net, p: Profile) {
+        net.send(Command::Connect(Box::new(v3_config(p))))
+            .expect("send");
+    }
+
+    /// Reads the CONNECT, answers with a 3.1.1 CONNACK (`rc`, no session) and returns the CONNECT
+    /// body.
+    fn accept_v3(sock: &mut TcpStream, rc: u8) -> Option<Vec<u8>> {
+        let (kind, body) = read_packet(sock)?;
+        if kind != 0x10 {
+            return None;
+        }
+        sock.write_all(&[0x20, 0x02, 0x00, rc]).ok()?;
+        Some(body)
+    }
+
+    /// The whole PUBLISH (QoS 0, topic "t") with a given Remaining Length. `pad`: the length
+    /// uses 4 bytes (a non-minimal encoding). MQTT 5 adds the property length byte.
+    fn publish_with_remaining(r: usize, v5: bool, pad: bool) -> Vec<u8> {
+        let mut p = vec![0x30];
+        if pad {
+            p.extend([
+                (r & 0x7f) as u8 | 0x80,
+                ((r >> 7) & 0x7f) as u8 | 0x80,
+                ((r >> 14) & 0x7f) as u8 | 0x80,
+                ((r >> 21) & 0x7f) as u8,
+            ]);
+        } else {
+            let mut n = r;
+            loop {
+                let b = (n & 0x7f) as u8;
+                n >>= 7;
+                p.push(if n > 0 { b | 0x80 } else { b });
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        // The Remaining Length counts everything after the length bytes.
+        let start = p.len();
+        p.extend([0x00, 0x01, b't']);
+        if v5 {
+            p.push(0x00);
+        }
+        p.resize(start + r, b'x');
+        p
+    }
+
+    /// The Remaining Length of a minimal-encoded packet with this total size.
+    fn remaining_for_total(total: usize) -> usize {
+        (1..=4usize)
+            .map(|len| total - 1 - len)
+            .find(|&r| {
+                let l = match r {
+                    0..=127 => 1,
+                    128..=16_383 => 2,
+                    16_384..=2_097_151 => 3,
+                    _ => 4,
+                };
+                1 + l + r == total
+            })
+            .expect("a length fits")
+    }
+
+    #[test]
+    fn the_largest_remaining_length_is_exact_at_the_varint_boundaries() {
+        // 1 + varint_len(r) + r <= max_packet, with the largest r. Values by hand.
+        for (max_packet, r) in [
+            (0, 0),
+            (129, 127),
+            (130, 127),
+            (131, 128),
+            (16_386, 16_383),
+            (16_387, 16_383),
+            (16_388, 16_384),
+            (1024, 1021),
+            (1_048_576, 1_048_572),
+            (2_097_155, 2_097_151),
+            (2_097_156, 2_097_151),
+            (2_097_157, 2_097_152),
+        ] {
+            assert_eq!(v3_max_remaining(max_packet), r, "max_packet {max_packet}");
+        }
+        // The brute force rule agrees around every boundary.
+        let varint = |r: u64| match r {
+            0..=127 => 1,
+            128..=16_383 => 2,
+            16_384..=2_097_151 => 3,
+            _ => 4,
+        };
+        for boundary in [127u64, 16_383, 2_097_151] {
+            for max in boundary..boundary + 12 {
+                let brute = (0..=max)
+                    .rev()
+                    .find(|&r| 1 + varint(r) + r <= max)
+                    .unwrap_or(0);
+                assert_eq!(u64::from(v3_max_remaining(max as usize)), brute, "{max}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_session_persists_by_version() {
+        let mut c = ConnectConfig::from(Profile::default());
+        for (protocol, clean, expiry, persists) in [
+            (Protocol::V5, true, 0, false),
+            (Protocol::V5, true, 60, true),
+            (Protocol::V5, false, 0, false),
+            (Protocol::V311, true, 0, false),
+            (Protocol::V311, true, 60, false),
+            (Protocol::V311, false, 0, true),
+        ] {
+            c.protocol = protocol;
+            c.profile.clean_start = clean;
+            c.profile.session_expiry_secs = expiry;
+            assert_eq!(
+                session_persists(&c),
+                persists,
+                "{protocol:?} clean {clean} expiry {expiry}"
+            );
+        }
+    }
+
+    /// The CONNECT is MQTT 3.1.1 (level 4). The Clean Session flag follows the profile: off means
+    /// the broker keeps the session (D3).
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_v3_connect_packet_has_level_4_and_the_clean_session_flag() {
+        for clean in [true, false] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let tx = std::sync::Mutex::new(tx);
+            let broker = Fake::start(move |_, mut sock| {
+                if let Some(body) = accept_v3(&mut sock, 0) {
+                    let _ = tx.lock().expect("lock").send(body);
+                }
+                while read_packet(&mut sock).is_some() {}
+            });
+            let mut net = Net::start(NetLimits::default());
+            let mut p = tcp_profile(broker.port, &[]);
+            p.clean_start = clean;
+            p.client_id = "cid".into();
+            p.keepalive_secs = 30;
+            connect_v3_to(&mut net, p).await;
+            wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+            let body = rx.recv_timeout(Duration::from_secs(2)).expect("CONNECT");
+            assert_eq!(&body[..7], [0, 4, b'M', b'Q', b'T', b'T', 4], "level 4");
+            assert_eq!(body[7] & 0x02 != 0, clean, "Clean Session flag");
+            assert_eq!(&body[8..10], [0, 30], "keep alive");
+            net.disconnect();
+            net.shutdown().await;
+        }
+    }
+
+    /// Return codes 1 to 5 each have a plain text. Only "server unavailable" is retried.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_connack_return_codes_have_plain_text() {
+        for (rc, retry, text) in [
+            (
+                1u8,
+                false,
+                "This broker does not support MQTT 3.1.1. Set Protocol to MQTT 5.",
+            ),
+            (
+                2,
+                false,
+                "The broker rejected the connection: the client ID is not valid.",
+            ),
+            (
+                3,
+                true,
+                "The broker rejected the connection: the server is not available.",
+            ),
+            (
+                4,
+                false,
+                "The broker rejected the connection: the user name or password is wrong.",
+            ),
+            (
+                5,
+                false,
+                "The broker rejected the connection: this client is not authorized.",
+            ),
+        ] {
+            let broker = Fake::start(move |_, mut sock| {
+                let _ = accept_v3(&mut sock, rc);
+            });
+            let mut net = Net::start(NetLimits::default());
+            connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+            let s = wait_status(&mut net, |s| {
+                matches!(
+                    s.state,
+                    ConnState::Reconnecting { .. } | ConnState::Failed(_)
+                )
+            })
+            .await;
+            let want = if retry {
+                ConnState::Reconnecting {
+                    attempt: 1,
+                    reason: text.into(),
+                }
+            } else {
+                ConnState::Failed(text.into())
+            };
+            assert_eq!(s.state, want, "return code {rc}");
+            net.disconnect();
+            net.shutdown().await;
+        }
+    }
+
+    /// Each version error of plan "Version errors", sent as raw bytes.
+    async fn version_error(v3: bool, reply: &'static [u8]) -> ConnState {
+        let broker = Fake::start(move |_, mut sock| {
+            if read_packet(&mut sock).is_some() {
+                let _ = sock.write_all(reply);
+            }
+            // An empty reply closes the connection.
+        });
+        let mut net = Net::start(NetLimits::default());
+        let p = tcp_profile(broker.port, &[]);
+        if v3 {
+            connect_v3_to(&mut net, p).await;
+        } else {
+            net.send(Command::Connect(Box::new(ConnectConfig::from(p))))
+                .expect("send");
+        }
+        let s = wait_status(&mut net, |s| {
+            matches!(
+                s.state,
+                ConnState::Reconnecting { .. } | ConnState::Failed(_)
+            )
+        })
+        .await;
+        net.disconnect();
+        net.shutdown().await;
+        s.state
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v5_connack_0x84_names_the_protocol_setting() {
+        assert_eq!(
+            version_error(false, &[0x20, 0x03, 0x00, 0x84, 0x00]).await,
+            ConnState::Failed(
+                "This broker does not support MQTT 5. Set Protocol to MQTT 3.1.1.".into()
+            )
+        );
+    }
+
+    /// A 3.1.1-only broker answers an MQTT 5 CONNECT with a 3.1.1 refusal (return code 1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connack_that_v5_cannot_decode_says_the_reply_is_not_mqtt_5() {
+        assert_eq!(
+            version_error(false, &[0x20, 0x02, 0x00, 0x01]).await,
+            ConnState::Failed(
+                "The broker sent a reply that is not MQTT 5. If the broker supports only MQTT 3.1.1, set Protocol to MQTT 3.1.1."
+                    .into()
+            )
+        );
+    }
+
+    /// A clean close and a reset before the CONNACK have the same text, on both versions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_close_before_the_connack_does_not_claim_a_version() {
+        let text = "The broker closed the connection before it accepted it. Check the address, the TLS settings and the Protocol.";
+        for v3 in [false, true] {
+            for reset in [false, true] {
+                let broker = Fake::start(move |_, mut sock| {
+                    if reset {
+                        // Read one byte only. The close with unread data sends a RST.
+                        let mut one = [0u8; 1];
+                        let _ = sock.read_exact(&mut one);
+                    } else {
+                        let _ = read_packet(&mut sock);
+                    }
+                });
+                let mut net = Net::start(NetLimits::default());
+                let p = tcp_profile(broker.port, &[]);
+                if v3 {
+                    connect_v3_to(&mut net, p).await;
+                } else {
+                    net.send(Command::Connect(Box::new(ConnectConfig::from(p))))
+                        .expect("send");
+                }
+                let s = wait_status(&mut net, |s| {
+                    matches!(
+                        s.state,
+                        ConnState::Reconnecting { .. } | ConnState::Failed(_)
+                    )
+                })
+                .await;
+                assert_eq!(
+                    s.state,
+                    ConnState::Reconnecting {
+                        attempt: 1,
+                        reason: text.into()
+                    },
+                    "v3 {v3} reset {reset}"
+                );
+                net.disconnect();
+                net.shutdown().await;
+            }
+        }
+    }
+
+    fn suback_v3(sock: &mut TcpStream, code: u8) {
+        let Some((0x82, body)) = read_packet(sock) else {
+            return;
+        };
+        let _ = sock.write_all(&[0x90, 0x03, body[0], body[1], code]);
+    }
+
+    /// SUBACK: granted 0 and 1 are granted QoS; 0x80 is "Refused (0x80)"; granted 2 is an error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_suback_codes_become_results() {
+        for (code, want) in [
+            (0u8, Ok(Qos::AtMostOnce)),
+            (1, Ok(Qos::AtLeastOnce)),
+            (0x80, Err("Refused (0x80)".to_owned())),
+            (
+                2,
+                Err("The broker granted QoS 2. This app supports QoS 0 and 1.".to_owned()),
+            ),
+        ] {
+            let broker = Fake::start(move |_, mut sock| {
+                if accept_v3(&mut sock, 0).is_some() {
+                    suback_v3(&mut sock, code);
+                    while read_packet(&mut sock).is_some() {}
+                }
+            });
+            let mut net = Net::start(NetLimits::default());
+            connect_v3_to(&mut net, tcp_profile(broker.port, &["a/b"])).await;
+            match next_event(&mut net).await {
+                Event::Subscribed { filter, result, .. } => {
+                    assert_eq!((filter.as_str(), result), ("a/b", want), "code {code}");
+                }
+                other => panic!("{other:?}"),
+            }
+            net.disconnect();
+            net.shutdown().await;
+        }
+    }
+
+    /// v3: an UNSUBACK is done (it has no reason). The CONNECT, SUBSCRIBE and UNSUBSCRIBE of the
+    /// fake use packet IDs from the packets themselves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_unsuback_means_done() {
+        let broker = Fake::start(|_, mut sock| {
+            if accept_v3(&mut sock, 0).is_none() {
+                return;
+            }
+            suback_v3(&mut sock, 1);
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                if kind == 0xa2 {
+                    let _ = sock.write_all(&[0xb0, 0x02, body[0], body[1]]);
+                }
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        connect_v3_to(&mut net, tcp_profile(broker.port, &["a/b"])).await;
+        assert!(matches!(
+            next_event(&mut net).await,
+            Event::Subscribed {
+                result: Ok(Qos::AtLeastOnce),
+                ..
+            }
+        ));
+        net.send(Command::Unsubscribe {
+            filter: "a/b".into(),
+        })
+        .expect("send");
+        assert!(matches!(
+            next_event(&mut net).await,
+            Event::Unsubscribed { filter, result: Ok(()), .. } if filter == "a/b"
+        ));
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    fn v3_publish_cmd(op_id: u64, qos: Qos, payload: Vec<u8>) -> Command {
+        Command::Publish(Box::new(Outgoing {
+            op_id,
+            topic: "t".into(),
+            payload: Bytes::from(payload),
+            qos,
+            retain: false,
+            props: MsgProps::default(),
+        }))
+    }
+
+    async fn published(net: &mut Net, op_id: u64) -> PublishResult {
+        loop {
+            if let Event::Published {
+                op_id: id, result, ..
+            } = next_event(net).await
+                && id == op_id
+            {
+                return result;
+            }
+        }
+    }
+
+    /// QoS 0 is Sent, QoS 1 is Acknowledged by the PUBACK. A close with a QoS 1 publish open is
+    /// "Lost on disconnect". No PUBACK in 10 s (here 300 ms) is "Timed out".
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_publish_results() {
+        let broker = Fake::start(|n, mut sock| {
+            if accept_v3(&mut sock, 0).is_none() {
+                return;
+            }
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                if kind & 0xf0 != 0x30 {
+                    continue;
+                }
+                let payload_start = 2 + 1 + usize::from(kind & 0x06 != 0) * 2;
+                match (n, &body[payload_start..]) {
+                    (0, b"ack") => {
+                        let _ = sock.write_all(&[0x40, 0x02, body[3], body[4]]);
+                    }
+                    // The connection closes with the publish open.
+                    (0, b"lose") => return,
+                    _ => {}
+                }
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        net.send(v3_publish_cmd(1, Qos::AtMostOnce, b"zero".to_vec()))
+            .expect("send");
+        assert_eq!(published(&mut net, 1).await, PublishResult::Sent);
+        net.send(v3_publish_cmd(2, Qos::AtLeastOnce, b"ack".to_vec()))
+            .expect("send");
+        assert_eq!(published(&mut net, 2).await, PublishResult::Acknowledged);
+        net.send(v3_publish_cmd(3, Qos::AtLeastOnce, b"lose".to_vec()))
+            .expect("send");
+        assert_eq!(
+            published(&mut net, 3).await,
+            PublishResult::LostOnDisconnect
+        );
+        // The next connection never answers a QoS 1 publish. The status moves to `Reconnecting`
+        // after the lost result, so wait for it before the wait for `Connected`.
+        wait_status(&mut net, |s| {
+            matches!(s.state, ConnState::Reconnecting { .. })
+        })
+        .await;
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        net.send(v3_publish_cmd(4, Qos::AtLeastOnce, b"silent".to_vec()))
+            .expect("send");
+        assert_eq!(published(&mut net, 4).await, PublishResult::TimedOut);
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// v3: a broker that sends QoS 2 gets no PUBREC. The connection closes and the session fails
+    /// with the QoS 2 text, as on MQTT 5.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_qos2_closes_without_pubrec() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let broker = Fake::start(move |_, mut sock| {
+            if accept_v3(&mut sock, 0).is_none() {
+                return;
+            }
+            // PUBLISH QoS 2, topic "t", packet ID 1, payload "x".
+            let _ = sock.write_all(&[0x34, 0x06, 0x00, 0x01, b't', 0x00, 0x01, b'x']);
+            // Everything the client sends until it closes.
+            let mut kinds = vec![];
+            while let Some((kind, _)) = read_packet(&mut sock) {
+                kinds.push(kind);
+            }
+            let _ = tx.lock().expect("lock").send(kinds);
+        });
+        let mut net = Net::start(NetLimits::default());
+        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+        let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
+        assert_eq!(s.state, ConnState::Failed(QOS2_TEXT.into()));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(3)).expect("closed"),
+            vec![0xe0],
+            "no PUBREC (0x50): the only packet is the DISCONNECT of the close"
+        );
+        assert_eq!(broker.accepts(), 1, "no retry");
+        net.shutdown().await;
+    }
+
+    /// The panic test of V5, on MQTT 3.1.1. The first call never ends. The second one panics
+    /// after an await. ntex runs it in a detached task, so only `contained()` can end the
+    /// attempt: it must end with `Failed` in a bounded time, not hang. A new connect works.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_v3_handler_panic_after_an_await_fails_the_attempt() {
+        let broker = Fake::start(|n, mut sock| {
+            if accept_v3(&mut sock, 0).is_none() {
+                return;
+            }
+            if n == 0 {
+                for topic in [&b"__handler_hold__"[..], &b"__handler_panic__"[..]] {
+                    let mut packet =
+                        vec![0x30, (2 + topic.len() + 1) as u8, 0x00, topic.len() as u8];
+                    packet.extend_from_slice(topic);
+                    packet.push(b'x');
+                    let _ = sock.write_all(&packet);
+                }
+            }
+            while read_packet(&mut sock).is_some() {}
+        });
+        let mut net = Net::start(NetLimits::default());
+        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+        let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
+        assert_eq!(s.state, ConnState::Failed(PANIC_TEXT.into()));
+        assert_eq!(broker.accepts(), 1, "no retry after a panic");
+        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// An empty client ID with Clean Session off is refused before the dial, with a text about
+    /// the client ID (not "the broker sent invalid data"). No connection is made.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_empty_client_id_needs_clean_session() {
+        let broker = Fake::start(|_, mut sock| {
+            let _ = accept_v3(&mut sock, 0);
+        });
+        let mut net = Net::start(NetLimits::default());
+        let mut p = tcp_profile(broker.port, &[]);
+        p.client_id = String::new();
+        p.clean_start = false;
+        connect_v3_to(&mut net, p).await;
+        let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
+        assert_eq!(
+            s.state,
+            ConnState::Failed("MQTT 3.1.1 needs a client ID when Clean session is off. Enter a client ID, or turn on Clean session.".into())
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(broker.accepts(), 0, "nothing was dialed");
+        net.shutdown().await;
+    }
+
+    /// Incoming boundary (plan, Facts, size row): a whole packet of exactly `max_packet` passes,
+    /// one byte more fails, on both versions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incoming_packet_of_max_packet_passes_and_one_more_byte_fails() {
+        const MAX: usize = 1024;
+        for v5 in [false, true] {
+            for (total, ok) in [(MAX, true), (MAX + 1, false)] {
+                let packet = publish_with_remaining(remaining_for_total(total), v5, false);
+                assert_eq!(packet.len(), total, "the helper builds the size");
+                let broker = Fake::start(move |_, mut sock| {
+                    let connected = if v5 {
+                        accept_connect(&mut sock, 0)
+                    } else {
+                        accept_v3(&mut sock, 0).is_some()
+                    };
+                    if connected {
+                        let _ = sock.write_all(&packet);
+                        while read_packet(&mut sock).is_some() {}
+                    }
+                });
+                let mut net = Net::start(NetLimits {
+                    max_packet: MAX,
+                    ..NetLimits::default()
+                });
+                let p = tcp_profile(broker.port, &[]);
+                if v5 {
+                    net.send(Command::Connect(Box::new(ConnectConfig::from(p))))
+                        .expect("send");
+                } else {
+                    connect_v3_to(&mut net, p).await;
+                }
+                if ok {
+                    let m = tokio::time::timeout(Duration::from_secs(5), net.incoming.recv())
+                        .await
+                        .expect("timeout")
+                        .expect("message");
+                    assert_eq!(&*m.topic, "t", "v5 {v5}");
+                    assert_eq!(
+                        m.payload.len(),
+                        MAX - 1 - 2 - 3 - usize::from(v5),
+                        "v5 {v5}"
+                    );
+                    assert_eq!(net.status.borrow().state, ConnState::Connected);
+                } else {
+                    let s =
+                        wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
+                    assert_eq!(
+                        s.state,
+                        ConnState::Failed(
+                            "The broker sent a packet that is larger than the allowed size.".into()
+                        ),
+                        "v5 {v5}"
+                    );
+                    assert!(net.incoming.try_recv().is_err());
+                }
+                net.disconnect();
+                net.shutdown().await;
+            }
+        }
+    }
+
+    /// v3 checks the Remaining Length only. A non-minimal length encoding of the largest allowed
+    /// value passes (the packet is 3 bytes over `max_packet`). One more fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn v3_non_minimal_length_encoding_is_checked_by_remaining_length() {
+        const MAX: usize = 1024;
+        let r_max = v3_max_remaining(MAX) as usize;
+        for (r, ok) in [(r_max, true), (r_max + 1, false)] {
+            let packet = publish_with_remaining(r, false, true);
+            let broker = Fake::start(move |_, mut sock| {
+                if accept_v3(&mut sock, 0).is_some() {
+                    let _ = sock.write_all(&packet);
+                    while read_packet(&mut sock).is_some() {}
+                }
+            });
+            let mut net = Net::start(NetLimits {
+                max_packet: MAX,
+                ..NetLimits::default()
+            });
+            connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+            if ok {
+                let m = tokio::time::timeout(Duration::from_secs(5), net.incoming.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("message");
+                assert_eq!(m.payload.len(), r - 3);
+            } else {
+                let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
+                assert_eq!(
+                    s.state,
+                    ConnState::Failed(
+                        "The broker sent a packet that is larger than the allowed size.".into()
+                    )
+                );
+            }
+            net.disconnect();
+            net.shutdown().await;
+        }
+    }
+
+    /// Outgoing v3: exactly `max_packet` is sent. One byte more is refused before the send with
+    /// the text of the plan; the broker sees no PUBLISH for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_v3_publish_of_max_packet_is_sent_and_one_more_byte_is_refused() {
+        const MIB: usize = 1024 * 1024;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let broker = Fake::start(move |_, mut sock| {
+            if accept_v3(&mut sock, 0).is_none() {
+                return;
+            }
+            while let Some((kind, body)) = read_packet(&mut sock) {
+                let varint = if body.len() < 128 {
+                    1
+                } else if body.len() < 16_384 {
+                    2
+                } else {
+                    3
+                };
+                // The size of the whole packet.
+                let _ = tx
+                    .lock()
+                    .expect("lock")
+                    .send((kind, 1 + varint + body.len()));
+                if kind & 0xf0 == 0x30 && kind & 0x06 != 0 {
+                    let _ = sock.write_all(&[0x40, 0x02, body[3], body[4]]);
+                }
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        // Topic "t", QoS 1: fixed header 1, length 3, topic 3, packet ID 2.
+        let payload = |total: usize| vec![b'x'; total - (1 + 3 + 3 + 2)];
+        net.send(v3_publish_cmd(1, Qos::AtLeastOnce, payload(MIB)))
+            .expect("send");
+        assert_eq!(published(&mut net, 1).await, PublishResult::Acknowledged);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).expect("PUBLISH"),
+            (0x32, MIB)
+        );
+        net.send(v3_publish_cmd(2, Qos::AtLeastOnce, payload(MIB + 1)))
+            .expect("send");
+        assert_eq!(
+            published(&mut net, 2).await,
+            PublishResult::Rejected("MQTT 3.1.1 messages can be at most 1 MiB in this app.".into())
+        );
+        net.disconnect();
+        net.shutdown().await;
+        // After the refusal the broker saw only the DISCONNECT.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).expect("DISCONNECT"),
+            (0xe0, 2)
+        );
+        assert!(rx.try_recv().is_err(), "no other packet");
     }
 }

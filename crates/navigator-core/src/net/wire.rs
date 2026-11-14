@@ -1,7 +1,7 @@
 //! The private `Wire` interface (D6 of the ntex plan): one set of operations over an MQTT
-//! client version. Today there is the MQTT 5 adapter. The MQTT 3.1.1 adapter adds a second
-//! variant of [`Wire`] and a second arm in [`connect`]. The supervisor and the session loop in
-//! `net.rs` use only this module, so they do not change.
+//! client version. There is an adapter for MQTT 5 and one for MQTT 3.1.1 (two variants of
+//! [`Wire`], two arms in [`connect`]). The supervisor and the session loop in `net.rs` use only
+//! this module, so they do not know the version.
 //!
 //! The adapter owns three jobs:
 //!
@@ -22,9 +22,10 @@ use std::time::Duration;
 use ntex::ws::{WsClient, WsClientConfig, error::WsClientError};
 use ntex_bytes::{ByteString, Bytes as NtexBytes};
 use ntex_error::Error as NtexError;
-use ntex_io::IoConfig;
+use ntex_io::{Io, IoConfig, Sealed};
 use ntex_mqtt::control::{Control, Reason};
 use ntex_mqtt::error::{DecodeError, MqttClientError, MqttProtocolError, SendPacketError};
+use ntex_mqtt::v3;
 use ntex_mqtt::v5::client::{Connect as ConnectV5, MqttConnector, ProtocolMessage};
 use ntex_mqtt::v5::codec::{
     ConnectAck, ConnectAckReason, Disconnect, DisconnectReasonCode, LastWill, PublishAckReason,
@@ -41,7 +42,7 @@ use ntex_util::time::{Millis, Seconds};
 
 use super::dial::{Dialer, Target};
 use super::{
-    CONNECT_TIMEOUT, ConnectConfig, Ingest, NetLimits, Outcome, Outgoing, PANIC_TEXT,
+    CONNECT_TIMEOUT, ConnectConfig, Ingest, NetLimits, Outcome, Outgoing, PANIC_TEXT, Protocol,
     PublishResult, Transport, io_outcome,
 };
 use crate::model::{Incoming, MsgProps, Qos};
@@ -69,18 +70,28 @@ pub(super) const QOS2_TEXT: &str =
 pub(super) const CONNECTION_CLOSED_TEXT: &str =
     "The connection closed (the broker did not answer, or the network failed).";
 const PROTOCOL_TEXT: &str = "The broker sent data that is not valid MQTT 5.";
+const PROTOCOL_TEXT_V3: &str = "The broker sent data that is not valid MQTT 3.1.1.";
 const DUPLICATE_ID_TEXT: &str =
     "The broker broke the MQTT protocol: it reused a packet ID that was still in use.";
 const TOO_LARGE_TEXT: &str = "The broker sent a packet that is larger than the allowed size.";
 const WRITE_TIMEOUT_TEXT: &str = "The broker did not read our data for 10 s.";
 const READ_TIMEOUT_TEXT: &str = "The broker stopped in the middle of a packet.";
-const CLOSED_TEXT: &str = "The broker closed the connection.";
+/// The broker closed the connection before the CONNACK. This is not a claim about the version.
+const CLOSED_BEFORE_CONNACK_TEXT: &str = "The broker closed the connection before it accepted it. Check the address, the TLS settings and the Protocol.";
+const NOT_V5_TEXT: &str = "The broker sent a reply that is not MQTT 5. If the broker supports only MQTT 3.1.1, set Protocol to MQTT 3.1.1.";
+const NO_V5_TEXT: &str = "This broker does not support MQTT 5. Set Protocol to MQTT 3.1.1.";
+const NO_V311_TEXT: &str = "This broker does not support MQTT 3.1.1. Set Protocol to MQTT 5.";
+/// The largest MQTT 3.1.1 Will message: the CONNECT binary field has a 16-bit length.
+const EMPTY_ID_TEXT: &str = "MQTT 3.1.1 needs a client ID when Clean session is off. Enter a client ID, or turn on Clean session.";
+const V3_WILL_MAX: usize = 65_535;
 
 /// The operations of a connected client. Cheap to clone. Every operation can wait for the
 /// network, so the caller sets the time limit.
 #[derive(Clone)]
 pub(super) enum Wire {
     V5(MqttSink),
+    /// The sink and the packet limit of this app (the v3 codec has one limit for both ways).
+    V3(v3::MqttSink, usize),
 }
 
 /// Why an UNSUBSCRIBE did not finish.
@@ -97,6 +108,7 @@ impl Wire {
     pub(super) fn close(&self) {
         match self {
             Self::V5(s) => s.close(),
+            Self::V3(s, _) => s.close(),
         }
     }
 
@@ -104,6 +116,7 @@ impl Wire {
     pub(super) fn force_close(&self) {
         match self {
             Self::V5(s) => s.force_close(),
+            Self::V3(s, _) => s.force_close(),
         }
     }
 
@@ -126,18 +139,30 @@ impl Wire {
         }
         match self {
             Self::V5(s) => publish_v5(s, o).await,
+            Self::V3(s, max_packet) => {
+                // The text names the limit before the send. The codec would refuse it too.
+                if v3_remaining(o) > v3_max_remaining(*max_packet) {
+                    return PublishResult::Rejected(format!(
+                        "MQTT 3.1.1 messages can be at most {} in this app.",
+                        size_text(*max_packet)
+                    ));
+                }
+                publish_v3(s, o).await
+            }
         }
     }
 
     pub(super) async fn subscribe(&self, filter: &str, qos: Qos) -> Result<Qos, String> {
         match self {
             Self::V5(s) => subscribe_v5(s, filter, qos).await,
+            Self::V3(s, _) => subscribe_v3(s, filter, qos).await,
         }
     }
 
     pub(super) async fn unsubscribe(&self, filter: &str) -> Result<(), UnsubFail> {
         match self {
             Self::V5(s) => unsubscribe_v5(s, filter).await,
+            Self::V3(s, _) => unsubscribe_v3(s, filter).await,
         }
     }
 }
@@ -147,6 +172,93 @@ fn wire_qos(qos: Qos) -> WireQos {
         Qos::AtMostOnce => WireQos::AtMostOnce,
         Qos::AtLeastOnce => WireQos::AtLeastOnce,
     }
+}
+
+/// Largest Remaining Length `r` with `1 + varint_len(r) + r <= max_packet` (v3 `set_max_size`).
+/// Each length of the varint gives one candidate: the largest `r` that fits both the packet
+/// limit and that length. The best candidate wins.
+pub(super) fn v3_max_remaining(max_packet: usize) -> u32 {
+    const RANGE: [u64; 4] = [127, 16_383, 2_097_151, 268_435_455];
+    let max = max_packet as u64;
+    let best = (1..=4u64)
+        .zip(RANGE)
+        .map(|(len, range)| max.saturating_sub(1 + len).min(range))
+        .max()
+        .unwrap_or(0);
+    best as u32
+}
+
+/// The Remaining Length of the v3 PUBLISH for `o` (v3 has no properties).
+fn v3_remaining(o: &Outgoing) -> u32 {
+    let id = if o.qos == Qos::AtLeastOnce { 2 } else { 0 };
+    u32::try_from(2 + o.topic.len() + id + o.payload.len()).unwrap_or(u32::MAX)
+}
+
+/// "1 MiB" for a whole number of MiB, else the bytes.
+fn size_text(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes != 0 && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+async fn publish_v3(sink: &v3::MqttSink, o: &Outgoing) -> PublishResult {
+    let builder = sink.publish(ByteString::from(o.topic.clone()));
+    let builder = if o.retain { builder.retain() } else { builder };
+    let payload = NtexBytes::copy_from_slice(&o.payload);
+    match o.qos {
+        Qos::AtMostOnce => match builder.send_at_most_once(payload).await {
+            Ok(()) => PublishResult::Sent,
+            Err(e) => send_failure(e),
+        },
+        Qos::AtLeastOnce => match builder.send_at_least_once(payload).await {
+            Ok(()) => PublishResult::Acknowledged,
+            Err(e) => send_failure(e),
+        },
+    }
+}
+
+async fn subscribe_v3(sink: &v3::MqttSink, filter: &str, qos: Qos) -> Result<Qos, String> {
+    let codes = sink
+        .subscribe()
+        .topic_filter(ByteString::from(filter.to_owned()), wire_qos(qos))
+        .send()
+        .await
+        .map_err(|e| match e {
+            SendPacketError::Disconnected => "Not connected.".to_owned(),
+            other => other.to_string(),
+        })?;
+    subscribe_result_v3(&codes)
+}
+
+/// The result of one SUBSCRIBE from its SUBACK return codes.
+pub(super) fn subscribe_result_v3(codes: &[v3::codec::SubscribeReturnCode]) -> Result<Qos, String> {
+    use v3::codec::SubscribeReturnCode as Code;
+    match codes.first() {
+        Some(Code::Success(WireQos::AtMostOnce)) => Ok(Qos::AtMostOnce),
+        Some(Code::Success(WireQos::AtLeastOnce)) => Ok(Qos::AtLeastOnce),
+        Some(Code::Success(WireQos::ExactlyOnce)) => {
+            Err("The broker granted QoS 2. This app supports QoS 0 and 1.".into())
+        }
+        Some(Code::Failure) => Err("Refused (0x80)".into()),
+        None => Err("The broker sent an empty SUBACK.".to_owned()),
+    }
+}
+
+async fn unsubscribe_v3(sink: &v3::MqttSink, filter: &str) -> Result<(), UnsubFail> {
+    // MQTT 3.1.1 has no reason in the UNSUBACK: an answer means done.
+    sink.unsubscribe()
+        .topic_filter(ByteString::from(filter.to_owned()))
+        .send()
+        .await
+        .map_err(|e| {
+            UnsubFail::Lost(match e {
+                SendPacketError::Disconnected => "Not connected.".to_owned(),
+                other => other.to_string(),
+            })
+        })
 }
 
 async fn publish_v5(sink: &MqttSink, o: &Outgoing) -> PublishResult {
@@ -303,17 +415,21 @@ pub(super) struct Connected {
 
 /// The shared configuration of one connection: ntex reads each limit from here, so the limits
 /// are per connection and nothing is global.
-fn shared_cfg(max_packet: usize) -> SharedCfg {
+fn shared_cfg(max_packet: usize, protocol: Protocol) -> SharedCfg {
     let ws = WsClientConfig::new()
         .set_max_frame_size(max_packet)
         .set_max_message_size(max_packet)
         .set_protocols(["mqtt"])
         .expect("the constant protocol name is valid")
         .set_close_timeout(Millis(2000));
-    let mqtt = MqttServiceConfig::new()
+    let mut mqtt = MqttServiceConfig::new()
         .set_handshake_timeout(HANDSHAKE_TIMEOUT)
         .set_max_receive(RECEIVE_MAX)
         .set_max_send(RECEIVE_MAX);
+    if protocol == Protocol::V311 {
+        // v3 limits the Remaining Length, in both directions. v5 sets it in CONNECT.
+        mqtt = mqtt.set_max_size(v3_max_remaining(max_packet));
+    }
     let (check, cap, least) = FRAME_RATE;
     SharedCfg::new("navigator")
         .add(
@@ -341,7 +457,7 @@ pub(super) struct Params<'a> {
 /// Connects under one deadline. The error is the outcome of the attempt.
 pub(super) async fn connect(p: Params<'_>) -> Result<Connected, Outcome> {
     let up = Rc::new(Cell::new(false));
-    match tokio::time::timeout(CONNECT_TIMEOUT, connect_v5(&p, up.clone())).await {
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(&p, up.clone())).await {
         Ok(result) => result,
         // After the transport is up, a missing CONNACK is the broker's fault.
         Err(_) if up.get() => Err(Outcome::Retry(
@@ -392,23 +508,68 @@ fn ws_error(e: &NtexError<WsClientError>) -> NtexError<ConnectError> {
     NtexError::from(ConnectError::Io(io))
 }
 
-async fn connect_v5(p: &Params<'_>, up: Rc<Cell<bool>>) -> Result<Connected, Outcome> {
+type ConnFuture = Pin<Box<dyn Future<Output = Result<Io<Sealed>, NtexError<ConnectError>>>>>;
+
+/// The transport of a connection: our dialer (TCP, TLS), then the WebSocket upgrade for WS and
+/// WSS. Both versions use it as their connector, so the profile host stays the one name for
+/// SNI, verification and the HTTP authority.
+fn transport(
+    p: &Params<'_>,
+    cfg: &SharedCfg,
+    up: Rc<Cell<bool>>,
+) -> impl Fn(Connect<Target>) -> ConnFuture + use<> {
+    let config = p.config;
+    let tls = matches!(config.profile.transport, Transport::Tls | Transport::Wss);
+    let dialer = Dialer::new(if tls { p.ssl.clone() } else { None }, up);
+    let ws = matches!(config.profile.transport, Transport::Ws | Transport::Wss)
+        .then(|| Rc::new(WsClient::new(ws_uri(config), cfg.clone()).connector(dialer.clone())));
+    let plain = Rc::new(Pipeline::new(cfg.clone(), dialer.clone()));
+    move |c: Connect<Target>| {
+        let (ws, plain, dialer) = (ws.clone(), plain.clone(), dialer.clone());
+        Box::pin(async move {
+            match ws {
+                // Our dialer gives the socket (and TLS for WSS), then the upgrade runs on it.
+                Some(client) => {
+                    let conn = client.connect().await.map_err(|e| ws_error(&e))?;
+                    dialer.mark_up();
+                    Ok(conn.into_transport().seal())
+                }
+                None => plain.call(c).await,
+            }
+        })
+    }
+}
+
+async fn connect_inner(p: &Params<'_>, up: Rc<Cell<bool>>) -> Result<Connected, Outcome> {
+    let cfg = shared_cfg(p.limits.max_packet, p.config.protocol);
+    let connector = transport(p, &cfg, up);
+    match p.config.protocol {
+        Protocol::V5 => connect_v5(p, cfg, connector).await,
+        Protocol::V311 => connect_v3(p, cfg, connector).await,
+    }
+}
+
+fn target(config: &ConnectConfig) -> Target {
+    Target {
+        host: config.profile.host.clone(),
+        port: config.profile.port,
+    }
+}
+
+async fn connect_v5(
+    p: &Params<'_>,
+    cfg: SharedCfg,
+    connector: impl Fn(Connect<Target>) -> ConnFuture + 'static,
+) -> Result<Connected, Outcome> {
     let config = p.config;
     let profile = &config.profile;
-    let cfg = shared_cfg(p.limits.max_packet);
-    let tls = matches!(profile.transport, Transport::Tls | Transport::Wss);
-    let dialer = Dialer::new(if tls { p.ssl.clone() } else { None }, up);
-    let target = Target {
-        host: profile.host.clone(),
-        port: profile.port,
-    };
     let will = match profile.will.as_ref().map(last_will) {
         Some(None) => return Err(Outcome::Failed("The Will topic is not valid.".into())),
         Some(Some(w)) => Some(w),
         None => None,
     };
     let max_packet = u32::try_from(p.limits.max_packet).unwrap_or(u32::MAX);
-    let mut req = ConnectV5::new(target)
+    let mut req = ConnectV5::new(target(config))
         .client_id(profile.client_id.clone())
         .keep_alive(Seconds(profile.keepalive_secs))
         .max_packet_size(max_packet)
@@ -428,26 +589,21 @@ async fn connect_v5(p: &Params<'_>, up: Rc<Cell<bool>>) -> Result<Connected, Out
         req = req.password(NtexBytes::copy_from_slice(pw.as_bytes()));
     }
 
-    let result = if matches!(profile.transport, Transport::Ws | Transport::Wss) {
-        // Our dialer gives the socket (and TLS for WSS), then the upgrade runs on it.
-        let client = Rc::new(WsClient::new(ws_uri(config), cfg.clone()).connector(dialer.clone()));
-        let connector = move |_: Connect<Target>| {
-            let (client, dialer) = (client.clone(), dialer.clone());
-            async move {
-                let conn = client.connect().await.map_err(|e| ws_error(&e))?;
-                dialer.mark_up();
-                Ok::<_, NtexError<ConnectError>>(conn.into_transport().seal())
-            }
-        };
-        Pipeline::new(cfg, MqttConnector::new().connector(connector))
-            .call(req)
-            .await
-    } else {
-        Pipeline::new(cfg, MqttConnector::new().connector(dialer))
-            .call(req)
-            .await
-    };
-    let client = result.map_err(|e| connect_outcome(&e, p.diag, profile.client_cert.is_some()))?;
+    let result = Pipeline::new(
+        cfg,
+        MqttConnector::new().connector(async move |c: Connect<Target>| connector(c).await),
+    )
+    .call(req)
+    .await;
+    let client = result.map_err(|e| {
+        connect_outcome(
+            &e,
+            p.diag,
+            profile.client_cert.is_some(),
+            Protocol::V5,
+            |a| connack_outcome(a),
+        )
+    })?;
 
     let ack = client.packet();
     let (session_present, broker_max_packet) = (ack.session_present, ack.max_packet_size);
@@ -464,16 +620,14 @@ async fn connect_v5(p: &Params<'_>, up: Rc<Cell<bool>>) -> Result<Connected, Out
         let control = {
             let flags = flags.clone();
             fn_service(move |m: Control<HandlerError>| {
-                if let Control::Stop(reason) = m {
-                    *flags.stop.borrow_mut() = Some(reason);
-                }
+                record_stop(&flags, m);
                 async { Ok::<_, ()>(None) }
             })
         };
         if let Err(e) = client.start_with_control(proto, control).await {
             tracing::debug!(error = %e, "the MQTT dispatcher ended with an error");
         }
-        stop_outcome(&flags)
+        stop_outcome(&flags, Protocol::V5)
     });
     Ok(Connected {
         wire: Wire::V5(sink),
@@ -481,6 +635,109 @@ async fn connect_v5(p: &Params<'_>, up: Rc<Cell<bool>>) -> Result<Connected, Out
         broker_max_packet,
         driver,
     })
+}
+
+async fn connect_v3(
+    p: &Params<'_>,
+    cfg: SharedCfg,
+    connector: impl Fn(Connect<Target>) -> ConnFuture + 'static,
+) -> Result<Connected, Outcome> {
+    let config = p.config;
+    let profile = &config.profile;
+    let will = match profile.will.as_ref() {
+        Some(w) if crate::topic::topic_error(&w.topic).is_some() => {
+            return Err(Outcome::Failed("The Will topic is not valid.".into()));
+        }
+        Some(w) if w.payload.len() > V3_WILL_MAX => {
+            return Err(Outcome::Failed(
+                "The Will message is too long for MQTT 3.1.1 (65 535 bytes at most).".into(),
+            ));
+        }
+        Some(w) => Some(v3::codec::LastWill {
+            qos: wire_qos(w.qos),
+            retain: w.retain,
+            topic: ByteString::from(w.topic.clone()),
+            message: NtexBytes::copy_from_slice(&w.payload),
+        }),
+        None => None,
+    };
+    // D3: Clean Session off means a persistent session. The profile flag is Clean Session here.
+    let clean_session = profile.clean_start;
+    // MQTT 3.1.1 [3.1.3.1]: an empty client ID needs Clean Session. The encoder refuses it, so
+    // say it before the dial, and do not blame the broker.
+    if profile.client_id.is_empty() && !clean_session {
+        return Err(Outcome::Failed(EMPTY_ID_TEXT.into()));
+    }
+    let mut req = v3::client::Connect::new(target(config))
+        .client_id(profile.client_id.clone())
+        .keep_alive(Seconds(profile.keepalive_secs))
+        .packet(|c| c.clean_session = clean_session);
+    if let Some(w) = will {
+        req = req.last_will(w);
+    }
+    // MQTT 3.1.1 allows a password only with a user name.
+    if let Some(u) = &profile.username {
+        req = req.username(ByteString::from(u.clone()));
+        if let Some(pw) = &config.password {
+            req = req.password(NtexBytes::copy_from_slice(pw.as_bytes()));
+        }
+    }
+
+    let result = Pipeline::new(
+        cfg,
+        v3::client::MqttConnector::new()
+            .connector(async move |c: Connect<Target>| connector(c).await),
+    )
+    .call(req)
+    .await;
+    let client = result.map_err(|e| {
+        connect_outcome(
+            &e,
+            p.diag,
+            profile.client_cert.is_some(),
+            Protocol::V311,
+            |a| connack_outcome_v3(a.return_code),
+        )
+    })?;
+
+    let session_present = client.session_present();
+    let sink = client.sink();
+    let flags = Rc::new(Flags::default());
+    let handler = HandlerV3 {
+        ingest: p.ingest.clone(),
+        sink: sink.clone(),
+        flags: flags.clone(),
+        max_packet: p.limits.max_packet,
+    };
+    let driver = Box::pin(async move {
+        let proto = fn_service(move |msg: v3::client::ProtocolMessage| handler.clone().call(msg));
+        let control = {
+            let flags = flags.clone();
+            fn_service(move |m: Control<HandlerError>| {
+                record_stop(&flags, m);
+                async { Ok::<_, ()>(None) }
+            })
+        };
+        if let Err(e) = client.start_with_control(proto, control).await {
+            tracing::debug!(error = %e, "the MQTT dispatcher ended with an error");
+        }
+        stop_outcome(&flags, Protocol::V311)
+    });
+    Ok(Connected {
+        wire: Wire::V3(sink, p.limits.max_packet),
+        session_present,
+        // MQTT 3.1.1 has no Maximum Packet Size in the CONNACK.
+        broker_max_packet: None,
+        driver,
+    })
+}
+
+/// The control services of both versions call this: it keeps the stop reason for
+/// [`stop_outcome`].
+fn record_stop(flags: &Flags, m: Control<HandlerError>) {
+    if let Control::Stop(reason) = m {
+        *flags.stop.borrow_mut() = Some(reason);
+    }
 }
 
 /// The Will of a profile as ntex wants it. `None`: the topic is not valid.
@@ -543,18 +800,8 @@ impl Handler {
         self,
         msg: ProtocolMessage,
     ) -> Result<v5::client::ProtocolMessageAck, HandlerError> {
-        let sink = self.sink.clone();
-        let flags = self.flags.clone();
-        match Contain::new(self.handle(msg)).await {
-            Ok(result) => result,
-            Err(text) => {
-                // A panic in a call that ntex runs in a detached task must not hang the attempt.
-                tracing::error!(panic = %text, "an MQTT handler panicked");
-                flags.panicked.set(true);
-                sink.force_close();
-                Err(HandlerError::Panic)
-            }
-        }
+        let (sink, flags) = (self.sink.clone(), self.flags.clone());
+        contained(self.handle(msg), &flags, || sink.force_close()).await
     }
 
     async fn handle(
@@ -606,6 +853,96 @@ impl Handler {
             }
             other => Ok(other.ack()),
         }
+    }
+}
+
+/// Runs one handler call inside `catch_unwind`. A panic in a call that ntex runs in a detached
+/// task must not hang the attempt: it records the panic and closes the connection at once.
+async fn contained<T: 'static>(
+    call: impl Future<Output = Result<T, HandlerError>> + 'static,
+    flags: &Flags,
+    force_close: impl FnOnce(),
+) -> Result<T, HandlerError> {
+    match Contain::new(call).await {
+        Ok(result) => result,
+        Err(text) => {
+            tracing::error!(panic = %text, "an MQTT handler panicked");
+            flags.panicked.set(true);
+            force_close();
+            Err(HandlerError::Panic)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HandlerV3 {
+    ingest: Rc<Ingest>,
+    sink: v3::MqttSink,
+    flags: Rc<Flags>,
+    max_packet: usize,
+}
+
+impl HandlerV3 {
+    async fn call(
+        self,
+        msg: v3::client::ProtocolMessage,
+    ) -> Result<v3::client::ProtocolMessageAck, HandlerError> {
+        let (sink, flags) = (self.sink.clone(), self.flags.clone());
+        contained(self.handle(msg), &flags, || sink.force_close()).await
+    }
+
+    async fn handle(
+        self,
+        msg: v3::client::ProtocolMessage,
+    ) -> Result<v3::client::ProtocolMessageAck, HandlerError> {
+        use v3::client::ProtocolMessage as M;
+        match msg {
+            M::Publish(p) => {
+                #[cfg(test)]
+                if p.packet().topic == "__handler_hold__" {
+                    // A call that never ends, so that the panic below runs as a second call.
+                    std::future::pending::<()>().await;
+                }
+                #[cfg(test)]
+                if p.packet().topic == "__handler_panic__" {
+                    ntex_util::time::sleep(Millis(10)).await;
+                    panic!("test: handler panic after an await");
+                }
+                if p.packet().qos == WireQos::ExactlyOnce {
+                    // No PUBREC: the error closes the connection. MQTT 3.1.1 has no DISCONNECT
+                    // from the client side with a reason.
+                    self.flags.qos2.set(true);
+                    return Err(HandlerError::Qos2);
+                }
+                // The codec checked the declared size already. This is the second line.
+                if p.packet_size() > v3_max_remaining(self.max_packet) {
+                    self.sink.force_close();
+                    return Err(HandlerError::Payload);
+                }
+                let payload = p.read_all().await.map_err(|_| HandlerError::Payload)?;
+                self.ingest
+                    .queue(|generation| incoming_v3(generation, p.packet(), &payload));
+                Ok(p.ack())
+            }
+            other => Ok(other.ack()),
+        }
+    }
+}
+
+fn incoming_v3(generation: u64, p: &v3::codec::Publish, payload: &NtexBytes) -> Incoming {
+    Incoming {
+        generation,
+        topic: std::sync::Arc::from(p.topic.as_str()),
+        payload: bytes::Bytes::copy_from_slice(payload),
+        // We subscribe with maximum QoS 1. QoS 2 never gets here.
+        qos: if p.qos == WireQos::AtMostOnce {
+            Qos::AtMostOnce
+        } else {
+            Qos::AtLeastOnce
+        },
+        retain: p.retain,
+        props: MsgProps::default(),
+        received_at: std::time::SystemTime::now(),
     }
 }
 
@@ -671,33 +1008,85 @@ impl<T> Future for Contain<T> {
 // Error text
 // ---------------------------------------------------------------------------------------------
 
-fn connect_outcome(
-    e: &NtexError<MqttClientError<Box<ConnectAck>>>,
+/// The outcome of a failed connect. `ack` turns a refused CONNACK into an outcome.
+fn connect_outcome<T: std::fmt::Debug>(
+    e: &NtexError<MqttClientError<T>>,
     diag: Option<&TlsDiag>,
     has_client_cert: bool,
+    protocol: Protocol,
+    ack: impl FnOnce(&T) -> Outcome,
 ) -> Outcome {
     match &**e {
+        // The peer cut the connection during the MQTT handshake (a reset, as a clean EOF is
+        // `Disconnected(None)`). A TLS diagnosis still wins.
+        MqttClientError::Disconnected(Some(io))
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) && diag.and_then(TlsDiag::text).is_none() =>
+        {
+            Outcome::Retry(CLOSED_BEFORE_CONNACK_TEXT.into())
+        }
         MqttClientError::Connect(ConnectError::Io(io))
         | MqttClientError::Disconnected(Some(io)) => io_outcome(io, diag, has_client_cert),
         MqttClientError::Connect(other) => Outcome::Failed(format!("Network error: {other}")),
-        MqttClientError::Disconnected(None) => Outcome::Retry(CLOSED_TEXT.into()),
-        MqttClientError::Protocol(e) => protocol_outcome(e),
+        MqttClientError::Disconnected(None) => Outcome::Retry(CLOSED_BEFORE_CONNACK_TEXT.into()),
+        // A 3.1.1 broker answers an MQTT 5 CONNECT with a 3.1.1 refusal. The v5 decoder cannot
+        // read it. A size error is not that.
+        MqttClientError::Protocol(MqttProtocolError::Decode(d))
+            if protocol == Protocol::V5 && !matches!(d, DecodeError::MaxSizeExceeded { .. }) =>
+        {
+            Outcome::Failed(NOT_V5_TEXT.into())
+        }
+        MqttClientError::Protocol(e) => protocol_outcome_for(e, protocol),
         MqttClientError::ConnectTimeout => {
             Outcome::Retry("The broker did not answer the connection request.".into())
         }
-        MqttClientError::Ack(ack) => {
-            let text = connack_text(ack);
-            if connack_is_temporary(ack.reason_code) {
-                Outcome::Retry(text)
-            } else {
-                Outcome::Failed(text)
-            }
-        }
+        MqttClientError::Ack(a) => ack(a),
     }
 }
 
-/// The outcome of a protocol error of the connection or of the handshake.
+fn connack_outcome(ack: &ConnectAck) -> Outcome {
+    let text = connack_text(ack);
+    if connack_is_temporary(ack.reason_code) {
+        Outcome::Retry(text)
+    } else {
+        Outcome::Failed(text)
+    }
+}
+
+/// The outcome of an MQTT 3.1.1 CONNACK refusal (return codes 1 to 5). Only "server
+/// unavailable" is temporary.
+pub(super) fn connack_outcome_v3(code: v3::codec::ConnectAckReason) -> Outcome {
+    use v3::codec::ConnectAckReason as C;
+    let why = match code {
+        C::UnacceptableProtocolVersion => return Outcome::Failed(NO_V311_TEXT.into()),
+        C::IdentifierRejected => "the client ID is not valid",
+        C::ServiceUnavailable => "the server is not available",
+        C::BadUserNameOrPassword => "the user name or password is wrong",
+        C::NotAuthorized => "this client is not authorized",
+        other => {
+            return Outcome::Failed(format!("The broker rejected the connection: {other:?}."));
+        }
+    };
+    let text = format!("The broker rejected the connection: {why}.");
+    if code == C::ServiceUnavailable {
+        Outcome::Retry(text)
+    } else {
+        Outcome::Failed(text)
+    }
+}
+
+/// The outcome of a protocol error of an MQTT 5 connection or handshake.
+#[cfg(test)]
 pub(super) fn protocol_outcome(e: &MqttProtocolError) -> Outcome {
+    protocol_outcome_for(e, Protocol::V5)
+}
+
+fn protocol_outcome_for(e: &MqttProtocolError, protocol: Protocol) -> Outcome {
     match e {
         MqttProtocolError::KeepAliveTimeout => Outcome::Retry(CONNECTION_CLOSED_TEXT.into()),
         MqttProtocolError::WriteTimeout => Outcome::Retry(WRITE_TIMEOUT_TEXT.into()),
@@ -710,12 +1099,13 @@ pub(super) fn protocol_outcome(e: &MqttProtocolError) -> Outcome {
         {
             Outcome::Failed(DUPLICATE_ID_TEXT.into())
         }
+        _ if protocol == Protocol::V311 => Outcome::Failed(PROTOCOL_TEXT_V3.into()),
         _ => Outcome::Failed(PROTOCOL_TEXT.into()),
     }
 }
 
 /// How the connection ended, from what the callbacks saw.
-fn stop_outcome(f: &Flags) -> Outcome {
+fn stop_outcome(f: &Flags, protocol: Protocol) -> Outcome {
     if f.qos2.get() {
         return Outcome::Failed(QOS2_TEXT.into());
     }
@@ -726,7 +1116,7 @@ fn stop_outcome(f: &Flags) -> Outcome {
         return disconnect_outcome(reason, text.as_deref());
     }
     match f.stop.take() {
-        Some(Reason::Protocol(e)) => protocol_outcome(e.get_ref()),
+        Some(Reason::Protocol(e)) => protocol_outcome_for(e.get_ref(), protocol),
         Some(Reason::PeerGone(gone)) => match gone.err() {
             Some(io) => io_outcome(io, None, false),
             None => Outcome::Retry(CONNECTION_CLOSED_TEXT.into()),
@@ -778,6 +1168,9 @@ pub(super) fn disconnect_outcome(reason: DisconnectReasonCode, text: Option<&str
 }
 
 fn connack_text(ack: &ConnectAck) -> String {
+    if ack.reason_code == ConnectAckReason::UnsupportedProtocolVersion {
+        return NO_V5_TEXT.into();
+    }
     let reason = match ack.reason_code {
         ConnectAckReason::BadUserNameOrPassword => "the user name or password is wrong",
         ConnectAckReason::NotAuthorized => "this client is not authorized",
@@ -786,7 +1179,7 @@ fn connack_text(ack: &ConnectAck) -> String {
         ConnectAckReason::ServerBusy => "the server is busy",
         ConnectAckReason::Banned => "this client is banned",
         ConnectAckReason::BadAuthenticationMethod => "the authentication method is not accepted",
-        ConnectAckReason::UnsupportedProtocolVersion => "the broker does not support MQTT 5",
+        ConnectAckReason::UnsupportedProtocolVersion => "",
         ConnectAckReason::PacketTooLarge => "the CONNECT packet is too large",
         ConnectAckReason::QuotaExceeded => "a quota is exceeded",
         ConnectAckReason::UseAnotherServer | ConnectAckReason::ServerMoved => "use another server",

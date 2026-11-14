@@ -17,8 +17,8 @@ use ms_mqtt_client::topic::TopicName;
 use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, PublishResult,
-    Transport, queue_cost,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
+    PublishResult, Transport, queue_cost,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -978,6 +978,16 @@ async fn a_replaced_connect_never_uses_the_new_generation() {
 /// remove it after the CONNACK, or the broker keeps sending its messages.
 #[tokio::test(flavor = "current_thread")]
 async fn a_removal_while_offline_reaches_a_resumed_session() {
+    removal_while_offline(Protocol::V5).await;
+}
+
+/// The same test on MQTT 3.1.1: Clean Session off keeps the session (D3).
+#[tokio::test(flavor = "current_thread")]
+async fn v3_a_removal_while_offline_reaches_a_resumed_session() {
+    removal_while_offline(Protocol::V311).await;
+}
+
+async fn removal_while_offline(protocol: Protocol) {
     let _limits = limits_lock();
     require_broker();
     let p = prefix();
@@ -989,7 +999,9 @@ async fn a_removal_while_offline_reaches_a_resumed_session() {
     v.port = port;
     v.clean_start = false;
     v.session_expiry_secs = 60;
-    let generation = connect(&mut net, v).await;
+    let mut config = ConnectConfig::from(v);
+    config.protocol = protocol;
+    let generation = connect(&mut net, config).await;
     assert!(matches!(
         next_event(&mut net).await,
         Event::Subscribed { result: Ok(_), .. }
@@ -1254,4 +1266,228 @@ async fn a_new_profile_on_a_shared_session_gets_the_cached_set() {
     publish_plain(&topic, b"must not arrive".to_vec()).await;
     expect_silence(&mut fresh).await;
     fresh.shutdown().await;
+}
+
+// -------------------------------------------------------------------------------------------
+// MQTT 3.1.1 (S2b)
+// -------------------------------------------------------------------------------------------
+
+/// A v3 profile. Clean Session off (`persistent`) gives a session that the broker keeps.
+fn v3(subs: &[&str], client_id: &str, persistent: bool) -> ConnectConfig {
+    let mut c = ConnectConfig::from(Profile {
+        client_id: client_id.into(),
+        clean_start: !persistent,
+        ..profile(subs)
+    });
+    c.protocol = Protocol::V311;
+    c
+}
+
+async fn published(net: &mut Net, op_id: u64) -> PublishResult {
+    loop {
+        if let Event::Published {
+            op_id: id, result, ..
+        } = next_event(net).await
+            && id == op_id
+        {
+            return result;
+        }
+    }
+}
+
+/// Connect, subscribe (granted QoS 1), publish QoS 0 and QoS 1, receive both.
+#[tokio::test(flavor = "current_thread")]
+async fn v3_subscribe_publish_receive_and_disconnect() {
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let topic = format!("{p}/x");
+    let mut net = Net::start(NetLimits::default());
+    let generation = connect(&mut net, v3(&[&topic], "v3-basic", false)).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(Qos::AtLeastOnce), filter, .. } if filter == topic
+    ));
+    for (id, qos, want) in [
+        (1, Qos::AtMostOnce, PublishResult::Sent),
+        (2, Qos::AtLeastOnce, PublishResult::Acknowledged),
+    ] {
+        net.send(out(id, &topic, b"hello", qos)).expect("send");
+        let m = next_incoming(&mut net).await;
+        assert_eq!(&*m.topic, topic);
+        assert_eq!(&m.payload[..], b"hello");
+        assert_eq!(m.generation, generation);
+        assert_eq!(m.props, MsgProps::default(), "no properties on v3");
+        assert_eq!(published(&mut net, id).await, want);
+    }
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    net.shutdown().await;
+}
+
+/// Clean Session off: the broker keeps the subscription and queues a QoS 1 message while the
+/// client is away. The new connection gets it, and the session is reported for the profile.
+#[tokio::test(flavor = "current_thread")]
+async fn v3_persistent_session_resumes_with_the_queued_message() {
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let topic = format!("{p}/persist");
+    let id = format!("v3-persist-{}", std::process::id());
+
+    let mut first = Net::start(NetLimits::default());
+    connect(&mut first, v3(&[&topic], &id, true)).await;
+    assert!(matches!(
+        next_event(&mut first).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    // D3: a v3 session with Clean Session off is reported (it has no session expiry).
+    let filters = next_session_filters(&mut first, |f| f == [topic.as_str()]).await;
+    assert_eq!(filters, [topic.as_str()]);
+    first.shutdown().await;
+
+    let mut other = Net::start(NetLimits::default());
+    connect(&mut other, v3(&[], "v3-persist-other", false)).await;
+    other
+        .send(out(1, &topic, b"queued", Qos::AtLeastOnce))
+        .expect("send");
+    assert_eq!(published(&mut other, 1).await, PublishResult::Acknowledged);
+    other.shutdown().await;
+
+    // The same client ID and Clean Session off: the broker resumes the session. The profile has
+    // no filters, so only the session can deliver.
+    let mut again = Net::start(NetLimits::default());
+    connect(&mut again, v3(&[], &id, true)).await;
+    let m = next_incoming(&mut again).await;
+    assert_eq!((&*m.topic, &m.payload[..]), (&*topic, &b"queued"[..]));
+    again.shutdown().await;
+}
+
+/// The control: with Clean Session on, the broker keeps nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn v3_clean_session_keeps_nothing() {
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let topic = format!("{p}/clean");
+    let id = format!("v3-clean-{}", std::process::id());
+
+    let mut first = Net::start(NetLimits::default());
+    connect(&mut first, v3(&[&topic], &id, false)).await;
+    assert!(matches!(
+        next_event(&mut first).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    first.shutdown().await;
+
+    let mut other = Net::start(NetLimits::default());
+    connect(&mut other, v3(&[], "v3-clean-other", false)).await;
+    other
+        .send(out(1, &topic, b"lost", Qos::AtLeastOnce))
+        .expect("send");
+    assert_eq!(published(&mut other, 1).await, PublishResult::Acknowledged);
+    other.shutdown().await;
+
+    let mut again = Net::start(NetLimits::default());
+    connect(&mut again, v3(&[], &id, false)).await;
+    expect_silence(&mut again).await;
+    again.shutdown().await;
+}
+
+/// A QoS 1 message with a whole packet of `total` bytes (v3, one-byte QoS 1 topic prefix
+/// included in `topic`).
+fn v3_message(op_id: u64, topic: &str, total: usize) -> Command {
+    // Fixed header 1, length bytes 3 (for sizes of 16 KiB to 2 MiB), topic length 2, topic,
+    // packet ID 2.
+    let payload = total - (1 + 3 + 2 + topic.len() + 2);
+    Command::Publish(Box::new(Outgoing {
+        op_id,
+        topic: topic.into(),
+        payload: Bytes::from(vec![b'x'; payload]),
+        qos: Qos::AtLeastOnce,
+        retain: false,
+        props: MsgProps::default(),
+    }))
+}
+
+/// Size boundaries on the real broker, v3: a packet of exactly 1 MiB goes out and comes back;
+/// one byte more is refused before the send, with the text of the plan.
+#[tokio::test(flavor = "current_thread")]
+async fn v3_a_packet_of_one_mib_round_trips_and_one_byte_more_is_refused() {
+    const MIB: usize = 1024 * 1024;
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let topic = format!("{p}/mib");
+    let mut net = Net::start(NetLimits::default());
+    connect(&mut net, v3(&[&topic], "v3-mib", false)).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    net.send(v3_message(1, &topic, MIB)).expect("send");
+    let m = next_incoming(&mut net).await;
+    assert_eq!(m.payload.len(), MIB - (1 + 3 + 2 + topic.len() + 2));
+    assert_eq!(published(&mut net, 1).await, PublishResult::Acknowledged);
+
+    net.send(v3_message(2, &topic, MIB + 1)).expect("send");
+    assert_eq!(
+        published(&mut net, 2).await,
+        PublishResult::Rejected("MQTT 3.1.1 messages can be at most 1 MiB in this app.".into())
+    );
+    let nothing = tokio::time::timeout(Duration::from_secs(1), net.incoming.recv()).await;
+    assert!(
+        nothing.is_err(),
+        "the refused message was sent: {nothing:?}"
+    );
+    net.shutdown().await;
+}
+
+/// Incoming v3 boundary on the real broker: a packet of exactly the limit is delivered. One byte
+/// more (sent by a publisher with a larger limit) ends the session with the size text.
+#[tokio::test(flavor = "current_thread")]
+async fn v3_an_incoming_packet_over_the_limit_ends_the_session() {
+    const LIMIT: usize = 64 * 1024;
+    let _limits = limits_lock();
+    require_broker();
+    let p = prefix();
+    let topic = format!("{p}/limit");
+    let mut sub = Net::start(NetLimits {
+        max_packet: LIMIT,
+        ..NetLimits::default()
+    });
+    connect(&mut sub, v3(&[&topic], "v3-limit-sub", false)).await;
+    assert!(matches!(
+        next_event(&mut sub).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    let mut publisher = Net::start(NetLimits {
+        max_packet: 2 * LIMIT,
+        ..NetLimits::default()
+    });
+    connect(&mut publisher, v3(&[], "v3-limit-pub", false)).await;
+
+    publisher.send(v3_message(1, &topic, LIMIT)).expect("send");
+    assert_eq!(
+        published(&mut publisher, 1).await,
+        PublishResult::Acknowledged
+    );
+    let m = next_incoming(&mut sub).await;
+    assert_eq!(m.payload.len(), LIMIT - (1 + 3 + 2 + topic.len() + 2));
+
+    publisher
+        .send(v3_message(2, &topic, LIMIT + 1))
+        .expect("send");
+    assert_eq!(
+        published(&mut publisher, 2).await,
+        PublishResult::Acknowledged
+    );
+    wait_state(&mut sub, |s| matches!(s, ConnState::Failed(_))).await;
+    let state = sub.status.borrow().state.clone();
+    assert_eq!(
+        state,
+        ConnState::Failed("The broker sent a packet that is larger than the allowed size.".into())
+    );
+    publisher.shutdown().await;
+    sub.shutdown().await;
 }
