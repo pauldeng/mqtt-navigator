@@ -3,6 +3,94 @@
 /// Largest filter or topic length that MQTT allows, in bytes.
 pub const MAX_LEN: usize = 65_535;
 
+/// Why `s` is not a valid MQTT string, in the words of the old client (`bad string: ...`). The
+/// rules: at most 65 535 bytes; no NUL, no control character, no unassigned code point (this
+/// includes the non-characters). `None`: the string is valid.
+fn string_error(s: &str) -> Option<String> {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory as _};
+    if s.len() > usize::from(u16::MAX) {
+        return Some("bad string: longer than 65,535 bytes".into());
+    }
+    for c in s.chars() {
+        let why = if c == '\0' {
+            "contains U+0000"
+        } else {
+            match c.general_category() {
+                GeneralCategory::Control => "contains control codepoint",
+                GeneralCategory::Unassigned => "contains non-character codepoint",
+                _ => continue,
+            }
+        };
+        return Some(format!("bad string: {why}"));
+    }
+    None
+}
+
+/// Why `topic` is not a valid MQTT topic name, in the words of the old client: "empty topic",
+/// "bad string: ...", or "bad topic {topic}" (a wildcard). `None`: it is valid.
+pub fn topic_error(topic: &str) -> Option<String> {
+    if topic.is_empty() {
+        return Some("empty topic".into());
+    }
+    if let Some(e) = string_error(topic) {
+        return Some(e);
+    }
+    topic
+        .contains(['+', '#'])
+        .then(|| format!("bad topic {topic}"))
+}
+
+/// Why `filter` is not a valid MQTT topic filter, in the words of the old client: "empty
+/// filter", "bad string: ...", or "bad filter {text}" (a wildcard in a wrong place, or a wrong
+/// `$share` group). `None`: the filter is valid.
+pub fn filter_error(filter: &str) -> Option<String> {
+    if filter.is_empty() {
+        return Some("empty filter".into());
+    }
+    if let Some(e) = string_error(filter) {
+        return Some(e);
+    }
+    let bad = |text: &str| Some(format!("bad filter {text}"));
+    let body = match filter.strip_prefix("$share/") {
+        Some(rest) => {
+            let end = rest.find(['+', '#', '/']);
+            // A wildcard in the group, no separator, or an empty group.
+            match end {
+                Some(i) if rest.as_bytes()[i] == b'/' && i > 0 => {}
+                _ => return bad(filter),
+            }
+            let inner = &rest[end.unwrap_or(0) + 1..];
+            if inner.is_empty() {
+                return Some("empty filter".into());
+            }
+            inner
+        }
+        None => filter,
+    };
+    // Levels: `+` and `#` stand alone, and `#` is last.
+    #[derive(PartialEq)]
+    enum State {
+        Separator,
+        Literal,
+        Single,
+        Multiple,
+    }
+    let mut state = State::Separator;
+    for c in body.chars() {
+        state = match (state, c) {
+            (State::Multiple, _) => return bad(body),
+            (_, '/') => State::Separator,
+            (State::Separator, '+') => State::Single,
+            (State::Separator, '#') => State::Multiple,
+            (State::Separator, _) => State::Literal,
+            (State::Literal, '+' | '#') => return bad(body),
+            (State::Literal, _) => State::Literal,
+            _ => return bad(body),
+        };
+    }
+    None
+}
+
 /// True if `filter` is a valid MQTT 5 topic filter.
 ///
 /// - It has 1 to 65 535 bytes and no NUL.

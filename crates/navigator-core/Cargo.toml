@@ -12,24 +12,7 @@ workspace = true
 
 [dependencies]
 bytes = "1.12.1"
-ms-mqtt-client = { version = "0.1.0", features = ["websockets"] }
-openssl = { version = "0.10.82", features = ["vendored"] }
-serde = { version = "1.0.229", features = ["derive"] }
-# preserve_order: the JSON view keeps the key order of the payload.
-serde_json = { version = "1.0.154", features = ["preserve_order"] }
-thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
-tracing = "0.1.44"
-uuid = { version = "1.29.2", features = ["v4", "serde"] }
-
-[features]
-# Tests against the Docker brokers in tests/broker (see tests/broker/README.md).
-broker-tests = []
-
-[dev-dependencies]
-tempfile = "3.27.0"
-# S1 spike (examples/ntex_spike.rs): ntex-mqtt inside our runtime. Not used by the library.
-log = "0.4"
+# The MQTT client (D4 of the ntex plan). Exact pin: the maintainer breaks the API in each major.
 ntex = { version = "4.8.0", default-features = false, features = ["tokio", "ws"] }
 ntex-bytes = "1.15.2"
 ntex-error = "3.1.0"
@@ -39,4 +22,25 @@ ntex-net = { version = "4.12.0", features = ["tokio"] }
 ntex-service = "5.7.2"
 ntex-tls = { version = "4.8.0", features = ["openssl"] }
 ntex-util = "4.11.0"
+openssl = { version = "0.10.82", features = ["vendored"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# preserve_order: the JSON view keeps the key order of the payload.
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros", "net"] }
+tracing = "0.1.44"
+# Unicode general categories for the MQTT string rules (the old client used it; it is in Cargo.lock).
+unicode-properties = "0.1.5"
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
+
+[features]
+# Tests against the Docker brokers in tests/broker (see tests/broker/README.md).
+broker-tests = []
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# Test publishers and examples/flood.rs still use the old client until S3 ports them.
+ms-mqtt-client = { version = "0.1.0", features = ["websockets"] }
+# The spike (examples/ntex_spike.rs) captures `log` records.
+log = "0.4"
 tokio = { version = "1.54.1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }

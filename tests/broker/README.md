@@ -49,7 +49,7 @@ Other brokers (the ports are on `127.0.0.1`):
 - `hivemq-config.xml`: the HiveMQ listeners.
 - `mosquitto.conf`: the listeners.
 - `gen-certs.sh`: makes a test CA, server and client certificates, and the password file in `certs/`. It also makes the bad cases: an expired certificate, a certificate for another host name, and a client key that does not match its certificate. `up.sh` runs it when `certs/` is empty.
-- `up.sh`: starts the brokers. It waits for an MQTT CONNACK (30 s for Mosquitto, 90 s for the others).
+- `up.sh`: starts the brokers. It waits for an MQTT CONNACK (30 s for Mosquitto, 90 s for the others). It makes a real connect on every listener: Mosquitto 18830 to 18837 (the two bad-certificate listeners without verification), EMQX 18840 and 18841, HiveMQ 18850 and 18851. It needs `openssl` for the TLS ones.
 - `down.sh`: stops and removes the brokers.
 
 `certs/` is in `.gitignore`. The keys are for tests only. Do not use them anywhere else.

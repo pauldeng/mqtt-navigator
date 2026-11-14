@@ -27,7 +27,7 @@ pub fn tls(ca: bool, client: bool, verify: bool) -> Result<(SslConnector, TlsDia
         None,
         verify,
     )?
-    .ssl_connector()
+    .connector()
 }
 
 fn ms(d: Duration) -> String {

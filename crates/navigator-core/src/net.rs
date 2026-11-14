@@ -1,4 +1,5 @@
-//! The "net" thread: one tokio `current_thread` runtime that owns the MQTT client.
+//! The "net" thread: one tokio `current_thread` runtime that owns the MQTT client (ntex-mqtt, in
+//! the `wire` module, with our own dialer in `dial`).
 //!
 //! The UI talks to it only through [`Net`]. The net thread never waits for the UI. See the
 //! "Threads and data flow" section of the plan, ADR 0002 and ARCHITECTURE.md.
@@ -6,33 +7,23 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::future::Future;
-use std::num::{NonZeroU16, NonZeroU32};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use ms_mqtt_client::client::{
-    Client, ClientOptions, ConnectResult, DisconnectedEvent, KeepAliveConfig, new_client,
-};
-use ms_mqtt_client::error::{ConnectError, ProtocolError};
-use ms_mqtt_client::local_limits;
-use ms_mqtt_client::packet::{
-    ConnAckReason, ConnectProperties, DeliveryQoS, DisconnectProperties, DisconnectReason,
-    PayloadFormatIndicator, Publish, PublishProperties, QoS as WireQos, RetainOptions,
-    SubAckReason, SubscribeProperties, UnsubscribeProperties,
-};
-use ms_mqtt_client::topic::{TopicFilter, TopicName};
-use ms_mqtt_client::transport::{
-    ConnectionTransportConfig, ConnectionTransportType, IntoWsRequest as _,
-};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinSet, LocalSet};
 
 use crate::model::{Incoming, MsgProps, Qos};
-use crate::text::display_safe;
 use crate::tls::{TlsDiag, TlsMaterial};
+
+mod dial;
+mod wire;
+
+use crate::topic::filter_error;
+use wire::{Connected, Params, UnsubFail, Wire};
 
 pub use crate::profile::{Profile, Transport, Will};
 
@@ -182,7 +173,7 @@ pub enum Event {
 /// Counters shared with the UI.
 #[derive(Debug, Default)]
 pub struct NetStats {
-    /// Messages dropped because a queue was full (both the client queue and ours).
+    /// Messages dropped because a queue was full (the byte budget or the message count).
     pub drops: AtomicU64,
     /// Events dropped because the event log was full. This stays 0 while the UI drains the log
     /// (see [`EVENTS_CAP`]). It can grow only if the UI stops draining during many reconnects.
@@ -193,7 +184,7 @@ pub struct NetStats {
 #[derive(Clone, Copy, Debug)]
 pub struct NetLimits {
     /// Largest incoming packet (the whole packet), in bytes. The default is 1 MiB. It is
-    /// advertised as Maximum Packet Size in CONNECT, and the patched reader enforces it.
+    /// advertised as Maximum Packet Size in CONNECT, and the ntex codec enforces it.
     pub max_packet: usize,
     /// Capacity of the queue to the UI, in messages.
     pub queue_len: usize,
@@ -380,7 +371,12 @@ impl Net {
                         return;
                     }
                 };
-                LocalSet::new().block_on(&rt, supervisor(cmd_rx, cancel_rx, shared));
+                // One reactor scope for the whole thread body. ntex needs it for its I/O and
+                // timers. A nested call panics, so nothing below may start another scope.
+                let reactor: Box<dyn ntex_net::Reactor> = Box::new(ntex_net::tokio::Reactor);
+                ntex_net::with_reactor(&reactor, || {
+                    LocalSet::new().block_on(&rt, supervisor(cmd_rx, cancel_rx, shared));
+                });
                 done_tx.send_replace(true);
             });
         if let Err(e) = thread {
@@ -957,7 +953,7 @@ impl Sup {
         let up = c.attempt.as_ref().filter(|a| a.up.get());
         match command {
             Command::Subscribe { filter, qos } => {
-                if let Err(e) = TopicFilter::new(&filter) {
+                if let Some(e) = filter_error(&filter) {
                     let why = format!("Invalid topic filter: {e}");
                     reject(
                         &self.shared,
@@ -1148,7 +1144,7 @@ async fn run_session(
 
 /// Why the session loop ended.
 enum Ended {
-    Driver(DisconnectedEvent),
+    Driver(Outcome),
     /// An operation timed out and has reported it.
     Expired,
     /// An operation task panicked.
@@ -1162,84 +1158,42 @@ async fn session(
     commands: &mut mpsc::Receiver<Command>,
     stop: &Notify,
 ) -> AttemptEnd {
-    let profile = &config.profile;
     let generation = ctx.generation;
-    local_limits::set_limits(
-        shared.limits.max_packet,
-        shared.limits.queue_len,
-        shared.limits.queue_bytes,
-    );
     // The files are read and parsed, and the connector is built, off the net thread (the system
     // CA store alone takes some ms). A stop during that returns at once.
-    let tls = match tls_setup(config, &ctx.tls, stop).await {
-        Ok(t) => t,
+    let (ssl, diag) = match tls_setup(config, &ctx.tls, stop).await {
+        Ok(Some((ssl, diag))) => (Some(ssl), Some(diag)),
+        Ok(None) => (None, None),
         Err(end) => return end,
     };
-    let (transport, diag) = match transport(config, tls) {
-        Ok(t) => t,
-        Err(text) => return AttemptEnd::never_up(Outcome::Failed(text)),
-    };
-    let will = match profile.will.as_ref().map(wire_will) {
-        Some(None) => {
-            return AttemptEnd::never_up(Outcome::Failed("The Will topic is not valid.".into()));
-        }
-        Some(Some(w)) => Some(w),
-        None => None,
-    };
-    let (client, connect_handle, mut receiver) = new_client(ClientOptions {
-        client_id: Some(profile.client_id.clone()).filter(|id| !id.is_empty()),
-        ..Default::default()
+    let ingest = Rc::new(Ingest {
+        shared: shared.clone(),
+        generation,
+        token: ctx.token,
     });
-    let keep_alive = match NonZeroU16::new(profile.keepalive_secs) {
-        Some(ping_after) => KeepAliveConfig::Duration {
-            ping_after,
-            response_timeout: CONNECT_TIMEOUT,
-        },
-        None => KeepAliveConfig::Infinite,
-    };
-    let max_packet = u32::try_from(shared.limits.max_packet).unwrap_or(u32::MAX);
-    let connect = connect_handle.connect(
-        ConnectionTransportConfig {
-            transport_type: transport,
-            timeout: Some(CONNECT_TIMEOUT),
-            proxy: None,
-            tcp_nodelay: true,
-        },
-        profile.clean_start,
-        keep_alive,
-        will,
-        profile.username.clone(),
-        config
-            .password
-            .as_ref()
-            .map(|p| Bytes::copy_from_slice(p.as_bytes())),
-        ConnectProperties {
-            maximum_packet_size: NonZeroU32::new(max_packet).unwrap_or(NonZeroU32::MAX),
-            session_expiry_interval: profile.session_expiry_secs.into(),
-            ..Default::default()
-        },
-        Some(CONNECT_TIMEOUT),
-    );
+    let connect = wire::connect(Params {
+        config,
+        limits: shared.limits,
+        ssl,
+        diag: diag.as_ref(),
+        ingest,
+    });
     let result = tokio::select! {
         result = connect => result,
         () = stop.notified() => return AttemptEnd::never_up(Outcome::Disconnected),
     };
-    let (connection, disconnect_handle, session_present) = match result {
-        ConnectResult::Success(connection, connack, handle) => {
-            shared.broker_max_packet.store(
-                connack.properties.maximum_packet_size.get(),
-                Ordering::Relaxed,
-            );
-            (connection, handle, connack.session_present)
-        }
-        ConnectResult::Failure(_, error) => {
-            return AttemptEnd::never_up(connect_outcome(
-                &error,
-                diag.as_ref(),
-                profile.client_cert.is_some(),
-            ));
-        }
+    let Connected {
+        wire,
+        session_present,
+        broker_max_packet,
+        mut driver,
+    } = match result {
+        Ok(connected) => connected,
+        Err(outcome) => return AttemptEnd::never_up(outcome),
     };
+    shared
+        .broker_max_packet
+        .store(broker_max_packet.unwrap_or(0), Ordering::Relaxed);
     let up_at = tokio::time::Instant::now();
     // No `await` from here to the end of the subscribe loop: the supervisor sees `up` and
     // `desired` as one step.
@@ -1284,17 +1238,14 @@ async fn session(
     // An operation that times out reports it here. The session then ends.
     let expired = Rc::new(Notify::new());
     // Subscribe in batches: `dispatch` rejects more than `MAX_PENDING_OPS` operations.
-    resub.feed(&client, ctx, shared, &expired, &mut ops);
+    resub.feed(&wire, ctx, shared, &expired, &mut ops);
 
-    let mut ingest = Ingest {
-        shared: shared.clone(),
-        generation,
-        token: ctx.token,
-        last_drops: Cell::new(local_limits::dropped()),
-    };
-    let mut driver = Box::pin(connection.run_until_disconnect());
-    let mut disconnect_handle = Some(disconnect_handle);
-    let (mut receiver_open, mut commands_open) = (true, true);
+    // The user asked to disconnect: the connection closes gracefully, and `grace` forces it if
+    // the close takes too long. The timer starts with the request and ends with the close.
+    let (mut closing, mut forced) = (false, false);
+    let grace = tokio::time::sleep(wire::CLOSE_GRACE);
+    tokio::pin!(grace);
+    let mut commands_open = true;
     // The timer runs only after a change of the session set. It makes one report for many.
     let report = tokio::time::sleep(REPORT_DELAY);
     tokio::pin!(report);
@@ -1317,14 +1268,9 @@ async fn session(
                 report_armed = false;
                 report_filters(shared, ctx);
             },
-            (_handle, event) = &mut driver => break Ended::Driver(event),
+            outcome = &mut driver => break Ended::Driver(outcome),
             () = expired.notified() => break Ended::Expired,
-            message = receiver.recv(), if receiver_open => match message {
-                // Dropping the acknowledgement token acknowledges a QoS 1 message.
-                Some((publish, _ack)) => ingest.publish(publish),
-                None => receiver_open = false,
-            },
-            command = commands.recv(), if disconnect_handle.is_some() && commands_open => match command {
+            command = commands.recv(), if !closing && commands_open => match command {
                 Some(command) => {
                     // A newer command for a filter replaces its queued re-subscribe.
                     match &command {
@@ -1334,57 +1280,59 @@ async fn session(
                         }
                         _ => {}
                     }
-                    dispatch(&client, command, ctx, shared, &expired, &mut ops);
+                    dispatch(&wire, command, ctx, shared, &expired, &mut ops);
                 }
                 None => commands_open = false,
             },
-            () = stop.notified(), if disconnect_handle.is_some() => {
-                if let Some(handle) = disconnect_handle.take() {
-                    let _ = handle.disconnect(&DisconnectProperties::default());
-                }
+            () = stop.notified(), if !closing => {
+                closing = true;
+                wire.close();
+                grace.as_mut().reset(tokio::time::Instant::now() + wire::CLOSE_GRACE);
+            },
+            () = &mut grace, if closing && !forced => {
+                // The graceful close did not finish. End the I/O now.
+                forced = true;
+                wire.force_close();
             },
             Some(joined) = ops.join_next(), if !ops.is_empty() => {
                 if joined.is_err_and(|e| e.is_panic()) {
                     break Ended::OpPanic;
                 }
-                resub.feed(&client, ctx, shared, &expired, &mut ops);
+                resub.feed(&wire, ctx, shared, &expired, &mut ops);
             },
             // The UI took events out of the log. A waiting re-subscribe or report tries again.
             () = shared.drained.notified(), if resub.blocked || report_blocked => {
-                resub.feed(&client, ctx, shared, &expired, &mut ops);
+                resub.feed(&wire, ctx, shared, &expired, &mut ops);
             },
         }
     };
-    ingest.sync_drops();
     let up_for = Some(up_at.elapsed());
-    // Dropping the client side ends the open operations. Let them report "lost".
+    // Open operations end with "lost" when the connection ends. Let them report it.
     let outcome = match ended {
-        Ended::Expired => {
-            // Drop the connection at once.
-            drop((driver, disconnect_handle, receiver, client));
+        Ended::Expired | Ended::OpPanic => {
+            if matches!(ended, Ended::OpPanic) {
+                tracing::error!(generation, "an operation task panicked");
+            }
+            // Drop the connection at once, and let ntex finish its own clean-up.
+            wire.force_close();
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, &mut driver).await;
             drain(&mut ops).await;
+            let text = if matches!(ended, Ended::Expired) {
+                OP_TIMEOUT_END_TEXT
+            } else {
+                PANIC_TEXT
+            };
             return AttemptEnd {
-                outcome: Outcome::Failed(OP_TIMEOUT_END_TEXT.into()),
+                outcome: Outcome::Failed(text.into()),
                 up_for,
             };
         }
-        Ended::OpPanic => {
-            tracing::error!(generation, "an operation task panicked");
-            drop((driver, disconnect_handle, receiver, client));
-            drain(&mut ops).await;
-            return AttemptEnd {
-                outcome: Outcome::Failed(PANIC_TEXT.into()),
-                up_for,
-            };
-        }
-        Ended::Driver(event) => event,
+        Ended::Driver(_) if closing => Outcome::Disconnected,
+        Ended::Driver(outcome) => outcome,
     };
-    drop((receiver, client));
+    drop(wire);
     drain(&mut ops).await;
-    AttemptEnd {
-        outcome: disconnect_outcome(outcome),
-        up_for,
-    }
+    AttemptEnd { outcome, up_for }
 }
 
 /// What the session still has to send after the CONNACK: the `Reconnected` event and the
@@ -1405,7 +1353,7 @@ impl Resub {
     /// drains the log.
     fn feed(
         &mut self,
-        client: &Client,
+        wire: &Wire,
         ctx: &AttemptCtx,
         shared: &Rc<Shared>,
         expired: &Rc<Notify>,
@@ -1415,10 +1363,8 @@ impl Resub {
         self.blocked = false;
         if self.announce {
             if !shared.has_room() {
-                {
-                    self.blocked = true;
-                    return;
-                }
+                self.blocked = true;
+                return;
             }
             shared.event(Event::Reconnected {
                 generation,
@@ -1431,7 +1377,7 @@ impl Resub {
             && let Some(filter) = self.unsubs.pop_front()
         {
             ops.spawn_local(stale_unsubscribe_op(
-                client.clone(),
+                wire.clone(),
                 filter,
                 ctx.maybe.clone(),
                 ctx.desired.clone(),
@@ -1440,14 +1386,12 @@ impl Resub {
         }
         while ops.len() < MAX_PENDING_OPS / 2 && !self.pending.is_empty() {
             if !shared.has_room() {
-                {
-                    self.blocked = true;
-                    return;
-                }
+                self.blocked = true;
+                return;
             }
             if let Some((filter, qos)) = self.pending.pop_front() {
                 let subscribe = Command::Subscribe { filter, qos };
-                dispatch(client, subscribe, ctx, shared, expired, ops);
+                dispatch(wire, subscribe, ctx, shared, expired, ops);
             }
         }
     }
@@ -1462,43 +1406,24 @@ async fn drain(ops: &mut JoinSet<()>) {
 
 const CLIENT_CERT_TEXT: &str =
     "The broker needs a client certificate. Add your certificate and key.";
-const PROTOCOL_TEXT: &str = "The broker sent data that is not valid MQTT 5.";
-const QOS2_TEXT: &str = "The broker sent a message with QoS 2, which this app does not support.";
-const DUPLICATE_ID_TEXT: &str =
-    "The broker broke the MQTT protocol: it reused a packet ID that was still in use.";
-
-/// The text of a protocol error. It is final: the app does not connect again.
-fn protocol_text(e: &ProtocolError) -> String {
-    if e.is_unsupported_qos2() {
-        QOS2_TEXT
-    } else if e.is_duplicate_packet_id() {
-        DUPLICATE_ID_TEXT
-    } else {
-        PROTOCOL_TEXT
-    }
-    .into()
-}
-
-/// Turns incoming publishes into `Incoming` and queues them for the UI. Never waits for the UI.
+/// Queues incoming publishes for the UI. Never waits for the UI.
 struct Ingest {
     shared: Rc<Shared>,
     generation: u64,
     /// Attempt token. After a cancel or a loss, [`Shared::active`] differs and nothing is queued.
     token: u64,
-    /// Value of `local_limits::dropped()` that we already counted.
-    last_drops: Cell<u64>,
 }
 
 impl Ingest {
-    fn publish(&mut self, publish: Publish) {
-        self.sync_drops();
+    /// Queues the message that `make` builds for this generation. It drops the message (and
+    /// counts it) when a queue is full.
+    fn queue(&self, make: impl FnOnce(u64) -> Incoming) {
         let s = &*self.shared;
         // The attempt was cancelled: queue nothing more for the UI. This is not a drop.
         if s.active.get() != self.token {
             return;
         }
-        // The client queue already bounds `publish`, so the conversion is bounded too.
-        let message = self.convert(publish);
+        let message = make(self.generation);
         let cost = queue_cost(&message);
         // Only this thread adds to the counter, so check-then-add is safe.
         let fits =
@@ -1512,45 +1437,12 @@ impl Ingest {
         }
         s.stats.drops.fetch_add(1, Ordering::Relaxed);
     }
-
-    fn convert(&self, p: Publish) -> Incoming {
-        let props = p.properties;
-        Incoming {
-            generation: self.generation,
-            topic: Arc::from(p.topic_name.as_str()),
-            payload: p.payload,
-            qos: match p.qos {
-                DeliveryQoS::AtMostOnce => Qos::AtMostOnce,
-                // We subscribe with maximum QoS 1. QoS 2 cannot arrive.
-                DeliveryQoS::AtLeastOnce(_) | DeliveryQoS::ExactlyOnce(_) => Qos::AtLeastOnce,
-            },
-            retain: p.retain,
-            props: MsgProps {
-                content_type: props.content_type,
-                response_topic: props.response_topic.map(|t| t.as_str().to_owned()),
-                correlation_data: props.correlation_data,
-                message_expiry: props.message_expiry_interval,
-                user: props.user_properties,
-                payload_utf8: props.payload_format_indicator == PayloadFormatIndicator::UTF8,
-            },
-            received_at: SystemTime::now(),
-        }
-    }
-
-    /// Adds the drops of the client's own queue (the local patch) to our counter.
-    fn sync_drops(&self) {
-        let now = local_limits::dropped();
-        let delta = now.saturating_sub(self.last_drops.replace(now));
-        if delta > 0 {
-            self.shared.stats.drops.fetch_add(delta, Ordering::Relaxed);
-        }
-    }
 }
 
-/// Starts one operation in its own task, so a full client queue never stalls the session loop.
+/// Starts one operation in its own task, so a full send queue never stalls the session loop.
 /// At most `MAX_PENDING_OPS` operations run at one time. More are rejected.
 fn dispatch(
-    client: &Client,
+    wire: &Wire,
     command: Command,
     ctx: &AttemptCtx,
     shared: &Rc<Shared>,
@@ -1563,53 +1455,27 @@ fn dispatch(
         reject(shared, generation, command, TOO_MANY_OPS_TEXT);
         return;
     }
-    let (client, shared, expired) = (client.clone(), shared.clone(), expired.clone());
+    let (wire, shared, expired) = (wire.clone(), shared.clone(), expired.clone());
     match command {
         Command::Subscribe { filter, qos } => {
             ops.spawn_local(subscribe_op(
-                client, filter, qos, generation, maybe, shared, expired,
+                wire, filter, qos, generation, maybe, shared, expired,
             ));
         }
         Command::Unsubscribe { filter } => {
             ops.spawn_local(unsubscribe_op(
-                client, filter, generation, maybe, desired, shared, expired,
+                wire, filter, generation, maybe, desired, shared, expired,
             ));
         }
         Command::Publish(outgoing) => {
-            ops.spawn_local(publish_op(client, *outgoing, generation, shared, expired));
+            ops.spawn_local(publish_op(wire, *outgoing, generation, shared, expired));
         }
         Command::Connect(_) => {}
     }
 }
 
-/// The Will of a profile as the MQTT library wants it. `None`: the topic is not valid.
-fn wire_will(w: &Will) -> Option<ms_mqtt_client::packet::Will> {
-    Some(ms_mqtt_client::packet::Will {
-        topic_name: TopicName::try_from(w.topic.as_str()).ok()?,
-        qos: wire_qos(w.qos),
-        retain: w.retain,
-        payload: Bytes::copy_from_slice(&w.payload),
-        properties: ms_mqtt_client::packet::WillProperties {
-            delay_interval: w.delay_secs,
-            payload_format_indicator: PayloadFormatIndicator::Unspecified,
-            message_expiry_interval: None,
-            content_type: None,
-            response_topic: None,
-            correlation_data: None,
-            user_properties: Vec::new(),
-        },
-    })
-}
-
-fn wire_qos(qos: Qos) -> WireQos {
-    match qos {
-        Qos::AtMostOnce => WireQos::AtMostOnce,
-        Qos::AtLeastOnce => WireQos::AtLeastOnce,
-    }
-}
-
 async fn subscribe_op(
-    client: Client,
+    wire: Wire,
     filter: String,
     qos: Qos,
     generation: u64,
@@ -1618,27 +1484,12 @@ async fn subscribe_op(
     expired: Rc<Notify>,
 ) {
     let result = tokio::time::timeout(OP_TIMEOUT, async {
-        let topic_filter =
-            TopicFilter::new(&filter).map_err(|e| format!("Invalid topic filter: {e}"))?;
+        if let Some(e) = filter_error(&filter) {
+            return Err(format!("Invalid topic filter: {e}"));
+        }
         // From the moment of the send, the broker may hold the filter.
         maybe.borrow_mut().insert(&filter);
-        let token = client
-            .subscribe(
-                topic_filter,
-                wire_qos(qos),
-                false,
-                RetainOptions::default(),
-                SubscribeProperties::default(),
-            )
-            .await
-            .map_err(|_| "Not connected.".to_owned())?;
-        let ack = token.await.map_err(|e| e.to_string())?;
-        match ack.reasons.first() {
-            Some(SubAckReason::GrantedQoS0) => Ok(Qos::AtMostOnce),
-            Some(SubAckReason::GrantedQoS1) => Ok(Qos::AtLeastOnce),
-            Some(other) => Err(suback_text(other)),
-            None => Err("The broker sent an empty SUBACK.".to_owned()),
-        }
+        wire.subscribe(&filter, qos).await
     })
     .await
     .unwrap_or_else(|_| {
@@ -1658,7 +1509,7 @@ async fn subscribe_op(
 }
 
 async fn unsubscribe_op(
-    client: Client,
+    wire: Wire,
     filter: String,
     generation: u64,
     maybe: SessionSubs,
@@ -1668,15 +1519,13 @@ async fn unsubscribe_op(
 ) {
     let fail = |why: &str| format!("Cannot unsubscribe from {filter}: {why}");
     let result = tokio::time::timeout(OP_TIMEOUT, async {
-        let topic_filter =
-            TopicFilter::new(&filter).map_err(|e| fail(&format!("Invalid topic filter: {e}")))?;
-        let token = client
-            .unsubscribe(topic_filter, UnsubscribeProperties::default())
-            .await
-            .map_err(|_| fail("Not connected."))?;
-        let ack = token.await.map_err(|e| fail(&e.to_string()))?;
-        ack.as_result()
-            .map_err(|e| format!("Unsubscribe rejected: {}", e.reason))
+        if let Some(e) = filter_error(&filter) {
+            return Err(fail(&format!("Invalid topic filter: {e}")));
+        }
+        wire.unsubscribe(&filter).await.map_err(|e| match e {
+            UnsubFail::Lost(why) => fail(&why),
+            UnsubFail::Rejected(text) => text,
+        })
     })
     .await
     .unwrap_or_else(|_| {
@@ -1686,17 +1535,10 @@ async fn unsubscribe_op(
     if result.is_ok() {
         forget(&maybe, &desired, &filter);
     }
-    shared.event(match result {
-        Ok(()) => Event::Unsubscribed {
-            generation,
-            filter,
-            result: Ok(()),
-        },
-        Err(message) => Event::Unsubscribed {
-            generation,
-            filter,
-            result: Err(message),
-        },
+    shared.event(Event::Unsubscribed {
+        generation,
+        filter,
+        result,
     });
 }
 
@@ -1712,19 +1554,17 @@ fn forget(maybe: &SessionSubs, desired: &Rc<RefCell<Vec<(String, Qos)>>>, filter
 /// no event: the user got the result when he removed the filter. A failure keeps the filter in
 /// the set, so the next CONNACK that resumes the session tries again.
 async fn stale_unsubscribe_op(
-    client: Client,
+    wire: Wire,
     filter: String,
     maybe: SessionSubs,
     desired: Rc<RefCell<Vec<(String, Qos)>>>,
     expired: Rc<Notify>,
 ) {
     let sent = tokio::time::timeout(OP_TIMEOUT, async {
-        let topic_filter = TopicFilter::new(&filter).map_err(|_| ())?;
-        let token = client
-            .unsubscribe(topic_filter, UnsubscribeProperties::default())
-            .await
-            .map_err(|_| ())?;
-        token.await.map_err(|_| ())?.as_result().map_err(|_| ())
+        if filter_error(&filter).is_some() {
+            return Err(());
+        }
+        wire.unsubscribe(&filter).await.map_err(|_| ())
     })
     .await;
     match sent {
@@ -1738,7 +1578,7 @@ async fn stale_unsubscribe_op(
 }
 
 async fn publish_op(
-    client: Client,
+    wire: Wire,
     o: Outgoing,
     generation: u64,
     shared: Rc<Shared>,
@@ -1748,7 +1588,7 @@ async fn publish_op(
     if o.topic == "__panic__" {
         panic!("test: operation task panic");
     }
-    let result = match tokio::time::timeout(OP_TIMEOUT, publish(&client, &o)).await {
+    let result = match tokio::time::timeout(OP_TIMEOUT, wire.publish(&o)).await {
         Ok(result) => result,
         Err(_) => {
             expired.notify_one();
@@ -1762,138 +1602,12 @@ async fn publish_op(
     });
 }
 
-async fn publish(client: &Client, o: &Outgoing) -> PublishResult {
-    let topic = match TopicName::new(&o.topic) {
-        Ok(t) => t,
-        Err(e) => return PublishResult::Rejected(format!("Invalid topic: {e}")),
-    };
-    let response_topic = match o
-        .props
-        .response_topic
-        .as_deref()
-        .map(TopicName::new)
-        .transpose()
-    {
-        Ok(t) => t,
-        Err(e) => return PublishResult::Rejected(format!("Invalid response topic: {e}")),
-    };
-    let props = PublishProperties {
-        content_type: o.props.content_type.clone(),
-        response_topic,
-        correlation_data: o.props.correlation_data.clone(),
-        message_expiry_interval: o.props.message_expiry,
-        user_properties: o.props.user.clone(),
-        payload_format_indicator: if o.props.payload_utf8 {
-            PayloadFormatIndicator::UTF8
-        } else {
-            PayloadFormatIndicator::Unspecified
-        },
-        ..Default::default()
-    };
-    match o.qos {
-        Qos::AtMostOnce => {
-            let Ok(token) = client
-                .publish_qos0(topic, o.payload.clone(), o.retain, props)
-                .await
-            else {
-                return PublishResult::LostOnDisconnect;
-            };
-            match token.await {
-                Ok(()) => PublishResult::Sent,
-                Err(_) => PublishResult::LostOnDisconnect,
-            }
-        }
-        Qos::AtLeastOnce => {
-            let Ok(token) = client
-                .publish_qos1(topic, o.payload.clone(), o.retain, props)
-                .await
-            else {
-                return PublishResult::LostOnDisconnect;
-            };
-            match token.await {
-                Ok(ack) if ack.is_success() => PublishResult::Acknowledged,
-                Ok(ack) => PublishResult::Rejected(match ack.properties.reason_string {
-                    Some(text) => format!("{:?}: {}", ack.reason, display_safe(&text)),
-                    None => format!("{:?}", ack.reason),
-                }),
-                Err(_) => PublishResult::LostOnDisconnect,
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
-// Transport and error text
+// TLS set-up and error text
 // ---------------------------------------------------------------------------------------------
 
-/// The transport for one attempt. The [`TlsDiag`] (TLS only) tells why a handshake failed.
-/// `tls` is the result of [`tls_setup`]. It is `Some` for TLS and WSS. This does no I/O.
-fn transport(
-    c: &ConnectConfig,
-    tls: Option<TlsParts>,
-) -> Result<(ConnectionTransportType, Option<TlsDiag>), String> {
-    let p = &c.profile;
-    let host = p.host.clone();
-    match p.transport {
-        Transport::Tcp => Ok((
-            ConnectionTransportType::Tcp {
-                hostname: host,
-                port: p.port,
-            },
-            None,
-        )),
-        Transport::Tls => {
-            let (tls_config, diag) = tls.ok_or(NO_TLS_TEXT)?;
-            Ok((
-                ConnectionTransportType::Tls {
-                    hostname: host,
-                    port: p.port,
-                    tls_config,
-                },
-                Some(diag),
-            ))
-        }
-        Transport::Ws | Transport::Wss => {
-            let secure = p.transport == Transport::Wss;
-            let path = if p.ws_path.starts_with('/') {
-                p.ws_path.clone()
-            } else {
-                format!("/{}", p.ws_path)
-            };
-            let host = if host.contains(':') && !host.starts_with('[') {
-                format!("[{host}]")
-            } else {
-                host
-            };
-            let url = format!(
-                "{}://{host}:{}{path}",
-                if secure { "wss" } else { "ws" },
-                p.port
-            );
-            let request = url
-                .into_client_request()
-                .map_err(|e| format!("Invalid WebSocket address: {e}"))?;
-            let (tls_config, diag) = if secure {
-                let (config, diag) = tls.ok_or(NO_TLS_TEXT)?;
-                (Some(config), Some(diag))
-            } else {
-                (None, None)
-            };
-            Ok((
-                ConnectionTransportType::Ws {
-                    request,
-                    tls_config,
-                },
-                diag,
-            ))
-        }
-    }
-}
-
-const NO_TLS_TEXT: &str = "TLS is not set up.";
-
-/// The TLS configuration of one attempt, and its diagnosis slot.
-type TlsParts = (ms_mqtt_client::transport::TlsConfig, TlsDiag);
+/// The TLS connector of one attempt, and its diagnosis slot.
+type TlsParts = (openssl::ssl::SslConnector, TlsDiag);
 
 /// The TLS configuration of one attempt for a TLS or WSS profile. `Ok(None)` for other
 /// transports.
@@ -1963,6 +1677,8 @@ fn io_outcome(e: &std::io::Error, diag: Option<&TlsDiag>, has_client_cert: bool)
             Outcome::Retry("The broker refused the connection. Check the host and the port.".into())
         }
         K::TimedOut => Outcome::Retry("The connection timed out.".into()),
+        // The WebSocket upgrade timeout of ntex has no kind: its text is exactly "Timeout".
+        K::Other if text == "Timeout" => Outcome::Retry("The connection timed out.".into()),
         K::UnexpectedEof | K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe => {
             Outcome::Retry("The broker closed the connection.".into())
         }
@@ -2001,119 +1717,14 @@ fn io_outcome(e: &std::io::Error, diag: Option<&TlsDiag>, has_client_cert: bool)
     }
 }
 
-fn connect_outcome(e: &ConnectError, diag: Option<&TlsDiag>, has_client_cert: bool) -> Outcome {
-    match e {
-        ConnectError::Io(e) => io_outcome(e, diag, has_client_cert),
-        ConnectError::Protocol(e) => Outcome::Failed(protocol_text(e)),
-        ConnectError::ResponseTimeout => {
-            Outcome::Retry("The broker did not answer the connection request.".into())
-        }
-        ConnectError::Rejected(ack) => {
-            let text = connack_text(ack);
-            if connack_is_temporary(&ack.reason) {
-                Outcome::Retry(text)
-            } else {
-                Outcome::Failed(text)
-            }
-        }
-    }
-}
-
-/// CONNACK reasons that a retry can fix. Bad credentials, a ban, a wrong protocol version and
-/// every unknown reason are not here: they stop the session.
-fn connack_is_temporary(reason: &ConnAckReason) -> bool {
-    matches!(
-        reason,
-        ConnAckReason::ServerUnavailable
-            | ConnAckReason::ServerBusy
-            | ConnAckReason::ConnectionRateExceeded
-            | ConnAckReason::QuotaExceeded
-    )
-}
-
-/// DISCONNECT reasons that a retry can fix.
-fn disconnect_is_temporary(reason: &DisconnectReason) -> bool {
-    matches!(
-        reason,
-        DisconnectReason::NormalDisconnection
-            | DisconnectReason::ServerBusy
-            | DisconnectReason::ServerShuttingDown
-            | DisconnectReason::KeepAliveTimeout
-            | DisconnectReason::MessageRateTooHigh
-            | DisconnectReason::QuotaExceeded
-            | DisconnectReason::ConnectionRateExceeded
-            | DisconnectReason::MaximumConnectTime
-    )
-}
-
-fn disconnect_outcome(event: DisconnectedEvent) -> Outcome {
-    match event {
-        DisconnectedEvent::ApplicationDisconnect => Outcome::Disconnected,
-        DisconnectedEvent::ServerDisconnect(d) => {
-            let temporary = disconnect_is_temporary(&d.reason);
-            let reason = d.properties.reason_string.map_or_else(
-                || format!("{:?}", d.reason),
-                |s| display_safe(&s).into_owned(),
-            );
-            let text = format!("The broker closed the connection: {reason}.");
-            if temporary {
-                Outcome::Retry(text)
-            } else {
-                Outcome::Failed(text)
-            }
-        }
-        DisconnectedEvent::IoError(e) => io_outcome(&e, None, false),
-        DisconnectedEvent::ProtocolError(e) => Outcome::Failed(protocol_text(&e)),
-        DisconnectedEvent::PingTimeout => {
-            Outcome::Retry("The broker did not answer the keep-alive ping.".into())
-        }
-    }
-}
-
-fn connack_text(ack: &ms_mqtt_client::packet::ConnAck) -> String {
-    let reason = match ack.reason {
-        ConnAckReason::BadUserNameOrPassword => "the user name or password is wrong",
-        ConnAckReason::NotAuthorized => "this client is not authorized",
-        ConnAckReason::ClientIdentifierNotValid => "the client ID is not valid",
-        ConnAckReason::ServerUnavailable => "the server is not available",
-        ConnAckReason::ServerBusy => "the server is busy",
-        ConnAckReason::Banned => "this client is banned",
-        ConnAckReason::BadAuthenticationMethod => "the authentication method is not accepted",
-        ConnAckReason::UnsupportedProtocolVersion => "the broker does not support MQTT 5",
-        ConnAckReason::PacketTooLarge => "the CONNECT packet is too large",
-        ConnAckReason::QuotaExceeded => "a quota is exceeded",
-        ConnAckReason::UseAnotherServer | ConnAckReason::ServerMoved => "use another server",
-        ConnAckReason::ConnectionRateExceeded => "the connection rate is exceeded",
-        _ => "",
-    };
-    // The broker chooses this text. It can hold direction controls.
-    let text = ack.properties.reason_string.as_deref().map(display_safe);
-    match (&text, reason) {
-        (Some(s), "") => format!("The broker rejected the connection: {s}."),
-        (Some(s), r) => format!("The broker rejected the connection: {r} ({s})."),
-        (None, "") => format!("The broker rejected the connection: {:?}.", ack.reason),
-        (None, r) => format!("The broker rejected the connection: {r}."),
-    }
-}
-
-fn suback_text(r: &SubAckReason) -> String {
-    match r {
-        SubAckReason::NotAuthorized => "Not authorized to subscribe.".into(),
-        SubAckReason::TopicFilterInvalid => "The broker says the topic filter is not valid.".into(),
-        SubAckReason::QuotaExceeded => "The subscription quota is exceeded.".into(),
-        SubAckReason::SharedSubscriptionsNotSupported => {
-            "The broker does not support shared subscriptions.".into()
-        }
-        SubAckReason::WildcardSubscriptionsNotSupported => {
-            "The broker does not support wildcard subscriptions.".into()
-        }
-        other => format!("The broker refused the subscription: {other:?}."),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::wire::{
+        CONNECTION_CLOSED_TEXT, QOS2_TEXT, connack_is_temporary, disconnect_is_temporary,
+        protocol_outcome,
+    };
     use super::*;
+    use ntex_mqtt::error::{DecodeError, MqttProtocolError};
 
     /// Connect and Subscribe are queued (queue full), then a disconnect comes. The net thread
     /// has read nothing yet. No connection must start.
@@ -2700,7 +2311,9 @@ mod tests {
     /// retry. The net thread lives on and can connect again.
     #[tokio::test(flavor = "current_thread")]
     async fn qos2_publish_fails_the_session_without_retry_or_panic() {
-        let broker = Fake::start(|n, mut sock| {
+        let (got_tx, got_rx) = std::sync::mpsc::channel();
+        let got_tx = std::sync::Mutex::new(got_tx);
+        let broker = Fake::start(move |n, mut sock| {
             if !accept_connect(&mut sock, 0) {
                 return;
             }
@@ -2712,10 +2325,11 @@ mod tests {
                 // PUBLISH QoS 2, topic "t", packet ID 1, no properties, payload "x".
                 let _ = sock.write_all(&[0x34, 0x07, 0x00, 0x01, b't', 0x00, 0x01, 0x00, b'x']);
             }
-            // The client sends a DISCONNECT with reason 0x82. Then the connection ends.
+            // The client sends a DISCONNECT with reason 0x9B (QoS not supported) and no
+            // properties. Then the connection ends.
             if n == 0 {
                 let got = read_packet(&mut sock);
-                assert_eq!(got, Some((0xe0, vec![0x82])), "DISCONNECT 0x82");
+                got_tx.lock().expect("lock").send(got).expect("send");
             } else {
                 while read_packet(&mut sock).is_some() {}
             }
@@ -2729,6 +2343,11 @@ mod tests {
         assert!(
             matches!(&s.state, ConnState::Failed(t) if t == QOS2_TEXT),
             "{s:?}"
+        );
+        assert_eq!(
+            got_rx.recv_timeout(Duration::from_secs(2)).expect("packet"),
+            Some((0xe0, vec![0x9b, 0x00])),
+            "DISCONNECT 0x9B"
         );
         tokio::time::sleep(BACKOFF_MAX).await;
         assert!(matches!(net.status.borrow().state, ConnState::Failed(_)));
@@ -2905,25 +2524,26 @@ mod tests {
         assert!(!shared.set_connected(1, 1), "attempt 1 is stale");
         assert_eq!(status_rx.borrow().state, ConnState::Connecting);
 
-        let publish = || Publish {
+        let publish = |g: u64| Incoming {
+            generation: g,
+            topic: Arc::from("t"),
             payload: Bytes::from_static(b"x"),
-            qos: DeliveryQoS::AtMostOnce,
+            qos: Qos::AtMostOnce,
             retain: false,
-            topic_name: TopicName::new("t").expect("topic"),
-            properties: PublishProperties::default(),
+            props: MsgProps::default(),
+            received_at: SystemTime::now(),
         };
-        let mut stale = Ingest {
+        let stale = Ingest {
             shared: shared.clone(),
             generation: 1,
             token: 1,
-            last_drops: Cell::new(local_limits::dropped()),
         };
-        stale.publish(publish());
+        stale.queue(publish);
         assert!(incoming_rx.try_recv().is_err(), "stale message was queued");
         assert_eq!(shared.queued_bytes.load(Ordering::Acquire), 0);
         assert_eq!(shared.stats.drops.load(Ordering::Relaxed), 0);
-        let mut live = Ingest { token: 2, ..stale };
-        live.publish(publish());
+        let live = Ingest { token: 2, ..stale };
+        live.queue(publish);
         assert!(incoming_rx.try_recv().is_ok());
 
         assert!(shared.set_connected(1, 2));
@@ -2963,14 +2583,14 @@ mod tests {
 
     #[test]
     fn temporary_and_final_reasons_are_sorted() {
-        use ConnAckReason as C;
+        use ntex_mqtt::v5::codec::ConnectAckReason as C;
         for r in [
             C::ServerUnavailable,
             C::ServerBusy,
             C::ConnectionRateExceeded,
             C::QuotaExceeded,
         ] {
-            assert!(connack_is_temporary(&r), "{r:?}");
+            assert!(connack_is_temporary(r), "{r:?}");
         }
         for r in [
             C::NotAuthorized,
@@ -2984,16 +2604,16 @@ mod tests {
             C::UnspecifiedError,
             C::UseAnotherServer,
         ] {
-            assert!(!connack_is_temporary(&r), "{r:?}");
+            assert!(!connack_is_temporary(r), "{r:?}");
         }
-        use DisconnectReason as D;
+        use ntex_mqtt::v5::codec::DisconnectReasonCode as D;
         for r in [
             D::ServerBusy,
             D::ServerShuttingDown,
             D::ConnectionRateExceeded,
             D::MaximumConnectTime,
         ] {
-            assert!(disconnect_is_temporary(&r), "{r:?}");
+            assert!(disconnect_is_temporary(r), "{r:?}");
         }
         for r in [
             D::NotAuthorized,
@@ -3002,7 +2622,7 @@ mod tests {
             D::PacketTooLarge,
             D::UnspecifiedError,
         ] {
-            assert!(!disconnect_is_temporary(&r), "{r:?}");
+            assert!(!disconnect_is_temporary(r), "{r:?}");
         }
     }
 
@@ -3023,10 +2643,13 @@ mod tests {
         assert!(retry(Error::other(
             "failed to lookup address information: Temporary failure in name resolution"
         )));
+        // The WebSocket upgrade timeout of ntex: kind Other, text "Timeout".
+        assert!(retry(Error::other("Timeout")));
         for e in [
             Error::other("failed to lookup address information: Name or service not known"),
             Error::new(K::InvalidData, "packet exceeds maximum packet size"),
             Error::other("something new"),
+            Error::other("Timeout while waiting for something else"),
             Error::other("certificate verify failed"),
         ] {
             assert!(!retry(Error::new(e.kind(), e.to_string())), "{e}");
@@ -3135,5 +2758,354 @@ mod tests {
         let max = max_open.load(Ordering::SeqCst);
         assert!(max > 1 && max <= MAX_PENDING_OPS, "{max} open at once");
         net.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Tests of the ntex port (S2)
+    // -----------------------------------------------------------------------------------------
+
+    /// Each protocol error of ntex has its own text. Keep alive, write timeout and read timeout
+    /// are temporary; a packet over the limit and malformed data are final.
+    #[test]
+    fn protocol_errors_have_their_own_outcome() {
+        assert_eq!(
+            protocol_outcome(&MqttProtocolError::KeepAliveTimeout),
+            Outcome::Retry(CONNECTION_CLOSED_TEXT.into())
+        );
+        assert_eq!(
+            protocol_outcome(&MqttProtocolError::WriteTimeout),
+            Outcome::Retry("The broker did not read our data for 10 s.".into())
+        );
+        assert_eq!(
+            protocol_outcome(&MqttProtocolError::ReadTimeout),
+            Outcome::Retry("The broker stopped in the middle of a packet.".into())
+        );
+        assert_eq!(
+            protocol_outcome(&MqttProtocolError::Decode(DecodeError::MaxSizeExceeded {
+                size: 2,
+                max_size: 1
+            })),
+            Outcome::Failed(
+                "The broker sent a packet that is larger than the allowed size.".into()
+            )
+        );
+        assert_eq!(
+            protocol_outcome(&MqttProtocolError::Decode(DecodeError::MalformedPacket)),
+            Outcome::Failed("The broker sent data that is not valid MQTT 5.".into())
+        );
+    }
+
+    /// The broker reads PINGREQ and never answers. Keep alive ends the attempt. ntex reports it as
+    /// a plain close, so the text is the general one. It ends within 2 x keep alive x 1.125 + 1 s (plan, "A dead peer is found").
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_missing_pingresp_ends_the_attempt_with_the_general_text() {
+        const KEEP_ALIVE: u16 = 2;
+        let broker = Fake::start(|_, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            // No answer to PINGREQ. The read waits up to 5 s for each packet.
+            while read_packet(&mut sock).is_some() {}
+        });
+        let mut net = Net::start(NetLimits::default());
+        let profile = Profile {
+            keepalive_secs: KEEP_ALIVE,
+            ..tcp_profile(broker.port, &[])
+        };
+        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
+            .expect("send");
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        let up = std::time::Instant::now();
+        let lost = tokio::time::timeout(
+            Duration::from_secs(10),
+            net.status
+                .wait_for(|s| matches!(s.state, ConnState::Reconnecting { .. })),
+        )
+        .await
+        .expect("keep alive did not end the attempt")
+        .expect("status")
+        .clone();
+        let bound = 2.0 * f64::from(KEEP_ALIVE) * 1.125 + 1.0;
+        assert!(
+            up.elapsed().as_secs_f64() <= bound,
+            "{:?} > {bound} s",
+            up.elapsed()
+        );
+        assert!(
+            matches!(&lost.state, ConnState::Reconnecting { reason, .. } if reason == CONNECTION_CLOSED_TEXT),
+            "{lost:?}"
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// A server that accepts the TCP connection and never answers the WebSocket upgrade. ntex
+    /// ends the upgrade after 5 s with an I/O error "Timeout" (kind Other). That is temporary
+    /// and gets the same text as a TCP timeout. Without the `io_outcome` branch the text would
+    /// be "Network error: Timeout", and final.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_websocket_upgrade_is_a_temporary_timeout() {
+        let broker = Fake::start(|_, mut sock| {
+            sock.set_read_timeout(Some(Duration::from_secs(12)))
+                .expect("timeout");
+            let mut buf = [0u8; 1024];
+            while sock.read(&mut buf).is_ok_and(|n| n > 0) {}
+        });
+        let mut net = Net::start(NetLimits::default());
+        let profile = Profile {
+            transport: Transport::Ws,
+            ws_path: "/mqtt".into(),
+            ..tcp_profile(broker.port, &[])
+        };
+        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
+            .expect("send");
+        let started = std::time::Instant::now();
+        let lost = tokio::time::timeout(
+            Duration::from_secs(11),
+            net.status
+                .wait_for(|s| matches!(s.state, ConnState::Reconnecting { .. })),
+        )
+        .await
+        .expect("the upgrade timeout did not end the attempt")
+        .expect("status")
+        .clone();
+        assert!(
+            matches!(&lost.state, ConnState::Reconnecting { attempt: 1, reason } if reason == "The connection timed out."),
+            "{lost:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "the ntex upgrade timeout (5 s) must end it: {:?}",
+            started.elapsed()
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// The first protocol call never ends. The second one panics after an await. ntex runs it
+    /// in a detached task, so only our `catch_unwind` can end the attempt: it must end with
+    /// `Failed`, not hang. The net thread then connects again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handler_panic_after_an_await_fails_the_attempt() {
+        let broker = Fake::start(|n, mut sock| {
+            if !accept_connect(&mut sock, 0) {
+                return;
+            }
+            if n == 0 {
+                let Some((0x82, body)) = read_packet(&mut sock) else {
+                    return;
+                };
+                answer_subscribe(&mut sock, &body);
+                // Two PUBLISH packets, QoS 0, no properties, payload "x".
+                for topic in [&b"__handler_hold__"[..], &b"__handler_panic__"[..]] {
+                    let mut packet =
+                        vec![0x30, (2 + topic.len() + 2) as u8, 0x00, topic.len() as u8];
+                    packet.extend_from_slice(topic);
+                    packet.extend_from_slice(&[0x00, b'x']);
+                    let _ = sock.write_all(&packet);
+                }
+            }
+            while read_packet(&mut sock).is_some() {}
+        });
+        let mut net = Net::start(NetLimits::default());
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &["#"]),
+        ))))
+        .expect("send");
+        let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
+        assert!(
+            matches!(&s.state, ConnState::Failed(t) if t == PANIC_TEXT),
+            "{s:?}"
+        );
+        assert_eq!(broker.accepts(), 1, "no retry after a panic");
+        net.send(Command::Connect(Box::new(ConnectConfig::from(
+            tcp_profile(broker.port, &[]),
+        ))))
+        .expect("send");
+        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// The peer closes the TCP connection before it answers the WebSocket upgrade. That is a
+    /// temporary close: the attempt reconnects. Without the mapping of `Disconnected(None)` it
+    /// would be `Failed("Network error: ...")`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_close_before_the_upgrade_answer_is_retried() {
+        let broker = Fake::start(|_, mut sock| {
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf); // the upgrade request
+            drop(sock);
+        });
+        let mut net = Net::start(NetLimits::default());
+        let profile = Profile {
+            transport: Transport::Ws,
+            ws_path: "/mqtt".into(),
+            ..tcp_profile(broker.port, &[])
+        };
+        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
+            .expect("send");
+        let s = wait_status(&mut net, |s| {
+            matches!(
+                s.state,
+                ConnState::Reconnecting { .. } | ConnState::Failed(_)
+            )
+        })
+        .await;
+        assert!(
+            matches!(&s.state, ConnState::Reconnecting { attempt: 1, reason } if reason == "The broker closed the connection."),
+            "{s:?}"
+        );
+        net.disconnect();
+        net.shutdown().await;
+    }
+
+    /// The reasons for a bad topic name are the texts of the old client: controls, NUL,
+    /// non-characters, unassigned code points, wildcards, empty and too long.
+    #[test]
+    fn topic_errors_are_the_texts_of_the_old_client() {
+        use ms_mqtt_client::topic::TopicName;
+        let long = "a".repeat(70_000);
+        let cases = [
+            "",
+            "a/b",
+            "a/+",
+            "a/#",
+            "a#",
+            "a\0b",
+            "a\u{7}b",
+            "a\u{85}b",
+            "a\u{7f}b",
+            "a\u{fdd0}b",
+            "a\u{ffff}b",
+            "a\u{10fffe}b",
+            "a\u{378}b",
+            "a\u{e0080}b",
+            "a\u{10fffd}b",
+            "a\u{e000}b",
+            "a\u{200b}b",
+            "a/\u{e9}/\u{1f600}",
+            &long,
+        ];
+        for t in cases {
+            let old = TopicName::new(t).err().map(|e| e.to_string());
+            assert_eq!(
+                crate::topic::topic_error(t),
+                old,
+                "{:?}",
+                t.chars().take(20).collect::<String>()
+            );
+        }
+    }
+
+    /// A TLS or WSS server on the IPv6 loopback, with a certificate for the IP address `::1`
+    /// (an IP entry). The URL of WSS has brackets around the address, but the name for
+    /// verification must not have them. After the handshake the server closes, so the attempt
+    /// is temporary (`Reconnecting`). With "[::1]" as the name, verification fails and the
+    /// attempt is final (`Failed`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn tls_and_wss_verify_an_ipv6_address_without_brackets() {
+        use crate::tls::testutil::{TempDir, cert, key};
+        use openssl::ssl::{SslAcceptor, SslMethod};
+        let (ca_key, srv_key) = (key(), key());
+        let ca = cert("Test CA", &ca_key, None, true, -1, 30);
+        let leaf = cert("::1", &srv_key, Some((&ca, &ca_key)), false, -1, 30);
+        let dir = TempDir::new();
+        let ca_path = dir.write("ca.pem", &ca.to_pem().expect("pem"));
+        for transport in [Transport::Wss, Transport::Tls] {
+            let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+                panic!("the IPv6 loopback is needed for this test");
+            };
+            let port = listener.local_addr().expect("addr").port();
+            let mut acceptor =
+                SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).expect("acceptor");
+            acceptor.set_certificate(&leaf).expect("cert");
+            acceptor.set_private_key(&srv_key).expect("key");
+            let acceptor = acceptor.build();
+            let (ok_tx, ok_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                while let Ok((sock, _)) = listener.accept() {
+                    // The handshake ends well only if the client accepted our certificate.
+                    let _ = ok_tx.send(acceptor.accept(sock).is_ok());
+                }
+            });
+            let mut net = Net::start(NetLimits::default());
+            let profile = Profile {
+                host: "::1".into(),
+                port,
+                transport,
+                ca_file: Some(ca_path.clone()),
+                verify_tls: true,
+                subscriptions: vec![],
+                ..Profile::default()
+            };
+            net.connect(ConnectConfig::from(profile)).expect("connect");
+            let s = wait_status(&mut net, |s| {
+                matches!(
+                    s.state,
+                    ConnState::Reconnecting { .. } | ConnState::Failed(_)
+                )
+            })
+            .await;
+            assert!(
+                matches!(s.state, ConnState::Reconnecting { .. }),
+                "{transport:?}: {s:?}"
+            );
+            assert_eq!(ok_rx.recv_timeout(Duration::from_secs(2)), Ok(true));
+            net.disconnect();
+            net.shutdown().await;
+        }
+    }
+
+    /// The reasons for a bad filter are the texts of the old client, for each kind of fault.
+    #[test]
+    fn filter_errors_are_the_texts_of_the_old_client() {
+        use ms_mqtt_client::topic::TopicFilter;
+        let long = "a".repeat(70_000);
+        let cases = [
+            "",
+            "a/b",
+            "a/+/c",
+            "#",
+            "+",
+            "a/#",
+            "$SYS/#",
+            "$share/g/a/#",
+            "$share/g/",
+            "$share/g",
+            "$share//a",
+            "$share/+/a",
+            "$share/g/a#",
+            "foo/#baz",
+            "foo/baz#",
+            "foo/#/baz",
+            "a+",
+            "+a",
+            "a/b+",
+            "a\u{378}b",
+            "a\u{e0080}b",
+            "a\u{10fffd}b",
+            "a\u{e000}b",
+            "a\u{200b}b",
+            "+/\u{378}",
+            "$share/g/\u{e000}/#",
+            "a\0b",
+            "a\u{7}b",
+            "a\u{85}b",
+            "a\u{fdd0}b",
+            "a\u{ffff}b",
+            "a\u{10fffe}b",
+            "a/\u{e9}/\u{1f600}",
+            &long,
+        ];
+        for f in cases {
+            let old = TopicFilter::new(f).err().map(|e| e.to_string());
+            assert_eq!(
+                filter_error(f),
+                old,
+                "{:?}",
+                f.chars().take(20).collect::<String>()
+            );
+        }
     }
 }

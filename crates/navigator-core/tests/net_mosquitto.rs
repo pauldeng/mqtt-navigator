@@ -1,6 +1,8 @@
-//! Integration tests against a local broker at 127.0.0.1:1883 (plain TCP, anonymous).
-//! Each test returns early if the broker is not reachable.
+//! Integration tests against a local broker at 127.0.0.1:18830 (plain TCP, anonymous).
+//! Run them with `--features broker-tests` and `tests/broker/up.sh mosquitto`. A test fails if
+//! the broker is not reachable: a missing broker must never look like a pass.
 
+#![cfg(feature = "broker-tests")]
 // Each test holds `LIMITS` for its whole run. The guard must live across the awaits.
 #![allow(clippy::await_holding_lock)]
 
@@ -29,16 +31,13 @@ fn limits_lock() -> std::sync::MutexGuard<'static, ()> {
     LIMITS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn broker_up() -> bool {
-    let up = std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:1883".parse().expect("addr"),
+/// Fails the test if there is no broker at 127.0.0.1:18830.
+fn require_broker() {
+    std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:18830".parse().expect("addr"),
         Duration::from_secs(1),
     )
-    .is_ok();
-    if !up {
-        eprintln!("skipped: no broker at 127.0.0.1:1883");
-    }
-    up
+    .expect("no broker at 127.0.0.1:18830: start it with tests/broker/up.sh mosquitto");
 }
 
 /// A topic prefix that no other run uses.
@@ -52,7 +51,7 @@ fn prefix() -> String {
 fn profile(subs: &[&str]) -> Profile {
     Profile {
         host: "127.0.0.1".into(),
-        port: 1883,
+        port: 18830,
         transport: Transport::Tcp,
         subscriptions: subs
             .iter()
@@ -154,9 +153,7 @@ fn out(op_id: u64, topic: &str, payload: &'static [u8], qos: Qos) -> Command {
 #[tokio::test(flavor = "current_thread")]
 async fn subscribe_publish_receive_and_disconnect() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let mut net = Net::start(NetLimits::default());
     let p = prefix();
     let gen1 = connect(&mut net, profile(&[&format!("{p}/#"), "a/#/b"])).await;
@@ -237,9 +234,7 @@ async fn subscribe_publish_receive_and_disconnect() {
 #[tokio::test(flavor = "current_thread")]
 async fn reconnect_increments_generation() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let mut net = Net::start(NetLimits::default());
     assert_eq!(connect(&mut net, profile(&[])).await, 1);
     // A second Connect while connected stops the old session first.
@@ -277,7 +272,7 @@ async fn publish_plain(topic: &str, payload: Vec<u8>) {
             ConnectionTransportConfig {
                 transport_type: ConnectionTransportType::Tcp {
                     hostname: "127.0.0.1".into(),
-                    port: 1883,
+                    port: 18830,
                 },
                 timeout: None,
                 proxy: None,
@@ -313,9 +308,7 @@ async fn publish_plain(topic: &str, payload: Vec<u8>) {
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_packet_is_not_delivered() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let limits = NetLimits {
         max_packet: 1024,
         ..NetLimits::default()
@@ -350,9 +343,7 @@ async fn oversized_packet_is_not_delivered() {
 #[tokio::test(flavor = "current_thread")]
 async fn full_queue_drops_and_bounds_memory() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let limits = NetLimits {
         queue_len: 4,
         ..NetLimits::default()
@@ -431,9 +422,7 @@ async fn hostile_broker_oversized_packet_fails_session() {
 #[tokio::test(flavor = "current_thread")]
 async fn property_heavy_messages_are_bounded_and_budget_recovers() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let mut net = Net::start(NetLimits {
         queue_bytes: 8 * 1024,
         ..NetLimits::default()
@@ -569,9 +558,7 @@ async fn pending_operations_are_capped() {
 /// exactly one `Published` result (sent, or rejected by the cap). The old log held 256 events and dropped the rest.
 #[tokio::test(flavor = "current_thread")]
 async fn slow_ui_still_gets_every_publish_result() {
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let _limits = limits_lock();
     let mut net = Net::start(NetLimits::default());
     connect(&mut net, profile(&[])).await;
@@ -628,9 +615,7 @@ async fn slow_ui_still_gets_every_publish_result() {
 /// and nothing may be dropped.
 #[tokio::test(flavor = "current_thread")]
 async fn many_filters_and_a_slow_ui_lose_no_result() {
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let _limits = limits_lock();
     let mut net = Net::start(NetLimits::default());
     let p = prefix();
@@ -850,7 +835,7 @@ impl CuttableProxy {
                 if c.load(Ordering::SeqCst) {
                     return;
                 }
-                let Ok(upstream) = std::net::TcpStream::connect("127.0.0.1:1883") else {
+                let Ok(upstream) = std::net::TcpStream::connect("127.0.0.1:18830") else {
                     continue;
                 };
                 for (mut from, mut to) in [
@@ -893,9 +878,7 @@ impl CuttableProxy {
 #[tokio::test(flavor = "current_thread")]
 async fn will_is_published_when_the_connection_drops() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let p = prefix();
     let will_topic = format!("{p}/will");
     let mut observer = Net::start(NetLimits::default());
@@ -935,9 +918,7 @@ async fn will_is_published_when_the_connection_drops() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_replaced_connect_never_uses_the_new_generation() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let mut net = Net::start(NetLimits::default());
     let mut a = profile(&[]);
     a.port = 1; // nothing listens here: the Connect A never gets a CONNACK
@@ -998,9 +979,7 @@ async fn a_replaced_connect_never_uses_the_new_generation() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_removal_while_offline_reaches_a_resumed_session() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let p = prefix();
     let topic = format!("{p}/kept");
     let proxy = CuttableProxy::start();
@@ -1067,13 +1046,11 @@ async fn expect_silence(net: &mut Net) {
 #[tokio::test(flavor = "current_thread")]
 async fn a_removal_after_a_manual_disconnect_reaches_the_next_session() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let p = prefix();
     let topic = format!("{p}/x");
     let mut net = Net::start(NetLimits::default());
-    let first = persistent(&[&topic], 1883);
+    let first = persistent(&[&topic], 18830);
     connect(&mut net, first.clone()).await;
     assert!(matches!(
         next_event(&mut net).await,
@@ -1110,9 +1087,7 @@ async fn a_removal_after_a_manual_disconnect_reaches_the_next_session() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_lost_unsubscribe_is_retried_on_the_resumed_session() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let p = prefix();
     let topic = format!("{p}/lost");
     let proxy = CuttableProxy::start();
@@ -1131,6 +1106,18 @@ async fn a_lost_unsubscribe_is_retried_on_the_resumed_session() {
     .expect("unsubscribe");
     let _ = next_event(&mut net).await; // Ok (offline) or the error of the lost request
     let _proxy2 = CuttableProxy::start_on(port);
+    // First wait for the loss. The error of the lost request can arrive before the status leaves
+    // `Connected`, so waiting for `Connected` alone can return at once, and the publish below
+    // would then reach the broker while the session is still offline and subscribed.
+    tokio::time::timeout(
+        WAIT * 2,
+        net.status.wait_for(|s| {
+            s.generation == generation && matches!(s.state, ConnState::Reconnecting { .. })
+        }),
+    )
+    .await
+    .expect("the loss is noticed")
+    .expect("status");
     tokio::time::timeout(
         WAIT * 2,
         net.status
@@ -1149,9 +1136,7 @@ async fn a_lost_unsubscribe_is_retried_on_the_resumed_session() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_clean_session_forgets_the_filters() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let p = prefix();
     let topic = format!("{p}/clean");
     let mut net = Net::start(NetLimits::default());
@@ -1194,12 +1179,10 @@ async fn a_clean_session_forgets_the_filters() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_removal_survives_a_restart_with_the_saved_session_filters() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let p = prefix();
     let topic = format!("{p}/restart");
-    let first = persistent(&[&topic], 1883);
+    let first = persistent(&[&topic], 18830);
     let mut net = Net::start(NetLimits::default());
     connect(&mut net, first.clone()).await;
     // The report comes after the SUBSCRIBE was sent. The app would save this set.
@@ -1233,12 +1216,10 @@ async fn a_removal_survives_a_restart_with_the_saved_session_filters() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_new_profile_on_a_shared_session_gets_the_cached_set() {
     let _limits = limits_lock();
-    if !broker_up() {
-        return;
-    }
+    require_broker();
     let p = prefix();
     let topic = format!("{p}/shared");
-    let original = persistent(&[&topic], 1883);
+    let original = persistent(&[&topic], 18830);
     let mut net = Net::start(NetLimits::default());
     connect(&mut net, original.clone()).await;
     next_session_filters(&mut net, |f| f.contains(&topic)).await;

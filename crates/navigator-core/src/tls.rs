@@ -1,17 +1,16 @@
 //! TLS set-up and diagnostics.
 //!
-//! We build the OpenSSL connector here, so we can record why a certificate failed. The vendored
+//! We build the OpenSSL connector here, so we can record why a certificate failed. The MQTT
 //! client turns the handshake error into a generic I/O error. The verify callback sees the
 //! exact OpenSSL code first. We keep it in a [`TlsDiag`] and map it to plain text.
 //!
-//! The vendored client builds the connection with `connector.build().configure()` and
-//! `into_ssl(hostname)`. That call also sets the host name (or IP address) to verify. A wrong
-//! name gives code 62 or 64, and the unit tests below prove that.
+//! `ntex-tls` wraps the connector and calls `configure()` and `into_ssl(hostname)`. That call
+//! also sets the host name (or IP address) to verify. A wrong name gives code 62 or 64, and the
+//! unit tests below prove that.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use ms_mqtt_client::transport::TlsConfig;
 use openssl::error::ErrorStack;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{SslConnector, SslConnectorBuilder, SslMethod, SslVerifyMode, SslVersion};
@@ -99,7 +98,7 @@ pub fn build(
     client_cert: Option<(&Path, &Path)>,
     key_passphrase: Option<&str>,
     verify: bool,
-) -> Result<(TlsConfig, TlsDiag), String> {
+) -> Result<(SslConnector, TlsDiag), String> {
     TlsMaterial::load(ca_file, client_cert, key_passphrase, verify)?.connector()
 }
 
@@ -184,14 +183,7 @@ impl TlsMaterial {
 
     /// The configuration for one connection attempt, with a new [`TlsDiag`]. It loads the system
     /// CA store (some ms), so call it in a blocking task too.
-    pub fn connector(&self) -> Result<(TlsConfig, TlsDiag), String> {
-        let (builder, diag) = self.builder()?;
-        Ok((TlsConfig::from(builder), diag))
-    }
-
-    /// The same set-up as [`TlsMaterial::connector`], as a plain OpenSSL connector. Blocking
-    /// (loads the system CA store): call it in a blocking task.
-    pub fn ssl_connector(&self) -> Result<(SslConnector, TlsDiag), String> {
+    pub fn connector(&self) -> Result<(SslConnector, TlsDiag), String> {
         let (builder, diag) = self.builder()?;
         Ok((builder.build(), diag))
     }
@@ -258,7 +250,7 @@ pub(crate) mod testutil {
         PKey::from_ec_key(EcKey::generate(&group).expect("ec key")).expect("pkey")
     }
 
-    /// A certificate for `cn` (DNS name). `issuer` is `(cert, key)` of a CA, or `None` for a
+    /// A certificate for `cn` (a DNS name, or an IP address that gets an IP entry). `issuer` is `(cert, key)` of a CA, or `None` for a
     /// self-signed certificate. The validity is `[now + from_days, now + to_days]`.
     pub fn cert(
         cn: &str,
@@ -287,8 +279,14 @@ pub(crate) mod testutil {
             let bc = BasicConstraints::new().critical().ca().build().expect("bc");
             b.append_extension(bc).expect("ext");
         }
-        let san = SubjectAlternativeName::new()
-            .dns(cn)
+        let mut san = SubjectAlternativeName::new();
+        // An IP address needs an IP entry: OpenSSL does not match it with a DNS entry.
+        if cn.parse::<std::net::IpAddr>().is_ok() {
+            san.ip(cn);
+        } else {
+            san.dns(cn);
+        }
+        let san = san
             .build(&b.x509v3_context(issuer.map(|(c, _)| c.as_ref()), None))
             .expect("san");
         b.append_extension(san).expect("ext");
@@ -421,9 +419,7 @@ mod tests {
         let cert = cert("client", &key_a, None, false, -1, 1);
         let cert_path = dir.write("c.pem", &cert.to_pem().expect("pem"));
         let key_path = dir.write("k.pem", &key_b.private_key_to_pem_pkcs8().expect("pem"));
-        let err = build(None, Some((&cert_path, &key_path)), None, true)
-            .err()
-            .expect("error");
+        let err = build(None, Some((&cert_path, &key_path)), None, true).expect_err("error");
         assert_eq!(err, "The client certificate and key do not match.");
         // The matching key is accepted.
         let key_path = dir.write("k2.pem", &key_a.private_key_to_pem_pkcs8().expect("pem"));
@@ -433,12 +429,10 @@ mod tests {
     #[test]
     fn unreadable_and_empty_files_give_text() {
         let dir = TempDir::new();
-        let err = build(Some(&dir.path().join("none.pem")), None, None, true)
-            .err()
-            .expect("error");
+        let err = build(Some(&dir.path().join("none.pem")), None, None, true).expect_err("error");
         assert!(err.starts_with("Cannot read the CA file"), "{err}");
         let empty = dir.write("e.pem", b"");
-        let err = build(Some(&empty), None, None, true).err().expect("error");
+        let err = build(Some(&empty), None, None, true).expect_err("error");
         assert!(err.contains("no certificate"), "{err}");
     }
 
@@ -471,7 +465,7 @@ mod tests {
         let ca_path = ca.map(|c| dir.write("ca.pem", &c.to_pem().expect("pem")));
         let material = TlsMaterial::load(ca_path.as_deref(), None, None, verify).expect("load");
         let (builder, diag) = material.builder().expect("build");
-        // Same steps as the vendored `tls_handshake`.
+        // Same steps as `ntex-tls`.
         let ssl = builder
             .build()
             .configure()
@@ -512,7 +506,7 @@ mod tests {
         assert!(!ok);
         assert!(text.expect("text").contains("not trusted"));
 
-        // Wrong host name. This proves that the vendored `into_ssl` checks the name.
+        // Wrong host name. This proves that `into_ssl` checks the name.
         let (ok, text) = handshake(
             std::slice::from_ref(&good),
             &srv_key,

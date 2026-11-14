@@ -321,3 +321,114 @@ Conditions for S2:
 4. v5 outgoing size follows today's rule (`publish::validate_outgoing` with the announced limit, else allowed). v3 outgoing is limited to `max_packet`.
 5. The flaky `a_lost_unsubscribe_is_retried_on_the_resumed_session` (one failure in two full broker runs) needs a look in S2, because S2 changes the code that it tests.
 6. The "Not run" items stay open for S3 and S4.
+
+## S2 port of `net.rs` (MQTT 5 only)
+
+Date: 2026-11-15. Branch `feat/ntex-mqtt`, base commit 713fea5. Nothing is committed.
+
+### What changed
+
+- `crates/navigator-core/Cargo.toml`: `ntex-mqtt` (pinned `=10.0.0`), `ntex` (`default-features = false`, `tokio` and `ws`), `ntex-net` (`tokio`), `ntex-tls` (`openssl`) and the small `ntex-*` helper crates are now dependencies. `tokio` gets the `net` feature. `ms-mqtt-client` is a dev-dependency (used by `tests/` and `examples/flood.rs` until S3). The vendor copy and `[patch]` stay.
+- `src/net.rs`: supervisor, backoff, retry rules, generations, attempt tokens, bounded queues, drop counter, cancel signal, `SessionSet`, `OP_TIMEOUT` (final) and `CONNECT_TIMEOUT` are as before. The session, the operations and the incoming path use the private `Wire` interface. The net thread body runs inside one `with_reactor` scope. `io_outcome` has a branch for the WebSocket upgrade timeout (kind `Other`, text "Timeout").
+- `src/net/wire.rs` (new): `Wire` (one variant, V5; S2b adds V3), `connect` (one 10 s deadline), per-connection `SharedCfg` (write timeout 10 s, handshake timeout 10 s, frame read rate 10 s / 60 s / 256, WS frame and message caps = `max_packet`, subprotocol `mqtt`, v5 `max_packet_size` = `max_packet`, `topic_alias_max` 16, Receive Maximum 16), `start_with_control`, `catch_unwind` around the protocol service, payload collection, QoS 2 refusal (`close_with_reason` 0x9B, then an error), error mapping to `Outcome`.
+- `src/net/dial.rs` (new): our dialer (DNS in our `spawn_blocking` with a one-slot semaphore, `tokio` TCP for each address, `from_tcp_stream`, `ntex-tls`). The same dialer serves `WsClient`.
+- `src/tls.rs`: `TlsMaterial::connector` and `tls::build` return `(openssl::ssl::SslConnector, TlsDiag)`. The S1 function `ssl_connector` is removed (the spike now calls `connector`). `TlsDiag` and all texts are unchanged. Callers: `net.rs`, the spike (`examples/ntex_spike/cases.rs`); `grep -rn` found no other.
+- `tests/net_mosquitto.rs`: the file is behind the `broker-tests` feature. A missing broker now fails the test (`require_broker`, `expect`). It was an early return in 15 tests.
+- `tests/broker/up.sh`: checks a real MQTT connect on the Mosquitto listeners 18830 to 18835 (plain, user and password, TLS with the test CA and host name, mTLS with the client certificate, WS, WSS). The probe is bash plus `openssl s_client`. I checked that it fails for: mTLS without a client certificate, the auth listener with an anonymous CONNECT, a closed port, and a TCP port used as WebSocket.
+- `.github/workflows/ci.yml`: the broker job also runs `--test net_mosquitto` (the file is no longer run by `cargo test --workspace`).
+- `git diff crates/navigator-app` is empty.
+
+### Commands run (final code)
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo deny check
+cargo test --workspace
+tests/broker/up.sh mosquitto        # six listeners, real connect
+<net_mosquitto binary> x30          # one run after another, nothing else running
+tests/broker/up.sh                  # all three brokers
+cargo test -p navigator-core --features broker-tests --no-fail-fast -- --test-threads=1   # 3 times
+docker compose -f tests/broker/compose.yml stop emqx hivemq
+cargo run --release -p navigator-core --example ntex_spike
+```
+
+### Results
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | ok |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | ok |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok |
+| `cargo test --workspace` | 271 passed, 0 failed, 1 ignored (139 unit tests in `navigator-core`) |
+| `tests/broker/up.sh` | all six Mosquitto listeners, EMQX and HiveMQ answered CONNACK |
+| Full broker suite, run 1, 2, 3 | each run: 139 unit, 15 `broker_compat`, 15 `broker_matrix`, 1 `load_ci` (about 361 s), 21 `net_mosquitto`; 0 failed; `soak` 1 ignored. Same command as S1 (`--test-threads=1`). |
+| `net_mosquitto` alone, 30 runs | 30 passed, 0 failed |
+| `ntex_spike` (release) | 93 cases, 93 passed, 0 failed |
+
+The run of the whole suite does not skip anything. `net_mosquitto` now fails when no broker is there.
+
+New unit tests (each was made to fail once, or has an exact expected value): `protocol_errors_have_their_own_outcome`, `a_missing_pingresp_ends_the_attempt_with_the_general_text` (bound 2 x keep alive x 1.125 + 1 s), `a_stalled_websocket_upgrade_is_a_temporary_timeout` (fails without the new `io_outcome` branch: checked by removing it), `a_handler_panic_after_an_await_fails_the_attempt` (first call never ends, second panics; fails without `catch_unwind`: checked by removing it), `tests/net_blocked_write.rs::disconnect_during_a_blocked_write_is_prompt` (production `OP_TIMEOUT`; about 20 MB of QoS 0 publishes to a broker that does not read; the test checks that some sends are still open at the disconnect, no result is `TimedOut`, the state never was `Failed`, and Disconnected comes in under 3 s), `the_next_address_is_tried_when_the_first_refuses`, `cancelled_attempts_keep_one_lookup`, `websocket_errors_become_io_errors`, `a_will_topic_with_a_wildcard_is_not_valid`. The first version of the blocked-write test was a unit test. Its disconnect (after 500 ms) came after the unit-test `OP_TIMEOUT` (300 ms), so it could pass after an operation timeout. It moved to an integration test with the production timeout. The test does not prove the `force_close` branch: the I/O shutdown wait (1 s) already ends the blocked write.
+
+### Changed expectations in existing tests
+
+| Test | Change | Plan line |
+|---|---|---|
+| `net::tests::qos2_publish_fails_the_session_without_retry_or_panic` | DISCONNECT packet `e0 01 82` (reason 0x82) became `e0 02 9b 00` (0x9B, QoS not supported). `QOS2_TEXT` has a new value: "The broker sent a QoS 2 message. This app supports QoS 0 and 1." The check of the packet moved from the fake-broker thread (where a failed `assert_eq!` did not fail the test) into the test body, so it is stronger. | Facts table, row "Incoming QoS 2 goes to the handler" (line 33); S1 finding 3 |
+| `net_mosquitto.rs` (15 tests) | `if !broker_up() { return; }` became `require_broker()`, which panics. The file is behind `#![cfg(feature = "broker-tests")]`, so `cargo test --workspace` without a broker still works. | Steps, item 3 (line 128); S2 extras |
+| `net_mosquitto::a_lost_unsubscribe_is_retried_on_the_resumed_session` | The test now waits for `Reconnecting`, then for `Connected` (before: only `Connected`). The assertion, the sleep and the timeouts are the same. See "Flaky test" below. No plan line: this is a race in the test set-up. | none |
+| `net::tests::stale_attempt_results_are_dropped` | Rewritten around `Ingest::queue(|generation| Incoming)` instead of the old `Publish` type and `local_limits::dropped()`. The checks (stale token queues nothing and counts no drop, live token queues) are the same. | Mapping row `local_limits` (line 116) |
+| `net::tests::temporary_and_final_reasons_are_sorted` | Enum types of ntex instead of `ms-mqtt-client`. The two lists of reasons are the same. | D8 (line 71) |
+| `net::tests::io_errors_are_sorted` | Added cases only: `Other "Timeout"` is temporary; `Other "Timeout while ..."` is final. | S1 condition 2 |
+| `tls::tests` | `.err().expect(..)` became `.expect_err(..)` (clippy `err_expect`, because `build` now returns a type that has `Debug`). Same checks. | none |
+| `reconnects_after_drop_and_resubscribes_live_filters` | No change to the test. The observed text of a plain close is the general text (it contains "closed"). | Facts table, row "Keep alive" (line 30) |
+
+No test timeout was changed. No assertion was removed.
+
+### Flaky test: `a_lost_unsubscribe_is_retried_on_the_resumed_session`
+
+- Result: with the first port (before the fix of the test) the 30 runs of `net_mosquitto` alone gave 26 passed and 4 failed. All 4 failures were this test ("the removed filter still delivers"). After the fix: 30 of 30, and 3 of 3 full suite runs.
+- Cause (found with debug prints that are removed now, and a time stamp for each line): the test cuts the proxy and sends the UNSUBSCRIBE at once, then waits for `Connected`. The error of the lost UNSUBSCRIBE reaches the UI before the supervisor has moved the status from `Connected` to `Reconnecting`. `wait_for(Connected)` is true at once, so the test sleeps 500 ms and publishes while the client is still in its backoff. The broker still holds the filter (the UNSUBSCRIBE was lost), so it queues the message and delivers it at the next CONNACK, before our stale UNSUBSCRIBE is answered. This is correct behaviour; the test published at the wrong time.
+- Old client versus new: the old client reported the failed operation later, after the status change, so the race was rare (it showed in 2 of the full-suite runs of S1). ntex fails the operation at once when the I/O closes, so the race is now frequent. The product code is not at fault: in every failing run the stale UNSUBSCRIBE was sent after the new CONNACK with `session present` true.
+
+### Deviations from the plan, and open points
+
+1. `net_mosquitto.rs` is behind the `broker-tests` feature, and `.github/workflows/ci.yml` runs it in the broker job. The plan says only "must fail, not return early". Without the feature gate, the normal CI job (no broker) would fail.
+2. `tls::TlsMaterial::ssl_connector` (S1) is merged into `connector`. `tls::build` and `connector` return `SslConnector`.
+3. A plain close of an established connection has the general text "The connection closed (the broker did not answer, or the network failed)." ntex reports a keep-alive death, a broker close and a lost network in the same way (`Stop(PeerGone(None))`; checked with a debug print in the keep-alive test), so one text must cover all three. The old text "The broker closed the connection." stays for a close before the CONNACK and for a reset (I/O error). Keep alive is `Retry`.
+4. New texts (new causes): write timeout "The broker did not read our data for 10 s."; read timeout "The broker stopped in the middle of a packet."; a publish that the codec refuses by size: "The broker does not accept a message of this size.". 
+5. The version texts of the plan (CONNACK 0x84, a reply that is not MQTT 5, close before CONNACK with "Check ... the Protocol") are not in S2: they point to a Protocol select that does not exist before S2c. The existing texts stay ("the broker does not support MQTT 5").
+6. A timeout of our 10 s deadline has two texts, as before: "The connection timed out." before the transport is up, and "The broker did not answer the connection request." after TCP and TLS are up.
+7. The user guide (`docs/user-guide.md`, line 395) still lists "The broker did not answer the keep-alive ping." S5 updates the user guide. The log filter `ms_mqtt_client=off` is in `navigator-app` (`logging.rs`); the change is S5 (the app must not change in S2).
+8. The test lock for the old `local_limits` is still in `net_mosquitto.rs`, `broker_matrix.rs`, `broker_compat.rs`. `Net` does not set global limits any more, but the old test publishers still link the old client. S3 removes it.
+9. Not done in S2 (S3 owns them): the fd-count test and the stalled-lookup test in the `tests/` set (the dialer unit tests cover the first-address and one-lookup rules), the frame-read-rate cases, the overload test, the 1000-publish Receive Maximum 2 test, topic alias set, reuse and invalid alias.
+
+### Codex round 1: six defects fixed
+
+1. `net_mosquitto.rs` used 127.0.0.1:1883 (the owner's own Mosquitto). Every use (readiness, profiles, publishers, proxy upstream) now points to the compose anonymous listener 18830. The doc comment says so. The CI edit stays.
+2. `Disconnected(None)` from the WebSocket connector (the peer closes before the upgrade answer) is now an `UnexpectedEof` I/O error: temporary, "The broker closed the connection.". Tests: `a_close_before_the_upgrade_answer_is_retried` (fake server; checked: without the fix the state is `Failed("Network error: Connector has been disconnected: None")`) and `a_disconnect_before_the_upgrade_answer_is_a_temporary_close`.
+3. The unit test of the blocked write is replaced by `tests/net_blocked_write.rs` (see above). The unit version could not prove its claim.
+4. SUBACK and UNSUBACK refusals keep the broker reason string (cleaned with `display_safe`): "<reason text> Broker reason: <string>" and "Unsubscribe rejected: <Reason>: <string>". Test: `suback_and_unsuback_keep_the_reason_string` (distinct strings, a direction control, and the cases without a string).
+5. The detailed invalid-filter reasons are back for subscribe, unsubscribe and the route check: "Invalid topic filter: empty filter / bad string: ... / bad filter ...". `filter_error` follows the rules of the old client. Test: `filter_errors_are_the_texts_of_the_old_client` compares 27 filters at that time (empty, too long, NUL, control, non-character, wildcards, `$share` forms) with the old `TopicFilter::new` message. Residual: a code point that is unassigned but not a non-character is not detected (the old client used Unicode tables).
+6. `up.sh` also probes Mosquitto 18836 and 18837 (without verification: the certificate is bad on purpose), EMQX WebSocket 18841 and HiveMQ WebSocket 18851 with a real CONNECT (12 listeners in all).
+
+Runs after the fixes (logs `s2r1-*.txt` in the scratchpad):
+
+| Check | Result |
+|---|---|
+| fmt, clippy `--all-features -D warnings` | ok |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok |
+| `cargo test --workspace` | 275 passed, 0 failed, 1 ignored |
+| `tests/broker/up.sh` (all three brokers) | all 12 listeners answered CONNACK (Mosquitto 18830 to 18837, EMQX 18840 and 18841, HiveMQ 18850 and 18851) |
+| Full broker suite, once, `--no-fail-fast -- --test-threads=1` | 142 unit, 15 `broker_compat`, 15 `broker_matrix`, 1 `load_ci`, 1 `net_blocked_write`, 21 `net_mosquitto`; 0 failed; `soak` 1 ignored |
+| `net_mosquitto` alone, 10 runs (compose Mosquitto on 18830) | 10 passed, 0 failed |
+
+EMQX and HiveMQ are stopped. `git diff crates/navigator-app` is empty.
+
+### Codex round 2: three defects fixed
+
+1. IPv6 TLS name: the dialer now strips the brackets of an IPv6 address before `tls.connect` (SNI and verification). The URL keeps them. Test `tls_and_wss_verify_an_ipv6_address_without_brackets`: a TLS server and a WSS server on `[::1]` with a certificate that has an IP entry for `::1` (the test certificate helper now adds an IP entry for an IP address). The attempt must be `Reconnecting` and the server must see a good handshake. Without the fix the state is `Failed("The server certificate is for another host name.")` for WSS (checked). Plain TLS already passed the name without brackets; the test covers it too.
+2. One shared validator (`topic::topic_error`, `topic::filter_error`, and a string check) now serves publish topics, response topics, Will topics, and subscribe and unsubscribe filters. It has the rules and texts of the old client, including controls and unassigned code points (general category table of `unicode-properties`, the crate the old client used). `unicode-properties` 0.1.5 was already in `Cargo.lock`; it is now a normal dependency of `navigator-core` (MIT OR Apache-2.0, `cargo deny` ok). The publish path gives "Invalid topic: ..." and "Invalid response topic: ..." as at HEAD. Parity tests against the old client: `topic_errors_are_the_texts_of_the_old_client` (19 topics) and `filter_errors_are_the_texts_of_the_old_client` (34 filters), with NUL, controls, non-characters, unassigned code points, private use, wildcards, empty and too long.
+3. The listener count is 12, not 14 (8 Mosquitto, 2 EMQX, 2 HiveMQ). Corrected above.
+
+Runs after the fixes (`s2r2-*.txt`): fmt ok; clippy `--all-features -D warnings` ok; `cargo deny check` ok; `cargo test --workspace` 277 passed, 0 failed, 1 ignored; `net_mosquitto` 21 passed and `net_blocked_write` 1 passed against Mosquitto on 18830.
