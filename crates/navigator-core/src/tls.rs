@@ -189,6 +189,13 @@ impl TlsMaterial {
         Ok((TlsConfig::from(builder), diag))
     }
 
+    /// The same set-up as [`TlsMaterial::connector`], as a plain OpenSSL connector. Blocking
+    /// (loads the system CA store): call it in a blocking task.
+    pub fn ssl_connector(&self) -> Result<(SslConnector, TlsDiag), String> {
+        let (builder, diag) = self.builder()?;
+        Ok((builder.build(), diag))
+    }
+
     fn builder(&self) -> Result<(SslConnectorBuilder, TlsDiag), String> {
         let tls = |e: ErrorStack| format!("TLS set-up failed: {e}");
         let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(tls)?;
