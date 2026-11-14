@@ -73,6 +73,7 @@ fn profile(port: u16, transport: Transport, prefix: &str) -> Profile {
         port,
         transport,
         subscriptions: vec![(format!("{prefix}/#"), Qos::AtLeastOnce)],
+        protocol: Protocol::V5,
         ..Profile::default()
     }
 }

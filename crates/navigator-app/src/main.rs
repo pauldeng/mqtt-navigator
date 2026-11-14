@@ -21,7 +21,7 @@ mod ui;
 
 use gpui_kit::*;
 use navigator_core::Qos;
-use navigator_core::net::{ConnectConfig, Transport};
+use navigator_core::net::{ConnectConfig, Protocol, Transport};
 use navigator_core::settings::{self, Load};
 
 actions!(navigator, [Quit]);
@@ -163,9 +163,10 @@ fn open(cli: Option<ConnectConfig>, prepared: Prepared, cx: &mut App) {
 }
 
 const USAGE: &str = "Usage: mqtt-navigator [--host HOST] [--port PORT] [--tcp | --ws | --wss] \
-[--insecure] [--ca FILE] [--user NAME] [--password-stdin] [--sub FILTER[:QOS]]...
+[--insecure] [--ca FILE] [--user NAME] [--password-stdin] [--mqtt 3|5] [--sub FILTER[:QOS]]...
 
 TLS on port 8883 is the default. --tcp connects without encryption.
+--mqtt 3 uses MQTT 3.1.1 (the default). --mqtt 5 uses MQTT 5.
 --password-stdin reads the password from the first line of the standard input.
 The environment variable MQTT_NAVIGATOR_PASSWORD also sets it (less safe).";
 
@@ -243,6 +244,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(ConnectConfig, bool
             "--ws" => p.transport = Transport::Ws,
             "--wss" => p.transport = Transport::Wss,
             "--insecure" => p.verify_tls = false,
+            "--mqtt" => {
+                p.protocol = match value("--mqtt")?.as_str() {
+                    "3" => Protocol::V311,
+                    "5" => Protocol::V5,
+                    _ => return Err("Use --mqtt 3 or --mqtt 5.".into()),
+                }
+            }
             "--ca" => p.ca_file = Some(value("--ca")?.into()),
             "--user" => p.username = Some(value("--user")?),
             "--password-stdin" => password_stdin = true,
@@ -269,13 +277,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(ConnectConfig, bool
     if !subs.is_empty() {
         p.subscriptions = subs;
     }
+    c.protocol = c.profile.protocol;
     Ok((c, password_stdin))
 }
 
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
-    use super::{ConnectConfig, Qos, Transport, cli_session, parse_args};
+    use super::{ConnectConfig, Protocol, Qos, Transport, cli_session, parse_args};
 
     fn parse(s: &str) -> Result<navigator_core::net::Profile, String> {
         parse_args(s.split_whitespace().map(String::from))
@@ -288,6 +297,24 @@ mod tests {
         assert_eq!(
             (p.transport, p.port, p.verify_tls),
             (Transport::Tls, 8883, true)
+        );
+    }
+
+    #[test]
+    fn mqtt_3_is_the_default_and_mqtt_5_is_an_option() {
+        let proto = |s: &str| {
+            parse_args(s.split_whitespace().map(String::from))
+                .map(|(c, _)| (c.profile.protocol, c.protocol))
+        };
+        assert_eq!(proto(""), Ok((Protocol::V311, Protocol::V311)));
+        assert_eq!(proto("--mqtt 3"), Ok((Protocol::V311, Protocol::V311)));
+        assert_eq!(proto("--mqtt 5"), Ok((Protocol::V5, Protocol::V5)));
+        for bad in ["--mqtt 4", "--mqtt", "--mqtt v5"] {
+            assert!(proto(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            proto("--mqtt 4").expect_err("bad"),
+            "Use --mqtt 3 or --mqtt 5."
         );
     }
 

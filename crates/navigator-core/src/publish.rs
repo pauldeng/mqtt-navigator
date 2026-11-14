@@ -116,6 +116,48 @@ pub fn encoded_size(o: &Outgoing) -> usize {
     1 + varint(remaining) + remaining
 }
 
+/// Largest Remaining Length `r` with `1 + varint_len(r) + r <= max_packet` (v3 `set_max_size`).
+/// Each length of the varint gives one candidate: the largest `r` that fits both the packet
+/// limit and that length. The best candidate wins.
+pub fn v3_max_remaining(max_packet: usize) -> u32 {
+    const RANGE: [u64; 4] = [127, 16_383, 2_097_151, 268_435_455];
+    let max = max_packet as u64;
+    let best = (1..=4u64)
+        .zip(RANGE)
+        .map(|(len, range)| max.saturating_sub(1 + len).min(range))
+        .max()
+        .unwrap_or(0);
+    best as u32
+}
+
+/// The Remaining Length of the MQTT 3.1.1 PUBLISH for `o`. Version 3.1.1 has no properties.
+fn v3_remaining(o: &Outgoing) -> u32 {
+    let id = if o.qos == Qos::AtLeastOnce { 2 } else { 0 };
+    u32::try_from(2 + o.topic.len() + id + o.payload.len()).unwrap_or(u32::MAX)
+}
+
+/// "1 MiB" for a whole number of MiB, else the bytes.
+fn size_text(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes != 0 && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// The size rule of MQTT 3.1.1. The app limits the packet to `max_packet` in both directions,
+/// because a 3.1.1 CONNACK has no Maximum Packet Size.
+pub fn validate_v3_size(o: &Outgoing, max_packet: usize) -> Result<(), String> {
+    if v3_remaining(o) > v3_max_remaining(max_packet) {
+        return Err(format!(
+            "MQTT 3.1.1 messages can be at most {} in this app.",
+            size_text(max_packet)
+        ));
+    }
+    Ok(())
+}
+
 /// Reads hex bytes: pairs of hex digits, with white space (spaces, tabs, new lines) anywhere
 /// (white space is ignored, so `a b` is the byte `ab`).
 /// An empty text gives no bytes.
@@ -175,6 +217,28 @@ mod tests {
 
     fn err(o: &Outgoing, max: Option<u32>) -> String {
         validate_outgoing(o, max).expect_err("should fail")
+    }
+
+    #[test]
+    fn the_v3_size_rule_refuses_one_byte_over_the_limit() {
+        const MIB: usize = 1024 * 1024;
+        // Topic "a" (1 byte) and QoS 0: Remaining Length = 2 + 1 + payload.
+        let at = |payload: usize| Outgoing {
+            payload: Bytes::from(vec![0; payload]),
+            ..msg("a")
+        };
+        let r = v3_max_remaining(MIB) as usize;
+        assert_eq!(r, MIB - 4);
+        assert_eq!(validate_v3_size(&at(r - 3), MIB), Ok(()));
+        assert_eq!(
+            validate_v3_size(&at(r - 2), MIB),
+            Err("MQTT 3.1.1 messages can be at most 1 MiB in this app.".to_owned())
+        );
+        assert_eq!(validate_v3_size(&at(5), 10), Ok(()));
+        assert_eq!(
+            validate_v3_size(&at(6), 10),
+            Err("MQTT 3.1.1 messages can be at most 10 bytes in this app.".to_owned())
+        );
     }
 
     #[test]

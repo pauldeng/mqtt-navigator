@@ -57,6 +57,7 @@ fn profile(subs: &[&str]) -> Profile {
             .iter()
             .map(|s| ((*s).to_owned(), Qos::AtLeastOnce))
             .collect(),
+        protocol: Protocol::V5,
         ..Profile::default()
     }
 }

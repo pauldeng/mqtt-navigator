@@ -62,6 +62,11 @@ pub fn status_text(status: &SendStatus) -> String {
     }
 }
 
+/// The status of a subscription that the broker accepted. `granted` is the QoS of the SUBACK.
+pub fn granted_text(granted: navigator_core::Qos) -> String {
+    format!("Granted QoS {}", granted.as_u8())
+}
+
 /// True for a status that the user must notice (shown in the danger colour, and with text).
 pub fn status_failed(status: &SendStatus) -> bool {
     matches!(
@@ -74,7 +79,9 @@ pub fn status_failed(status: &SendStatus) -> bool {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::{colour_slot, format_time, group_digits, status_from_result, status_text};
+    use super::{
+        colour_slot, format_time, granted_text, group_digits, status_from_result, status_text,
+    };
     use navigator_core::net::PublishResult;
     use navigator_core::store::SendStatus;
 
@@ -106,6 +113,18 @@ mod tests {
             assert_eq!(group_digits(n), s);
         }
         assert_eq!(group_digits(12_345_678), "12 345 678");
+    }
+
+    #[test]
+    fn a_suback_shows_the_granted_qos() {
+        assert_eq!(
+            granted_text(navigator_core::Qos::AtMostOnce),
+            "Granted QoS 0"
+        );
+        assert_eq!(
+            granted_text(navigator_core::Qos::AtLeastOnce),
+            "Granted QoS 1"
+        );
     }
 
     #[test]

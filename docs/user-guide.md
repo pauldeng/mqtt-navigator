@@ -70,6 +70,7 @@ Open the sheet with **Manage connections…** in the profile menu of the title b
 |---|---|
 | Name, Host | Free text and the broker address. |
 | Transport | TLS (default), WSS, TCP, WS. |
+| Protocol | MQTT 3.1.1 (default for a new connection) or MQTT 5. Set it to the version that the broker supports. A connection that you saved before this setting existed uses MQTT 5. See [MQTT 3.1.1 connections](#mqtt-311-connections). |
 | Port | Follows the transport: TLS 8883, WSS 443, TCP 1883, WS 80. The port changes only if it is still the default of the old transport. |
 | Username, Password | Optional. |
 | Client ID | The app makes one. You can edit it. |
@@ -110,12 +111,24 @@ Select **Advanced (show)** to open this part.
 | Keep alive (seconds) | 60 | 0 to 65535. |
 | Will topic, Will payload, Will QoS, Retain the will message, Will delay (seconds) | no will | The broker sends the will message when the connection ends without a DISCONNECT. An empty Will topic means no will message. |
 
+### MQTT 3.1.1 connections
+
+When **Protocol** is MQTT 3.1.1, the app hides the MQTT 5 features:
+
+- The sheet shows **Clean session** instead of **Clean start**. It has no **Session expiry** and no **Will delay**. The broker keeps the session when **Clean session** is off.
+- The composer has no **Properties** section. A message with MQTT 3.1.1 has no properties.
+- **Edit and publish** copies the topic, the payload, the QoS and retain. **Reply** uses the Response Topic as the topic. On MQTT 3.1.1 both actions drop the properties. If the message had a property, they show "MQTT 3.1.1 does not send properties."
+- The details pane shows "No properties (MQTT 3.1.1)." for a message without properties.
+- A message can be at most 1 MiB. The composer shows "MQTT 3.1.1 messages can be at most 1 MiB in this app." before it sends a larger message.
+
+If the broker does not support the version, the connection fails with a text that names the **Protocol** setting.
+
 ### Lose no messages during an outage
 
 By default, a connection uses clean start and QoS 0 subscriptions. In this setup the broker keeps nothing for you while you are offline. To keep messages during a short outage:
 
-1. Turn off **Clean start**.
-2. Set **Session expiry** to the time the broker must keep the session (for example 3600).
+1. Turn off **Clean start** (**Clean session** for MQTT 3.1.1).
+2. MQTT 5 only: set **Session expiry** to the time the broker must keep the session (for example 3600). MQTT 3.1.1 has no session expiry: the broker decides.
 3. Subscribe with **QoS 1**.
 4. Keep the same **Client ID**.
 
@@ -144,7 +157,7 @@ Rules:
 - A new connection starts with `#`. When you add a narrower filter, a hint asks "Remove # to receive only your filters?".
 - An invalid filter (for example `a/#/b`) shows an error under the input. The app does not send it. A filter that is in the list shows "You are already subscribed to …".
 - A row has a colour dot, the filter, a **Q0** or **Q1** tag and a status line. The tag is the QoS that you asked for. The row has no message count.
-- The status line shows "Subscribing…" (or "Waiting for connection" while you are offline). Then it shows "granted 0" or "granted 1". This is the QoS that the broker granted. It can be lower than the tag.
+- The status line shows "Subscribing…" (or "Waiting for connection" while you are offline). Then it shows "Granted QoS 0" or "Granted QoS 1". This is the QoS that the broker granted. If the broker refuses the filter, the row shows the reason, for example "Refused (0x80)" for MQTT 3.1.1. It can be lower than the tag.
 - If the broker rejects a filter, the status line shows the reason in red. Select **Retry** or **Remove**. The SUBACK reasons show as:
   - "Not authorized to subscribe."
   - "The broker says the topic filter is not valid."
@@ -210,7 +223,7 @@ The right pane has two tabs: **Value** and **History**. The **Details** button i
 - If a decoder cannot show the payload, the pane shows the cause and **Use Hex**.
 - JSON shows pretty-printed. **Wrap** turns line wrapping on or off. **Copy** copies the whole formatted text. **Copy topic** copies the topic.
 - **Long payloads:** the pane shows the first 256 KiB and a **Show all** button. It formats in the background. For very long text, it shows the first part and **Show more (+N KiB)**. Each press adds more.
-- MQTT 5 properties show under the value: content type, response topic, correlation data (hex), message expiry, payload format and user properties.
+- MQTT 5 properties show under the value (MQTT 3.1.1 messages have none): content type, response topic, correlation data (hex), message expiry, payload format and user properties.
 - **History:** the last 100 messages of the topic (each stored up to 64 KiB). Select a row to show it in the Value tab. You can also click in the list, use Up and Down to move the cursor, and press Enter to show the row in the Value tab.
 - If the memory limit removed the selected message, the pane says "Removed from the message list (memory limit)."
 
@@ -238,8 +251,8 @@ The result shows below the payload and in the list row. It is short: "Sending…
 | Action | Effect |
 |---|---|
 | Publish to this topic | Sets the topic. Keeps the payload. |
-| Edit and publish | Copies topic, exact payload bytes, QoS, retain and properties. A payload that is not valid UTF-8 opens in Hex mode. Off when the full payload is not stored ("The full payload is not stored."). |
-| Reply | Shows only when the message has a Response Topic. Sets that topic and copies the correlation data. The payload is empty. |
+| Edit and publish | Copies topic, exact payload bytes, QoS, retain and properties (MQTT 3.1.1: no properties). A payload that is not valid UTF-8 opens in Hex mode. Off when the full payload is not stored ("The full payload is not stored."). |
+| Reply | Shows only when the message has a Response Topic. Sets that topic and copies the correlation data (MQTT 3.1.1: no correlation data). The payload is empty. |
 | Clear retained… | Shows only while you are connected and the topic has a retained message. After you confirm, it sends an empty retained message at QoS 1. |
 
 ## Memory limit
@@ -301,7 +314,8 @@ The theme files keep the licences of their projects. See [THIRD-PARTY-NOTICES.md
 
 ```
 mqtt-navigator [--host HOST] [--port PORT] [--tcp | --ws | --wss] [--insecure]
-               [--ca FILE] [--user NAME] [--password-stdin] [--sub FILTER[:QOS]]...
+               [--ca FILE] [--user NAME] [--password-stdin] [--mqtt 3|5]
+               [--sub FILTER[:QOS]]...
 ```
 
 | Option | Meaning |
@@ -313,6 +327,7 @@ mqtt-navigator [--host HOST] [--port PORT] [--tcp | --ws | --wss] [--insecure]
 | `--ca FILE` | CA file (PEM). |
 | `--user NAME` | User name. |
 | `--password-stdin` | Read the password from the first line of the standard input, before the window opens. The app removes the line ending. An empty line means no password. |
+| `--mqtt 3`, `--mqtt 5` | MQTT version. `--mqtt 3` is MQTT 3.1.1 and is the default. |
 | `--sub FILTER[:QOS]` | A subscription. QoS is 0 or 1. Repeat the option for more. |
 | `-h`, `--help` | Show the usage and exit with code 2. |
 

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model::Qos;
-use crate::net::ConnectConfig;
+use crate::net::{ConnectConfig, Protocol};
 use crate::topic;
 
 /// Transport. TLS is the default.
@@ -103,6 +103,12 @@ pub struct Profile {
     pub client_key: Option<PathBuf>,
     /// Verify the server certificate and host name.
     pub verify_tls: bool,
+    /// The MQTT version. A new profile has MQTT 3.1.1. A file or an import without this field
+    /// has MQTT 5, because every profile of v0.1.x used MQTT 5.
+    #[serde(default = "protocol_of_old_files")]
+    pub protocol: Protocol,
+    /// MQTT 5: Clean Start. MQTT 3.1.1: Clean Session (the same CONNECT flag). Persistent
+    /// session in MQTT 3.1.1 means this is off.
     pub clean_start: bool,
     pub session_expiry_secs: u32,
     pub keepalive_secs: u16,
@@ -114,6 +120,10 @@ pub struct Profile {
     /// and gives them back at the next start, so a removal is not lost across a restart. It is
     /// state, not a setting: an export and an import leave it out.
     pub session_filters: Vec<String>,
+}
+
+fn protocol_of_old_files() -> Protocol {
+    Protocol::V5
 }
 
 impl Default for Profile {
@@ -158,6 +168,7 @@ impl Profile {
             client_cert: None,
             client_key: None,
             verify_tls: true,
+            protocol: Protocol::V311,
             clean_start: true,
             session_expiry_secs: 0,
             keepalive_secs: 60,
@@ -430,6 +441,48 @@ mod tests {
         // QoS 2 is refused.
         assert!(serde_json::from_str::<Profile>(r#"{"subscriptions":[["a",2]]}"#).is_err());
         assert!(serde_json::from_str::<Will>(r#"{"qos":2}"#).is_err());
+    }
+
+    #[test]
+    fn a_new_profile_uses_mqtt_311_and_an_old_one_mqtt_5() {
+        assert_eq!(Profile::new().protocol, Protocol::V311);
+        assert_eq!(Profile::default().protocol, Protocol::V311);
+        let q: Profile = serde_json::from_str(r#"{"name":"b"}"#).expect("old");
+        assert_eq!(q.protocol, Protocol::V5);
+        let q: Profile = serde_json::from_str(r#"{"protocol":"v311"}"#).expect("v311");
+        assert_eq!(q.protocol, Protocol::V311);
+        let json = serde_json::to_string(&Profile::new()).expect("json");
+        assert!(json.contains("\"protocol\":\"v311\""));
+    }
+
+    #[test]
+    fn the_connect_config_takes_the_protocol_of_the_profile() {
+        for protocol in [Protocol::V311, Protocol::V5] {
+            let p = Profile {
+                protocol,
+                ..named("x")
+            };
+            assert_eq!(ConnectConfig::from(p).protocol, protocol);
+        }
+    }
+
+    #[test]
+    fn export_has_the_protocol_and_an_import_without_it_gets_mqtt_5() {
+        let a = Profile {
+            protocol: Protocol::V311,
+            ..named("a")
+        };
+        let json = export_profiles(&[a]);
+        assert!(json.contains("\"protocol\": \"v311\""));
+        assert_eq!(
+            import_profiles(&json, &[]).expect("import")[0].protocol,
+            Protocol::V311
+        );
+        let old = r#"{"format":"mqtt-navigator-profiles","version":1,"profiles":[{"name":"o"}]}"#;
+        assert_eq!(
+            import_profiles(old, &[]).expect("old import")[0].protocol,
+            Protocol::V5
+        );
     }
 
     #[test]

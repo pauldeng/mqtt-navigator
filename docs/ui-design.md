@@ -62,7 +62,7 @@ The window has one place for each job:
 - **Left pane, Subscribe (major feature 1):**
   - One input: type a topic filter and press Enter. A toggle group (Q0 | Q1) next to it sets the QoS. QoS 0 is the default.
   - An invalid filter (for example `a/#/b` or an empty filter) shows an error under the input. The app does not send it.
-  - A new row shows "Subscribing…" until the SUBACK arrives. Then it shows "granted 0" or "granted 1". The Q0 or Q1 tag is the QoS that you asked for. A row has no message count.
+  - A new row shows "Subscribing…" until the SUBACK arrives. Then it shows "Granted QoS 0" or "Granted QoS 1". The Q0 or Q1 tag is the QoS that you asked for. A row has no message count.
   - A rejected row shows the reason in text (for example "Not authorized to subscribe."), with **Retry** and **Remove**.
   - The rows are `ListItem`s on a virtual list. Each subscription gets a colour from its row position. The colours repeat after 10 rows. A message takes the colour of the **first** subscription in the list that matches its topic. The colour dot is not a control.
   - **Show only**: click a subscription to show only its messages, and click again to show all. This changes the view only. It does not unsubscribe. Remove (×) unsubscribes.
@@ -117,7 +117,7 @@ The window has one place for each job:
 - **TLS is on by default.** A new profile uses transport TLS on port 8883. The default ports are TLS 8883, WSS 443, TCP 1883 and WS 80. When you change the transport, the port changes too, but only if it is still the default of the old transport.
 - To turn TLS off, select TCP or WS. The sheet then shows a warning: "Not encrypted. Passwords and messages are sent in clear text."
 - **TLS** (TLS and WSS only): verify the server certificate (on), CA file, client certificate and key.
-- **Advanced** (collapsed): WebSocket path, clean start, session expiry, keepalive, Will message.
+- **Advanced** (collapsed): WebSocket path, clean start (MQTT 3.1.1: clean session), session expiry (MQTT 5), keepalive, Will message (will delay: MQTT 5). The **Protocol** select is a basic field after Transport.
 - The saved connections are `ListItem` rows. The row of the draft is selected. "New connection" is the last row.
 - Buttons: **Save and connect** (primary), **Save**, **Cancel**. A button that opens a dialog ends with "…" (for example "Delete connection…"). A dialog has **Cancel** and a verb ("Discard changes", "Switch connection"). Validation runs when you press a button, and focus moves to the first wrong field.
 - There is no separate "Test connection" button. "Save and connect" is the test, and a failure shows its cause in the sheet.

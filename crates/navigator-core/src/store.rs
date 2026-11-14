@@ -47,6 +47,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 
 use crate::model::{Incoming, MsgProps, Qos};
+use crate::net::Protocol;
 use crate::topic;
 
 /// Items one step of node eviction handles. A node can hold a whole history ring, so this is
@@ -166,6 +167,8 @@ pub struct Msg {
     pub retain: bool,
     pub props: MsgProps,
     pub received_at: SystemTime,
+    /// The MQTT version that carried the message. An MQTT 3.1.1 message has no properties.
+    pub protocol: Protocol,
 }
 
 /// What `insert` and `record_sent` did with a message.
@@ -848,6 +851,7 @@ impl TopicStore {
             retain,
             props,
             received_at,
+            protocol,
             ..
         } = msg;
 
@@ -992,6 +996,7 @@ impl TopicStore {
             retain,
             props,
             received_at,
+            protocol,
         };
         let hist_msg = if latest.payload.len() > hist_len {
             Msg {
@@ -1097,6 +1102,7 @@ impl TopicStore {
         retain: bool,
         props: MsgProps,
         at: SystemTime,
+        protocol: Protocol,
     ) -> Insert {
         let node = self.find(topic);
         let shared = node.map(|n| Arc::clone(&self.nodes[n.ix()].topic));
@@ -1131,6 +1137,7 @@ impl TopicStore {
                     retain,
                     props,
                     received_at: at,
+                    protocol,
                 },
                 direction: Direction::Sent,
                 status: Some(SendStatus::Sending),
@@ -2362,6 +2369,7 @@ mod tests {
             retain: false,
             props,
             received_at: SystemTime::UNIX_EPOCH,
+            protocol: Protocol::V5,
         }
     }
 
@@ -2398,6 +2406,7 @@ mod tests {
             false,
             MsgProps::default(),
             SystemTime::UNIX_EPOCH,
+            Protocol::V5,
         )
     }
 
@@ -4717,6 +4726,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn each_message_keeps_the_protocol_that_carried_it() {
+        let mut s = TopicStore::new(Limits::default());
+        // A reconnect with another protocol each time: V5, V311, V5. Then a sent message.
+        for (topic, protocol) in [
+            ("t/a", Protocol::V5),
+            ("t/b", Protocol::V311),
+            ("t/c", Protocol::V5),
+        ] {
+            let mut m = msg(topic, b"x");
+            m.protocol = protocol;
+            s.insert(m);
+        }
+        s.record_sent(
+            9,
+            "t/d",
+            Bytes::from_static(b"x"),
+            Qos::AtMostOnce,
+            false,
+            MsgProps::default(),
+            SystemTime::now(),
+            Protocol::V311,
+        );
+        let got: Vec<(String, Protocol)> = (0..s.list_len())
+            .map(|i| match s.list_row(i).expect("row") {
+                RowView::Message { topic, msg, .. } => (topic.to_owned(), msg.protocol),
+                other => panic!("expected a message, got {other:?}"),
+            })
+            .collect();
+        // Newest first.
+        assert_eq!(
+            got,
+            [
+                ("t/d".to_owned(), Protocol::V311),
+                ("t/c".to_owned(), Protocol::V5),
+                ("t/b".to_owned(), Protocol::V311),
+                ("t/a".to_owned(), Protocol::V5),
+            ]
+        );
+    }
+
     fn retained_msg(topic: &str, payload: &[u8], retain: bool, expiry: Option<u32>) -> Incoming {
         Incoming {
             retain,
@@ -4779,6 +4829,7 @@ mod tests {
                 retain,
                 MsgProps::default(),
                 SystemTime::UNIX_EPOCH,
+                Protocol::V5,
             );
         };
         // Sending is not enough. A normal publish and a non-retained empty one do not clear.
@@ -4819,6 +4870,7 @@ mod tests {
             true,
             MsgProps::default(),
             SystemTime::UNIX_EPOCH,
+            Protocol::V5,
         );
         // "Sent" is not the end of a QoS 1 delete.
         s.set_send_status(1, SendStatus::Sent);
@@ -4840,6 +4892,7 @@ mod tests {
                 true,
                 MsgProps::default(),
                 SystemTime::UNIX_EPOCH,
+                Protocol::V5,
             );
         }
         assert_eq!(s.pending_retained.len(), MAX_PENDING_RETAINED);
@@ -4862,6 +4915,7 @@ mod tests {
             true,
             MsgProps::default(),
             t0,
+            Protocol::V5,
         );
         s.set_send_status(1, SendStatus::Acknowledged);
         assert!(s.has_retained_topic("r/t"));
@@ -4890,6 +4944,7 @@ mod tests {
                     ..MsgProps::default()
                 },
                 t0,
+                Protocol::V5,
             );
         };
         assert!(s.find("out/t").is_none() && !s.has_retained_topic("out/t"));
@@ -4930,6 +4985,7 @@ mod tests {
                 true,
                 MsgProps::default(),
                 t0,
+                Protocol::V5,
             );
             s.set_send_status(op, SendStatus::Sent);
         }

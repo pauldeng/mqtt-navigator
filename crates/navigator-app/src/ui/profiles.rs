@@ -216,7 +216,7 @@ impl Navigator {
         self.session.iter().chain(self.settings.profiles.iter())
     }
 
-    fn find_profile(&self, id: Uuid) -> Option<&Profile> {
+    pub(super) fn find_profile(&self, id: Uuid) -> Option<&Profile> {
         self.all_profiles().find(|p| p.id == id)
     }
 

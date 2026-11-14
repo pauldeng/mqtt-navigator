@@ -94,7 +94,7 @@ Moved here from the rumqttc-next plan, unchanged. "Have" means v0.1.x has it; it
 - **Profile.** New field `protocol: V311 | V5`. A new profile uses `V311`. Settings `schema_version` goes from 1 to 2. A profile without the field (old file or import) gets `V5`, because every v0.1.x profile used MQTT 5. The connection sheet has a "Protocol" select.
 - **Hide or show for 3.1.1.**
   - Connection sheet: "Clean session" instead of "Clean start" and "Session expiry". No will delay. No subscription options.
-  - Composer: no properties. "Edit and publish" or "Reply" of an MQTT 5 message copies topic, payload, QoS and retain, and shows "MQTT 3.1.1 does not send properties."
+  - Composer: no properties. "Edit and publish" of an MQTT 5 message copies topic, payload, QoS and retain. "Reply" keeps its behaviour (the topic is the Response Topic) and copies no properties. Each action shows "MQTT 3.1.1 does not send properties." when the source message has an MQTT 5 property.
   - Inspector: "No properties (MQTT 3.1.1)."
   - Results: QoS 1 shows "Acknowledged" or "Timed out". SUBACK shows "Granted QoS n" or "Refused (0x80)". CONNACK return codes 1 to 5 get plain text.
   - Connection details: session present only.

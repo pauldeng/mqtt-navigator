@@ -5,6 +5,8 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 
+use crate::net::Protocol;
+
 /// Quality of service. QoS 2 is not expressible: the MQTT library does not support it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Qos {
@@ -87,6 +89,8 @@ pub struct Incoming {
     pub retain: bool,
     pub props: MsgProps,
     pub received_at: SystemTime,
+    /// The MQTT version of the connection that received the message.
+    pub protocol: Protocol,
 }
 
 #[cfg(test)]

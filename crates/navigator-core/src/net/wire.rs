@@ -46,6 +46,7 @@ use super::{
     PublishResult, Transport, io_outcome,
 };
 use crate::model::{Incoming, MsgProps, Qos};
+pub(super) use crate::publish::v3_max_remaining;
 use crate::text::display_safe;
 use crate::tls::TlsDiag;
 
@@ -141,11 +142,8 @@ impl Wire {
             Self::V5(s) => publish_v5(s, o).await,
             Self::V3(s, max_packet) => {
                 // The text names the limit before the send. The codec would refuse it too.
-                if v3_remaining(o) > v3_max_remaining(*max_packet) {
-                    return PublishResult::Rejected(format!(
-                        "MQTT 3.1.1 messages can be at most {} in this app.",
-                        size_text(*max_packet)
-                    ));
+                if let Err(why) = crate::publish::validate_v3_size(o, *max_packet) {
+                    return PublishResult::Rejected(why);
                 }
                 publish_v3(s, o).await
             }
@@ -171,36 +169,6 @@ fn wire_qos(qos: Qos) -> WireQos {
     match qos {
         Qos::AtMostOnce => WireQos::AtMostOnce,
         Qos::AtLeastOnce => WireQos::AtLeastOnce,
-    }
-}
-
-/// Largest Remaining Length `r` with `1 + varint_len(r) + r <= max_packet` (v3 `set_max_size`).
-/// Each length of the varint gives one candidate: the largest `r` that fits both the packet
-/// limit and that length. The best candidate wins.
-pub(super) fn v3_max_remaining(max_packet: usize) -> u32 {
-    const RANGE: [u64; 4] = [127, 16_383, 2_097_151, 268_435_455];
-    let max = max_packet as u64;
-    let best = (1..=4u64)
-        .zip(RANGE)
-        .map(|(len, range)| max.saturating_sub(1 + len).min(range))
-        .max()
-        .unwrap_or(0);
-    best as u32
-}
-
-/// The Remaining Length of the v3 PUBLISH for `o` (v3 has no properties).
-fn v3_remaining(o: &Outgoing) -> u32 {
-    let id = if o.qos == Qos::AtLeastOnce { 2 } else { 0 };
-    u32::try_from(2 + o.topic.len() + id + o.payload.len()).unwrap_or(u32::MAX)
-}
-
-/// "1 MiB" for a whole number of MiB, else the bytes.
-fn size_text(bytes: usize) -> String {
-    const MIB: usize = 1024 * 1024;
-    if bytes != 0 && bytes.is_multiple_of(MIB) {
-        format!("{} MiB", bytes / MIB)
-    } else {
-        format!("{bytes} bytes")
     }
 }
 
@@ -942,6 +910,7 @@ fn incoming_v3(generation: u64, p: &v3::codec::Publish, payload: &NtexBytes) -> 
         },
         retain: p.retain,
         props: MsgProps::default(),
+        protocol: Protocol::V311,
         received_at: std::time::SystemTime::now(),
     }
 }
@@ -974,6 +943,7 @@ fn incoming(generation: u64, p: &v5::codec::Publish, payload: &NtexBytes) -> Inc
                 .collect(),
             payload_utf8: props.is_utf8_payload,
         },
+        protocol: Protocol::V5,
         received_at: std::time::SystemTime::now(),
     }
 }

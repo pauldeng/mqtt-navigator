@@ -27,7 +27,7 @@ use ms_mqtt_client::topic::TopicName;
 use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::Qos;
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Transport,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Protocol, Transport,
 };
 use navigator_core::store::{Limits, TopicStore};
 
@@ -187,6 +187,7 @@ fn soak_with_broker_restarts() {
             port: PORT,
             transport: Transport::Tcp,
             subscriptions: vec![("soak/#".into(), Qos::AtMostOnce)],
+            protocol: Protocol::V5,
             ..Profile::default()
         }))))
         .expect("send");

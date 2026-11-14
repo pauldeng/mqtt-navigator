@@ -27,8 +27,9 @@ use wire::{Connected, Params, UnsubFail, Wire};
 
 pub use crate::profile::{Profile, Transport, Will};
 
-/// The MQTT version of a connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The MQTT version of a connection. In JSON: `"v311"` or `"v5"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// MQTT 3.1.1. The profile's `clean_start` is the Clean Session flag. Session expiry, will
     /// delay and properties do not exist in this version.
@@ -41,8 +42,7 @@ pub enum Protocol {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectConfig {
     pub profile: Profile,
-    /// The MQTT version. Until the profile has its own field, [`ConnectConfig::from`] gives
-    /// [`Protocol::V5`].
+    /// The MQTT version. [`ConnectConfig::from`] takes it from the profile.
     pub protocol: Protocol,
     pub password: Option<String>,
     /// Decrypts an encrypted client key. Never prompted for.
@@ -60,8 +60,8 @@ pub struct ConnectConfig {
 impl From<Profile> for ConnectConfig {
     fn from(profile: Profile) -> Self {
         Self {
+            protocol: profile.protocol,
             profile,
-            protocol: Protocol::V5,
             password: None,
             key_passphrase: None,
             generation: 0,
@@ -1780,6 +1780,7 @@ mod tests {
             port,
             transport: Transport::Tcp,
             subscriptions: vec![],
+            protocol: Protocol::V5,
             ..Profile::default()
         };
         cmd_tx
@@ -1884,6 +1885,7 @@ mod tests {
             port,
             transport: Transport::Tcp,
             subscriptions: vec![],
+            protocol: Protocol::V5,
             ..Profile::default()
         };
         net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
@@ -1959,6 +1961,7 @@ mod tests {
             retain: false,
             props: MsgProps::default(),
             received_at: SystemTime::now(),
+            protocol: Protocol::V5,
         };
         let mut heavy = empty.clone();
         heavy.topic = Arc::from("a/long/topic");
@@ -2085,6 +2088,7 @@ mod tests {
                 .iter()
                 .map(|f| ((*f).into(), Qos::AtMostOnce))
                 .collect(),
+            protocol: Protocol::V5,
             ..Profile::default()
         }
     }
@@ -2480,6 +2484,7 @@ mod tests {
             port: broker.port,
             transport: Transport::Tls,
             subscriptions: vec![],
+            protocol: Protocol::V5,
             ..Profile::default()
         };
         net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
@@ -2512,6 +2517,7 @@ mod tests {
             transport: Transport::Tls,
             ca_file: Some(fifo.clone()),
             subscriptions: vec![],
+            protocol: Protocol::V5,
             ..Profile::default()
         };
         net.connect(ConnectConfig::from(profile)).expect("connect");
@@ -2556,6 +2562,7 @@ mod tests {
             retain: false,
             props: MsgProps::default(),
             received_at: SystemTime::now(),
+            protocol: Protocol::V5,
         };
         let stale = Ingest {
             shared: shared.clone(),
@@ -3061,6 +3068,7 @@ mod tests {
                 ca_file: Some(ca_path.clone()),
                 verify_tls: true,
                 subscriptions: vec![],
+                protocol: Protocol::V5,
                 ..Profile::default()
             };
             net.connect(ConnectConfig::from(profile)).expect("connect");
@@ -3719,6 +3727,8 @@ mod tests {
                         .expect("timeout")
                         .expect("message");
                     assert_eq!(&*m.topic, "t", "v5 {v5}");
+                    let want = if v5 { Protocol::V5 } else { Protocol::V311 };
+                    assert_eq!(m.protocol, want, "v5 {v5}");
                     assert_eq!(
                         m.payload.len(),
                         MAX - 1 - 2 - 3 - usize::from(v5),

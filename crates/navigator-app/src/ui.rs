@@ -32,7 +32,7 @@ use gpui_kit::*;
 use navigator_core::Qos;
 use navigator_core::decode::preview;
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, SendError, Status,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Protocol, SendError, Status,
 };
 use navigator_core::settings::{Load, RowHeight, Settings, ThemeMode, ViewMode};
 use navigator_core::store::{
@@ -44,7 +44,8 @@ use uuid::Uuid;
 
 use crate::connections::{Choice, ConnectionSheet, ProfileItem, SheetEvent};
 use crate::messages::{
-    colour_slot, format_time, group_digits, status_failed, status_from_result, status_text,
+    colour_slot, format_time, granted_text, group_digits, status_failed, status_from_result,
+    status_text,
 };
 use crate::palette::Cmd;
 use crate::persist::Writer;
@@ -452,6 +453,15 @@ fn connection_live(state: &ConnState, gate: &GenGate, status_generation: u64) ->
     ) || gate.outstanding(status_generation)
 }
 
+/// A connection of the current generation is on its way or up. A status of another generation
+/// (the old connection after a reconnect or a cancel) does not count: the gate drops its later
+/// statuses, so it would never end.
+fn connection_active(state: &ConnState, gate: &GenGate, status_generation: u64) -> bool {
+    gate.outstanding(status_generation)
+        || (gate.current == Some(status_generation)
+            && !matches!(state, ConnState::Disconnected | ConnState::Failed(_)))
+}
+
 /// A topic or filter as drawn: invisible and direction characters are made visible. The
 /// original string stays for publish, subscribe and copy.
 fn safe(s: &SharedString) -> SharedString {
@@ -492,6 +502,25 @@ fn validate_filter(filter: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// See [`Navigator::composer_protocol`].
+///
+/// - A Connect waits for the keyring (`pending`): the saved version of the profile that it
+///   connects. `conn_protocol` changes only when the Connect command goes out.
+/// - Else a connection or an attempt is `active`: the connection's version.
+/// - Else the saved version of the selected profile.
+fn composer_protocol(
+    pending: Option<Protocol>,
+    active: bool,
+    connection: Protocol,
+    saved: Option<Protocol>,
+) -> Protocol {
+    match (pending, active) {
+        (Some(p), _) => p,
+        (None, true) => connection,
+        (None, false) => saved.unwrap_or(connection),
+    }
+}
+
 pub struct Navigator {
     /// The active profile. `None`: the user has not chosen one (or deleted it).
     profile: Option<Profile>,
@@ -517,6 +546,8 @@ pub struct Navigator {
     /// The profile of each recent Connect, by generation. A report of the session filters can
     /// come after a switch, and it belongs to the old profile.
     connect_owners: Vec<(u64, Uuid)>,
+    /// The MQTT version of the latest Connect.
+    conn_protocol: Protocol,
     profile_select: Entity<SelectState<Vec<ProfileItem>>>,
     sheet: Option<WeakEntity<ConnectionSheet>>,
     /// The window system can resize a new window soon after the first frame. A resize before
@@ -724,6 +755,7 @@ impl Navigator {
             next_secret_token: 1,
             reconnect_pending: false,
             connect_owners: Vec::new(),
+            conn_protocol: Protocol::V311,
             profile_select,
             sheet: None,
             resize_settled_at: None,
@@ -846,6 +878,9 @@ impl Navigator {
     fn cancel_connection(&mut self) {
         self.net.disconnect();
         self.gate.clear();
+        // The gate drops the later statuses of the old connection. Its last status must not
+        // stay on screen as "Connected".
+        self.status = Status::default();
         self.secret_req = None;
         self.reconnect_pending = false;
     }
@@ -874,6 +909,7 @@ impl Navigator {
         // A settings file or an old version can hold a value that panics the MQTT library.
         config.validate()?;
         self.reconnect_pending = false;
+        self.conn_protocol = config.protocol;
         tracing::info!(url = %self.url(), "Connect");
         match self.net.connect(config) {
             Ok(generation) => {
@@ -1559,6 +1595,20 @@ impl Navigator {
         self.status.state == ConnState::Connected
     }
 
+    /// The MQTT version that the composer follows: the connection's while a connection or an
+    /// attempt is live, else the saved version of the selected profile. `self.profile` is the
+    /// profile of the last Connect: an edit that was saved during the connection is not in it.
+    fn composer_protocol(&self) -> Protocol {
+        let saved_of = |id| self.find_profile(id).map(|p| p.protocol);
+        let pending = self.secret_req.and_then(|(_, id)| saved_of(id));
+        let active = connection_active(&self.status.state, &self.gate, self.status.generation);
+        let saved = self
+            .profile
+            .as_ref()
+            .map(|p| saved_of(p.id).unwrap_or(p.protocol));
+        composer_protocol(pending, active, self.conn_protocol, saved)
+    }
+
     fn state_text(&self) -> String {
         match &self.status.state {
             _ if self.connecting() => "Connecting…".into(),
@@ -1717,7 +1767,7 @@ impl Navigator {
         let state: SharedString = match &s.state {
             SubState::Pending if self.connected() => "Subscribing…".into(),
             SubState::Pending => "Waiting for connection".into(),
-            SubState::Active(q) => format!("granted {}", q.as_u8()).into(),
+            SubState::Active(q) => granted_text(*q).into(),
             SubState::Failed(e) | SubState::RemoveFailed(e) | SubState::NotRemoved(e) => {
                 e.clone().into()
             }
@@ -2985,6 +3035,66 @@ mod tests {
     use navigator_core::Qos;
     use navigator_core::net::SendError;
     use std::time::Duration;
+
+    #[test]
+    fn the_composer_follows_the_connection_while_connected_and_the_profile_otherwise() {
+        use super::{
+            Protocol::{V5, V311},
+            composer_protocol,
+        };
+        // Nothing live: the saved profile, in both directions.
+        assert_eq!(composer_protocol(None, false, V311, Some(V5)), V5);
+        assert_eq!(composer_protocol(None, false, V5, Some(V311)), V311);
+        // A connection is active: the connection, also after a saved edit of the profile. When
+        // the connection ends, the saved version applies (V311 to V5 and back).
+        assert_eq!(composer_protocol(None, true, V311, Some(V5)), V311);
+        assert_eq!(composer_protocol(None, false, V311, Some(V5)), V5);
+        assert_eq!(composer_protocol(None, true, V5, Some(V311)), V5);
+        assert_eq!(composer_protocol(None, false, V5, Some(V311)), V311);
+        // No profile: the last connection.
+        assert_eq!(composer_protocol(None, false, V5, None), V5);
+    }
+
+    /// The keyring read of a Connect is pending: `conn_protocol` is still the old value, and the
+    /// pending profile decides, with and without an active connection, in both directions.
+    /// A connected V5 session is replaced (a reconnect), and the Connect is cancelled while the
+    /// keyring read waits. The old status (generation 1) is still the last one, and the gate is
+    /// clear. It must not count as active, in both directions.
+    #[test]
+    fn a_cancelled_reconnect_leaves_no_active_connection() {
+        use super::{
+            ConnState, GenGate,
+            Protocol::{V5, V311},
+            composer_protocol, connection_active,
+        };
+        let mut gate = GenGate::default();
+        gate.begin(1);
+        assert!(connection_active(&ConnState::Connected, &gate, 1));
+        gate.clear();
+        // The status of generation 1 is stale now.
+        assert!(!connection_active(&ConnState::Connected, &gate, 1));
+        for (old, saved) in [(V5, V311), (V311, V5)] {
+            let active = connection_active(&ConnState::Connected, &gate, 1);
+            assert_eq!(composer_protocol(None, active, old, Some(saved)), saved);
+        }
+        // A new Connect (generation 2) has no status yet: it is active and uses its protocol.
+        gate.begin(2);
+        assert!(connection_active(&ConnState::Connected, &gate, 1));
+        assert!(connection_active(&ConnState::Connecting, &gate, 2));
+        assert!(!connection_active(&ConnState::Disconnected, &gate, 2));
+    }
+
+    #[test]
+    fn a_connect_that_waits_for_the_keyring_uses_the_protocol_of_its_profile() {
+        use super::{
+            Protocol::{V5, V311},
+            composer_protocol,
+        };
+        for active in [false, true] {
+            assert_eq!(composer_protocol(Some(V5), active, V311, Some(V311)), V5);
+            assert_eq!(composer_protocol(Some(V311), active, V5, Some(V5)), V311);
+        }
+    }
 
     #[test]
     fn a_connect_replaced_before_it_answers_is_never_accepted() {

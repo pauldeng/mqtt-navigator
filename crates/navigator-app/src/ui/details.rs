@@ -747,19 +747,46 @@ impl Navigator {
         if composer::edit_unavailable(&s.msg, s.evicted).is_some() {
             return;
         }
+        let mut d = Draft::from_message(&s.topic, &s.msg);
+        let notice = self.v3_notice(&s.msg.props);
         self.close_details_sheet(window, cx);
-        self.replace_composer(Draft::from_message(&s.topic, &s.msg), true, window, cx);
+        self.prepare_v3_draft(&mut d, notice, window, cx);
+        self.replace_composer(d, true, window, cx);
     }
 
     pub(super) fn reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(s) = self.shown() else {
             return;
         };
-        let Some(d) = Draft::reply(&s.msg, self.comp.qos) else {
+        let Some(mut d) = Draft::reply(&s.msg, self.comp.qos) else {
             return;
         };
+        let notice = self.v3_notice(&s.msg.props);
         self.close_details_sheet(window, cx);
+        self.prepare_v3_draft(&mut d, notice, window, cx);
         self.replace_composer(d, true, window, cx);
+    }
+
+    /// True if the notice "MQTT 3.1.1 does not send properties." is due: the composer follows an
+    /// MQTT 3.1.1 connection, and the source message has an MQTT 5 property.
+    fn v3_notice(&self, source: &navigator_core::MsgProps) -> bool {
+        composer::v3_drops_properties(self.composer_protocol(), source)
+    }
+
+    /// An MQTT 3.1.1 connection sends no properties. The draft loses them.
+    fn prepare_v3_draft(
+        &mut self,
+        d: &mut Draft,
+        notice: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_protocol() == Protocol::V311 {
+            d.drop_properties();
+        }
+        if notice {
+            self.notify(Notification::info(composer::V3_NO_PROPERTIES), window, cx);
+        }
     }
 
     /// Asks before it clears the retained message of the shown topic. "Cancel" has the focus.
@@ -1085,6 +1112,10 @@ impl Navigator {
                         .child("Removed from the message list (memory limit)."),
                 )
             })
+            .when_some(
+                crate::inspector::no_properties_note(m.protocol, &m.props),
+                |d, note| d.child(div().text_xs().text_color(muted).child(note)),
+            )
             .when(!rows.is_empty(), |d| {
                 d.child(
                     div().id("props").max_h(ui(140.)).overflow_y_scroll().child(

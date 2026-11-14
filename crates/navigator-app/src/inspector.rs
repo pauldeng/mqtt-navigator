@@ -113,6 +113,19 @@ pub fn meta_line(qos: Qos, retain: bool, size: usize, stored: usize, truncated: 
     out
 }
 
+/// Shown instead of the property list for a message of an MQTT 3.1.1 connection.
+pub const V3_NO_PROPERTIES: &str = "No properties (MQTT 3.1.1).";
+
+/// The note under a message without properties. It follows the protocol of the message, not the
+/// protocol of the connection now.
+pub fn no_properties_note(
+    protocol: navigator_core::net::Protocol,
+    props: &MsgProps,
+) -> Option<&'static str> {
+    (protocol == navigator_core::net::Protocol::V311 && props_rows(props).is_empty())
+        .then_some(V3_NO_PROPERTIES)
+}
+
 /// The MQTT 5 properties as (name, value) rows. User properties keep their order, also with the
 /// same name twice. A message with no properties gives no rows.
 pub fn props_rows(p: &MsgProps) -> Vec<(String, String)> {
@@ -224,7 +237,7 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
         DecoderChoice, DecoderPick, Jobs, MAX_STEP, MIN_STEP, meta_line, next_cut, next_step,
-        props_rows, size_text,
+        no_properties_note, props_rows, size_text,
     };
     use bytes::Bytes;
     use navigator_core::decode::Decoder;
@@ -270,6 +283,19 @@ mod tests {
         assert_eq!(size_text(20), "20 B");
         assert_eq!(size_text(340 * 1024), "340 KiB");
         assert_eq!(size_text(1_258_291), "1.2 MiB");
+    }
+
+    #[test]
+    fn the_no_properties_note_follows_the_protocol_of_the_message() {
+        use navigator_core::net::Protocol;
+        let none = MsgProps::default();
+        // A V5 message with no property after a V311 connection: no note.
+        assert_eq!(no_properties_note(Protocol::V5, &none), None);
+        // A V311 message after a V5 connection: the note.
+        assert_eq!(
+            no_properties_note(Protocol::V311, &none),
+            Some("No properties (MQTT 3.1.1).")
+        );
     }
 
     #[test]

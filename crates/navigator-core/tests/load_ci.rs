@@ -21,7 +21,7 @@ use ms_mqtt_client::topic::TopicName;
 use ms_mqtt_client::transport::{ConnectionTransportConfig, ConnectionTransportType};
 use navigator_core::model::Qos;
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Transport,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Profile, Protocol, Transport,
 };
 use navigator_core::store::{Limits, TopicStore};
 
@@ -166,6 +166,7 @@ fn ten_thousand_messages_per_second_through_net_and_store() {
             port: PORT,
             transport: Transport::Tcp,
             subscriptions: vec![("load/#".into(), Qos::AtMostOnce)],
+            protocol: Protocol::V5,
             ..Profile::default()
         }))))
         .expect("send");

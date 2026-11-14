@@ -10,7 +10,7 @@ use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
 use navigator_core::decode::{self, Decoder};
-use navigator_core::publish::validate_outgoing;
+use navigator_core::publish::{validate_outgoing, validate_v3_size};
 
 use super::profiles::display_name;
 use super::*;
@@ -466,9 +466,19 @@ impl Navigator {
         cx: &mut Context<Self>,
     ) {
         let op_id = self.next_op;
-        let checked = d
-            .to_outgoing(op_id)
-            .and_then(|o| validate_outgoing(&o, self.net.broker_max_packet()).map(|()| o));
+        let v3 = self.composer_protocol() == Protocol::V311;
+        // An MQTT 3.1.1 message has no properties. The hidden fields must not block it.
+        let mut wire = d.clone();
+        if v3 {
+            wire.drop_properties();
+        }
+        let checked = wire.to_outgoing(op_id).and_then(|o| {
+            validate_outgoing(&o, self.net.broker_max_packet())?;
+            if v3 {
+                validate_v3_size(&o, NetLimits::default().max_packet)?;
+            }
+            Ok(o)
+        });
         let out = match checked {
             Ok(o) => o,
             Err(e) => {
@@ -495,6 +505,7 @@ impl Navigator {
                     out.retain,
                     out.props,
                     SystemTime::now(),
+                    self.conn_protocol,
                 );
                 self.restore_anchor();
                 self.last_result = Some((op_id, status_text(&SendStatus::Sending)));
@@ -746,7 +757,9 @@ impl Navigator {
                                 })),
                         ),
                 )
-                .child(self.render_props(cx))
+                .when(self.composer_protocol() == Protocol::V5, |d| {
+                    d.child(self.render_props(cx))
+                })
                 .when_some(topic_note, |d, n| {
                     d.child(div().text_xs().text_color(muted).child(n))
                 })

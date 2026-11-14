@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::profile::Profile;
 
 /// The schema version that this build writes.
-pub const CURRENT_SCHEMA: u32 = 1;
+pub const CURRENT_SCHEMA: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,8 +132,20 @@ pub struct Load {
     pub read_only: bool,
 }
 
-/// `MIGRATIONS[i]` changes version `i + 1` into version `i + 2`. Empty until schema 2 exists.
-const MIGRATIONS: &[fn(&mut serde_json::Value)] = &[];
+/// `MIGRATIONS[i]` changes version `i + 1` into version `i + 2`.
+const MIGRATIONS: &[fn(&mut serde_json::Value)] = &[v1_to_v2];
+
+/// Schema 1 has no `protocol`. Every profile of schema 1 used MQTT 5.
+fn v1_to_v2(value: &mut serde_json::Value) {
+    let profiles = value
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut);
+    for p in profiles.into_iter().flatten() {
+        if let Some(o) = p.as_object_mut() {
+            o.entry("protocol").or_insert_with(|| "v5".into());
+        }
+    }
+}
 
 fn parse(text: &str) -> Result<Result<Settings, u32>, serde_json::Error> {
     let mut value: serde_json::Value = serde_json::from_str(text)?;
@@ -303,6 +315,7 @@ pub fn save_atomic_with_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::Protocol;
 
     fn with_name(name: &str) -> Settings {
         Settings {
@@ -342,7 +355,7 @@ mod tests {
         assert_eq!((none.settings, none.notice), (Settings::default(), None));
         fs::write(&path, r#"{"profiles":[{"name":"x"}]}"#).expect("write");
         let l = load(&path);
-        assert_eq!(l.settings.schema_version, 1);
+        assert_eq!(l.settings.schema_version, 2);
         assert_eq!(l.settings.ui, UiState::default());
         assert_eq!(l.settings.ui.theme_preset, "default");
         assert_eq!(l.settings.ui.store_budget_mib, 128);
@@ -351,6 +364,43 @@ mod tests {
             "an old file keeps the update check on"
         );
         assert_eq!(l.settings.profiles[0].port, 8883);
+    }
+
+    #[test]
+    fn a_schema_1_file_loads_its_profiles_as_mqtt_5() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"schema_version":1,"profiles":[{"name":"old"},{"name":"also","protocol":"v311"}]}"#,
+        )
+        .expect("write");
+        let l = load(&path);
+        assert_eq!(l.notice, None);
+        assert_eq!(l.settings.schema_version, 2);
+        let got: Vec<_> = l.settings.profiles.iter().map(|p| p.protocol).collect();
+        assert_eq!(got, [Protocol::V5, Protocol::V311]);
+        // A file with no version is schema 1.
+        fs::write(&path, r#"{"profiles":[{"name":"old"}]}"#).expect("write");
+        assert_eq!(load(&path).settings.profiles[0].protocol, Protocol::V5);
+    }
+
+    #[test]
+    fn the_protocol_survives_a_save_and_a_load() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        let mut s = with_name("a");
+        assert_eq!(s.profiles[0].protocol, Protocol::V311);
+        s.profiles.push(Profile {
+            name: "b".into(),
+            protocol: Protocol::V5,
+            ..Profile::new()
+        });
+        save_atomic(&path, &s).expect("save");
+        let got = load(&path).settings;
+        assert_eq!(got.schema_version, 2);
+        let got: Vec<_> = got.profiles.iter().map(|p| p.protocol).collect();
+        assert_eq!(got, [Protocol::V311, Protocol::V5]);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use navigator_core::model::{MsgProps, Qos};
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, PublishResult,
-    Transport,
+    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
+    PublishResult, Transport,
 };
 
 const SENDS: u64 = 24;
@@ -34,6 +34,7 @@ async fn disconnect_during_a_blocked_write_is_prompt() {
         port,
         transport: Transport::Tcp,
         subscriptions: vec![],
+        protocol: Protocol::V5,
         ..Profile::default()
     };
     net.connect(ConnectConfig::from(profile)).expect("connect");

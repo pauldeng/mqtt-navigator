@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use bytes::Bytes;
-use navigator_core::net::Outgoing;
+use navigator_core::net::{Outgoing, Protocol};
 use navigator_core::publish::{parse_hex, to_hex};
 use navigator_core::store::Msg;
 use navigator_core::text::display_safe;
@@ -20,6 +20,8 @@ pub const HISTORY_BYTES: usize = 1024 * 1024;
 pub const MAX_DRAFTS: usize = 5;
 /// Most sent messages that History keeps.
 pub const MAX_SENT: usize = 20;
+/// Shown when "Edit and publish" or "Reply" drops properties on an MQTT 3.1.1 connection.
+pub const V3_NO_PROPERTIES: &str = "MQTT 3.1.1 does not send properties.";
 /// Shown when the payload is not stored completely.
 pub const NOT_STORED: &str = "The full payload is not stored.";
 
@@ -142,6 +144,24 @@ impl Draft {
         })
     }
 
+    /// Clears every MQTT 5 property (an MQTT 3.1.1 message has none). Topic, payload, QoS and
+    /// retain stay. Returns true if the draft had a property.
+    pub fn drop_properties(&mut self) -> bool {
+        let had = self.content_type.is_some()
+            || !self.response_topic.is_empty()
+            || self.correlation.is_some()
+            || !self.expiry.is_empty()
+            || self.utf8
+            || !self.user.is_empty();
+        self.content_type = None;
+        self.response_topic.clear();
+        self.correlation = None;
+        self.expiry.clear();
+        self.utf8 = false;
+        self.user.clear();
+        had
+    }
+
     /// "Edit and publish": the exact bytes, QoS, retain and all properties of `msg`. A payload
     /// that is not valid UTF-8 opens in Hex mode. The caller checks [`edit_unavailable`] first.
     pub fn from_message(topic: &str, msg: &Msg) -> Self {
@@ -190,6 +210,14 @@ impl Draft {
         };
         format!("{}  {}", display_safe(&self.topic), payload)
     }
+}
+
+/// True if "Edit and publish" or "Reply" must say "MQTT 3.1.1 does not send properties.": the
+/// target connection is MQTT 3.1.1 and the source message has an MQTT 5 property. The decision
+/// uses the source message, because a draft that Reply builds can be empty of properties even
+/// when the message had a Response Topic.
+pub fn v3_drops_properties(target: Protocol, source: &MsgProps) -> bool {
+    target == Protocol::V311 && !crate::inspector::props_rows(source).is_empty()
 }
 
 /// `Some(reason)` if "Edit and publish" must be off: the stored payload is not the full payload
@@ -446,9 +474,10 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
         ComposerModel, Draft, History, LineKeep, MAX_DRAFTS, MAX_SENT, NOT_STORED, PayloadMode,
-        edit_unavailable, hidden_chars_note, line_breaks_note,
+        edit_unavailable, hidden_chars_note, line_breaks_note, v3_drops_properties,
     };
     use bytes::Bytes;
+    use navigator_core::net::Protocol;
     use navigator_core::store::Msg;
     use navigator_core::{MsgProps, Qos};
     use std::time::SystemTime;
@@ -470,7 +499,67 @@ mod tests {
             retain: true,
             props,
             received_at: SystemTime::UNIX_EPOCH,
+            protocol: Protocol::V5,
         }
+    }
+
+    #[test]
+    fn an_mqtt_311_edit_keeps_topic_payload_qos_and_retain_and_drops_the_properties() {
+        let props = MsgProps {
+            content_type: Some("text/plain".into()),
+            response_topic: Some("r/t".into()),
+            correlation_data: Some(Bytes::from_static(b"\x01")),
+            message_expiry: Some(30),
+            user: vec![("k".into(), "v".into())],
+            payload_utf8: true,
+        };
+        let mut d = Draft::from_message("a/b", &msg(b"hello", props));
+        assert!(d.drop_properties());
+        assert_eq!(
+            d,
+            Draft {
+                topic: "a/b".into(),
+                payload: "hello".into(),
+                qos: Qos::AtLeastOnce,
+                retain: true,
+                ..Draft::default()
+            }
+        );
+        // A message with no property has nothing to drop: no note.
+        let mut plain = Draft::from_message("a/b", &msg(b"hello", MsgProps::default()));
+        assert!(!plain.drop_properties());
+        // A reply copies the correlation data. MQTT 3.1.1 drops it, and keeps the topic.
+        let reply_props = MsgProps {
+            response_topic: Some("reply/here".into()),
+            correlation_data: Some(Bytes::from_static(b"\x02")),
+            ..MsgProps::default()
+        };
+        let source = msg(b"q", reply_props);
+        let mut r = Draft::reply(&source, Qos::AtMostOnce).expect("reply");
+        assert!(r.drop_properties());
+        assert_eq!(
+            r,
+            Draft {
+                topic: "reply/here".into(),
+                ..Draft::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_notice_follows_the_source_message_and_the_target_protocol() {
+        // A Response Topic alone is a property. The Reply draft has none left, but the notice is due.
+        let only_response_topic = MsgProps {
+            response_topic: Some("reply/here".into()),
+            ..MsgProps::default()
+        };
+        let source = msg(b"q", only_response_topic.clone());
+        let reply = Draft::reply(&source, Qos::AtMostOnce).expect("reply");
+        assert!(!reply.clone().drop_properties());
+        assert!(v3_drops_properties(Protocol::V311, &only_response_topic));
+        // An MQTT 5 target sends properties: no notice. A source without properties: no notice.
+        assert!(!v3_drops_properties(Protocol::V5, &only_response_topic));
+        assert!(!v3_drops_properties(Protocol::V311, &MsgProps::default()));
     }
 
     #[test]

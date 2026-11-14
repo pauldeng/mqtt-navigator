@@ -507,3 +507,91 @@ New texts (plan "Version errors", plan lines 100-105 of the "MQTT 3.1.1 in the a
 3. `Disconnected(Some(io))` with kind EOF, reset, abort or broken pipe during the handshake now gives the close-before-CONNACK text (temporary), unless a TLS diagnosis exists. The test `a_close_before_the_connack_does_not_claim_a_version` covers a clean close and a reset (the fake closes with unread data, which sends a RST) on v3 and v5. Checked: without the mapping the reset case gives "The broker closed the connection.".
 
 Runs (`s2br1-*.txt`): fmt ok; clippy `--all-features -D warnings` ok; `cargo deny check` ok; `cargo test --workspace` 293 passed, 0 failed, 1 ignored (161 unit tests); `net_mosquitto` once against Mosquitto 18830: 27 passed. `git diff crates/navigator-app` is empty. Not rerun: the full broker suite (the change touches the connect error path and one test-only branch).
+
+## S2c Profile and app
+
+Date: 2026-11-15. Branch `feat/ntex-mqtt`, base commit d704988. Nothing is committed. Logs: `s2c-*.txt` in the scratchpad (`ntex/`).
+
+### What changed
+
+- `navigator-core`:
+  - `Protocol` has serde (`"v311"`, `"v5"`). `Profile.protocol` is new. `Profile::new()` and `Profile::default()` give `V311` (D7). A profile JSON without the field gives `V5` (field-level serde default), for a settings file and for an import.
+  - Settings `CURRENT_SCHEMA` is 2. Migration `v1_to_v2` writes `"protocol": "v5"` into each profile that has none. The profile export (version 1 of the export format) includes the field. An export without the field imports as `V5`.
+  - `From<Profile> for ConnectConfig` passes `profile.protocol` (S2b hard-coded `V5`).
+  - `publish.rs` now holds the v3 size rules: `v3_max_remaining`, `v3_remaining`, `size_text` and the new `validate_v3_size`. They moved from `net/wire.rs` without change. `wire.rs` calls `validate_v3_size`, so the text "MQTT 3.1.1 messages can be at most 1 MiB in this app." exists once.
+- `navigator-app`:
+  - Connection sheet: a "Protocol" select (MQTT 3.1.1, MQTT 5) after Transport. For 3.1.1 the sheet shows "Clean session" instead of "Clean start" and hides "Session expiry" and "Will delay". A hidden field is not read: the profile keeps its saved value. The app has no subscription options yet (S2d).
+  - Clean session mapping (D3): the profile field `clean_start` is the CONNECT Clean Session flag in 3.1.1 (the same bit). Clean Session off means a persistent session. `session_expiry_secs` is ignored for 3.1.1 and keeps its value in the profile.
+  - `Navigator.protocol` is the version of the latest Connect (set in `send_connect`). The composer and the inspector follow it.
+  - Composer, 3.1.1: no "Properties" section. Send drops properties from the draft before the check, so hidden fields cannot block a send. Before the send, the composer checks `validate_v3_size` with the app limit (the same check as v5 with the broker Maximum Packet Size). "Edit and publish" and "Reply" copy the draft, drop the properties and show the notification "MQTT 3.1.1 does not send properties." only when the draft had a property.
+  - Inspector, 3.1.1: a message with no properties shows "No properties (MQTT 3.1.1)."
+  - Subscription row: "granted N" became "Granted QoS N". Refusal texts ("Refused (0x80)") come from core.
+  - `--mqtt 3|5`, default 3. Help text and `docs/user-guide.md` list it.
+- Docs: `docs/user-guide.md` (Protocol field, "MQTT 3.1.1 connections" section, `--mqtt`, "Granted QoS"; the keep-alive text at line 395 is untouched), `docs/ui-design.md` (two lines).
+
+### Tests added
+
+`profile::tests`: `a_new_profile_uses_mqtt_311_and_an_old_one_mqtt_5`, `the_connect_config_takes_the_protocol_of_the_profile`, `export_has_the_protocol_and_an_import_without_it_gets_mqtt_5`. `settings::tests`: `a_schema_1_file_loads_its_profiles_as_mqtt_5`, `the_protocol_survives_a_save_and_a_load`. `publish::tests::the_v3_size_rule_refuses_one_byte_over_the_limit`. App: `mqtt_3_is_the_default_and_mqtt_5_is_an_option` (`main.rs`), `an_mqtt_311_edit_keeps_topic_payload_qos_and_retain_and_drops_the_properties` (`composer.rs`), `mqtt_311_shows_clean_session_and_hides_the_mqtt_5_session_fields` (`connections.rs`), `a_suback_shows_the_granted_qos` (`messages.rs`).
+
+Mutation checks: the field default changed to `V311` made `a_new_profile_uses_mqtt_311_and_an_old_one_mqtt_5` and `export_has_the_protocol_and_an_import_without_it_gets_mqtt_5` fail. `From<Profile>` with a hard-coded `V5` made `the_connect_config_takes_the_protocol_of_the_profile` fail. I restored both. Not checked by mutation: the migration function (the field default gives the same result; the function is needed so that `MIGRATIONS[version - 1..]` does not panic at schema 2).
+
+### Changed expectations (plan lines)
+
+| Test or text | Change | Plan line |
+|---|---|---|
+| All broker tests and net unit tests that build `Profile { .., ..Profile::default() }` (`net.rs`, `broker_compat.rs`, `broker_matrix.rs`, `net_mosquitto.rs`, `net_blocked_write.rs`, `load_ci.rs`, `soak.rs`) | The profile now sets `protocol: Protocol::V5`. No assertion changed. | S2: "Existing tests that build a profile pin it to V5 before S2c changes the default" (line 142) |
+| `settings::tests::round_trip_and_defaults` | `schema_version` after the load of an old file: 1 became 2. | "Settings schema_version goes from 1 to 2" (line 94) |
+| Subscription row text | "granted N" became "Granted QoS N" (no test pinned the old text; the new text has a test). `docs/ui-design.md` and the user guide changed with it. | "SUBACK shows Granted QoS n" (line 99) |
+
+### Gate
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | ok (`s2c-fmt.txt`) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | ok (`s2c-clippy.txt`) |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok (`s2c-deny.txt`) |
+| `cargo test --workspace` | 303 passed, 0 failed, 1 ignored (`s2c-test.txt`) |
+| `tests/broker/up.sh mosquitto` | all Mosquitto listeners answered (`s2c-up.txt`) |
+| Broker suite, `--no-fail-fast -- --test-threads=1` (`s2c-broker.txt`) | 166 unit, 22 `broker_matrix`, 1 `load_ci`, 1 `net_blocked_write`, 27 `net_mosquitto` passed. `broker_compat`: 8 passed (Mosquitto), 16 failed (all `emqx::` and `hivemq::` tests: those brokers were not started, so "connect failed" / "not connected"). Those brokers were not started in the first run. See "S2c Codex round 1" for the rerun. |
+| `cargo build --release -p navigator-app` | ok |
+| `--help` | prints the new usage (`s2c-help.txt`); the exit code is 2 |
+| Short run `--mqtt 3 --tcp --host 127.0.0.1 --port 18830`, then `--mqtt 5` | the app ran until the 8 s timeout (exit 124) for both, with no output on stderr (`s2c-run3.txt`, `s2c-run5.txt`). No screenshot: no screenshot tool is available here. |
+
+Mosquitto still runs. EMQX and HiveMQ were not started.
+
+### Deviations and open points
+
+1. No UI-state tests with `#[gpui_kit::test]`: the codebase has none. The hide and show rules are pure functions with unit tests. The sheet, composer and inspector rendering was built and launched but not seen.
+2. The QoS 1 timeout text stays "No acknowledgement after 10 s." (existing text, same for both versions). The plan's "Timed out" is the name of the result.
+3. The inspector cannot tell the version of a stored message (no per-message version). It uses the version of the latest Connect and shows "No properties (MQTT 3.1.1)." only when the message has no properties. A store that keeps messages across a version change can mix.
+4. `publish.rs` has no per-version `encoded_size`. The v5 `encoded_size` stays. The v3 rule is `validate_v3_size` (Remaining Length against `v3_max_remaining`), the same rule as the net thread. `Net::send` still checks only the v5 rules; the 3.1.1 limit is checked in the composer and again on the net thread.
+5. The sheet does not check "Clean session off with an empty client ID" (core refuses it at connect with its own text, S2b).
+6. The lost-UNSUBACK and app-restart session tests on v3 (S2b open point 5) are not added.
+7. Edit/Reply notification shows only when the draft had a property.
+
+### S2c Codex round 1
+
+Fixes (logs `s2cr1-*.txt`; fmt ok, clippy `--all-features -D warnings` ok, `cargo deny check` ok, `cargo test --workspace` 308 passed, 0 failed, 1 ignored):
+
+1. The composer follows the connection while connected, and the selected profile while disconnected (`composer_protocol`; test in `ui.rs`, both directions).
+2. `Incoming.protocol` (set by the net thread) and `Msg.protocol` (also for sent messages: `record_sent` has a `protocol` argument) keep the version of each message. The inspector note uses it (`inspector::no_properties_note`). Tests: store rows V5, V311, V5 and a sent V311; the note for both switches; the net test for a packet of `max_packet` checks `Incoming.protocol` for v3 and v5.
+3. The sheet keeps hidden session expiry and will delay values across a protocol switch and a save. Under 3.1.1 a wrong text is no error. Test `a_hidden_session_field_keeps_its_edit_and_raises_no_error`.
+4 and 5. Plan line 97 changed: "Edit and publish" copies topic, payload, QoS and retain; "Reply" keeps its behaviour minus properties. The notice comes from the source message and the target protocol (`composer::v3_drops_properties`). Tests pin Edit, Reply and the notice (a Response Topic alone).
+6. The first broker run had no EMQX or HiveMQ. The earlier claim "S2c touches no core net code" was wrong: `From<Profile>` changes the protocol selection, and `Incoming` and `Msg` have a new field. The full broker rerun with all three brokers (`cargo test -p navigator-core --features broker-tests --no-fail-fast -- --test-threads=1`, log `s2cr1-broker.txt`) passed: 167 unit (1 ignored), 24 `broker_compat`, 22 `broker_matrix`, 1 `load_ci`, 1 `net_blocked_write`, 27 `net_mosquitto`; 0 failed; `soak` ignored. After the run, EMQX and HiveMQ were stopped. Mosquitto still runs.
+
+Deviations (all): 1 no `#[gpui_kit::test]` UI tests (none exist in the code base); 2 the QoS 1 timeout text stays "No acknowledgement after 10 s."; 3 (closed by fix 2); 4 `publish.rs` has no per-version `encoded_size`, the v3 rule is `validate_v3_size`, and `Net::send` checks only the v5 rules; 5 the sheet does not check Clean session off with an empty client ID (core refuses it); 6 lost-UNSUBACK and app-restart session tests on v3 are not added (D3 coverage open, S3); 7 (closed by fix 4 and 5); 8 the migration `v1_to_v2` is not covered by a mutation check (the field default gives the same result; the slice index needs it).
+
+### S2c Codex round 2
+
+1. While disconnected, the composer takes the protocol from the saved profile (`find_profile`, which reads the settings), not from the profile of the last Connect. While a connection or an attempt is live it uses the connection's protocol. Test `the_composer_follows_the_connection_while_connected_and_the_profile_otherwise` now also pins the edit during a connection followed by a disconnect, V311 to V5 and V5 to V311.
+2. `docs/user-guide.md` describes "Edit and publish" and "Reply" separately: Edit copies topic, payload, QoS and retain; Reply uses the Response Topic; on MQTT 3.1.1 both drop properties and show the notice when the message had a property.
+
+Runs (`s2cr2-*.txt`): fmt ok, clippy `--all-features -D warnings` ok, `cargo test --workspace` 308 passed, 0 failed, 1 ignored. The broker suite was not rerun: the change is in the app only.
+
+### S2c Codex round 3
+
+The composer protocol has three cases (`composer_protocol(pending, active, connection, saved)`): a Connect that waits for the keyring uses the saved protocol of its profile (`conn_protocol` changes only when the command goes out); else an active connection or attempt uses the connection's protocol; else the saved protocol of the selected profile. New test `a_connect_that_waits_for_the_keyring_uses_the_protocol_of_its_profile` (both directions, with and without an active connection); the earlier test passes `pending = None`. Runs (`s2cr3-*.txt`): fmt ok, clippy `--all-features -D warnings` ok, `cargo test --workspace` 309 passed, 0 failed, 1 ignored. Broker suite not rerun (app-only change).
+
+### S2c Codex round 4
+
+Root cause: `cancel_connection` cleared the generation gate but kept the last status (for example Connected of generation 1). The gate then drops the later statuses of that connection, so a cancel during the keyring read left "Connected" on screen for good. Before this change the same path already showed a stale "Connected" in the status bar and the Connect button, and it kept Send on (`connected()` read the stale state): a bug from before S2c, in the reconnect of the same profile. Fixes: `cancel_connection` resets `status` to the default (Disconnected, generation 0); the new `connection_active` counts a status only when its generation is the current one (or a Connect has no status yet), and the composer decision uses it. Test `a_cancelled_reconnect_leaves_no_active_connection` runs the real inputs (`GenGate`, `ConnState`, generations) in both protocol directions; with the generation check removed it fails (checked). The status reset itself has no unit test (it needs the window). Runs (`s2cr4-*.txt`): fmt ok, clippy `--all-features -D warnings` ok, `cargo test --workspace` 310 passed, 0 failed, 1 ignored. Broker suite not rerun (app-only change).

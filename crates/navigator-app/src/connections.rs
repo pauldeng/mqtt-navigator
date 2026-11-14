@@ -10,6 +10,7 @@ use gpui_kit::component::form::{Field, field, v_form};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::searchable_list::SearchableListItem;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::sheet::Sheet;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::TabBar;
@@ -19,7 +20,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use navigator_core::Qos;
-use navigator_core::net::ConnectConfig;
+use navigator_core::net::{ConnectConfig, Protocol};
 use navigator_core::profile::{FieldError, Profile, Transport, Will};
 use uuid::Uuid;
 
@@ -48,6 +49,52 @@ impl SearchableListItem for ProfileItem {
 
     fn value(&self) -> &Choice {
         &self.choice
+    }
+}
+
+#[derive(Clone)]
+struct ProtocolItem(Protocol);
+
+impl SearchableListItem for ProtocolItem {
+    type Value = Protocol;
+
+    fn title(&self) -> SharedString {
+        match self.0 {
+            Protocol::V311 => "MQTT 3.1.1",
+            Protocol::V5 => "MQTT 5",
+        }
+        .into()
+    }
+
+    fn value(&self) -> &Protocol {
+        &self.0
+    }
+}
+
+const PROTOCOLS: [Protocol; 2] = [Protocol::V311, Protocol::V5];
+
+/// The label of the profile field `clean_start`. In MQTT 3.1.1 the same CONNECT flag is Clean
+/// Session. Clean Session off asks the broker for a persistent session.
+fn clean_label(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::V311 => "Clean session",
+        Protocol::V5 => "Clean start",
+    }
+}
+
+/// Session expiry and will delay exist in MQTT 5 only.
+fn has_expiry_and_will_delay(protocol: Protocol) -> bool {
+    protocol == Protocol::V5
+}
+
+/// A field that exists in MQTT 5 only: session expiry or will delay. A number that does not
+/// parse is `None` (an error) in MQTT 5. In MQTT 3.1.1 the field is hidden: the number is not
+/// sent, so a wrong text is no error, and the profile keeps `saved`.
+fn seconds(text: &str, protocol: Protocol, saved: u32) -> Option<u32> {
+    match number(text, true) {
+        Some(n) => Some(n),
+        None if has_expiry_and_will_delay(protocol) => None,
+        None => Some(saved),
     }
 }
 
@@ -129,6 +176,8 @@ pub struct ConnectionSheet {
     is_new: bool,
     transport: Transport,
     verify_tls: bool,
+    protocol: Protocol,
+    protocol_select: Entity<SelectState<Vec<ProtocolItem>>>,
     clean_start: bool,
     will_retain: bool,
     will_qos: Qos,
@@ -203,7 +252,21 @@ impl ConnectionSheet {
             ("will.topic", &will_topic),
             ("will.delay_secs", &will_delay),
         ];
-        let subs = watched
+        let protocol_select = cx.new(|cx| {
+            let items = PROTOCOLS.map(ProtocolItem).to_vec();
+            SelectState::new(items, None, window, cx)
+        });
+        let protocol_sub = cx.subscribe(
+            &protocol_select,
+            |s, _, ev: &SelectEvent<Vec<ProtocolItem>>, cx| {
+                let SelectEvent::Confirm(Some(p)) = ev else {
+                    return;
+                };
+                s.protocol = *p;
+                cx.notify();
+            },
+        );
+        let mut subs: Vec<Subscription> = watched
             .into_iter()
             .map(|(field, input)| {
                 cx.subscribe(input, move |s, _, ev: &InputEvent, cx| {
@@ -214,7 +277,9 @@ impl ConnectionSheet {
                 })
             })
             .collect();
+        subs.push(protocol_sub);
         let draft = Profile::new();
+        let draft_protocol = draft.protocol;
         let mut this = Self {
             profiles,
             origin: draft.clone(),
@@ -222,6 +287,8 @@ impl ConnectionSheet {
             is_new: true,
             transport: Transport::Tls,
             verify_tls: true,
+            protocol: draft_protocol,
+            protocol_select,
             clean_start: true,
             will_retain: false,
             will_qos: Qos::AtMostOnce,
@@ -400,6 +467,9 @@ impl ConnectionSheet {
         self.transport = p.transport;
         self.verify_tls = p.verify_tls;
         self.clean_start = p.clean_start;
+        self.protocol = p.protocol;
+        self.protocol_select
+            .update(cx, |s, cx| s.set_selected_value(&p.protocol, window, cx));
         self.ca_file = p.ca_file.clone();
         self.client_cert = p.client_cert.clone();
         self.client_key = p.client_key.clone();
@@ -433,11 +503,20 @@ impl ConnectionSheet {
         p.client_cert = self.client_cert.clone();
         p.client_key = self.client_key.clone();
         p.verify_tls = self.verify_tls;
+        p.protocol = self.protocol;
         p.clean_start = self.clean_start;
-        p.session_expiry_secs = number(&text(&self.session_expiry), true).unwrap_or_else(|| {
-            errors.push(err("session_expiry", "Enter a number of seconds."));
-            0
-        });
+        // A hidden field keeps the value of the draft. A wrong value is no error while hidden.
+        match seconds(
+            &text(&self.session_expiry),
+            self.protocol,
+            self.origin.session_expiry_secs,
+        ) {
+            Some(n) => p.session_expiry_secs = n,
+            None => {
+                errors.push(err("session_expiry", "Enter a number of seconds."));
+                p.session_expiry_secs = 0;
+            }
+        }
         p.keepalive_secs = number(&text(&self.keepalive), true).unwrap_or_else(|| {
             errors.push(err("keepalive", "Enter a number from 0 to 65535."));
             0
@@ -451,7 +530,12 @@ impl ConnectionSheet {
                 .unwrap_or_else(|| text(&self.will_payload).into_bytes()),
             qos: self.will_qos,
             retain: self.will_retain,
-            delay_secs: number(&text(&self.will_delay), true).unwrap_or_else(|| {
+            delay_secs: seconds(
+                &text(&self.will_delay),
+                self.protocol,
+                self.origin.will.as_ref().map_or(0, |w| w.delay_secs),
+            )
+            .unwrap_or_else(|| {
                 errors.push(err("will.delay_secs", "Enter a number of seconds."));
                 0
             }),
@@ -827,6 +911,13 @@ impl Render for ConnectionSheet {
                         .child("WS"),
                 ),
             )
+            .child(
+                field().label("Protocol").child(
+                    Select::new(&self.protocol_select)
+                        .small()
+                        .accessibility_label("Protocol"),
+                ),
+            )
             .child(self.input_field("Username", "username", &self.username, cx))
             .child(
                 field().label("Password").child(
@@ -925,19 +1016,21 @@ impl Render for ConnectionSheet {
                 field().child(
                     Switch::new("clean-start")
                         .checked(self.clean_start)
-                        .label("Clean start")
+                        .label(clean_label(self.protocol))
                         .on_click(cx.listener(|s, v: &bool, _, cx| {
                             s.clean_start = *v;
                             cx.notify();
                         })),
                 ),
             )
-            .child(self.input_field(
-                "Session expiry (seconds)",
-                "session_expiry",
-                &self.session_expiry,
-                cx,
-            ))
+            .when(has_expiry_and_will_delay(self.protocol), |f| {
+                f.child(self.input_field(
+                    "Session expiry (seconds)",
+                    "session_expiry",
+                    &self.session_expiry,
+                    cx,
+                ))
+            })
             .child(self.input_field("Keep alive (seconds)", "keepalive", &self.keepalive, cx))
             .child(self.input_field("Will topic", "will.topic", &self.will_topic, cx))
             .child(
@@ -988,12 +1081,14 @@ impl Render for ConnectionSheet {
                         })),
                 ),
             )
-            .child(self.input_field(
-                "Will delay (seconds)",
-                "will.delay_secs",
-                &self.will_delay,
-                cx,
-            ));
+            .when(has_expiry_and_will_delay(self.protocol), |f| {
+                f.child(self.input_field(
+                    "Will delay (seconds)",
+                    "will.delay_secs",
+                    &self.will_delay,
+                    cx,
+                ))
+            });
 
         v_flex()
             .gap_3()
@@ -1045,7 +1140,28 @@ impl Render for ConnectionSheet {
 
 #[cfg(test)]
 mod tests {
-    use super::number;
+    use navigator_core::net::Protocol;
+
+    use super::{clean_label, has_expiry_and_will_delay, number, seconds};
+
+    #[test]
+    fn a_hidden_session_field_keeps_its_edit_and_raises_no_error() {
+        // 0 changed to 3600 under MQTT 5, then MQTT 3.1.1, then save: the profile has 3600.
+        assert_eq!(seconds("3600", Protocol::V311, 0), Some(3600));
+        assert_eq!(seconds("3600", Protocol::V5, 0), Some(3600));
+        // A wrong text is an error for MQTT 5 only. MQTT 3.1.1 keeps the saved value.
+        assert_eq!(seconds("abc", Protocol::V5, 7), None);
+        assert_eq!(seconds("abc", Protocol::V311, 7), Some(7));
+        assert_eq!(seconds("", Protocol::V311, 7), Some(0));
+    }
+
+    #[test]
+    fn mqtt_311_shows_clean_session_and_hides_the_mqtt_5_session_fields() {
+        assert_eq!(clean_label(Protocol::V311), "Clean session");
+        assert_eq!(clean_label(Protocol::V5), "Clean start");
+        assert!(!has_expiry_and_will_delay(Protocol::V311));
+        assert!(has_expiry_and_will_delay(Protocol::V5));
+    }
 
     #[test]
     fn number_fields_parse() {

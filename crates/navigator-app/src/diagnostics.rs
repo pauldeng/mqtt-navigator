@@ -128,6 +128,7 @@ mod tests {
             retain: false,
             props: navigator_core::MsgProps::default(),
             received_at: std::time::SystemTime::now(),
+            protocol: navigator_core::net::Protocol::V5,
         });
         let info = Info::collect(
             gpu_text(Some(("Test GPU", "drv", "1.0", false))),
