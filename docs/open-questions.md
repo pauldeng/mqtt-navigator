@@ -15,10 +15,10 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
    - The RSS during the 2 MiB-header case. The test checks the time and the text. The S1 spike measured the RSS once.
    - A 3.1.1 load run (10k msg/s) and a load run on EMQX or HiveMQ. S4 measured MQTT 5 on Mosquitto only.
    - The new fake-broker tests on Windows and macOS (first CI run at S6).
-7. Version 0.1.x refuses a settings file with schema 2 (read-only, default settings). A user who goes back from 0.2.0 to 0.1.x sees this text. Decide at S6 if a note in the release text is enough.
 
 ## Closed
 
+- 2026-11-15: 0.1.x and a schema 2 settings file → a note is enough. The 0.2.0 CHANGELOG "Known limitations" states it, and the release text copies that section.
 - 2026-11-15: RSS after an overload → accepted. After 100k msg/s, RSS stays about 93 MiB above the 10k plateau until the app exits. It is bounded, it does not grow over repeated overloads, and the OS frees it at exit (memory check, phase 8). v0.1.1 does the same. The overload criterion is changed. Finding what holds the extra live memory is a later task.
 - 2026-11-15: macOS minimum version → 15.0 (gpui-kit). The packager setting is now 15.0.
 - 2026-11-11: First CI run on `main` passed on Ubuntu, macOS 15 and Windows 2022 (build, clippy, tests, vendored OpenSSL), plus fuzz and the broker tests.

@@ -4,6 +4,8 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
 ### Added
 
 - MQTT 3.1.1 support. The **Protocol** setting in the connection sheet selects MQTT 3.1.1 or MQTT 5. A new connection uses MQTT 3.1.1. The command line has `--mqtt 3` (default) and `--mqtt 5`.
@@ -109,6 +111,7 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/pauldeng/mqtt-navigator/releases/tag/v0.1.0
