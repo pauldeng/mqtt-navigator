@@ -1,6 +1,6 @@
 # ADR 0002: Local patch of ms-mqtt-client
 
-Status: accepted (2026-11-11). Advice: Codex (gpt-6.1-sol).
+Status: superseded by [ADR 0006](0006-ntex-mqtt.md) (2026-11-15). The vendor copy and the patch are removed. Accepted 2026-11-11. Advice: Codex (gpt-6.1-sol).
 
 ## Problem
 

@@ -15,8 +15,8 @@ const LOG_NAME: &str = "mqtt-navigator.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const QUEUE_LINES: usize = 1024;
 /// The binary crate is `mqtt_navigator`. The two library crates have their own names.
-const DEFAULT_FILTER: &str =
-    "warn,mqtt_navigator=info,navigator_app=info,navigator_core=info,ms_mqtt_client=off";
+/// ntex crates log through `log`, not `tracing`. The app has no `log` logger, so they need no entry.
+const DEFAULT_FILTER: &str = "warn,mqtt_navigator=info,navigator_app=info,navigator_core=info";
 const MAX_PANIC_TEXT: usize = 500;
 
 /// A log file with a size cap. When a line does not fit, the file becomes `<name>.1` (the old
@@ -199,6 +199,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mqtt-nav-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn the_default_filter_parses_and_names_only_our_crates() {
+        assert!(EnvFilter::try_new(DEFAULT_FILTER).is_ok());
+        // ntex logs through `log`. The app installs no `log` logger, so no ntex line reaches the file.
+        assert!(!DEFAULT_FILTER.contains("ntex"));
     }
 
     #[test]

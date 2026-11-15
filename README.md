@@ -1,13 +1,14 @@
 # MQTT Navigator
 
-MQTT Navigator is a fast native desktop app to inspect MQTT traffic. It shows a live topic tree, message values and history. It publishes messages with MQTT 5 properties. It runs on Windows, Ubuntu and macOS.
+MQTT Navigator is a fast native desktop app to inspect MQTT traffic. It shows a live topic tree, message values and history. It supports MQTT 3.1.1 and MQTT 5. It publishes messages with MQTT 5 properties. It runs on Windows, Ubuntu and macOS.
 
-> Status: version 0.1.0 is not released yet. See [the changelog](CHANGELOG.md) and [the plan](docs/plans/2026-11-10-plan.md).
+> Status: version 0.1.1 is released. Version 0.2.0 (MQTT 3.1.1) is in work. See [the changelog](CHANGELOG.md) and [the plan](docs/plans/2026-11-10-plan.md).
 
 ## Features
 
 - **Subscribe.** Add and remove topic filters while connected. See messages in a live topic tree or in a newest-first message list.
-- **Publish.** Send messages with QoS 0 or 1, retain, and MQTT 5 properties. See the broker acknowledgement.
+- **MQTT 3.1.1 and MQTT 5.** Choose the Protocol in each profile. A new profile uses MQTT 3.1.1.
+- **Publish.** Send messages with QoS 0 or 1, retain, and (MQTT 5) properties. See the broker acknowledgement.
 - **Memory limit.** Set 32 MiB to 2 GiB. The default is 128 MiB.
 - **Themes.** System, light or dark, with eight colour presets.
 - **Auto-update.** Signed updates from GitHub Releases. You can turn them off.
@@ -21,10 +22,8 @@ MQTT Navigator is a fast native desktop app to inspect MQTT traffic. It shows a 
 
 ## Limits
 
-- MQTT 5.0 only. MQTT 3.1.1 brokers cannot connect.
-- QoS 0 and QoS 1 only.
-
-These limits come from the MQTT library ([ms-mqtt-client](https://github.com/microsoft/rust-mqtt-client)).
+- QoS 0 and QoS 1 only. The app does not support QoS 2.
+- MQTT 3.1.1 has no message properties, no reason codes and no subscription options.
 
 ## Install
 

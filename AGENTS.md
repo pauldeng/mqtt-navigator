@@ -6,7 +6,7 @@ Install the tools (latest stable Rust, latest cargo-deny) with [mise](https://mi
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo deny check
 cargo run --release            # start the app
@@ -37,7 +37,8 @@ cargo run --release            # start the app
 - Do not use `unwrap()` in production paths. Use `expect("reason")` only for real invariants.
 - Use `thiserror` in `navigator-core` and `anyhow` in `navigator-app`.
 - `navigator-core` must not depend on gpui. `unsafe` is forbidden in core. Each `unsafe` block in the app needs a `// SAFETY:` comment.
-- QoS 2 must not be expressible. The library does not support it.
+- QoS 2 must not be expressible. The app does not support it (a product decision; the `Qos` type has two values). A broker QoS 2 message ends the session with a plain text.
+- The MQTT client is `ntex-mqtt`, pinned exactly (ADR 0006). Use it only in `navigator-core/src/net.rs` and its submodules. Set every deadline in our code. Run the fake-broker and broker tests on each ntex update.
 - Never block the net thread on the UI. Every queue has a bound.
 - Be event-driven. Do not write polling loops or periodic timers that run when the app is idle. A timer must start from an event and stop when its work is done.
 - Do no blocking I/O on the UI thread (files, keyring, DNS, certificates, network). Run it in the background and send the result back as an event.

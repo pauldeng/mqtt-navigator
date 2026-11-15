@@ -39,6 +39,6 @@ broker-tests = []
 
 [dev-dependencies]
 tempfile = "3.27.0"
-# The spike (examples/ntex_spike.rs) captures `log` records.
+# `tests/net_keepalive_tasks.rs` captures the `log` records of ntex-mqtt.
 log = "0.4"
 tokio = { version = "1.54.1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }

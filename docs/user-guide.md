@@ -108,7 +108,7 @@ Select **Advanced (show)** to open this part.
 | WebSocket path | `/mqtt` | For WS and WSS. It must start with `/`. |
 | Clean start | on | The broker keeps no session for you. |
 | Session expiry (seconds) | 0 | Seconds the broker keeps the session after a disconnect. |
-| Keep alive (seconds) | 60 | 0 to 65535. |
+| Keep alive (seconds) | 60 | 0 to 65535. The app sends a ping each interval. It ends a connection that does not answer. This takes about 2 times the keep alive, plus timer and shutdown delays (at most 145 s at the default). With 0, the app sends no ping and cannot find a silent broker, unless an MQTT 5 broker sets its own keep alive. The sheet then shows a note under the field. See [Connection details](#connection-details). |
 | Will topic, Will payload, Will QoS, Retain the will message, Will delay (seconds) | no will | The broker sends the will message when the connection ends without a DISCONNECT. An empty Will topic means no will message. |
 
 ### MQTT 3.1.1 connections
@@ -186,11 +186,12 @@ The app saves the subscriptions in the connection.
 
 ## Connection details
 
-While you are connected, the status bar has a **Connection details** button. It opens a list of the facts that the broker sent in its CONNACK.
+While you are connected, the status bar has a **Connection details** button. It opens a list of values from the broker's CONNACK.
 
 - MQTT 3.1.1: "Session present" only.
 - MQTT 5: "Session present", "Assigned client ID", "Keep alive", "Receive maximum", "Maximum packet size", "Maximum QoS", "Retained messages", "Wildcard subscriptions", "Shared subscriptions", "Subscription identifiers", "Topic alias maximum", "Server reference", "Response information" and "Reason string".
-- A line shows only when the broker sent the value. "Keep alive" always shows. It is the keep alive in use: the value of the broker (Server Keep Alive) if the broker sent one, else your value. "Keep alive: off" means 0. With keep alive off, the app finds a lost connection only when an operation times out or the system reports an error.
+- These lines always show: "Session present", "Keep alive", "Receive maximum", "Maximum QoS", "Retained messages", "Wildcard subscriptions", "Shared subscriptions", "Subscription identifiers" and "Topic alias maximum". If the broker did not send one of the last seven values, its line shows the MQTT 5 default. The other lines show only when the broker sent the value. The list does not show Session Expiry Interval or user properties.
+- "Keep alive" is the keep alive in use: the value of the broker (Server Keep Alive) if the broker sent one, else your value. "Keep alive: off" means 0. With keep alive off, the app finds a lost connection only when an operation times out or the system reports an error.
 
 If a broker refuses the connection or closes it with a server reference, the error text ends with "Server reference: …". The reference names another server. The app does not connect to it by itself.
 
@@ -385,13 +386,14 @@ The log folder is:
 - Use **Open the log folder** in the command palette to open it.
 - Use **Copy diagnostics** in the command palette to copy a short report: version, operating system, CPU architecture, graphics adapter, connection state and counters. It has no connection, host, path, topic, payload or secret. Paste it in a bug report.
 
-The settings file is `settings.json` in the `mqtt-navigator` folder of your system configuration folder (Linux: `~/.config`, macOS: `~/Library/Application Support`, Windows: `%APPDATA%`). The app keeps a damaged file as `.bad-<time>` and starts with defaults. A file from a newer version is not loaded and stays untouched. The app uses the default settings and does not save. It shows: "The settings file is from a newer version of MQTT Navigator (schema N). It was not changed. Default settings are in use, and changes are not saved." The app also does not save if it cannot read the file.
+The settings file is `settings.json` in the `mqtt-navigator` folder of your system configuration folder (Linux: `~/.config`, macOS: `~/Library/Application Support`, Windows: `%APPDATA%`). The app keeps a damaged file as `.bad-<time>` and starts with defaults. A file from a newer version is not loaded and stays untouched. Version 0.2.0 writes settings schema 2. Version 0.1.x cannot read a schema 2 file: it does not change the file, uses default settings and does not save. The app uses the default settings and does not save. It shows: "The settings file is from a newer version of MQTT Navigator (schema N). It was not changed. Default settings are in use, and changes are not saved." The app also does not save if it cannot read the file.
 
 ## Limits
 
-- MQTT 5.0 only. A broker that supports only MQTT 3.1.1 cannot connect.
-- QoS 0 and QoS 1 only. The MQTT library has no QoS 2.
-- The largest incoming packet is 1 MiB. The app closes the connection if a packet is larger.
+- QoS 0 and QoS 1 only. The app does not support QoS 2. If a broker sends a QoS 2 message, the session ends with "The broker sent a QoS 2 message. This app supports QoS 0 and 1."
+- MQTT 3.1.1 has no message properties, no reason codes, no subscription options and no session expiry. See [MQTT 3.1.1 connections](#mqtt-311-connections).
+- The app finds a lost connection in about 2 times the keep alive, plus timer and shutdown delays (keep alive 60 s: at most 145 s).
+- The largest incoming packet is 1 MiB. The app closes the connection if a packet is larger. One exception: on MQTT 3.1.1 the app checks the Remaining Length, so a packet with a non-minimal length encoding can be up to 3 bytes larger.
 - No proxy support.
 - No message export. Only connection profiles export.
 - No accessibility support for screen readers.
@@ -423,11 +425,17 @@ The app does not retry after a certificate error. Fix the cause and connect agai
 - **The broker closed the connection.** The connection dropped (for example a broker restart or a network cut). The app reconnects with growing waits. Select **Cancel** to stop.
 - **The broker closed the connection: …** The broker sent a DISCONNECT with a reason. For a temporary reason, the app reconnects. For any other reason, the session ends as Failed and the app does not retry. Connect again after you fix the cause.
 - **The broker sent a packet that is larger than the allowed size.** The broker sent a packet above 1 MiB. The app does not retry.
-- **The broker sent data that is not valid MQTT 5.** The broker broke the MQTT 5 protocol. The app does not retry. A broker that supports only MQTT 3.1.1 shows a different message: **The broker rejected the connection: the broker does not support MQTT 5**.
+- **The broker sent data that is not valid MQTT 5.** The broker broke the MQTT 5 protocol. The app does not retry. (On MQTT 3.1.1 the text says "MQTT 3.1.1".)
+- **This broker does not support MQTT 5. Set Protocol to MQTT 3.1.1.** Open the connection, set **Protocol** to MQTT 3.1.1, and connect again.
+- **The broker sent a reply that is not MQTT 5. If the broker supports only MQTT 3.1.1, set Protocol to MQTT 3.1.1.** Do the same.
+- **This broker does not support MQTT 3.1.1. Set Protocol to MQTT 5.** Set **Protocol** to MQTT 5.
+- **The broker closed the connection before it accepted it. Check the address, the TLS settings and the Protocol.** The broker closed the connection before it sent a CONNACK.
 - **The broker did not answer the connection request.** The broker sent no CONNACK in 10 s. The app retries with growing waits.
 - **No answer from the broker after 10 s.** A subscribe or an unsubscribe got no answer. The row shows this text (for an unsubscribe: "Cannot unsubscribe from <filter>: No answer from the broker after 10 s."). Then the session fails with "The broker did not answer for 10 s. Connect again." Connect again.
 - **No acknowledgement after 10 s.** A publish got no acknowledgement. The app ends the session in the same way: "The broker did not answer for 10 s. Connect again."
-- **The broker did not answer the keep-alive ping.** The app reconnects with growing waits.
+- **The connection closed (the broker did not answer, or the network failed).** The broker did not answer the keep-alive ping, or the network failed. The app reconnects with growing waits.
+- **The broker did not read our data for 10 s.** The broker stopped reading while the app sent data. The app reconnects.
+- **The broker stopped in the middle of a packet.** A packet started and did not finish. The app reconnects.
 
 ### The broker does not allow `#`
 

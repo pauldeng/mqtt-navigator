@@ -550,7 +550,7 @@ async fn broker_restart_reconnects_and_resubscribes() {
 }
 
 /// A QoS 1 message with a whole packet of exactly 1 MiB (the default `max_packet`) goes out and
-/// comes back, on every transport and both versions (S1 spike, case group "c"). In MQTT 5
+/// comes back, on every transport and both versions (S1 spike case group "c"; the spike is deleted). In MQTT 5
 /// Mosquitto adds a Topic Alias property (id 0x23 and 2 bytes: 3 bytes) to the first copy that it
 /// forwards for a topic. The proxy test `v5_forwarded_copy_carries_a_topic_alias` shows this on
 /// the wire. So a v5 packet of 1 MiB - 3 bytes comes back as exactly 1 MiB. The second packet is
@@ -770,7 +770,7 @@ async fn v3_one_mib_over_secure_websocket() {
 }
 
 /// A DNS name (not an IP address) gives SNI, host name verification and the WebSocket authority
-/// (S1 spike, "TLS (localhost)").
+/// (S1 spike case "TLS (localhost)"; the spike is deleted).
 async fn dns_name_round_trip(protocol: Protocol, port: u16, transport: Transport) {
     round_trip_with(protocol, port, transport, |mut p| {
         p.host = "localhost".into();

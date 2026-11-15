@@ -4,6 +4,28 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- MQTT 3.1.1 support. The **Protocol** setting in the connection sheet selects MQTT 3.1.1 or MQTT 5. A new connection uses MQTT 3.1.1. The command line has `--mqtt 3` (default) and `--mqtt 5`.
+- MQTT 3.1.1 connections show Clean session, no properties, and plain text for CONNACK return codes and SUBACK failures. A message can be at most 1 MiB.
+- Plain errors when the Protocol does not match the broker.
+- MQTT 5: subscription options (No Local, Retain As Published, Retain Handling) for each subscription.
+- A **Connection details** button in the status bar. It shows values from the CONNACK (MQTT 5: session present, keep alive in use, the broker limits and features, and the optional texts; MQTT 3.1.1: session present). See the user guide for the list.
+- A refused connection or a DISCONNECT shows the server reference in the error text. The app does not follow it.
+
+### Changed
+
+- New MQTT client library: `ntex-mqtt` replaces `ms-mqtt-client`. The local patch and the vendored copy are gone ([ADR 0006](docs/adr/0006-ntex-mqtt.md)).
+- Settings schema is 2. A connection saved by 0.1.x has no Protocol and loads as MQTT 5. Version 0.1.x does not load a schema 2 file: it leaves the file unchanged, uses default settings and does not save.
+- The app finds a connection that does not answer in about 2 times the keep alive, plus timer and shutdown delays (0.1.x: keep alive plus 10 s).
+- The connection ends with new plain texts when the broker stops reading, or stops in the middle of a packet.
+- The release file is 2.2% larger than 0.1.1 (35 699 608 B against 34 943 904 B on Linux).
+
+### Known limitations
+
+- QoS 2 is not supported.
+- Keep alive 0 turns off the detection of a silent broker, unless an MQTT 5 broker sets its own keep alive.
+
 ## [0.1.1] - 2026-11-12
 
 ### Changed

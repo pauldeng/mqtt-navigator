@@ -9,8 +9,8 @@ Status: `done`, `dropped` (with a reason), `better` (we do more than the referen
 | Feature | Reference behaviour | Our implementation | Phase | Status |
 |---|---|---|---|---|
 | Connection profiles | name, host, port, mqtt/ws, TLS toggle, client ID | Same, plus TCP/TLS/WS/WSS selector; "Save and connect" tests the profile; session and Will under Advanced | P4 | better |
-| MQTT version | 3.1.1 and 5 | 5 only (library limit) | — | dropped |
-| QoS | 0, 1, 2 | 0, 1 (library limit) | — | dropped |
+| MQTT version | 3.1.1 and 5 | 3.1.1 (default for a new connection) and 5, chosen with the Protocol setting (ADR 0006) | P8 | done |
+| QoS | 0, 1, 2 | 0, 1. QoS 2 is not supported (product decision) | — | dropped |
 | TLS | separate toggle, off by default; verify **off** by default | TLS **on** by default (port 8883); verify **on** by default; "Not encrypted" warning for TCP/WS; plain-language TLS errors; mTLS | P2 | better |
 | Secrets | OS secure storage, session fallback | System keyring, session fallback with a notice. Not run on a real keyring yet. | P4 | done |
 | Subscriptions | list of filter + QoS in the profile; default `#` and `$SYS/#` | Live panel: add and remove while connected; granted QoS and SUBACK failure reason; Retry and Remove | P2 | better |
@@ -26,6 +26,7 @@ Status: `done`, `dropped` (with a reason), `better` (we do more than the referen
 | Pause | stop merge, buffer up to 100 MB | Pause with the store budget, drops shown | P3 | done |
 | Value view | JSON/Text | JSON, Text, Hex, Base64, Number (8–64 bit, float, both byte orders); auto from content-type; background formatting; Show all and Show more for long payloads | P5 | better |
 | MQTT 5 properties (receive) | user properties only | All properties | P5 | better |
+| Subscription options and connection details | — | No Local, Retain As Published, Retain Handling (MQTT 5); a "Connection details" popover with the CONNACK facts | P8 | better |
 | MQTT 5 properties (publish) | none | content-type, response topic, correlation data, expiry, user properties | P5 | better |
 | History | 100 messages or 20 kB per topic | 100 messages per topic (64 KiB each); global budget | P3, P5 | better |
 | Publish | topic, payload, QoS, retain, Ctrl+Enter | Always-visible composer, Text and Hex, acknowledgement result, Drafts and Sent recall, Format | P1, P5 | better |

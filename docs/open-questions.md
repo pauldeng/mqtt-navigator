@@ -6,10 +6,18 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
 
 1. First release run: the secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` are set (2026-11-11). The Windows files are not signed. Test NSIS, the DMG, the update swap on Windows and macOS, and the attestations.
 2. The size gate runs only on Linux. Measure the Windows and macOS binaries from the first release.
-3. Upstream: open an issue for `ms-mqtt-client` about the missing Maximum Packet Size check and the unbounded incoming queue. Remove the local patch (ADR 0002) when upstream fixes both.
-4. Licence check for the Ayu and Gruvbox themes. Add them only if the licence allows it.
-5. A person has not checked the UI in a real window. Every phase report lists UI checks that were not run.
-6. The Linux keyring (Secret Service) is not tested (no Secret Service on the development machine). The software renderer was checked on Linux on 2026-11-11: with the Mesa lavapipe Vulkan driver the app starts (first frame 238 ms); with no Vulkan driver it still starts and connects, but which renderer it used was not confirmed (no screenshot). Windows (WARP) is not checked.
+3. Licence check for the Ayu and Gruvbox themes. Add them only if the licence allows it.
+4. A person has not checked the UI in a real window. Every phase report lists UI checks that were not run.
+5. The Linux keyring (Secret Service) is not tested (no Secret Service on the development machine). The software renderer was checked on Linux on 2026-11-11: with the Mesa lavapipe Vulkan driver the app starts (first frame 238 ms); with no Vulkan driver it still starts and connects, but which renderer it used was not confirmed (no screenshot). Windows (WARP) is not checked.
+6. RSS after an overload (owner decision at the S6 stop). The plan wants RSS to return to normal within 10 s after an overload. Neither v0.1.1 nor the ntex build meets this: after 100k msg/s, RSS stays about 93 MiB above the plateau for at least 15 s (S4, Round 1 finding 5). The cause is not profiled. Accept it and change the criterion, or ask for a fix (for example `malloc_trim` after the queues drain, which needs `unsafe` or a dependency).
+7. macOS minimum version. The docs and AGENTS.md say macOS 15 (gpui-kit). The packager setting `minimum-system-version` in `crates/navigator-app/Cargo.toml` is 13.0. Decide which value is right and make both the same.
+8. Test gaps from the removed ntex spike (phase 8, S5). Each one needs a host set-up that the repo does not have, or a measurement that no test makes:
+   - A broker that negotiates only TLS 1.2, an IPv6-only host, and the `getaddrinfo` order for `localhost`.
+   - Keep alive 60 s and 70 s while the app publishes. The tests run these two values without publishes, and keep alive 2 s with publishes.
+   - The RSS during the 2 MiB-header case. The test checks the time and the text. The S1 spike measured the RSS once.
+   - A 3.1.1 load run (10k msg/s) and a load run on EMQX or HiveMQ. S4 measured MQTT 5 on Mosquitto only.
+   - The new fake-broker tests on Windows and macOS (first CI run at S6).
+9. Version 0.1.x refuses a settings file with schema 2 (read-only, default settings). A user who goes back from 0.2.0 to 0.1.x sees this text. Decide at S6 if a note in the release text is enough.
 
 ## Closed
 
@@ -20,7 +28,7 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
 - 2026-11-10: Signing → minisign manifest key and Windows Authenticode. No Apple Developer ID.
 - 2026-11-10: v1.0 scope → core, MQTT 5 properties, TLS and mTLS.
 - 2026-11-10: License → MIT OR Apache-2.0.
-- 2026-11-10: MQTT 3.1.1 and QoS 2 → not supported (library limit).
+- 2026-11-14: MQTT 3.1.1 → supported (owner requirement), default for a new profile. Client library → `ntex-mqtt` (ADR 0006). QoS 2 stays unsupported (product decision, not a library limit).
 - 2026-11-10: Rust → latest stable, not pinned.
 - 2026-11-10: Scope → two major features, Subscribe and Publish. Tree and message list views. Profiles, TLS/mTLS, MQTT 5 properties, history and auto-update stay.
 - 2026-11-10: Proxy, message export, accessibility → not in v1.
@@ -29,5 +37,5 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
 - 2026-11-10: gpui-kit `Tree` renders through `uniform_list` (only visible rows).
 - 2026-11-11: gpui-kit `Tree` is not used. Its rebuild deep-clones subtrees. We use our own flat rows (ADR 0003). 100k topics at 10k msg/s: worst frame 15 ms.
 - 2026-11-11: TLS ALPN (AWS IoT Core on port 443) is possible: build an `openssl` `SslConnectorBuilder` with `set_alpn_protos` and pass it to the client. P2 adds a profile field if needed.
-- 2026-11-11: `ms-mqtt-client` does not reject an oversized packet before it allocates. We patch it (ADR 0002).
+- 2026-11-11: `ms-mqtt-client` does not reject an oversized packet before it allocates. We patched it (ADR 0002). Closed 2026-11-15: the library is gone (ADR 0006), and the incoming packet limit is checked by ntex-mqtt at the fixed header.
 - 2026-11-10: Binary size → measure in P1, set the gate at the end of P5 (measured + 10%).

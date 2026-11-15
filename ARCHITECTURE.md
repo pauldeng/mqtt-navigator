@@ -17,11 +17,11 @@ The app has two major features: **Subscribe** and **Publish**. Received messages
 ## Threads
 
 ```
- gpui main thread                         "net" thread (tokio, current_thread)
+ gpui main thread                         "net" thread (tokio current_thread + ntex)
  ┌──────────────────────────┐  commands  ┌─────────────────────────────────────┐
  │ UI and TopicStore        │──bounded──▶│ Supervisor: state machine,          │
  │                          │── cancel ─▶│ reconnect, resubscribe              │
- │ drain task:              │            │ Session: ms-mqtt-client             │
+ │ drain task:              │            │ Session: ntex-mqtt (v3 or v5)       │
  │  wait, merge ≤ 4 ms,     │◀─ bounded ─│ messages (try_send; full = drop++)  │
  │  notify, wait 33 ms      │◀── watch ──│ state + bounded result log          │
  └──────────────────────────┘            └─────────────────────────────────────┘
@@ -31,6 +31,18 @@ The app has two major features: **Subscribe** and **Publish**. Received messages
 - The UI merges messages at frame rate. It does no work for each separate message.
 - Each connection has a generation number. The UI ignores data from an old generation.
 - A panic in the session task stops the session, not the app.
+
+## MQTT client
+
+The session uses `ntex-mqtt` ([ADR 0006](docs/adr/0006-ntex-mqtt.md)). Only `navigator-core/src/net.rs` and its submodules use ntex.
+
+- ntex runs on the net thread, on tokio, inside one ntex reactor scope. The ntex types are not `Send`.
+- Two adapters (MQTT 3.1.1 and MQTT 5) sit behind one private interface. The supervisor, the queues and the timers do not know the version.
+- The supervisor owns reconnect. Each attempt makes one connector call and one client.
+- Our own dialer does DNS and TCP under one connect deadline. TLS uses OpenSSL (`tls.rs`) through `ntex-tls`. WebSocket uses `ntex::ws`.
+- Every deadline is set in our code: connect, write, frame read rate, keep alive and operation. Each one has a fake-broker test.
+- Limits come from the profile and `NetLimits`: the incoming packet limit is 1 MiB on both versions.
+- ntex logs through the `log` crate. The app installs no `log` logger, so these lines do not reach the log file.
 
 ## Event-driven design
 
@@ -79,6 +91,6 @@ See the TopicStore section of the plan.
 
 ## Persistence
 
-- Settings: JSON with `schema_version`. Writes are atomic.
+- Settings: JSON with `schema_version` (now 2). Writes are atomic. A profile without the `protocol` field loads as MQTT 5.
 - Secrets: system keyring only.
 - Logs: platform log folder, size-capped. Logs never contain payloads or secrets.

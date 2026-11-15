@@ -818,7 +818,7 @@ all_wires!(disconnect_while_a_half_frame_waits);
 
 /// A PUBLISH whose Remaining Length is 2 MiB, with a 1 MiB limit: the connection ends at the fixed
 /// header, at once, before the payload arrives (plan, "Bounded memory"). The text is the size
-/// text. The RSS was measured in the S1 spike; this test checks the time and the reason.
+/// text. The S1 spike (deleted in S5) measured the RSS; this test checks the time and the reason.
 async fn big_header(t: Transport, v: Protocol) {
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let go_rx = Mutex::new(go_rx);

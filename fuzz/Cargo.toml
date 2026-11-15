@@ -11,10 +11,6 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 navigator-core = { path = "../crates/navigator-core" }
 
-# This crate is its own workspace, so it repeats the root patch (see vendor/README.md).
-[patch.crates-io]
-ms-mqtt-client = { path = "../vendor/ms-mqtt-client" }
-
 [workspace]
 
 [[bin]]

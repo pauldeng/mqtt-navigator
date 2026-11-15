@@ -9805,7 +9805,3 @@ dependencies = [
  "syn 3.0.10",
  "winnow 1.0.5",
 ]
-
-[[patch.unused]]
-name = "ms-mqtt-client"
-version = "0.1.0"

@@ -1013,3 +1013,66 @@ A frame p95 difference of 1.6% is not significant. Only a constant slowdown of a
 ### Verdict
 
 **S5 is not blocked by the frame p95.** Measured against v0.1.1 on this machine, nothing is worse beyond noise. The size increase is +2.2% and inside the CI gate. The 6.45 ms merge slice and the 0.90 ms soak slice did not reproduce and stay unexplained. In the 10 later ntex runs of Round 2 (B and C), the merge max was 3.42 to 3.74 ms (`s4r2-stats.txt`). Later soak runs gave 0.34 to 0.37 ms. **Owner decision (2026-11-15): the owner accepts these two outliers. S5 can start.** One item stays open as an **owner decision for the S6 stop**: the plan criterion "RSS returns to normal within 10 s after the overload" is not met by either build and has no documented prior acceptance (Round 1 finding 5). Nothing was fixed in code.
+
+## S5 Clean up and document
+
+Date: 2026-11-15. Branch `feat/ntex-mqtt`, base commit 251aa0f. Nothing is committed. `git rm` staged the deletions of `vendor/` and the spike; all other changes are unstaged. Logs: `s5-*.txt` in the scratchpad (`ntex/`).
+
+### What changed
+
+1. **Removal.** `vendor/` (the crate and `vendor/README.md`) is deleted. `[patch.crates-io]` is gone from `Cargo.toml` and `fuzz/Cargo.toml`. The `exclude` list in `Cargo.toml` is now `["fuzz"]`. `Cargo.lock` and `fuzz/Cargo.lock` lose the `ms-mqtt-client` entry (4 lines each). `cargo tree -i ms-mqtt-client` finds no package in either workspace (`s5-tree.txt`). A case-insensitive grep for `ms-mqtt`, `ms_mqtt`, `rust-mqtt-client` and `microsoft` finds no hit in `crates/`, `fuzz/`, `tests/`, `.github/`, `deny.toml`, `about.toml`, `Cargo.lock` and `fuzz/Cargo.lock`. It finds hits only in history text: old plans and phase reports, the CHANGELOG entry of 0.1.0, ADR 0001 (history note), ADR 0002 and ADR 0006. `deny.toml`, `about.toml`, the CI workflows and `dependabot.yml` never named the crate, so they are unchanged.
+2. **Log filter.** `DEFAULT_FILTER` is now `warn,mqtt_navigator=info,navigator_app=info,navigator_core=info`. The `ms_mqtt_client=off` entry has no ntex counterpart. ntex-mqtt, ntex-io, ntex-net, ntex-rt and the other ntex crates log through the `log` crate, not `tracing`. `cargo tree -i tracing-log` finds nothing, and no code installs a `log` logger (`set_logger`, `LogTracer` and `env_logger` are only in a test and the deleted spike; the `env_logger` call in `ntex` is under `cfg(test)`). So no ntex line reaches the log file, and no payload can leak through it. I added no bridge. New test `logging::tests::the_default_filter_parses_and_names_only_our_crates` (passes).
+3. **Spike: deleted** (`examples/ntex_spike.rs` and `examples/ntex_spike/`, 3 112 lines). The `log` dev-dependency stays, because `tests/net_keepalive_tasks.rs` uses it; its comment is updated. Reasons for each case that S3 left in the spike:
+   - ka 60 s and 70 s with our publishes: not covered (the ignored tests run without publishes; ka 2 s with publishes is covered). Recorded as a known gap, `open-questions.md` item 8.
+   - RSS of the 2 MiB header case: the test checks time and text; recorded as a known gap (item 8). The overload RSS was measured in S4.
+   - TLS 1.2-only broker, IPv6-only host, `getaddrinfo` order: need a host set-up; known gap (item 8).
+   - The overload test: measured in S4 (50k and 100k msg/s). The RSS criterion that it exposes is open item 6 (owner decision).
+   - Release size and scaled frame-rate numbers: numbers, not tests; they are in the S1 and S4 reports.
+   - Also recorded in item 8: no 3.1.1 load run, no EMQX or HiveMQ load run, and the Windows and macOS runs of the new tests.
+4. **Docs.**
+   - New `docs/adr/0006-ntex-mqtt.md`: problem, decision, D1 to D8, alternatives (stay on ms-mqtt-client, rumqttc-next with defects D1 and D2, ntex-mqtt), consequences. Facts come from the plan and the S4 report only.
+   - ADR 0002: status "superseded by ADR 0006". ADR 0001: the MQTT and TLS rows and the MQTT consequences point to ADR 0006 (old facts kept as a history note).
+   - `ARCHITECTURE.md`: thread diagram, new "MQTT client" section, settings schema 2.
+   - `README.md`: MQTT 3.1.1 and 5, Protocol setting, new Limits (the line that blamed the library is gone; status line says 0.1.1 is released).
+   - `AGENTS.md`: clippy command has `--all-features` (as the gate); the QoS 2 rule now says "The app does not support it (a product decision; the `Qos` type has two values)" and a broker QoS 2 message ends the session with a plain text. New rule: ntex-mqtt is pinned exactly, used only in `net.rs` and its submodules, every deadline is set in our code, and the broker tests run on each ntex update. Before: "The library does not support it". The plan says only that the `Qos` enum keeps two values and that ntex-mqtt carries QoS 2 to the handler, so the old reason was not true.
+   - `docs/user-guide.md` already had the Protocol setting, subscription options, Connection details and the 3.1.1 limits (S2c, S2d). I changed: the keep-alive row (up to about 2 times the keep alive; 0 turns detection off), the Limits section (QoS 2 text, 3.1.1 limits, detection time), the version errors and the new connection texts in Troubleshooting (all taken from `wire.rs` and `net.rs`), and the schema 2 refusal of 0.1.x.
+   - `docs/ui-design.md` was already current (Protocol, Options, Connection details): no change.
+   - `docs/parity.md`: MQTT version row done; QoS row says product decision; new row for subscription options and connection details.
+   - `docs/open-questions.md`: removed the ms-mqtt-client upstream item; closed "MQTT 3.1.1 and QoS 2" (3.1.1 now supported) and the oversized-packet item. New open items: 6 RSS after overload (owner decision at S6); 7 macOS 15 in the docs against `minimum-system-version = "13.0"` in `crates/navigator-app/Cargo.toml:61`; 8 the spike gaps; 9 v0.1.x refuses a schema 2 file. No rumqttc bug-report item: no earlier list had one.
+   - `THIRD-PARTY-NOTICES.md`: no change. The file in the repo covers only the bundled themes. The release workflow (`release.yml:239-245`) appends `cargo about generate --locked --all-features about.hbs` for the Rust dependencies. `cargo-about` is not installed here, so I did not run it. `cargo deny check` (licenses ok) uses the same list as `about.toml`.
+   - `CHANGELOG.md`, Unreleased: Added (3.1.1 and Protocol, 3.1.1 behaviour, version errors, subscription options, Connection details, server reference), Changed (ntex-mqtt, schema 2 and v0.1.x refusal, 2x keep alive, new texts, +2.2% size), Known limitations.
+5. **Stale-claim grep** (README, ARCHITECTURE, AGENTS, CHANGELOG, SECURITY, docs/*.md, docs/adr): no "MQTT 5 only" left except the 0.1.0 history entry of the CHANGELOG and the ADR 0001 history note. Other hits (OpenSSL notes in AGENTS and ADR 0005) are still true.
+
+### Gate (final code)
+
+| Check | Result | Log |
+|---|---|---|
+| `cargo fmt --all --check` | ok | `s5-fmt.txt` |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | ok | `s5-clippy.txt` |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok | `s5-deny.txt` |
+| `cargo test --workspace` | 425 passed, 0 failed, 9 ignored (includes the new logging test and `net_fake`: 85 passed, 8 ignored) | `s5-test.txt` |
+| After the keep-alive note (UI only): fmt, clippy (all targets, all features, `-D warnings`), `cargo test --workspace` | ok; 426 passed, 0 failed, 9 ignored. The broker run was not repeated (UI-only change). | `s5b-*.txt` |
+| `cd fuzz && cargo +nightly fuzz build` | ok (4 targets) | `s5-fuzz.txt` |
+| `tests/broker/up.sh`, then `cargo test -p navigator-core --features broker-tests --no-fail-fast -- --test-threads=1` | 369 passed, 0 failed, 10 ignored: lib 182, broker_compat 24 (EMQX, HiveMQ), broker_matrix 38, load_ci 1 (361 s), net_blocked_write 1, net_fake 85 (426 s), net_fd_leak 1, net_keepalive_tasks 1, net_mosquitto 36 | `s5-up.txt`, `s5-broker.txt` |
+| `docker compose -f tests/broker/compose.yml stop emqx hivemq` | done | `s5-stop.txt` |
+| `cargo tree -i ms-mqtt-client` (both workspaces) | package not in the graph | `s5-tree.txt` |
+
+I did not run `cargo build --release` and did not touch `target/release`. I did not use port 1883 and did not prune Docker. Mosquitto from `up.sh` is still running on 18830 (I stopped only EMQX and HiveMQ, as asked).
+
+### Deviations and open points
+
+- Keep-alive note (plan, "Robust connection"; missed in S2c): done in S5. `connections.rs` shows "Keep alive 0 sends no ping. The app finds a lost connection only when an operation times out or the system reports an error." under the Keep alive field when the value is 0 or empty (`keep_alive_is_off`, a `warn` line with the theme `warning` token, in a `field()`). The input is already watched, so the note appears and disappears while the user types. Unit test `the_keep_alive_note_shows_for_0_and_for_an_empty_field_only`. The plan gives no exact UI text, so the sentence is mine. I did not look at the sheet in a real window. The user guide line is updated. The gate after this change: fmt, clippy (all targets, all features) and `cargo test --workspace` run again (see the Gate table); the broker run was not repeated, because the change is UI only and the first run is above.
+- The three test comments that named the S1 spike (`net_fake.rs`, `broker_matrix.rs` twice) now say that the spike is deleted.
+- The CHANGELOG "Known limitations" and the 0.2.0 release text must be checked at S6 (open items 6, 7, 9).
+- The Windows and macOS CI runs of the new tests are still open (S6).
+
+### S5 Round 1 fixes
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | The keep-alive note was false when an MQTT 5 broker sends Server Keep Alive | The note now says "An MQTT 5 broker can set a different keep alive." The user guide keep-alive row and the CHANGELOG line say the same. |
+| 2 | "Up to 2 times the keep alive" ignored timer and shutdown delays | ADR 0006 gives the plan bound (2 × keep alive × 1.125 + 10 s; 145 s at 60 s) and the S1 values (121.38 s, 144.93 s). The CHANGELOG and the user guide say "about 2 times the keep alive, plus timer and shutdown delays". |
+| 3 | Connection details text claimed "all the facts" | The CHANGELOG and the user guide now list the lines. Nine lines always show; seven of them show the MQTT 5 default when the broker did not send the value (`messages.rs` `details_rows`). Session Expiry Interval and user properties are not shown. |
+| 4 | The 1 MiB incoming limit omitted the v3 exception | The user guide states that on MQTT 3.1.1 a non-minimal length encoding can make a packet up to 3 bytes larger (plan line 34). |
+
+Gate after the fixes: `cargo fmt --all --check` ok; `cargo clippy --workspace --all-targets --all-features -- -D warnings` ok; `cargo test --workspace`: 426 passed, 0 failed, 9 ignored. The broker suite was not rerun: the change is UI text and docs only.

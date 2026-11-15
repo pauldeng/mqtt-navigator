@@ -82,6 +82,14 @@ fn clean_label(protocol: Protocol) -> &'static str {
     }
 }
 
+/// Keep alive 0 turns off our ping, unless an MQTT 5 broker sets its own (Server Keep Alive).
+/// An empty field means 0.
+fn keep_alive_is_off(text: &str) -> bool {
+    number::<u16>(text, true) == Some(0)
+}
+
+const KEEP_ALIVE_OFF_NOTE: &str = "Keep alive 0 sends no ping. An MQTT 5 broker can set a different keep alive. Without a ping, the app finds a lost connection only when an operation times out or the system reports an error.";
+
 /// Session expiry and will delay exist in MQTT 5 only.
 fn has_expiry_and_will_delay(protocol: Protocol) -> bool {
     protocol == Protocol::V5
@@ -1032,6 +1040,10 @@ impl Render for ConnectionSheet {
                 ))
             })
             .child(self.input_field("Keep alive (seconds)", "keepalive", &self.keepalive, cx))
+            .when(
+                keep_alive_is_off(self.keepalive.read(cx).value().as_ref()),
+                |f| f.child(field().child(warn(KEEP_ALIVE_OFF_NOTE))),
+            )
             .child(self.input_field("Will topic", "will.topic", &self.will_topic, cx))
             .child(
                 field().label("Will payload").child(
@@ -1142,7 +1154,7 @@ impl Render for ConnectionSheet {
 mod tests {
     use navigator_core::net::Protocol;
 
-    use super::{clean_label, has_expiry_and_will_delay, number, seconds};
+    use super::{clean_label, has_expiry_and_will_delay, keep_alive_is_off, number, seconds};
 
     #[test]
     fn a_hidden_session_field_keeps_its_edit_and_raises_no_error() {
@@ -1161,6 +1173,14 @@ mod tests {
         assert_eq!(clean_label(Protocol::V5), "Clean start");
         assert!(!has_expiry_and_will_delay(Protocol::V311));
         assert!(has_expiry_and_will_delay(Protocol::V5));
+    }
+
+    #[test]
+    fn the_keep_alive_note_shows_for_0_and_for_an_empty_field_only() {
+        assert!(keep_alive_is_off("0"));
+        assert!(keep_alive_is_off(" "));
+        assert!(!keep_alive_is_off("60"));
+        assert!(!keep_alive_is_off("abc"));
     }
 
     #[test]
