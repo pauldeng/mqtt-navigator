@@ -5,8 +5,8 @@
 1. Set `version` in the workspace `Cargo.toml`. Run `cargo check` to update `Cargo.lock`.
 2. Commit and merge to `main`. CI must pass.
 3. Tag the commit: `git tag v0.2.0 && git push origin v0.2.0`. The tag must equal `v` plus the crate version. The workflow stops when they differ.
-4. Wait for the `Release` workflow. It makes a **draft** release and attaches all files.
-5. Open the draft. Read the notes. Press **Publish release**.
+4. Wait for the `Release` workflow. It makes a **draft** release with GitHub generated notes (`--generate-notes`) and attaches all files.
+5. Open the draft. Paste the section of this version from `CHANGELOG.md` into the notes. Press **Publish release**.
 
 The app reads `latest.json` from the latest published release. A draft is not visible to the app. Users get the update only after you publish.
 
@@ -16,7 +16,7 @@ The app reads `latest.json` from the latest published release. A draft is not vi
 |---|---|
 | Linux x64 | `.AppImage`, `.deb`, `.tar.gz` |
 | Windows x64 | `-setup.exe` (per-user), `.zip` (portable) |
-| macOS universal (arm64 and x64 in one app) | `.dmg`, `.app.zip` |
+| macOS universal (arm64 and x64 in one app, macOS 15 or later) | `.dmg`, `.app.zip` |
 | All | `SHA256SUMS`, `latest.json`, `latest.json.minisig`, SBOM (`*.cdx.json`), `THIRD-PARTY-NOTICES.md`, build attestations |
 
 The AppImage, the Windows `.zip` and the macOS `.app.zip` are the update files. `latest.json` lists them.
@@ -36,19 +36,23 @@ The workflow uses `GITHUB_TOKEN` for everything else. Never put a key in the rep
 
 ## Rotate the minisign key
 
-The public key is compiled into the app. An old app trusts only the old key.
+The public key (`assets/update/minisign.pub`) is compiled into the app. An old app trusts only the old key. An old app also checks only the manifest, so the bridge release must carry a manifest that the **old** key signs.
 
-1. Make a new pair: `minisign -G -p assets/update/minisign.pub -s new.key`.
-2. Replace the two minisign secrets.
-3. Release one version signed with the **old** key that contains the **new** public key. Wait until users have it.
-4. Release the next version signed with the new key.
+Known gap: the release workflow cannot make the bridge release. `scripts/sign-manifest.sh` signs with the secret key from the environment, then verifies the signature with the public key in the repository. The bridge release must embed the **new** public key, so the check fails for a signature from the old key. The script and the workflow have no switch for another verification key. This needs a code change. Do not use this procedure until the owner has decided how to change the script ([open question 8](open-questions.md#open)).
 
-If the old key is lost or stolen, step 3 is not possible. Tell users to install the new version by hand.
+Plan, once the script supports it:
+
+1. Make a new pair in a safe place, not in the repository: `minisign -G -p new.pub -s new.key`. Keep a copy of the old public key.
+2. Build the bridge release: the repository has `new.pub` as `assets/update/minisign.pub`, and the secrets still hold the **old** key. The manifest signature must be verified with the **old** public key. Publish it. Wait until users have it.
+3. Replace `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` with the new key.
+4. Release the next version. It is signed with the new key and verified with the new public key.
+
+If the old key is lost or stolen, step 2 is not possible. Tell users to install the new version by hand.
 
 ## First start on a user machine
 
 - **Windows.** The installer and the programs have no Authenticode signature yet. SmartScreen warns about an unknown publisher. Choose **More info**, then **Run anyway**. Updates are safe: the app checks the minisign signature of each update.
-- **macOS.** The app has an ad-hoc signature, not a Developer ID. It is not notarized. Gatekeeper blocks the first start. Right-click the app, choose **Open**, then choose **Open** again. If macOS says the app is damaged, run `xattr -dr com.apple.quarantine "/Applications/MQTT Navigator.app"`. Copy the app to `/Applications` before the first start.
+- **macOS.** The app needs macOS 15 or later (`minimum-system-version` in `crates/navigator-app/Cargo.toml`). The app has an ad-hoc signature, not a Developer ID. It is not notarized. Gatekeeper blocks the first start. Start the app once. Then open **System Settings**, **Privacy & Security**, and choose **Open Anyway**. If macOS says the app is damaged, run `xattr -dr com.apple.quarantine "/Applications/MQTT Navigator.app"`. Copy the app to `/Applications` before the first start.
 - **Linux.** Run `chmod +x` on the AppImage. The `.deb` installs the app but does not update it. The app shows a link to the new release.
 
 ## Build the packages on your machine

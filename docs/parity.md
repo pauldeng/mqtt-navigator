@@ -19,13 +19,13 @@ Status: `done`, `dropped` (with a reason), `better` (we do more than the referen
 | Edit and publish, Reply | none | Copy a message into the composer; reply through the MQTT 5 Response Topic | P5 | better |
 | Session | clean start, session expiry, keepalive | Same, plus removal of subscriptions on a persistent session | P2, P4 | done |
 | Will message | — | Optional Will, under Advanced in the connection sheet | P4 | better |
-| Reconnect | — | Automatic reconnect with backoff (1 s to 30 s) and resubscribe | P2 | better |
+| Reconnect | — | Automatic reconnect with backoff (base 1 s to 30 s, real wait 0.8 s to 36 s) and resubscribe | P2 | better |
 | Topic tree | counts, activity blink, staged rendering | Virtual list (own flat rows, ADR 0003), a payload preview, a count of the topics below each row and message counts; no activity dot and no retained marker in the tree (the Messages list has the retained mark) | P1, P3 | partial |
 | Topic filter | substring | Substring, debounced, keeps ancestors; also searches the first 1 KiB of the payload in the Messages view | P3 | better |
 | Sort | a-z, messages, topics | Tree a–z only. The message list is always chronological. | P3 | dropped (simpler) |
 | Pause | stop merge, buffer up to 100 MB | Pause with the store budget, drops shown | P3 | done |
 | Value view | JSON/Text | JSON, Text, Hex, Base64, Number (8–64 bit, float, both byte orders); auto from content-type; background formatting; Show all and Show more for long payloads | P5 | better |
-| MQTT 5 properties (receive) | user properties only | All properties | P5 | better |
+| MQTT 5 properties (receive) | user properties only | Content type, response topic, correlation data, message expiry, payload format and user properties | P5 | better |
 | Subscription options and connection details | — | No Local, Retain As Published, Retain Handling (MQTT 5); a "Connection details" popover with the CONNACK facts | P8 | better |
 | MQTT 5 properties (publish) | none | content-type, response topic, correlation data, expiry, user properties | P5 | better |
 | History | 100 messages or 20 kB per topic | 100 messages per topic (64 KiB each); global budget | P3, P5 | better |
@@ -36,10 +36,10 @@ Status: `done`, `dropped` (with a reason), `better` (we do more than the referen
 | Drop counter, memory use | buffer fill percent when paused | Always in the status bar | P1, P3 | better |
 | Profile import/export | none | JSON, connection profiles only, no secrets | P4 | better |
 | Auto update | none | Signed GitHub Releases updates. Not run on Windows and macOS yet. | P6 | better |
-| macOS build | none | arm64 and x64 DMG. Not built in CI yet. | P6 | better |
+| macOS build | none | One universal DMG (arm64 and x64), macOS 15 or later. Built by the release workflow. | P6 | better |
 | Memory limit | fixed buffer | One limit, 32 MiB to 2 GiB, default 128 MiB. Soft limit: batch eviction | P5 | better |
 | Theme presets | none | Default, Catppuccin, Solarized, Everforest, Flexoki, Mellifluous, macOS Classic, Tokyo Night. Ayu and Gruvbox wait for a licence check. | P5 | better |
-| Command palette | none | `Ctrl/Cmd+K`. Every action is in it. | P5 | better |
+| Command palette | none | `Ctrl/Cmd+K`. Most actions are in it. | P5 | better |
 | Diagnostics | none | "Open the log folder" and "Copy diagnostics" (no secrets) | P5 | better |
 | Update check | none | Once at start, no timer, can be turned off; notice for deb and read-only installs | P6 | better |
 | Command line | none | Session connection from options (`--host`, `--tcp`, `--sub`, …) | P1, P4 | better |

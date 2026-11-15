@@ -1,6 +1,6 @@
 # ADR 0004: Release profile and size gate
 
-Status: accepted (2026-11-11). Advice: Codex (gpt-6.1-sol), decision D7 of P5.
+Status: accepted (2026-11-11). Advice: Codex (gpt-6.1-sol), decision D7 of P5. The measurements are for 0.1.x (`ms-mqtt-client`). The 0.2.0 binary is 2.2% larger ([ADR 0006](0006-ntex-mqtt.md)).
 
 ## Measurements (Linux x64, stripped, panic = unwind, split debug info)
 

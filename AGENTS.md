@@ -12,6 +12,17 @@ cargo deny check
 cargo run --release            # start the app
 ```
 
+Broker tests need Docker. They run in parallel. See [tests/broker/README.md](tests/broker/README.md).
+
+```bash
+tests/broker/up.sh             # Mosquitto (18830-18838, 18860), EMQX, HiveMQ CE
+cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks
+LOAD_WARMUP_SECS=15 LOAD_SECS=60 cargo test --release -p navigator-core --features broker-tests --test load_ci -- --nocapture
+tests/broker/down.sh
+```
+
+`LOAD_WARMUP_SECS` (default 60) and `LOAD_SECS` (default 300) set the load test time. `up.sh mosquitto` starts only the two Mosquitto services.
+
 ## System packages
 
 - Linux (Ubuntu 24.04): `sudo apt install gcc g++ clang pkg-config libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 perl make`
@@ -60,3 +71,9 @@ cargo run --release            # start the app
 
 - Each phase ends with a report in `docs/plans/phase-N-verification.md` and a read-only Codex review.
 - Report only checks that you actually ran.
+
+### Tests
+
+- Test against a real broker first (`tests/broker/`). Use the fake broker (`crates/navigator-core/tests/common/fake.rs`) only for faults that a real broker does not make. Do not write a second fake of a real broker.
+- Each test uses its own topics and client IDs, so the tests run in parallel. Use the `RwLock` of the file for a test that restarts a broker.
+- Tests may set short `NetLimits.timers`. Keep one test for each limit with the shipped value.

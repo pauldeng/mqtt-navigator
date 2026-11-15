@@ -5,7 +5,7 @@ These files start real brokers in Docker: Mosquitto 2.x, EMQX and HiveMQ CE. The
 ## Run
 
 ```bash
-tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test broker_matrix --test broker_compat && tests/broker/down.sh
+tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks && tests/broker/down.sh
 ```
 
 `up.sh` takes service names (`mosquitto`, `emqx`, `hivemq`). With no name, it starts all three. `mosquitto` starts two Mosquitto services: the main one and `mosquitto-limits`.
@@ -17,7 +17,7 @@ tests/broker/up.sh mosquitto && SOAK_SECS=600 cargo test --release -p navigator-
 ```
 
 You need Docker with Compose, and the `openssl` command.
-`broker_compat` has one test for each broker that restarts it. A `RwLock` in that file keeps it apart from the other tests of the file.
+The tests run in parallel. Each test has its own topics and client IDs. `broker_compat` has one test for each broker that restarts it. A `RwLock` in that file keeps it apart from the other tests of the file.
 
 ## Listeners
 

@@ -9,15 +9,17 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
 3. Licence check for the Ayu and Gruvbox themes. Add them only if the licence allows it.
 4. A person has not checked the UI in a real window. Every phase report lists UI checks that were not run.
 5. The Linux keyring (Secret Service) is not tested (no Secret Service on the development machine). The software renderer was checked on Linux on 2026-11-11: with the Mesa lavapipe Vulkan driver the app starts (first frame 238 ms); with no Vulkan driver it still starts and connects, but which renderer it used was not confirmed (no screenshot). Windows (WARP) is not checked.
-6. Test gaps from the removed ntex spike (phase 8, S5). Each one needs a host set-up that the repo does not have, or a measurement that no test makes:
+6. Test gaps from the ntex evaluation (phase 8, S5). Each one needs a host set-up that the repo does not have, or a measurement that no test makes:
    - A broker that negotiates only TLS 1.2, an IPv6-only host, and the `getaddrinfo` order for `localhost`.
    - Keep alive 60 s and 70 s while the app publishes. The tests run these two values without publishes, and keep alive 2 s with publishes.
-   - The RSS during the 2 MiB-header case. The test checks the time and the text. The S1 spike measured the RSS once.
+   - The RSS during the 2 MiB-header case. The test checks the time and the text. The evaluation (S1) measured the RSS once.
    - A 3.1.1 load run (10k msg/s) and a load run on EMQX or HiveMQ. S4 measured MQTT 5 on Mosquitto only.
-   - The new fake-broker tests on Windows and macOS (first CI run at S6).
+7. What holds the extra memory after an overload (above 10 000 msg/s)? RSS stays about 93 MiB above the 10k plateau until exit. The owner accepted this for 0.2.0. It is bounded and v0.1.1 does the same.
+8. Signing-key rotation. `scripts/sign-manifest.sh` verifies with the public key in the repository, so the workflow cannot make the bridge release that an old key must sign (see [Rotate the minisign key](release.md#rotate-the-minisign-key)). Decide how the script gets the old public key for verification before the first key rotation.
 
 ## Closed
 
+- 2026-11-15: The fake-broker tests on Windows and macOS → CI passed on Windows, macOS and Ubuntu for the 0.2.0 commit (79124ce).
 - 2026-11-15: 0.1.x and a schema 2 settings file → a note is enough. The 0.2.0 CHANGELOG "Known limitations" states it, and the release text copies that section.
 - 2026-11-15: RSS after an overload → accepted. After 100k msg/s, RSS stays about 93 MiB above the 10k plateau until the app exits. It is bounded, it does not grow over repeated overloads, and the OS frees it at exit (memory check, phase 8). v0.1.1 does the same. The overload criterion is changed. Finding what holds the extra live memory is a later task.
 - 2026-11-15: macOS minimum version → 15.0 (gpui-kit). The packager setting is now 15.0.

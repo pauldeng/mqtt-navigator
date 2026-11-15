@@ -11,7 +11,7 @@ This page is the design reference for the user interface. Read [ARCHITECTURE.md]
 - Each area has one primary action: Connect or Disconnect in the title bar, Send in the composer, Save and connect in the connection sheet. The subscribe input has no button: Enter adds the filter.
 - A choice shows its selected state (a toggle group, a toggle, a selected list row). Do not swap primary and ghost buttons to show a choice.
 - Follow the [gpui-kit design guides](https://gpui-kit.com/docs/design-guides.md) for sizes, copy and states.
-- All actions work from the keyboard. The one exception is pane resizing, which uses the mouse ("Reset layout" is in the command palette).
+- All actions work from the keyboard. The one exception is pane resizing, which uses the mouse ("Reset the layout" is in the command palette).
 
 Sources:
 - the UI/UX rule packs [jakubkrehel/skills](https://github.com/jakubkrehel/skills) (MIT) and [ui-ux-pro-max](https://github.com/nextlevelbuilder/ui-ux-pro-max-skill) (MIT), without their mobile-only rules;
@@ -54,7 +54,7 @@ The window has one place for each job:
 - **Title bar:**
   - The profile `Select`. Its last item, "Manage connections…", opens the connection sheet (section 3.1).
   - The theme menu (a `DropdownMenu`, section 5).
-  - The connection state, as a dot **and** text: "Connecting…", "Connected", "Reconnecting (3)…", "Disconnected: not authorized".
+  - The connection state, as a dot **and** text: "Connecting…", "Connected", "Reconnecting (3)…", "Disconnected: The broker rejected the connection: this client is not authorized.".
   - The filter, and the command palette.
   - The one primary action. It is "Connect" when disconnected, "Cancel" while connecting, and "Disconnect" when connected.
   - If you select a different profile while connected, the app asks "Disconnect from prod and connect to test? Messages from prod are removed.". It does not change the active broker silently.
@@ -110,7 +110,7 @@ The window has one place for each job:
   - The pane header has a close button. The pane stays closed until you open it again (button in the centre header, or the command palette).
   - When the window is narrower than 1 100 px, the details open as a right-side sheet.
 - **Status bar:** URL, a "Connection details" button while connected (a `Popover` with the facts of the CONNACK, see the user guide), msg/s, topics, memory used against the budget, and drops (red with text when above 0). A `Tag::warning()` shows "Not encrypted" for TCP and WS, and "Insecure TLS" when TLS verification is off.
-- **Panes:** the three panes (subscriptions, centre, details) are resizable. Each side pane has a least and a most width in rem, and the centre keeps at least 22.5 rem. The app saves the two side widths (`ui.pane_widths`) and clamps them when it loads them. "Expand" widens the details pane. The expanded width is not saved. "Reset layout" restores the default widths (16.25 rem and 22.5 rem).
+- **Panes:** the three panes (subscriptions, centre, details) are resizable. Each side pane has a least and a most width in rem, and the centre keeps at least 22.5 rem. The app saves the two side widths (`ui.pane_widths`) and clamps them when it loads them. "Expand" widens the details pane. The expanded width is not saved. "Reset the layout" restores the default widths (16.25 rem and 22.5 rem).
 
 ### 3.1 Connection sheet
 
@@ -121,7 +121,7 @@ The window has one place for each job:
 - **Advanced** (collapsed): WebSocket path, clean start (MQTT 3.1.1: clean session), session expiry (MQTT 5), keepalive, Will message (will delay: MQTT 5). The **Protocol** select is a basic field after Transport.
 - The saved connections are `ListItem` rows. The row of the draft is selected. "New connection" is the last row.
 - Buttons: **Save and connect** (primary), **Save**, **Cancel**. A button that opens a dialog ends with "…" (for example "Delete connection…"). A dialog has **Cancel** and a verb ("Discard changes", "Switch connection"). Validation runs when you press a button, and focus moves to the first wrong field.
-- There is no separate "Test connection" button. "Save and connect" is the test, and a failure shows its cause in the sheet.
+- There is no separate "Test connection" button. "Save and connect" is the test, a connection failure shows in the title bar, and a validation error shows in the sheet.
 
 ### 3.2 Filter scope
 
@@ -228,7 +228,7 @@ Every view designs these states: empty, loading, error with a recovery action, d
 
 | Where | Empty-state text | Action |
 |---|---|---|
-| No profiles | "Add a broker to start." | "New connection…" (primary), "Connect to localhost:1883 (not encrypted)" |
+| No profiles | "Add a broker to start" | "New connection…" (primary), "Connect to localhost:1883 (not encrypted)" |
 | Connected, no subscriptions | "Subscribe to a topic filter to see messages." | Focus the subscribe input |
 | Connecting | "Connecting to mqtts://broker:8883…" | "Cancel" |
 | Broker rejected `#` | "The broker does not allow #. Subscribe to a narrower filter." | Focus the subscribe input |
@@ -238,7 +238,7 @@ Every view designs these states: empty, loading, error with a recovery action, d
 | No selection | "Select a topic with a message." | — |
 
 - Not built yet: the empty state for a connection without subscriptions, and the one for a broker that rejects `#`.
-- An error states the cause and the next step. Example: "Certificate expired on 2026-03-01. Renew the server certificate, or turn off verification."
+- An error states the cause and the next step. Example: "The server certificate expired on 2026-03-01. Renew it, or turn off verification."
 - A publish result is short: "Sent" (QoS 0), "Acknowledged" (QoS 1), "Rejected: NotAuthorized" (the reason name of the broker, and its reason string if it sent one).
 
 ## 8. Keyboard
@@ -256,7 +256,7 @@ Other rules:
 
 | Keys | Action |
 |---|---|
-| `Ctrl/Cmd+K` | Command palette (every action is also here) |
+| `Ctrl/Cmd+K` | Command palette (most actions are also here) |
 | `Ctrl/Cmd+F` | Focus the filter |
 | `Esc` (in the filter) | Clear the filter |
 | `Esc` (elsewhere) | Close the top layer (menu, dialog, sheet) |
@@ -271,14 +271,14 @@ Other rules:
 | `Up`, `Down`, `Enter` (in History) | Move the cursor in the rows of the History tab, show the row in the Value tab |
 
 - Pause, Edit and publish, Reply, Publish to this topic and the details pane have buttons and command palette entries. They have no shortcut, so that they cannot conflict with system or editor keys.
-- Pane widths change with the mouse. The command palette has "Reset layout".
+- Pane widths change with the mouse. The command palette has "Reset the layout".
 - Tooltips and menus show the shortcuts.
 
 ## 9. Motion and live data
 
 - Hover, selection and tab changes are instant.
 - Planned, not built in v1: an activity marker on a topic row (a dot that fades out over 1 s, without a fade when the OS asks for reduced motion). Today the changing count is the only signal.
-- "Follow newest" in the Messages view is on by default. Selecting a row or scrolling turns it off. Pause stops view updates (WCAG 2.2.2).
+- The "Follow" toggle in the Messages view is on by default. Selecting a row or scrolling turns it off. Pause stops view updates (WCAG 2.2.2).
 
 ## 10. Accessibility
 

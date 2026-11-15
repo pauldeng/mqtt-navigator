@@ -41,8 +41,19 @@ The session uses `ntex-mqtt` ([ADR 0006](docs/adr/0006-ntex-mqtt.md)). Only `nav
 - The supervisor owns reconnect. Each attempt makes one connector call and one client.
 - Our own dialer does DNS and TCP under one connect deadline. TLS uses OpenSSL (`tls.rs`) through `ntex-tls`. WebSocket uses `ntex::ws`.
 - Every deadline is set in our code: connect, write, frame read rate, keep alive and operation. Each one has a fake-broker test.
+- `NetLimits.timers` (`Timers`) holds the time limits. The default is the shipped value: connect 10 s, operation 10 s, write 10 s, TLS handshake 5 s, WebSocket upgrade 5 s, frame check 10 s, whole packet 60 s. Only tests set shorter values.
+- The keep alive comes from the profile (default 60 s). The app finds a silent broker in about 2 times the keep alive, plus timer and shutdown delays. Keep alive 0 turns this off, unless an MQTT 5 broker sets its own.
+- Reconnect waits a base of 1 s that doubles for each retry up to 30 s. Jitter of 20% either way gives waits of 0.8 s to 36 s. A connection that stays up for 30 s resets the count.
 - Limits come from the profile and `NetLimits`: the incoming packet limit is 1 MiB on both versions.
 - ntex logs through the `log` crate. The app installs no `log` logger, so these lines do not reach the log file.
+
+## Testing
+
+- Unit tests and the fake-broker tests (`navigator-core/tests/net_fake.rs`) run in `cargo test --workspace`. They need no broker. The fake broker sends and withholds bytes on purpose. Each transport and each MQTT version has a case. Each time limit has one case with the shipped value. The other cases use short test-only `Timers`.
+- Real-broker tests run with `--features broker-tests` and need Docker (see [tests/broker/README.md](tests/broker/README.md)). Test against a real broker first. Use the fake broker for faults that a real broker does not make.
+- Three fake-broker tests run with the shipped timer values and take minutes: the 60 s packet cap and the keep-alive cases. They are `#[ignore]`, so `cargo test --workspace` skips them. Run `cargo test -p navigator-core --test net_fake -- --ignored` after a change to the timers, to the frame read rate or to the ntex version.
+- The Mosquitto services are: the main one on ports 18830 to 18838, and `mosquitto-limits` on 18860 (Server Keep Alive, Receive Maximum and Maximum Packet Size). EMQX and HiveMQ CE run the same checks in `broker_compat`.
+- The broker tests run in parallel. Each test has its own topics and client IDs. A `RwLock` keeps the tests that restart a broker apart from the others.
 
 ## Event-driven design
 
@@ -73,7 +84,7 @@ Rules:
 - Message merging is time-sliced (≤ 4 ms each frame), so input is never queued behind a message flood.
 - Only visible rows render.
 - The app decodes and formats a large payload on a background executor. A new selection cancels the old job.
-- The first window opens before profiles and settings load. They arrive as an event.
+- Startup loads the settings and the profiles in the background, applies the theme, then opens the window. The first frame has the saved theme and pane widths. The app reads the keyring only when a connection needs a secret, in the background.
 - Targets:
   - input-to-frame latency below 50 ms (p95) at 10k msg/s;
   - frame time below 16 ms (p95);
@@ -91,6 +102,6 @@ See the TopicStore section of the plan.
 
 ## Persistence
 
-- Settings: JSON with `schema_version` (now 2). Writes are atomic. A profile without the `protocol` field loads as MQTT 5.
+- Settings: JSON with `schema_version` (now 2). Writes are atomic. A profile without the `protocol` field loads as MQTT 5. A new profile uses MQTT 3.1.1. Version 0.1.x does not load schema 2.
 - Secrets: system keyring only.
 - Logs: platform log folder, size-capped. Logs never contain payloads or secrets.

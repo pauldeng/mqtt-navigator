@@ -21,9 +21,9 @@ The files have no Authenticode signature yet, so SmartScreen warns about an unkn
 
 1. Download the `.dmg`. One app runs on Apple silicon and on Intel.
 2. Open the DMG. Drag **MQTT Navigator** to **Applications**.
-3. Right-click the app and select **Open**. Select **Open** again in the dialog.
+3. Start the app. macOS blocks it. Open **System Settings**, then **Privacy & Security**. Scroll down to the message about MQTT Navigator. Select **Open Anyway**, then confirm.
 
-The app has an ad-hoc signature. It has no Developer ID and is not notarized. Gatekeeper therefore blocks a normal first start. You must use right-click, then **Open**, one time.
+The app has an ad-hoc signature. It has no Developer ID and is not notarized. Gatekeeper therefore blocks the first start. You must select **Open Anyway** in **Privacy & Security** one time, after the blocked start.
 
 If macOS says the app is damaged, run this command in Terminal:
 
@@ -53,7 +53,7 @@ If you start the app again, it adds the entry again. On X11 the window icon come
 
 ## First run
 
-1. Start the app. It opens with the message "Add a broker to start." The screen also has **Connect to localhost:1883 (not encrypted)** for a broker on your own computer.
+1. Start the app. It opens with the message "Add a broker to start" The screen also has **Connect to localhost:1883 (not encrypted)** for a broker on your own computer.
 2. Select **New connection…** (`Ctrl/Cmd+N`). Fill in the host. Select **Save and connect**.
 3. A new connection subscribes to `#`. Messages appear at once.
 4. Select a row. The details pane shows the payload.
@@ -143,7 +143,7 @@ QoS 1 does not guarantee that the app shows each message. If the app queue or th
 - **Delete connection…** also removes the saved password.
 - If you save a connection that is active, the status bar shows "Reconnect to apply your changes." Select **Reconnect**.
 - If you select another connection while connected, the app asks first. Messages of the old connection are removed.
-- The app reconnects by itself after a lost connection ("Reconnecting (3)…"). The wait grows from 1 s to 30 s. It also retries when the broker is not reachable or answers "server unavailable", "server busy", "quota exceeded" or "connection rate exceeded". It does not retry for a wrong user name or password, "not authorized", a ban, a host name that is not found, or a certificate error.
+- The app reconnects by itself after a lost connection ("Reconnecting (3)…"). The wait grows: the base doubles from 1 s to 30 s, and the real wait is 0.8 s to 36 s. It also retries when the broker is not reachable or answers with one of these reasons: the server is not available, the server is busy, a quota is exceeded, or the connection rate is exceeded. It does not retry for a wrong user name or password, a client that is not authorized, a ban, a host name that is not found, or a certificate error.
 
 ## Subscribe
 
@@ -191,7 +191,7 @@ While you are connected, the status bar has a **Connection details** button. It 
 - MQTT 3.1.1: "Session present" only.
 - MQTT 5: "Session present", "Assigned client ID", "Keep alive", "Receive maximum", "Maximum packet size", "Maximum QoS", "Retained messages", "Wildcard subscriptions", "Shared subscriptions", "Subscription identifiers", "Topic alias maximum", "Server reference", "Response information" and "Reason string".
 - These lines always show: "Session present", "Keep alive", "Receive maximum", "Maximum QoS", "Retained messages", "Wildcard subscriptions", "Shared subscriptions", "Subscription identifiers" and "Topic alias maximum". If the broker did not send one of the last seven values, its line shows the MQTT 5 default. The other lines show only when the broker sent the value. The list does not show Session Expiry Interval or user properties.
-- "Keep alive" is the keep alive in use: the value of the broker (Server Keep Alive) if the broker sent one, else your value. "Keep alive: off" means 0. With keep alive off, the app finds a lost connection only when an operation times out or the system reports an error.
+- "Keep alive" is the keep alive in use: the value of the broker (Server Keep Alive) if the broker sent one, else your value. The "Keep alive" value "off" means 0. With keep alive off, the app finds a lost connection only when an operation times out or the system reports an error.
 
 If a broker refuses the connection or closes it with a server reference, the error text ends with "Server reference: …". The reference names another server. The app does not connect to it by itself.
 
@@ -311,6 +311,16 @@ The theme files keep the licences of their projects. See [THIRD-PARTY-NOTICES.md
 - **deb install, or a folder you cannot write to:** the app cannot update itself. The title bar shows "Update <version> available", for example "Update 0.2.0 available". Point at it to see why. Select it to open the release page. Install the new deb yourself.
 - The update check is the only network traffic other than your broker. The app sends no telemetry.
 
+### Upgrade from 0.1.x
+
+- Version 0.2.0 reads the connections that 0.1.x saved. A connection without a Protocol uses MQTT 5, as before. A new connection uses MQTT 3.1.1.
+- The first save by 0.2.0 writes settings schema 2.
+- The macOS app needs macOS 15 or later.
+
+### Go back to version 0.1.x
+
+Version 0.1.x does not load a schema 2 settings file. It leaves the file unchanged, uses default settings and does not save. To use 0.1.x again, move or rename `settings.json` (see [Logs and diagnostics](#logs-and-diagnostics)), or delete it after you make a backup. Version 0.1.x then starts with default settings. You lose the connections and settings that 0.2.0 saved.
+
 ## Keyboard shortcuts
 
 `Ctrl` is `Cmd` on macOS.
@@ -386,7 +396,7 @@ The log folder is:
 - Use **Open the log folder** in the command palette to open it.
 - Use **Copy diagnostics** in the command palette to copy a short report: version, operating system, CPU architecture, graphics adapter, connection state and counters. It has no connection, host, path, topic, payload or secret. Paste it in a bug report.
 
-The settings file is `settings.json` in the `mqtt-navigator` folder of your system configuration folder (Linux: `~/.config`, macOS: `~/Library/Application Support`, Windows: `%APPDATA%`). The app keeps a damaged file as `.bad-<time>` and starts with defaults. A file from a newer version is not loaded and stays untouched. Version 0.2.0 writes settings schema 2. Version 0.1.x cannot read a schema 2 file: it does not change the file, uses default settings and does not save. The app uses the default settings and does not save. It shows: "The settings file is from a newer version of MQTT Navigator (schema N). It was not changed. Default settings are in use, and changes are not saved." The app also does not save if it cannot read the file.
+The settings file is `settings.json` in the `mqtt-navigator` folder of your system configuration folder (Linux: `~/.config`, macOS: `~/Library/Application Support`, Windows: `%APPDATA%`). The app keeps a damaged file as `.bad-<time>` and starts with defaults. A file from a newer version is not loaded and stays untouched. Version 0.2.0 writes settings schema 2. Version 0.1.x cannot read a schema 2 file: it does not change the file, uses default settings and does not save. A newer version shows this text when it meets a file it cannot read: "The settings file is from a newer version of MQTT Navigator (schema N). It was not changed. Default settings are in use, and changes are not saved." The app also does not save if it cannot read the file.
 
 ## Limits
 
@@ -422,8 +432,8 @@ The app does not retry after a certificate error. Fix the cause and connect agai
 
 ### Other connection problems
 
-- **The broker refused the connection. Check the host and the port.** The broker is off, or the host or port is wrong. The app retries with growing waits (1 s to 30 s).
-- **The broker rejected the connection: …** The broker gave a reason. For a temporary reason (server unavailable, server busy, quota exceeded, connection rate exceeded), the app retries with growing waits. For any other reason, for example a wrong user name or password, "not authorized" or a ban, the app does not retry.
+- **The broker refused the connection. Check the host and the port.** The broker is off, or the host or port is wrong. The app retries with growing waits (base 1 s to 30 s, real wait 0.8 s to 36 s).
+- **The broker rejected the connection: …** The broker gave a reason. For a temporary reason (the server is not available, the server is busy, a quota is exceeded, the connection rate is exceeded), the app retries with growing waits. For any other reason, for example a wrong user name or password, a client that is not authorized or a ban, the app does not retry.
 - **The broker closed the connection.** The connection dropped (for example a broker restart or a network cut). The app reconnects with growing waits. Select **Cancel** to stop.
 - **The broker closed the connection: …** The broker sent a DISCONNECT with a reason. For a temporary reason, the app reconnects. For any other reason, the session ends as Failed and the app does not retry. Connect again after you fix the cause.
 - **The broker sent a packet that is larger than the allowed size.** The broker sent a packet above 1 MiB. The app does not retry.
@@ -453,7 +463,7 @@ The app received more messages than it could keep. The reasons are a very high m
 
 ### The window does not open
 
-The app draws with the GPU (Vulkan on Linux). On a virtual machine or a remote desktop, the GPU can be missing. Install a software renderer (for example Mesa lavapipe on Linux). Check the log folder for an error. The software-renderer case is not tested yet.
+The app draws with the GPU (Vulkan on Linux). On a virtual machine or a remote desktop, the GPU can be missing. Install a software renderer (for example Mesa lavapipe on Linux). Check the log folder for an error. The app was checked on Linux with the Mesa lavapipe driver. Windows (WARP), virtual machines and remote desktops are not checked.
 
 ### More help
 
