@@ -84,11 +84,12 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: tests/broker/up.sh
-      - run: cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat -- --test-threads=1
+      # Each test has its own topics and client IDs, and a RwLock keeps the restart tests apart.
+      - run: cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks
       - name: Load test (10 000 msg/s)
         env:
-          LOAD_WARMUP_SECS: 30
-          LOAD_SECS: 120
+          LOAD_WARMUP_SECS: 15
+          LOAD_SECS: 60
         run: cargo test --release -p navigator-core --features broker-tests --test load_ci -- --nocapture
       - name: Stop the broker
         if: always()
@@ -106,12 +107,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
+      # rust-cache keeps ${CARGO_HOME}/bin by default (`cache-bin`), so a later run restores the
+      # installed cargo-fuzz and `cargo install` ends at once when the binary is up to date.
       - run: cargo install cargo-fuzz --locked
-      - name: Fuzz each target for 60 s
+      - name: Fuzz each target (20 s for the small input spaces, 60 s for the others)
         working-directory: fuzz
         run: |
-          for target in decode_render parse_hex topic_matches profile_import; do
-            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          for spec in decode_render:60 parse_hex:20 topic_matches:20 profile_import:60; do
+            cargo +nightly fuzz run "${spec%%:*}" -- -max_total_time="${spec##*:}"
           done
       - name: Keep the crash input
         if: failure()

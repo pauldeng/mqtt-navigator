@@ -48,50 +48,62 @@ async fn wait(net: &mut Net, f: impl Fn(&ConnState) -> bool) {
         .expect("status");
 }
 
-/// Five cancelled dials on each transport, for both versions.
+/// Polls the count of file descriptors until `f` is true. Returns the last count. It gives up
+/// after 3 s, so a leak shows as a wrong count and a missing dial as a count that stays low.
+async fn poll_fds(mut f: impl FnMut(usize) -> bool) -> usize {
+    let end = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let n = fds();
+        if f(n) || tokio::time::Instant::now() >= end {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Cancelled dials on each transport (round 0 warms the lazy set-up up: the DNS thread, the TLS
+/// context; the count is taken after it). MQTT 5 only: the dial code is the same for both
+/// versions, because it runs before any MQTT byte.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cancelled_black_hole_dial_leaves_no_file_descriptor() {
     let (listener, _fill) = black_hole().await;
     let port = listener.local_addr().expect("addr").port();
     let mut net = Net::start(NetLimits::default());
-    for protocol in [Protocol::V311, Protocol::V5] {
-        for transport in [
-            Transport::Tcp,
-            Transport::Tls,
-            Transport::Ws,
-            Transport::Wss,
-        ] {
-            // One dial first, so that lazy set-up (DNS thread, TLS context) is not counted.
-            let before = {
-                let mut warm = 0;
-                for round in 0..6 {
-                    let mut c = ConnectConfig::from(Profile {
-                        host: "127.0.0.1".into(),
-                        port,
-                        transport,
-                        ws_path: "/mqtt".into(),
-                        subscriptions: vec![],
-                        protocol,
-                        ..Profile::default()
-                    });
-                    c.protocol = protocol;
-                    net.send(Command::Connect(Box::new(c))).expect("send");
-                    wait(&mut net, |s| *s == ConnState::Connecting).await;
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    net.disconnect();
-                    wait(&mut net, |s| *s == ConnState::Disconnected).await;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    if round == 0 {
-                        warm = fds();
-                    }
-                }
-                warm
-            };
-            assert_eq!(
-                fds(),
-                before,
-                "{protocol:?} {transport:?}: a file descriptor leaked"
-            );
+    for transport in [
+        Transport::Tcp,
+        Transport::Tls,
+        Transport::Ws,
+        Transport::Wss,
+    ] {
+        let mut warm = 0;
+        for round in 0..3 {
+            let mut c = ConnectConfig::from(Profile {
+                host: "127.0.0.1".into(),
+                port,
+                transport,
+                ws_path: "/mqtt".into(),
+                subscriptions: vec![],
+                protocol: Protocol::V5,
+                ..Profile::default()
+            });
+            c.protocol = Protocol::V5;
+            net.send(Command::Connect(Box::new(c))).expect("send");
+            wait(&mut net, |s| *s == ConnState::Connecting).await;
+            if round > 0 {
+                // The dial is open: its socket is one more descriptor.
+                let open = poll_fds(|n| n > warm).await;
+                assert!(open > warm, "{transport:?}: the dial opened no socket");
+            }
+            net.disconnect();
+            wait(&mut net, |s| *s == ConnState::Disconnected).await;
+            if round == 0 {
+                // Let the descriptors settle: two equal counts in a row.
+                let mut last = usize::MAX;
+                warm = poll_fds(|n| std::mem::replace(&mut last, n) == n).await;
+            } else {
+                let after = poll_fds(|n| n == warm).await;
+                assert_eq!(after, warm, "{transport:?}: a file descriptor leaked");
+            }
         }
     }
     net.shutdown().await;

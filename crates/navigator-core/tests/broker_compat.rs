@@ -4,7 +4,7 @@
 //! a persistent session, and a broker restart. A probe test prints the CONNACK limits.
 //!
 //! Run: `tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test
-//! broker_compat -- --test-threads=1 --nocapture && tests/broker/down.sh`.
+//! broker_compat -- --nocapture && tests/broker/down.sh`.
 #![cfg(feature = "broker-tests")]
 
 use std::path::PathBuf;
@@ -14,8 +14,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use navigator_core::model::{Incoming, MsgProps, Qos};
 use navigator_core::net::{
-    Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
-    PublishResult, Transport,
+    Command, ConnState, ConnectConfig, ConnectionDetails, Event, Net, NetLimits, Outgoing, Profile,
+    Protocol, PublishResult, Transport, V5Details,
 };
 
 /// The restart test restarts the broker that the other tests of the same broker use. It takes the
@@ -339,6 +339,16 @@ async fn restart_reconnects(b: Broker) {
     let prefix = prefix();
     let generation = connect(&mut net, profile(b.tcp, Transport::Tcp, &prefix)).await;
     wait_subscribed(&mut net, WAIT).await;
+    // A filter that the user adds while connected must come back too (not only the profile one).
+    let live = format!("{prefix}-live/#");
+    net.send(Command::Subscribe {
+        filter: live.clone(),
+        qos: Qos::AtLeastOnce,
+        options: Default::default(),
+        req: 0,
+    })
+    .expect("send");
+    wait_subscribed(&mut net, WAIT).await;
 
     let compose = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/broker/compose.yml");
     let restart = tokio::task::spawn_blocking(move || {
@@ -369,27 +379,58 @@ async fn restart_reconnects(b: Broker) {
     .clone();
     assert_eq!(s.generation, generation);
     assert!(restart.await.expect("join").success(), "docker restart");
-    wait_subscribed(&mut net, RESTART_WAIT).await;
+    // `Reconnected` of the same generation, then both filters again (profile one and live one).
+    let mut filters = vec![];
+    let mut reconnected = false;
+    while filters.len() < 2 {
+        match next_event(&mut net, RESTART_WAIT).await {
+            Event::Reconnected { generation: g, .. } => {
+                assert_eq!(g, generation);
+                reconnected = true;
+            }
+            Event::Subscribed {
+                generation: g,
+                filter,
+                result,
+                ..
+            } => {
+                assert_eq!((g, result), (generation, Ok(Qos::AtLeastOnce)));
+                filters.push(filter);
+            }
+            Event::SessionFilters { .. } | Event::ConnectionDetails { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(reconnected, "no Reconnected event");
+    filters.sort();
+    assert_eq!(filters, [live, format!("{prefix}/#")]);
     round_trip(&mut net, &prefix, generation).await;
     assert_eq!(net.status.borrow().generation, generation);
     net.shutdown().await;
 }
 
+/// The next `ConnectionDetails` of the session.
+async fn next_details(net: &mut Net) -> ConnectionDetails {
+    loop {
+        match next_event(net, WAIT).await {
+            Event::ConnectionDetails { details, .. } => return *details,
+            Event::Subscribed { .. } | Event::SessionFilters { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
 /// Prints what the broker says in CONNACK, for a client that asks for 600 s keep alive and a
-/// session expiry of 7 days. Checks only what MQTT 5 requires of every broker.
+/// session expiry of 7 days. Checks only what MQTT 5 requires of every broker, except for
+/// Mosquitto: its values are fixed by the config, so all of them are checked. The MQTT 3.1.1
+/// CONNACK has only the session flag, so the details of a v3 connect have no v5 part.
 async fn connack_probe(b: Broker) {
     let mut net = Net::start(NetLimits::default());
     let mut p = profile(b.tcp, Transport::Tcp, &prefix());
     p.keepalive_secs = 600;
     p.session_expiry_secs = 7 * 86_400;
-    connect(&mut net, p).await;
-    let details = loop {
-        match next_event(&mut net, WAIT).await {
-            Event::ConnectionDetails { details, .. } => break details,
-            Event::Subscribed { .. } | Event::SessionFilters { .. } => {}
-            other => panic!("unexpected {other:?}"),
-        }
-    };
+    connect(&mut net, p.clone()).await;
+    let details = next_details(&mut net).await;
     let v5 = details
         .v5
         .as_ref()
@@ -419,10 +460,43 @@ async fn connack_probe(b: Broker) {
         "all three brokers keep retained messages"
     );
     assert!(v5.wildcard_subscriptions);
+    if b.service == "mosquitto" {
+        // Mosquitto 2.1.2 with the defaults: the keep alive is the one of the profile, and the
+        // broker announces 2 000 000 bytes for a packet (it cannot announce none).
+        assert_eq!(
+            *v5,
+            V5Details {
+                assigned_client_id: None,
+                keep_alive_secs: 600,
+                server_keep_alive_secs: None,
+                receive_max: 20,
+                max_packet_size: Some(2_000_000),
+                max_qos: 2,
+                retain_available: true,
+                wildcard_subscriptions: true,
+                shared_subscriptions: true,
+                subscription_ids: true,
+                topic_alias_max: 10,
+                server_reference: None,
+                response_info: None,
+                reason_string: None,
+            }
+        );
+    }
     println!(
         "compat {}: Net::broker_max_packet {:?}",
         b.service,
         net.broker_max_packet()
+    );
+    // MQTT 3.1.1: no v5 part, and no session on a clean connect.
+    connect_with(&mut net, p, Protocol::V311).await;
+    assert_eq!(
+        next_details(&mut net).await,
+        ConnectionDetails {
+            protocol: Protocol::V311,
+            session_present: false,
+            v5: None,
+        }
     );
     net.shutdown().await;
 }

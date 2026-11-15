@@ -2,17 +2,15 @@
 //! keep-alive task" (`log`, debug) when a task starts and "stopping keep-alive task" when the task
 //! of a closed connection ends, at its first tick (one interval after the start). The test
 //! captures the `log` records with their times, so it has its own test binary: the logger is
-//! global. It connects and disconnects 20 times with keep alive 2 s against a fake broker. It
-//! waits (bounded) for 20 starts, then for 20 stops. Each task is checked against its own
-//! lifetime: no task ends before its first tick, and every task ends within a bound.
-
-#[path = "common/fake.rs"]
-mod fake;
+//! global. It connects and disconnects 20 times with keep alive 2 s against Mosquitto at
+//! 127.0.0.1:18830 (`tests/broker/up.sh mosquitto`). It waits (bounded) for 20 starts, then for
+//! 20 stops. Each task is checked against its own lifetime: no task ends before its first tick,
+//! and every task ends within a bound.
+#![cfg(feature = "broker-tests")]
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use fake::{Fake, Options};
 use navigator_core::net::{
     Command, ConnState, ConnectConfig, Net, NetLimits, Profile, Protocol, Transport,
 };
@@ -55,11 +53,6 @@ async fn wait_for(done: impl Fn() -> bool, what: &str) {
 }
 
 async fn phase(v: Protocol) {
-    let f = Fake::start(Transport::Tcp, v, Options::default(), |_, mut conn| {
-        if conn.accept_connect().is_ok() {
-            conn.hold(Duration::from_secs(10));
-        }
-    });
     // Tasks of the earlier phase must have ended: every start has a stop.
     wait_for(
         || counts().0 == counts().1,
@@ -71,7 +64,7 @@ async fn phase(v: Protocol) {
     for _ in 0..20 {
         let mut c = ConnectConfig::from(Profile {
             host: "127.0.0.1".into(),
-            port: f.port,
+            port: 18830,
             transport: Transport::Tcp,
             keepalive_secs: 2,
             subscriptions: vec![],

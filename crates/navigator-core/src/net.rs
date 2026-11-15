@@ -279,6 +279,8 @@ pub struct NetLimits {
     /// Capacity of the queue to the UI, in bytes. Each message costs [`queue_cost`]: payload,
     /// topic, properties and a fixed overhead.
     pub queue_bytes: usize,
+    /// The time limits. Only tests change them (see [`Timers`]).
+    pub timers: Timers,
 }
 
 impl Default for NetLimits {
@@ -287,14 +289,50 @@ impl Default for NetLimits {
             max_packet: 1024 * 1024,
             queue_len: 50_000,
             queue_bytes: 32 * 1024 * 1024,
+            timers: Timers::default(),
+        }
+    }
+}
+
+/// The time limits of a connection. The default is the shipped value of each. Integration tests
+/// set shorter values, so that a test does not wait for the real ones. One test for each limit
+/// keeps the real value. The end texts keep the text of the real value (for example "10 s").
+/// ntex counts the write, TLS handshake and frame read-rate limits in whole seconds, so these
+/// round up to a whole second.
+#[derive(Clone, Copy, Debug)]
+pub struct Timers {
+    /// The transport set-up and the CONNACK (10 s).
+    pub connect: Duration,
+    /// One publish, subscribe or unsubscribe, from the submit to the acknowledgement (10 s).
+    pub op: Duration,
+    /// A write that stays blocked ends the connection (10 s).
+    pub write: Duration,
+    /// The TLS handshake (5 s, the default of ntex-tls).
+    pub tls_handshake: Duration,
+    /// The WebSocket upgrade answer (5 s, the default of ntex).
+    pub ws_upgrade: Duration,
+    /// Frame read rate: the time of one check (10 s) ...
+    pub frame_check: Duration,
+    /// ... and the time that a whole packet may take (60 s).
+    pub frame_cap: Duration,
+}
+
+impl Default for Timers {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            op: OP_TIMEOUT,
+            write: Duration::from_secs(10),
+            tls_handshake: Duration::from_secs(5),
+            ws_upgrade: Duration::from_secs(5),
+            frame_check: Duration::from_secs(10),
+            frame_cap: Duration::from_secs(60),
         }
     }
 }
 
 /// Cancel value that means "stop the thread".
 const SHUTDOWN: u64 = u64::MAX;
-/// Time limit for the transport set-up and for the CONNACK.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time limit for one publish, subscribe or unsubscribe, from submit to the acknowledgement.
 /// A timeout ends the session, because the client keeps the operation and its payload.
 /// Unit tests use a short limit.
@@ -1525,6 +1563,7 @@ impl Resub {
                 ctx.maybe.clone(),
                 ctx.desired.clone(),
                 expired.clone(),
+                shared.limits.timers.op,
             ));
         }
         while ops.len() < MAX_PENDING_OPS / 2 && !self.pending.is_empty() {
@@ -1641,7 +1680,7 @@ async fn subscribe_op(
     shared: Rc<Shared>,
     expired: Rc<Notify>,
 ) {
-    let result = tokio::time::timeout(OP_TIMEOUT, async {
+    let result = tokio::time::timeout(shared.limits.timers.op, async {
         if let Some(e) = filter_error(&filter) {
             return Err(format!("Invalid topic filter: {e}"));
         }
@@ -1683,7 +1722,7 @@ async fn unsubscribe_op(
     expired: Rc<Notify>,
 ) {
     let fail = |why: &str| format!("Cannot unsubscribe from {filter}: {why}");
-    let result = tokio::time::timeout(OP_TIMEOUT, async {
+    let result = tokio::time::timeout(shared.limits.timers.op, async {
         if let Some(e) = filter_error(&filter) {
             return Err(fail(&format!("Invalid topic filter: {e}")));
         }
@@ -1724,8 +1763,9 @@ async fn stale_unsubscribe_op(
     maybe: SessionSubs,
     desired: Rc<RefCell<Vec<Want>>>,
     expired: Rc<Notify>,
+    limit: Duration,
 ) {
-    let sent = tokio::time::timeout(OP_TIMEOUT, async {
+    let sent = tokio::time::timeout(limit, async {
         if filter_error(&filter).is_some() {
             return Err(());
         }
@@ -1753,7 +1793,7 @@ async fn publish_op(
     if o.topic == "__panic__" {
         panic!("test: operation task panic");
     }
-    let result = match tokio::time::timeout(OP_TIMEOUT, wire.publish(&o)).await {
+    let result = match tokio::time::timeout(shared.limits.timers.op, wire.publish(&o)).await {
         Ok(result) => result,
         Err(_) => {
             expired.notify_one();
@@ -2263,238 +2303,6 @@ mod tests {
             .expect("events closed")
     }
 
-    /// The broker drops the connection. The net thread reconnects with the same generation. It
-    /// subscribes again with the filters of that moment, including one that the user added.
-    #[tokio::test(flavor = "current_thread")]
-    async fn reconnects_after_drop_and_resubscribes_live_filters() {
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
-        let seen_tx = std::sync::Mutex::new(seen_tx);
-        let broker = Fake::start(move |n, mut sock| {
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            while let Some((kind, body)) = read_packet(&mut sock) {
-                if kind != 0x82 {
-                    continue;
-                }
-                let filters = answer_subscribe(&mut sock, &body);
-                if n == 0 && filters == ["live/x"] {
-                    // Let the client see the SUBACK, then drop the connection.
-                    std::thread::sleep(Duration::from_millis(50));
-                    return;
-                }
-                if n == 1 {
-                    for f in filters {
-                        seen_tx.lock().expect("lock").send(f).expect("send");
-                    }
-                }
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &["base/#"]),
-        ))))
-        .expect("send");
-        let first = wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        assert!(matches!(
-            next_event(&mut net).await,
-            Event::Subscribed { filter, result: Ok(_), .. } if filter == "base/#"
-        ));
-        net.send(Command::Subscribe {
-            filter: "live/x".into(),
-            qos: Qos::AtMostOnce,
-            options: Default::default(),
-            req: 0,
-        })
-        .expect("send");
-        assert!(matches!(
-            next_event(&mut net).await,
-            Event::Subscribed { filter, result: Ok(_), .. } if filter == "live/x"
-        ));
-
-        let lost = wait_status(&mut net, |s| {
-            matches!(s.state, ConnState::Reconnecting { .. })
-        })
-        .await;
-        assert_eq!(lost.generation, first.generation);
-        assert!(matches!(
-            &lost.state,
-            ConnState::Reconnecting { attempt: 1, reason } if reason.contains("closed")
-        ));
-        let back = wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        assert_eq!(back.generation, first.generation, "same generation");
-
-        match next_event(&mut net).await {
-            Event::Reconnected { generation, .. } => assert_eq!(generation, first.generation),
-            other => panic!("expected Reconnected, got {other:?}"),
-        }
-        let mut filters = vec![];
-        for _ in 0..2 {
-            match next_event(&mut net).await {
-                Event::Subscribed {
-                    generation,
-                    filter,
-                    result: Ok(_),
-                    ..
-                } => {
-                    assert_eq!(generation, first.generation);
-                    filters.push(filter);
-                }
-                other => panic!("expected Subscribed, got {other:?}"),
-            }
-        }
-        filters.sort();
-        assert_eq!(filters, ["base/#", "live/x"]);
-        let mut seen: Vec<_> = (0..2)
-            .map(|_| {
-                seen_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("broker saw")
-            })
-            .collect();
-        seen.sort();
-        assert_eq!(seen, ["base/#", "live/x"]);
-        assert_eq!(broker.accepts(), 2);
-        net.shutdown().await;
-    }
-
-    /// Subscribe and Unsubscribe while we wait for the retry change the next resubscribe.
-    #[tokio::test(flavor = "current_thread")]
-    async fn filters_changed_during_backoff_are_used_by_the_next_attempt() {
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
-        let seen_tx = std::sync::Mutex::new(seen_tx);
-        let broker = Fake::start(move |n, mut sock| {
-            // First connection: refuse (temporary). Second: accept.
-            if n == 0 {
-                let _ = accept_connect(&mut sock, 0x88);
-                return;
-            }
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            while let Some((kind, body)) = read_packet(&mut sock) {
-                if kind == 0x82 {
-                    for f in answer_subscribe(&mut sock, &body) {
-                        seen_tx.lock().expect("lock").send(f).expect("send");
-                    }
-                }
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &["a", "b"]),
-        ))))
-        .expect("send");
-        wait_status(&mut net, |s| {
-            matches!(s.state, ConnState::Reconnecting { .. })
-        })
-        .await;
-        net.send(Command::Subscribe {
-            filter: "c".into(),
-            qos: Qos::AtMostOnce,
-            options: Default::default(),
-            req: 0,
-        })
-        .expect("send");
-        net.send(Command::Unsubscribe { filter: "a".into() })
-            .expect("send");
-        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        let mut seen: Vec<_> = (0..2)
-            .map(|_| {
-                seen_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("broker saw")
-            })
-            .collect();
-        seen.sort();
-        assert_eq!(seen, ["b", "c"]);
-        assert!(seen_rx.recv_timeout(Duration::from_millis(200)).is_err());
-        net.shutdown().await;
-    }
-
-    /// A refused port gives Reconnecting. A disconnect during the wait ends it at once, and no
-    /// other attempt follows.
-    #[tokio::test(flavor = "current_thread")]
-    async fn disconnect_during_backoff_cancels_at_once() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        }; // closed: connections are refused
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(port, &[]),
-        ))))
-        .expect("send");
-        let waiting = wait_status(&mut net, |s| {
-            matches!(s.state, ConnState::Reconnecting { .. })
-        })
-        .await;
-        let started = std::time::Instant::now();
-        net.disconnect();
-        let done = wait_status(&mut net, |s| s.state == ConnState::Disconnected).await;
-        assert!(
-            started.elapsed() < BACKOFF_BASE,
-            "cancel waited for the backoff"
-        );
-        assert_eq!(done.generation, waiting.generation);
-        // The wait is over. Nothing starts again.
-        tokio::time::sleep(BACKOFF_MAX / 2).await;
-        assert_eq!(net.status.borrow().state, ConnState::Disconnected);
-        net.shutdown().await;
-    }
-
-    /// A CONNACK "not authorized" is final. No second connection follows.
-    #[tokio::test(flavor = "current_thread")]
-    async fn not_authorized_fails_without_retry() {
-        let broker = Fake::start(|_, mut sock| {
-            let _ = accept_connect(&mut sock, 0x87);
-        });
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &[]),
-        ))))
-        .expect("send");
-        let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
-        assert!(
-            matches!(&s.state, ConnState::Failed(t) if t.contains("not authorized")),
-            "{s:?}"
-        );
-        tokio::time::sleep(BACKOFF_MAX).await;
-        assert!(matches!(net.status.borrow().state, ConnState::Failed(_)));
-        assert_eq!(broker.accepts(), 1, "no retry");
-        net.shutdown().await;
-    }
-
-    /// A CONNACK "server unavailable" is temporary. The thread retries with growing attempts.
-    #[tokio::test(flavor = "current_thread")]
-    async fn server_unavailable_is_retried() {
-        let broker = Fake::start(|_, mut sock| {
-            let _ = accept_connect(&mut sock, 0x88);
-        });
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &[]),
-        ))))
-        .expect("send");
-        let s = wait_status(&mut net, |s| {
-            matches!(s.state, ConnState::Reconnecting { .. })
-        })
-        .await;
-        assert!(matches!(
-            &s.state,
-            ConnState::Reconnecting { attempt: 1, reason } if reason.contains("not available")
-        ));
-        let s = wait_status(&mut net, |s| {
-            matches!(s.state, ConnState::Reconnecting { attempt: 2, .. })
-        })
-        .await;
-        assert_eq!(s.generation, 1);
-        assert!(broker.accepts() >= 2);
-        net.disconnect();
-        wait_status(&mut net, |s| s.state == ConnState::Disconnected).await;
-        net.shutdown().await;
-    }
-
     /// A broker that sends QoS 2 breaks the protocol. The session ends with a plain text and no
     /// retry. The net thread lives on and can connect again.
     #[tokio::test(flavor = "current_thread")]
@@ -2551,54 +2359,6 @@ mod tests {
         net.shutdown().await;
     }
 
-    /// After the user disconnects, nothing more goes to the UI queue, even if the broker keeps
-    /// sending. The queue is bounded, so what it already holds stays for the UI to read.
-    #[tokio::test(flavor = "current_thread")]
-    async fn nothing_is_queued_after_disconnect() {
-        let broker = Fake::start(|_, mut sock| {
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            let Some((0x82, body)) = read_packet(&mut sock) else {
-                return;
-            };
-            answer_subscribe(&mut sock, &body);
-            // PUBLISH QoS 0, topic "t", no properties, payload "x".
-            let publish = [0x30, 0x06, 0x00, 0x01, b't', 0x00, b'x', b'x'];
-            while sock.write_all(&publish).is_ok() {
-                std::thread::sleep(Duration::from_micros(100));
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &["t"]),
-        ))))
-        .expect("send");
-        let first = tokio::time::timeout(Duration::from_secs(5), net.incoming.recv())
-            .await
-            .expect("timeout")
-            .expect("message");
-        net.release(&first);
-        net.disconnect();
-        // From `Disconnecting` on, the net thread queues nothing. Empty the queue now, then
-        // wait for the end. The broker still sends all the time.
-        wait_status(&mut net, |s| {
-            matches!(s.state, ConnState::Disconnecting | ConnState::Disconnected)
-        })
-        .await;
-        while let Ok(m) = net.incoming.try_recv() {
-            net.release(&m);
-        }
-        wait_status(&mut net, |s| s.state == ConnState::Disconnected).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            net.incoming.try_recv().is_err(),
-            "a message came after Disconnected"
-        );
-        assert_eq!(net.queued_bytes(), 0);
-        net.shutdown().await;
-    }
-
     /// A panic in an operation task ends the session as Failed. The net thread lives on.
     #[tokio::test(flavor = "current_thread")]
     async fn operation_panic_fails_the_session_not_the_thread() {
@@ -2620,43 +2380,6 @@ mod tests {
         connect_to(&mut net, port).await;
         net.shutdown().await;
         server.join().expect("server");
-    }
-
-    /// A TLS server with an unknown CA: the user gets the plain text, and there is no retry.
-    #[tokio::test(flavor = "current_thread")]
-    async fn untrusted_certificate_fails_without_retry() {
-        use crate::tls::testutil::{cert, key};
-        use openssl::ssl::{SslAcceptor, SslMethod};
-        let (ca_key, srv_key) = (key(), key());
-        let ca = cert("Test CA", &ca_key, None, true, -1, 30);
-        let leaf = cert("localhost", &srv_key, Some((&ca, &ca_key)), false, -1, 30);
-        let mut acceptor =
-            SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).expect("acceptor");
-        acceptor.set_certificate(&leaf).expect("cert");
-        acceptor.set_private_key(&srv_key).expect("key");
-        let acceptor = acceptor.build();
-        let broker = Fake::start(move |_, sock| {
-            let _ = acceptor.accept(sock);
-        });
-        let mut net = Net::start(NetLimits::default());
-        let profile = Profile {
-            host: "localhost".into(),
-            port: broker.port,
-            transport: Transport::Tls,
-            subscriptions: vec![],
-            protocol: Protocol::V5,
-            ..Profile::default()
-        };
-        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
-            .expect("send");
-        let s = wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
-        assert!(
-            matches!(&s.state, ConnState::Failed(t) if t.contains("not trusted")),
-            "{s:?}"
-        );
-        tokio::time::sleep(BACKOFF_MAX / 2).await;
-        assert_eq!(broker.accepts(), 1, "no retry");
-        net.shutdown().await;
     }
 
     /// The TLS files are read off the net thread. A CA "file" that blocks for ever (a FIFO with no
@@ -2987,93 +2710,6 @@ mod tests {
         );
     }
 
-    /// The broker reads PINGREQ and never answers. Keep alive ends the attempt. ntex reports it as
-    /// a plain close, so the text is the general one. It ends within 2 x keep alive x 1.125 + 1 s (plan, "A dead peer is found").
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_missing_pingresp_ends_the_attempt_with_the_general_text() {
-        const KEEP_ALIVE: u16 = 2;
-        let broker = Fake::start(|_, mut sock| {
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            // No answer to PINGREQ. The read waits up to 5 s for each packet.
-            while read_packet(&mut sock).is_some() {}
-        });
-        let mut net = Net::start(NetLimits::default());
-        let profile = Profile {
-            keepalive_secs: KEEP_ALIVE,
-            ..tcp_profile(broker.port, &[])
-        };
-        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
-            .expect("send");
-        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        let up = std::time::Instant::now();
-        let lost = tokio::time::timeout(
-            Duration::from_secs(10),
-            net.status
-                .wait_for(|s| matches!(s.state, ConnState::Reconnecting { .. })),
-        )
-        .await
-        .expect("keep alive did not end the attempt")
-        .expect("status")
-        .clone();
-        let bound = 2.0 * f64::from(KEEP_ALIVE) * 1.125 + 1.0;
-        assert!(
-            up.elapsed().as_secs_f64() <= bound,
-            "{:?} > {bound} s",
-            up.elapsed()
-        );
-        assert!(
-            matches!(&lost.state, ConnState::Reconnecting { reason, .. } if reason == CONNECTION_CLOSED_TEXT),
-            "{lost:?}"
-        );
-        net.disconnect();
-        net.shutdown().await;
-    }
-
-    /// A server that accepts the TCP connection and never answers the WebSocket upgrade. ntex
-    /// ends the upgrade after 5 s with an I/O error "Timeout" (kind Other). That is temporary
-    /// and gets the same text as a TCP timeout. Without the `io_outcome` branch the text would
-    /// be "Network error: Timeout", and final.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_stalled_websocket_upgrade_is_a_temporary_timeout() {
-        let broker = Fake::start(|_, mut sock| {
-            sock.set_read_timeout(Some(Duration::from_secs(12)))
-                .expect("timeout");
-            let mut buf = [0u8; 1024];
-            while sock.read(&mut buf).is_ok_and(|n| n > 0) {}
-        });
-        let mut net = Net::start(NetLimits::default());
-        let profile = Profile {
-            transport: Transport::Ws,
-            ws_path: "/mqtt".into(),
-            ..tcp_profile(broker.port, &[])
-        };
-        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
-            .expect("send");
-        let started = std::time::Instant::now();
-        let lost = tokio::time::timeout(
-            Duration::from_secs(11),
-            net.status
-                .wait_for(|s| matches!(s.state, ConnState::Reconnecting { .. })),
-        )
-        .await
-        .expect("the upgrade timeout did not end the attempt")
-        .expect("status")
-        .clone();
-        assert!(
-            matches!(&lost.state, ConnState::Reconnecting { attempt: 1, reason } if reason == "The connection timed out."),
-            "{lost:?}"
-        );
-        assert!(
-            started.elapsed() >= Duration::from_secs(4),
-            "the ntex upgrade timeout (5 s) must end it: {:?}",
-            started.elapsed()
-        );
-        net.disconnect();
-        net.shutdown().await;
-    }
-
     /// The first protocol call never ends. The second one panics after an await. ntex runs it
     /// in a detached task, so only our `catch_unwind` can end the attempt: it must end with
     /// `Failed`, not hang. The net thread then connects again.
@@ -3392,22 +3028,6 @@ mod tests {
         p
     }
 
-    /// The Remaining Length of a minimal-encoded packet with this total size.
-    fn remaining_for_total(total: usize) -> usize {
-        (1..=4usize)
-            .map(|len| total - 1 - len)
-            .find(|&r| {
-                let l = match r {
-                    0..=127 => 1,
-                    128..=16_383 => 2,
-                    16_384..=2_097_151 => 3,
-                    _ => 4,
-                };
-                1 + l + r == total
-            })
-            .expect("a length fits")
-    }
-
     #[test]
     fn the_largest_remaining_length_is_exact_at_the_varint_boundaries() {
         // 1 + varint_len(r) + r <= max_packet, with the largest r. Values by hand.
@@ -3496,62 +3116,6 @@ mod tests {
         }
     }
 
-    /// Return codes 1 to 5 each have a plain text. Only "server unavailable" is retried.
-    #[tokio::test(flavor = "current_thread")]
-    async fn v3_connack_return_codes_have_plain_text() {
-        for (rc, retry, text) in [
-            (
-                1u8,
-                false,
-                "This broker does not support MQTT 3.1.1. Set Protocol to MQTT 5.",
-            ),
-            (
-                2,
-                false,
-                "The broker rejected the connection: the client ID is not valid.",
-            ),
-            (
-                3,
-                true,
-                "The broker rejected the connection: the server is not available.",
-            ),
-            (
-                4,
-                false,
-                "The broker rejected the connection: the user name or password is wrong.",
-            ),
-            (
-                5,
-                false,
-                "The broker rejected the connection: this client is not authorized.",
-            ),
-        ] {
-            let broker = Fake::start(move |_, mut sock| {
-                let _ = accept_v3(&mut sock, rc);
-            });
-            let mut net = Net::start(NetLimits::default());
-            connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
-            let s = wait_status(&mut net, |s| {
-                matches!(
-                    s.state,
-                    ConnState::Reconnecting { .. } | ConnState::Failed(_)
-                )
-            })
-            .await;
-            let want = if retry {
-                ConnState::Reconnecting {
-                    attempt: 1,
-                    reason: text.into(),
-                }
-            } else {
-                ConnState::Failed(text.into())
-            };
-            assert_eq!(s.state, want, "return code {rc}");
-            net.disconnect();
-            net.shutdown().await;
-        }
-    }
-
     /// Each version error of plan "Version errors", sent as raw bytes.
     async fn version_error(v3: bool, reply: &'static [u8]) -> ConnState {
         let broker = Fake::start(move |_, mut sock| {
@@ -3578,16 +3142,6 @@ mod tests {
         net.disconnect();
         net.shutdown().await;
         s.state
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn v5_connack_0x84_names_the_protocol_setting() {
-        assert_eq!(
-            version_error(false, &[0x20, 0x03, 0x00, 0x84, 0x00]).await,
-            ConnState::Failed(
-                "This broker does not support MQTT 5. Set Protocol to MQTT 3.1.1.".into()
-            )
-        );
     }
 
     /// A 3.1.1-only broker answers an MQTT 5 CONNECT with a 3.1.1 refusal (return code 1).
@@ -3682,42 +3236,6 @@ mod tests {
             net.disconnect();
             net.shutdown().await;
         }
-    }
-
-    /// v3: an UNSUBACK is done (it has no reason). The CONNECT, SUBSCRIBE and UNSUBSCRIBE of the
-    /// fake use packet IDs from the packets themselves.
-    #[tokio::test(flavor = "current_thread")]
-    async fn v3_unsuback_means_done() {
-        let broker = Fake::start(|_, mut sock| {
-            if accept_v3(&mut sock, 0).is_none() {
-                return;
-            }
-            suback_v3(&mut sock, 1);
-            while let Some((kind, body)) = read_packet(&mut sock) {
-                if kind == 0xa2 {
-                    let _ = sock.write_all(&[0xb0, 0x02, body[0], body[1]]);
-                }
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        connect_v3_to(&mut net, tcp_profile(broker.port, &["a/b"])).await;
-        assert!(matches!(
-            next_event(&mut net).await,
-            Event::Subscribed {
-                result: Ok(Qos::AtLeastOnce),
-                ..
-            }
-        ));
-        net.send(Command::Unsubscribe {
-            filter: "a/b".into(),
-        })
-        .expect("send");
-        assert!(matches!(
-            next_event(&mut net).await,
-            Event::Unsubscribed { filter, result: Ok(()), .. } if filter == "a/b"
-        ));
-        net.disconnect();
-        net.shutdown().await;
     }
 
     fn v3_publish_cmd(op_id: u64, qos: Qos, payload: Vec<u8>) -> Command {
@@ -3880,69 +3398,6 @@ mod tests {
         net.shutdown().await;
     }
 
-    /// Incoming boundary (plan, Facts, size row): a whole packet of exactly `max_packet` passes,
-    /// one byte more fails, on both versions.
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_incoming_packet_of_max_packet_passes_and_one_more_byte_fails() {
-        const MAX: usize = 1024;
-        for v5 in [false, true] {
-            for (total, ok) in [(MAX, true), (MAX + 1, false)] {
-                let packet = publish_with_remaining(remaining_for_total(total), v5, false);
-                assert_eq!(packet.len(), total, "the helper builds the size");
-                let broker = Fake::start(move |_, mut sock| {
-                    let connected = if v5 {
-                        accept_connect(&mut sock, 0)
-                    } else {
-                        accept_v3(&mut sock, 0).is_some()
-                    };
-                    if connected {
-                        let _ = sock.write_all(&packet);
-                        while read_packet(&mut sock).is_some() {}
-                    }
-                });
-                let mut net = Net::start(NetLimits {
-                    max_packet: MAX,
-                    ..NetLimits::default()
-                });
-                let p = tcp_profile(broker.port, &[]);
-                if v5 {
-                    net.send(Command::Connect(Box::new(ConnectConfig::from(p))))
-                        .expect("send");
-                } else {
-                    connect_v3_to(&mut net, p).await;
-                }
-                if ok {
-                    let m = tokio::time::timeout(Duration::from_secs(5), net.incoming.recv())
-                        .await
-                        .expect("timeout")
-                        .expect("message");
-                    assert_eq!(&*m.topic, "t", "v5 {v5}");
-                    let want = if v5 { Protocol::V5 } else { Protocol::V311 };
-                    assert_eq!(m.protocol, want, "v5 {v5}");
-                    assert_eq!(
-                        m.payload.len(),
-                        MAX - 1 - 2 - 3 - usize::from(v5),
-                        "v5 {v5}"
-                    );
-                    assert_eq!(net.status.borrow().state, ConnState::Connected);
-                } else {
-                    let s =
-                        wait_status(&mut net, |s| matches!(s.state, ConnState::Failed(_))).await;
-                    assert_eq!(
-                        s.state,
-                        ConnState::Failed(
-                            "The broker sent a packet that is larger than the allowed size.".into()
-                        ),
-                        "v5 {v5}"
-                    );
-                    assert!(net.incoming.try_recv().is_err());
-                }
-                net.disconnect();
-                net.shutdown().await;
-            }
-        }
-    }
-
     /// v3 checks the Remaining Length only. A non-minimal length encoding of the largest allowed
     /// value passes (the packet is 3 bytes over `max_packet`). One more fails.
     #[tokio::test(flavor = "current_thread")]
@@ -3980,63 +3435,6 @@ mod tests {
             net.disconnect();
             net.shutdown().await;
         }
-    }
-
-    /// Outgoing v3: exactly `max_packet` is sent. One byte more is refused before the send with
-    /// the text of the plan; the broker sees no PUBLISH for it.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_v3_publish_of_max_packet_is_sent_and_one_more_byte_is_refused() {
-        const MIB: usize = 1024 * 1024;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = std::sync::Mutex::new(tx);
-        let broker = Fake::start(move |_, mut sock| {
-            if accept_v3(&mut sock, 0).is_none() {
-                return;
-            }
-            while let Some((kind, body)) = read_packet(&mut sock) {
-                let varint = if body.len() < 128 {
-                    1
-                } else if body.len() < 16_384 {
-                    2
-                } else {
-                    3
-                };
-                // The size of the whole packet.
-                let _ = tx
-                    .lock()
-                    .expect("lock")
-                    .send((kind, 1 + varint + body.len()));
-                if kind & 0xf0 == 0x30 && kind & 0x06 != 0 {
-                    let _ = sock.write_all(&[0x40, 0x02, body[3], body[4]]);
-                }
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
-        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        // Topic "t", QoS 1: fixed header 1, length 3, topic 3, packet ID 2.
-        let payload = |total: usize| vec![b'x'; total - (1 + 3 + 3 + 2)];
-        net.send(v3_publish_cmd(1, Qos::AtLeastOnce, payload(MIB)))
-            .expect("send");
-        assert_eq!(published(&mut net, 1).await, PublishResult::Acknowledged);
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).expect("PUBLISH"),
-            (0x32, MIB)
-        );
-        net.send(v3_publish_cmd(2, Qos::AtLeastOnce, payload(MIB + 1)))
-            .expect("send");
-        assert_eq!(
-            published(&mut net, 2).await,
-            PublishResult::Rejected("MQTT 3.1.1 messages can be at most 1 MiB in this app.".into())
-        );
-        net.disconnect();
-        net.shutdown().await;
-        // After the refusal the broker saw only the DISCONNECT.
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).expect("DISCONNECT"),
-            (0xe0, 2)
-        );
-        assert!(rx.try_recv().is_err(), "no other packet");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -4086,76 +3484,6 @@ mod tests {
             retain_as_published: true,
             retain_handling: RetainHandling::Never,
         }
-    }
-
-    /// v5: the options go into the options byte of each SUBSCRIBE: QoS in bits 0-1, No Local
-    /// bit 2, Retain As Published bit 3, Retain Handling bits 4-5 (MQTT 5, 3.8.3.1).
-    #[tokio::test(flavor = "current_thread")]
-    async fn v5_subscribe_sends_the_options_byte() {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<(String, u8)>>();
-        let tx = std::sync::Mutex::new(tx);
-        let broker = Fake::start(move |_, mut sock| {
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            while let Some((kind, body)) = read_packet(&mut sock) {
-                if kind == 0x82 {
-                    tx.lock()
-                        .expect("lock")
-                        .send(subscribe_option_bytes(&body))
-                        .expect("send");
-                    answer_subscribe(&mut sock, &body);
-                }
-            }
-        });
-        let mut profile = tcp_profile(broker.port, &["a/b"]);
-        profile
-            .subscription_options
-            .insert("a/b".into(), all_options());
-        let net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(profile))))
-            .expect("send");
-        // QoS 0 | No Local 0x04 | Retain As Published 0x08 | Retain Handling 2 (0x20).
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)).expect("SUBSCRIBE"),
-            [("a/b".to_owned(), 0x2C)]
-        );
-        for (filter, qos, options, want) in [
-            ("c", Qos::AtLeastOnce, SubOptions::default(), 0x01),
-            (
-                "d",
-                Qos::AtMostOnce,
-                SubOptions {
-                    retain_handling: RetainHandling::OnNewSubscription,
-                    ..SubOptions::default()
-                },
-                0x10,
-            ),
-            (
-                "e",
-                Qos::AtLeastOnce,
-                SubOptions {
-                    no_local: true,
-                    ..SubOptions::default()
-                },
-                0x05,
-            ),
-        ] {
-            net.send(Command::Subscribe {
-                filter: filter.into(),
-                qos,
-                options,
-                req: 0,
-            })
-            .expect("send");
-            assert_eq!(
-                rx.recv_timeout(Duration::from_secs(5)).expect("SUBSCRIBE"),
-                [(filter.to_owned(), want)],
-                "filter {filter}"
-            );
-        }
-        net.disconnect();
-        net.shutdown().await;
     }
 
     /// v3: the SUBSCRIBE has the filter and one QoS byte. No option bit is set, whatever the
@@ -4383,65 +3711,6 @@ mod tests {
         net.shutdown().await;
     }
 
-    /// Without Server Keep Alive the effective keep alive is the one of the profile (60 s). A
-    /// bare CONNACK has the MQTT defaults.
-    #[tokio::test(flavor = "current_thread")]
-    async fn connection_details_use_the_profile_keep_alive_without_a_server_one() {
-        let broker = Fake::start(|_, mut sock| {
-            if accept_connect(&mut sock, 0) {
-                while read_packet(&mut sock).is_some() {}
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &[]),
-        ))))
-        .expect("send");
-        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        match next_event_any(&mut net).await {
-            Event::ConnectionDetails { details, .. } => {
-                let v5 = details.v5.expect("v5 details");
-                assert_eq!(
-                    (
-                        details.session_present,
-                        v5.keep_alive_secs,
-                        v5.server_keep_alive_secs
-                    ),
-                    (false, 60, None)
-                );
-            }
-            other => panic!("{other:?}"),
-        }
-        net.disconnect();
-        net.shutdown().await;
-    }
-
-    /// v3: the details have the session present flag and nothing else.
-    #[tokio::test(flavor = "current_thread")]
-    async fn v3_connection_details_have_only_the_session_flag() {
-        let broker = Fake::start(|_, mut sock| {
-            if accept_v3(&mut sock, 0).is_some() {
-                while read_packet(&mut sock).is_some() {}
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        connect_v3_to(&mut net, tcp_profile(broker.port, &[])).await;
-        wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        match next_event_any(&mut net).await {
-            Event::ConnectionDetails { details, .. } => assert_eq!(
-                *details,
-                ConnectionDetails {
-                    protocol: Protocol::V311,
-                    session_present: false,
-                    v5: None
-                }
-            ),
-            other => panic!("{other:?}"),
-        }
-        net.disconnect();
-        net.shutdown().await;
-    }
-
     /// A refused v5 CONNACK with a server reference: the old text stays, and the reference
     /// follows it (plan, "Server reference", D8).
     #[tokio::test(flavor = "current_thread")]
@@ -4513,89 +3782,9 @@ mod tests {
         net.shutdown().await;
     }
 
-    /// The user changes the options of a subscription that exists. The new options replace the
-    /// old ones in the wanted set: after a reconnect the filter comes with them.
-    #[tokio::test(flavor = "current_thread")]
-    async fn changed_options_stay_after_a_reconnect() {
-        let (tx, rx) = std::sync::mpsc::channel::<(String, u8)>();
-        let tx = std::sync::Mutex::new(tx);
-        let broker = Fake::start(move |n, mut sock| {
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            let mut seen = 0;
-            while let Some((kind, body)) = read_packet(&mut sock) {
-                if kind != 0x82 {
-                    continue;
-                }
-                answer_subscribe(&mut sock, &body);
-                seen += 1;
-                for item in subscribe_option_bytes(&body) {
-                    tx.lock().expect("lock").send(item).expect("send");
-                }
-                if n == 0 && seen == 2 {
-                    std::thread::sleep(Duration::from_millis(50));
-                    return;
-                }
-            }
-        });
-        let net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &["a"]),
-        ))))
-        .expect("send");
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)).expect("first"),
-            ("a".to_owned(), 0x00)
-        );
-        net.send(Command::Subscribe {
-            filter: "a".into(),
-            qos: Qos::AtMostOnce,
-            options: SubOptions {
-                no_local: true,
-                ..SubOptions::default()
-            },
-            req: 0,
-        })
-        .expect("send");
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)).expect("changed"),
-            ("a".to_owned(), 0x04)
-        );
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10)).expect("again"),
-            ("a".to_owned(), 0x04)
-        );
-        net.disconnect();
-        net.shutdown().await;
-    }
-
-    /// With a nearly full event log, a reconnect adds no event until the UI reads: the
-    /// `ConnectionDetails` of the new connection waits for room like `Reconnected`, and it comes
-    /// after the drain, once for each connect and with the generation of the connection.
-    #[tokio::test(flavor = "current_thread")]
-    async fn connection_details_wait_for_room_in_a_full_log_and_are_not_lost() {
-        let broker = Fake::start(|n, mut sock| {
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            if n == 0 {
-                // Time to fill the log, then the connection drops.
-                std::thread::sleep(Duration::from_millis(2500));
-                return;
-            }
-            while read_packet(&mut sock).is_some() {}
-        });
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &[]),
-        ))))
-        .expect("send");
-        let generation = wait_status(&mut net, |s| s.state == ConnState::Connected)
-            .await
-            .generation;
-        // Each invalid filter makes one `Subscribed` error event. Stop when the log is at its
-        // reserve: `send` then answers `Full` also after a pause.
+    /// Fills the event log up to its reserve: each invalid filter makes one `Subscribed` error
+    /// event, and `send` answers `Full` also after a pause when the log is at its reserve.
+    async fn fill_the_log(net: &mut Net) {
         let bad = || Command::Subscribe {
             filter: "a/#/b".into(),
             qos: Qos::AtMostOnce,
@@ -4615,115 +3804,14 @@ mod tests {
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let filled = net.events.len();
-        wait_status(&mut net, |s| {
-            matches!(s.state, ConnState::Reconnecting { .. })
-        })
-        .await;
-        let back = wait_status(&mut net, |s| s.state == ConnState::Connected).await;
-        assert_eq!(back.generation, generation);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            net.events.len(),
-            filled,
-            "no event is added while the log is full"
-        );
-
-        // The UI reads: the events of the new connection come now.
-        let mut order = vec![];
-        while let Ok(Some(event)) =
-            tokio::time::timeout(Duration::from_millis(700), net.recv_event()).await
-        {
-            match event {
-                Event::ConnectionDetails {
-                    generation: g,
-                    attempt,
-                    ..
-                } => order.push(format!("details {g} {}", attempt == back.attempt)),
-                Event::Reconnected { generation: g, .. } => order.push(format!("reconnected {g}")),
-                // The filler of the log.
-                Event::Subscribed { result: Err(_), .. } => {}
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        // The first connection's details were in the log before the fill (an older attempt).
-        // After them: the details of the new attempt, then `Reconnected`.
-        assert_eq!(
-            order,
-            [
-                format!("details {generation} false"),
-                format!("details {generation} true"),
-                format!("reconnected {generation}"),
-            ]
-        );
-        assert_eq!(net.stats.event_drops.load(Ordering::Relaxed), 0);
-        net.disconnect();
-        net.shutdown().await;
     }
 
-    /// The app keeps only the details of the latest connection. The log is full, a second
-    /// Connect replaces the first one, and its connection drops twice. After the drain the UI
-    /// has the details of the last connection once, with the newest generation, and no
-    /// details of the dropped attempts.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_full_log_keeps_only_the_details_of_the_latest_connection() {
-        // Each attempt has its own Receive Maximum: 10, 11, 12, 13.
-        let broker = Fake::start(|n, mut sock| {
-            let props = [0x21, 0x00, 10 + n as u8];
-            if !accept_v5_with(&mut sock, 0x00, 0x00, &props) {
-                return;
-            }
-            match n {
-                0 => std::thread::sleep(Duration::from_secs(8)),
-                1 | 2 => std::thread::sleep(Duration::from_millis(300)),
-                _ => while read_packet(&mut sock).is_some() {},
-            }
-        });
-        let mut net = Net::start(NetLimits::default());
-        let config = || ConnectConfig::from(tcp_profile(broker.port, &[]));
-        let g1 = net.connect(config()).expect("connect");
-        let first_attempt = wait_status(&mut net, |s| s.state == ConnState::Connected)
-            .await
-            .attempt;
-        let bad = || Command::Subscribe {
-            filter: "a/#/b".into(),
-            qos: Qos::AtMostOnce,
-            options: Default::default(),
-            req: 0,
-        };
-        loop {
-            match net.send(bad()) {
-                Ok(()) => {}
-                Err(SendError::Full) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    if matches!(net.send(bad()), Err(SendError::Full)) {
-                        break;
-                    }
-                }
-                Err(e) => panic!("{e}"),
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // The second Connect: attempt 1 drops, attempt 2 drops, attempt 3 stays.
-        let g2 = net.connect(config()).expect("connect");
-        assert!(g2 > g1);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-        let last = loop {
-            let s = net.status.borrow().clone();
-            if broker.accepts() == 4 && s.generation == g2 && s.state == ConnState::Connected {
-                break s;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "no third connection: {s:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
+    /// Reads the log until nothing comes for 400 ms. Returns the details and the `Reconnected`
+    /// events as text: "details <generation> <receive maximum> <attempt>", "reconnected <gen>".
+    async fn drain_details(net: &mut Net) -> Vec<String> {
         let mut order = vec![];
         while let Ok(Some(event)) =
-            tokio::time::timeout(Duration::from_millis(700), net.recv_event()).await
+            tokio::time::timeout(Duration::from_millis(400), net.recv_event()).await
         {
             match event {
                 Event::ConnectionDetails {
@@ -4742,14 +3830,96 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
-        // g1: its details were in the log before the fill (Receive Maximum 10). g2: one, with
-        // the values of the last attempt (13) and the attempt of the final Connected status,
-        // then `Reconnected`. The dropped attempts (11, 12) left nothing.
+        order
+    }
+
+    /// The details of a connection with a nearly full event log (the UI does not read). The
+    /// connections have the Receive Maximum 10, 11, 12, 13, 14 (one for each accept).
+    /// 1. The connection drops. The details of the new connection wait for room like
+    ///    `Reconnected`, and they come after the drain, once for each connect and with the
+    ///    generation of the connection. No event is added while the log is full.
+    /// 2. The app keeps only the details of the latest connection. A second Connect replaces
+    ///    the first one, and its connection drops twice. After the drain the UI has the details
+    ///    of the last connection once, with the newest generation, and none of the dropped ones.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_log_keeps_the_details_of_the_latest_connection_and_loses_none() {
+        // The test tells the first connection when to drop (no fixed wait).
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+        let drop_rx = std::sync::Mutex::new(drop_rx);
+        let broker = Fake::start(move |n, mut sock| {
+            let props = [0x21, 0x00, 10 + n as u8];
+            if !accept_v5_with(&mut sock, 0x00, 0x00, &props) {
+                return;
+            }
+            match n {
+                0 => {
+                    let _ = drop_rx
+                        .lock()
+                        .expect("lock")
+                        .recv_timeout(Duration::from_secs(10));
+                }
+                2 | 3 => std::thread::sleep(Duration::from_millis(300)),
+                _ => while read_packet(&mut sock).is_some() {},
+            }
+        });
+        let mut net = Net::start(NetLimits::default());
+        let config = || ConnectConfig::from(tcp_profile(broker.port, &[]));
+
+        // 1. One drop.
+        let generation = net.connect(config()).expect("connect");
+        let first = wait_status(&mut net, |s| s.state == ConnState::Connected)
+            .await
+            .attempt;
+        fill_the_log(&mut net).await;
+        let filled = net.events.len();
+        drop_tx.send(()).expect("broker");
+        wait_status(&mut net, |s| {
+            matches!(s.state, ConnState::Reconnecting { .. })
+        })
+        .await;
+        let back = wait_status(&mut net, |s| s.state == ConnState::Connected).await;
+        assert_eq!(back.generation, generation);
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
-            order,
+            net.events.len(),
+            filled,
+            "no event is added while the log is full"
+        );
+        // The first connection's details were in the log before the fill (an older attempt).
+        // After them: the details of the new attempt, then `Reconnected`.
+        assert_eq!(
+            drain_details(&mut net).await,
             [
-                format!("details {g1} 10 {}", first_attempt),
-                format!("details {g2} 13 {}", last.attempt),
+                format!("details {generation} 10 {first}"),
+                format!("details {generation} 11 {}", back.attempt),
+                format!("reconnected {generation}"),
+            ]
+        );
+
+        // 2. A second Connect: connection 2 drops, connection 3 drops, connection 4 stays.
+        fill_the_log(&mut net).await;
+        let g2 = net.connect(config()).expect("connect");
+        assert!(g2 > generation);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        let last = loop {
+            let s = net.status.borrow().clone();
+            if broker.accepts() == 5 && s.generation == g2 && s.state == ConnState::Connected {
+                break s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no third connection: {s:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // g2: one set of details, with the values of the last attempt (14) and the attempt of
+        // the final Connected status, then `Reconnected`. The dropped attempts (12, 13) left
+        // nothing.
+        assert_eq!(
+            drain_details(&mut net).await,
+            [
+                format!("details {g2} 14 {}", last.attempt),
                 format!("reconnected {g2}"),
             ]
         );
@@ -4758,88 +3928,141 @@ mod tests {
         net.shutdown().await;
     }
 
-    /// Each `Subscribed` result has the `req` of the latest accepted Subscribe of its filter:
-    /// the first subscribe from the profile (0), live subscribes, a local refusal, and the
-    /// automatic resubscribe after a reconnect, which uses the stored `req`.
+    /// One CONNACK refusal: the plan texts and the retry rule. The rows are a MQTT 3.1.1 return
+    /// code (1 to 5) or a MQTT 5 reason code, sent as raw bytes. Only "server unavailable" is
+    /// retried.
     #[tokio::test(flavor = "current_thread")]
-    async fn subscribed_results_echo_the_req_also_on_resubscribe() {
-        let broker = Fake::start(|n, mut sock| {
-            if !accept_connect(&mut sock, 0) {
-                return;
-            }
-            while let Some((kind, body)) = read_packet(&mut sock) {
-                if kind != 0x82 {
-                    continue;
-                }
-                let filters = answer_subscribe(&mut sock, &body);
-                if n == 0 && filters == ["b"] {
-                    std::thread::sleep(Duration::from_millis(50));
-                    return;
-                }
-            }
-        });
-        let y = SubOptions {
-            no_local: true,
-            ..SubOptions::default()
-        };
-        let mut net = Net::start(NetLimits::default());
-        net.send(Command::Connect(Box::new(ConnectConfig::from(
-            tcp_profile(broker.port, &["a"]),
-        ))))
-        .expect("send");
-        let next = async |net: &mut Net| loop {
-            match next_event(net).await {
-                Event::Subscribed {
-                    filter,
-                    req,
-                    result,
-                    ..
-                } => return (filter, req, result.is_ok()),
-                // One after the reconnect.
-                Event::Reconnected { .. } => {}
-                other => panic!("expected Subscribed, got {other:?}"),
-            }
-        };
-        let live = |net: &Net, filter: &str, options, req| {
-            net.send(Command::Subscribe {
-                filter: filter.into(),
-                qos: Qos::AtMostOnce,
-                options,
-                req,
-            })
-            .expect("send");
-        };
-        let mut seen = vec![next(&mut net).await];
-        live(&net, "$share/g/t", y, 7);
-        seen.push(next(&mut net).await);
-        // The same filter twice with the same options: each result has its own req.
-        live(&net, "a", SubOptions::default(), 11);
-        seen.push(next(&mut net).await);
-        live(&net, "a", SubOptions::default(), 12);
-        seen.push(next(&mut net).await);
-        live(&net, "b", y, 9);
-        seen.push(next(&mut net).await);
-        // The connection drops. The resubscribe of the wanted set follows ("$share/g/t" is
-        // refused again, locally). Each filter has the req of its latest accepted Subscribe.
-        for _ in 0..3 {
-            seen.push(next(&mut net).await);
+    async fn connack_refusals_have_plain_text_and_the_right_retry_rule() {
+        /// The extra check of a row.
+        enum Then {
+            Nothing,
+            /// Wait for `BACKOFF_MAX`: no second connection.
+            NoRetry,
+            /// Attempt 2 comes, with the same generation.
+            Retry,
         }
-        // The local refusal and the SUBACKs of the resubscribe come in any order.
-        seen[5..].sort_by(|l, r| l.0.cmp(&r.0));
-        assert_eq!(
-            seen,
-            [
-                ("a".to_owned(), 0, true),
-                ("$share/g/t".to_owned(), 7, false),
-                ("a".to_owned(), 11, true),
-                ("a".to_owned(), 12, true),
-                ("b".to_owned(), 9, true),
-                ("$share/g/t".to_owned(), 7, false),
-                ("a".to_owned(), 12, true),
-                ("b".to_owned(), 9, true),
-            ]
-        );
-        net.disconnect();
-        net.shutdown().await;
+        // (v3, CONNACK bytes, retried, text, the text must be exact, extra check)
+        type Row = (bool, &'static [u8], bool, &'static str, bool, Then);
+        let rows: [Row; 8] = [
+            (
+                true,
+                &[0x20, 0x02, 0x00, 1],
+                false,
+                "This broker does not support MQTT 3.1.1. Set Protocol to MQTT 5.",
+                true,
+                Then::Nothing,
+            ),
+            (
+                true,
+                &[0x20, 0x02, 0x00, 2],
+                false,
+                "The broker rejected the connection: the client ID is not valid.",
+                true,
+                Then::Nothing,
+            ),
+            (
+                true,
+                &[0x20, 0x02, 0x00, 3],
+                true,
+                "The broker rejected the connection: the server is not available.",
+                true,
+                Then::Nothing,
+            ),
+            (
+                true,
+                &[0x20, 0x02, 0x00, 4],
+                false,
+                "The broker rejected the connection: the user name or password is wrong.",
+                true,
+                Then::Nothing,
+            ),
+            (
+                true,
+                &[0x20, 0x02, 0x00, 5],
+                false,
+                "The broker rejected the connection: this client is not authorized.",
+                true,
+                Then::Nothing,
+            ),
+            // v5 0x84: the MQTT 5 name of "unsupported protocol version".
+            (
+                false,
+                &[0x20, 0x03, 0x00, 0x84, 0x00],
+                false,
+                "This broker does not support MQTT 5. Set Protocol to MQTT 3.1.1.",
+                true,
+                Then::Nothing,
+            ),
+            (
+                false,
+                &[0x20, 0x03, 0x00, 0x87, 0x00],
+                false,
+                "not authorized",
+                false,
+                Then::NoRetry,
+            ),
+            (
+                false,
+                &[0x20, 0x03, 0x00, 0x88, 0x00],
+                true,
+                "not available",
+                false,
+                Then::Retry,
+            ),
+        ];
+        for (i, (v3, reply, retry, text, exact, then)) in rows.into_iter().enumerate() {
+            let broker = Fake::start(move |_, mut sock| {
+                if read_packet(&mut sock).is_some() {
+                    let _ = sock.write_all(reply);
+                }
+            });
+            let mut net = Net::start(NetLimits::default());
+            let p = tcp_profile(broker.port, &[]);
+            if v3 {
+                connect_v3_to(&mut net, p).await;
+            } else {
+                net.send(Command::Connect(Box::new(ConnectConfig::from(p))))
+                    .expect("send");
+            }
+            let s = wait_status(&mut net, |s| {
+                matches!(
+                    s.state,
+                    ConnState::Reconnecting { .. } | ConnState::Failed(_)
+                )
+            })
+            .await;
+            let (retried, got) = match &s.state {
+                ConnState::Reconnecting { attempt: 1, reason } => (true, reason.as_str()),
+                ConnState::Failed(t) => (false, t.as_str()),
+                other => panic!("row {i}: unexpected {other:?}"),
+            };
+            assert_eq!(retried, retry, "row {i}: {s:?}");
+            assert!(
+                if exact {
+                    got == text
+                } else {
+                    got.contains(text)
+                },
+                "row {i}: {got:?} is not {text:?}"
+            );
+            match then {
+                Then::Nothing => {}
+                Then::NoRetry => {
+                    tokio::time::sleep(BACKOFF_MAX).await;
+                    assert!(matches!(net.status.borrow().state, ConnState::Failed(_)));
+                    assert_eq!(broker.accepts(), 1, "no retry");
+                }
+                Then::Retry => {
+                    let s = wait_status(&mut net, |s| {
+                        matches!(s.state, ConnState::Reconnecting { attempt: 2, .. })
+                    })
+                    .await;
+                    assert_eq!(s.generation, 1);
+                    assert!(broker.accepts() >= 2);
+                }
+            }
+            net.disconnect();
+            net.shutdown().await;
+        }
     }
 }

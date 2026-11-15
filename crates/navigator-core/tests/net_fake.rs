@@ -1,7 +1,11 @@
 //! Tests of `Net` against a fake broker (no real broker needed): the "Robust connection" rules of
-//! the ntex plan for TCP, TLS, WS and WSS, each for MQTT 3.1.1 and MQTT 5. The fake broker sends
-//! and withholds bytes on purpose. Every bound is the bound of the plan. The timers are the
-//! production values.
+//! the ntex plan. Each transport (TCP, TLS, WS, WSS) and each MQTT version (3.1.1, 5) is used at
+//! least once. A case runs for another transport or version only where the code differs; the
+//! comment of the case names that code. The fake broker sends and withholds bytes on purpose.
+//!
+//! Timers: every time limit of `Net` has one case with the real (production) value; the comment
+//! of that case says so. The other cases use `short()` and scale the bounds of the plan from the
+//! timer value.
 
 #[path = "common/fake.rs"]
 mod fake;
@@ -14,8 +18,29 @@ use fake::{Fake, Options, ws_frame};
 use navigator_core::model::{MsgProps, Qos};
 use navigator_core::net::{
     Command, ConnState, ConnectConfig, Event, Net, NetLimits, Outgoing, Profile, Protocol,
-    PublishResult, Status, Transport,
+    PublishResult, Status, Timers, Transport,
 };
+
+/// Short timers for the cases that need not wait for the real values. ntex counts the write,
+/// TLS handshake and frame read-rate limits in whole seconds, so none is below 1 s.
+fn short() -> Timers {
+    Timers {
+        connect: Duration::from_secs(2),
+        op: Duration::from_secs(2),
+        write: Duration::from_secs(2),
+        tls_handshake: Duration::from_secs(1),
+        ws_upgrade: Duration::from_secs(1),
+        frame_check: Duration::from_secs(1),
+        frame_cap: Duration::from_secs(3),
+    }
+}
+
+fn start(timers: Timers) -> Net {
+    Net::start(NetLimits {
+        timers,
+        ..NetLimits::default()
+    })
+}
 
 /// The profile for a fake broker. TLS trusts the fake's CA.
 fn config(f: &Fake, t: Transport, v: Protocol, keepalive_secs: u16) -> ConnectConfig {
@@ -89,43 +114,19 @@ async fn drain_until_quiet(
     }
 }
 
-/// Makes the 8 tests of one case: MQTT 3.1.1 and MQTT 5 on TCP, TLS, WS and WSS.
-macro_rules! all_wires {
-    ($case:ident) => {
+/// Makes the tests of one case, each for one transport and one version. The cases are the
+/// diagonal: every transport and every version is used, and the code that differs between the
+/// two versions or the four transports is reached at least once.
+macro_rules! wires {
+    ($case:ident: $($name:ident $t:ident $v:ident),+ $(,)?) => {
         mod $case {
             use super::*;
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_tcp() {
-                super::$case(Transport::Tcp, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_tls() {
-                super::$case(Transport::Tls, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_ws() {
-                super::$case(Transport::Ws, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_wss() {
-                super::$case(Transport::Wss, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_tcp() {
-                super::$case(Transport::Tcp, Protocol::V5).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_tls() {
-                super::$case(Transport::Tls, Protocol::V5).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_ws() {
-                super::$case(Transport::Ws, Protocol::V5).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_wss() {
-                super::$case(Transport::Wss, Protocol::V5).await
-            }
+            $(
+                #[tokio::test(flavor = "current_thread")]
+                async fn $name() {
+                    super::$case(Transport::$t, Protocol::$v).await
+                }
+            )+
         }
     };
 }
@@ -137,24 +138,27 @@ const CONNECTION_CLOSED_TEXT: &str =
 
 /// The broker takes CONNECT and then stops reading. Our sends fill the buffers and block. Plan,
 /// "A peer that stops reading cannot block us": a blocked publish ends with `TimedOut` in at most
-/// 11 s, and the attempt ends at most write timeout + 2.5 s = 12.5 s after the send began. The
-/// operation timer (10 s from the submit, final) and the write timeout (10 s, temporary) race.
-/// Either one is right, so the test accepts exactly these two ends.
-async fn stalled_write(t: Transport, v: Protocol) {
-    stalled_write_with(t, v, 0).await;
-}
-
-/// With keep alive 2 s the PINGREQ sits behind the blocked data. The bound is 2 x keep alive x
-/// 1.125 + write timeout + 2.5 s = 17 s (plan, row "A dead peer is found"); the same ends are
-/// right.
-async fn stalled_write_with(t: Transport, v: Protocol, keep_alive: u16) {
-    let bound = if keep_alive == 0 { 12.5 } else { 17.0 };
+/// operation timeout + 1 s, and the attempt ends at most write timeout + 2.5 s after the send
+/// began (with keep alive 2 s: + 2 x keep alive x 1.125, as the PINGREQ sits behind the blocked
+/// data; plan, row "A dead peer is found"). The operation timer (from the submit, final) and the
+/// write timeout (temporary) race when they are equal. Either one is right, so the test accepts
+/// exactly these two ends. When one timer is shorter, only it can end the attempt, and the test
+/// expects its end. The bounds scale with the shorter timer.
+async fn stalled_write(t: Transport, v: Protocol, keep_alive: u16, timers: Timers) {
+    let (write, op) = (timers.write.as_secs_f64(), timers.op.as_secs_f64());
+    let first = write.min(op);
+    let ka_part = if keep_alive == 0 {
+        0.0
+    } else {
+        2.0 * f64::from(keep_alive) * 1.125
+    };
+    let bound = first + 2.5 + ka_part;
     let f = Fake::start(t, v, Options::default(), |_, mut conn| {
         if conn.accept_connect().is_ok() {
             conn.stop_reading(Duration::from_secs(30));
         }
     });
-    let mut net = Net::start(NetLimits::default());
+    let mut net = start(timers);
     connect(&mut net, config(&f, t, v, keep_alive)).await;
     const SENDS: usize = 24;
     let started = Instant::now();
@@ -178,14 +182,26 @@ async fn stalled_write_with(t: Transport, v: Protocol, keep_alive: u16) {
     .await;
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_secs(9) && took <= Duration::from_secs_f64(bound),
-        "the attempt ended after {took:?}, not between 9 s and {bound} s"
+        took >= Duration::from_secs_f64(first - 1.0) && took <= Duration::from_secs_f64(bound),
+        "the attempt ended after {took:?}, not between {} s and {bound} s",
+        first - 1.0
     );
     let by_write_timeout = match &ended.state {
         ConnState::Failed(text) if text == OP_TIMEOUT_END_TEXT => false,
         ConnState::Reconnecting { attempt: 1, reason } if reason == WRITE_TIMEOUT_TEXT => true,
         other => panic!("unexpected end of the attempt: {other:?}"),
     };
+    if write < op {
+        assert!(
+            by_write_timeout,
+            "the write timeout is the shorter one: {ended:?}"
+        );
+    } else if op < write {
+        assert!(
+            !by_write_timeout,
+            "the operation timeout is the shorter one: {ended:?}"
+        );
+    }
     while results.len() < SENDS {
         match tokio::time::timeout(Duration::from_secs(2), net.events.recv()).await {
             Ok(Some(Event::Published { result, .. })) => results.push((started.elapsed(), result)),
@@ -206,12 +222,13 @@ async fn stalled_write_with(t: Transport, v: Protocol, keep_alive: u16) {
             "no blocked send reported LostOnDisconnect: {results:?}"
         );
     } else {
-        // A blocked publish reports `TimedOut` in at most 11 s. More than one can be blocked.
+        // A blocked publish reports `TimedOut` in at most operation timeout + 1 s. More than
+        // one can be blocked.
         assert!(!timed_out.is_empty(), "{results:?}");
         assert!(
             timed_out
                 .iter()
-                .all(|(at, _)| *at <= Duration::from_secs(11)),
+                .all(|(at, _)| *at <= Duration::from_secs_f64(op + 1.0)),
             "{timed_out:?}"
         );
     }
@@ -226,35 +243,76 @@ async fn stalled_write_with(t: Transport, v: Protocol, keep_alive: u16) {
     net.shutdown().await;
 }
 
-all_wires!(stalled_write);
+/// REAL VALUE of the operation timeout (10 s). The write timeout is 60 s, so only the operation
+/// timer can end the attempt: the final end text, `TimedOut` in at most 11 s, the end in at most
+/// 12.5 s.
+#[tokio::test(flavor = "current_thread")]
+async fn v5_tcp_stalled_write_with_the_real_operation_timeout() {
+    let timers = Timers {
+        write: Duration::from_secs(60),
+        ..Timers::default()
+    };
+    stalled_write(Transport::Tcp, Protocol::V5, 0, timers).await;
+}
 
-/// The write timeout alone. ntex starts its write timeout (10 s) when the write buffer goes above
-/// the high watermark and does not drain. The operation timer (10 s) of a send starts at its
-/// submit. The fake broker reads nothing after CONNECT. The test sends QoS 0 messages one at a
-/// time. After each result it waits 4.5 s, so the write timeout of the stalled buffer is already
-/// running. The first send that gets no result in 0.7 s is the blocked one.
-///
-/// Let T0 be the time of the stall. The write timeout ends the attempt at T0 + 10 s to T0 + 12 s
-/// (the timer can be up to 1 s late, then up to 1 s of I/O shutdown). The blocked send comes at
-/// about T0 + 4.5 s, so the write timeout ends the attempt 5.5 s to 7.5 s after it. The operation
-/// timer of the blocked send ends it at 10 s after the send. So only the write timeout can end
-/// the attempt less than 9.8 s after that send: the end is temporary
-/// (`Reconnecting`) with the write timeout text, and no send reports `TimedOut`. Without the write
-/// timeout, the operation timer ends the attempt with the final operation text and the test fails
-/// (mutation check in the S3 report).
-async fn write_timeout_alone(v: Protocol) {
-    let f = Fake::start(Transport::Tcp, v, Options::default(), |_, mut conn| {
-        if conn.accept_connect().is_ok() {
-            conn.stop_reading(Duration::from_secs(60));
-        }
-    });
-    let mut net = Net::start(NetLimits::default());
-    connect(&mut net, config(&f, Transport::Tcp, v, 0)).await;
+// The short cases (write timeout = operation timeout = 2 s: the two race): TLS, WS and WSS carry
+// the data through other layers (the TLS record buffer, the WebSocket frame sink), so the blocked
+// write must end there too. v3 and v5 differ in the codec (`wire.rs`, v3 and v5 sinks).
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_stalled_write() {
+    stalled_write(Transport::Tls, Protocol::V311, 0, short()).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v5_ws_stalled_write() {
+    stalled_write(Transport::Ws, Protocol::V5, 0, short()).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_wss_stalled_write() {
+    stalled_write(Transport::Wss, Protocol::V311, 0, short()).await;
+}
+
+/// With keep alive 2 s the PINGREQ sits behind the blocked data (the keep-alive timer and the
+/// write timeout meet; the same ends are right).
+#[tokio::test(flavor = "current_thread")]
+async fn v5_stalled_write_with_keep_alive_2_s() {
+    stalled_write(Transport::Tcp, Protocol::V5, 2, short()).await;
+}
+
+/// REAL VALUE of the write timeout (10 s). The write timeout alone: the operation timeout is 60 s,
+/// so only the write timeout can end the attempt. ntex starts its write timeout when the write
+/// buffer goes above the high watermark and does not drain. The fake broker reads nothing after
+/// CONNECT. The test sends QoS 0 messages one at a time and takes the first one that gets no
+/// result in 0.4 s: the buffer is full, so the stall began at about that send. The write timeout
+/// ends the attempt at 10 s to 12 s after the stall (the timer can be up to 1 s late, then up to
+/// 1 s of I/O shutdown). The end is temporary (`Reconnecting`) with the write timeout text, and
+/// the blocked send is `LostOnDisconnect`, not `TimedOut`. Without the write timeout, nothing
+/// ends the attempt in that time and the test fails (mutation check in the S3 report).
+#[tokio::test(flavor = "current_thread")]
+async fn v5_write_timeout_alone_is_a_temporary_failure() {
+    let timers = Timers {
+        op: Duration::from_secs(60),
+        ..Timers::default()
+    };
+    let write = timers.write.as_secs_f64();
+    let f = Fake::start(
+        Transport::Tcp,
+        Protocol::V5,
+        Options::default(),
+        |_, mut conn| {
+            if conn.accept_connect().is_ok() {
+                conn.stop_reading(Duration::from_secs(60));
+            }
+        },
+    );
+    let mut net = start(timers);
+    connect(&mut net, config(&f, Transport::Tcp, Protocol::V5, 0)).await;
     let mut blocked_at = None;
     'sends: for op_id in 0..60u64 {
         let submitted = Instant::now();
         net.send(big_publish(op_id, Qos::AtMostOnce)).expect("send");
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
         loop {
             match tokio::time::timeout_at(deadline, net.events.recv()).await {
                 Ok(Some(Event::Published { result, .. })) => {
@@ -269,17 +327,16 @@ async fn write_timeout_alone(v: Protocol) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(4_500)).await;
     }
     let blocked_at = blocked_at.expect("the write never blocked");
-    let ended = status_where(&mut net, Duration::from_secs(12), |s| {
+    let ended = status_where(&mut net, Duration::from_secs_f64(write + 4.0), |s| {
         s.state != ConnState::Connected
     })
     .await;
-    let took = blocked_at.elapsed();
+    let took = blocked_at.elapsed().as_secs_f64();
     assert!(
-        took < Duration::from_millis(9_800),
-        "the attempt ended {took:?} after the blocked send ({ended:?}): not before its operation timer"
+        (write - 1.0..=write + 2.5).contains(&took),
+        "the attempt ended {took} s after the blocked send ({ended:?})"
     );
     assert!(
         matches!(&ended.state, ConnState::Reconnecting { attempt: 1, reason } if reason == WRITE_TIMEOUT_TEXT),
@@ -296,55 +353,6 @@ async fn write_timeout_alone(v: Protocol) {
     assert_eq!(results, [PublishResult::LostOnDisconnect]);
     net.disconnect();
     net.shutdown().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v3_write_timeout_alone_is_a_temporary_failure() {
-    write_timeout_alone(Protocol::V311).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_write_timeout_alone_is_a_temporary_failure() {
-    write_timeout_alone(Protocol::V5).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v3_stalled_write_with_keep_alive_2_s() {
-    stalled_write_with(Transport::Tcp, Protocol::V311, 2).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_stalled_write_with_keep_alive_2_s() {
-    stalled_write_with(Transport::Tcp, Protocol::V5, 2).await;
-}
-
-/// Like `all_wires!`, for TCP and TLS only (the cases of the frame read rate).
-macro_rules! stream_wires {
-    ($case:ident $(, #[$attr:meta])*) => {
-        mod $case {
-            use super::*;
-            $(#[$attr])*
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_tcp() {
-                super::$case(Transport::Tcp, Protocol::V311).await
-            }
-            $(#[$attr])*
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_tls() {
-                super::$case(Transport::Tls, Protocol::V311).await
-            }
-            $(#[$attr])*
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_tcp() {
-                super::$case(Transport::Tcp, Protocol::V5).await
-            }
-            $(#[$attr])*
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_tls() {
-                super::$case(Transport::Tls, Protocol::V5).await
-            }
-        }
-    };
 }
 
 fn small_publish(op_id: u64) -> Command {
@@ -431,11 +439,13 @@ async fn missing_pingresp_full(t: Transport, v: Protocol, keep_alive: u16, publi
     net.shutdown().await;
 }
 
-all_wires!(missing_pingresp);
+// The close of WS and WSS waits up to 1 s for the peer (`wire.rs`, WebSocket sink), so each
+// transport needs its own run; the versions differ in the keep-alive path of the two codecs.
+wires!(missing_pingresp: v5_tcp Tcp V5, v3_tls Tls V311, v5_ws Ws V5, v3_wss Wss V311);
 
-/// Keep alive 60 s and 70 s (70 s is in the 8 s timer step range and checks the rounding): the
-/// plan bound 2 x keep alive x 1.125 + 1 s is 136 s and 158.5 s. These run more than 2 minutes,
-/// so they are `#[ignore]`: run them with `--ignored`.
+/// REAL VALUES of the keep alive: 60 s (v5) and 70 s (v3; 70 s is in the 8 s timer step range and
+/// checks the rounding). The plan bound 2 x keep alive x 1.125 + 1 s is 136 s and 158.5 s. These
+/// run more than 2 minutes, so they are `#[ignore]`: run them with `--ignored`.
 macro_rules! long_keep_alive {
     ($name:ident, $t:expr, $v:expr, $ka:expr) => {
         #[tokio::test(flavor = "current_thread")]
@@ -446,45 +456,38 @@ macro_rules! long_keep_alive {
     };
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn v3_missing_pingresp_with_publishes() {
-    missing_pingresp_full(Transport::Tcp, Protocol::V311, 2, true).await;
-}
-
+/// Publishes do not hide a dead peer (the keep-alive timer sees only what the broker sends).
 #[tokio::test(flavor = "current_thread")]
 async fn v5_missing_pingresp_with_publishes() {
     missing_pingresp_full(Transport::Tcp, Protocol::V5, 2, true).await;
 }
 
-long_keep_alive!(v3_keep_alive_60_s, Transport::Tcp, Protocol::V311, 60);
 long_keep_alive!(v5_keep_alive_60_s, Transport::Tcp, Protocol::V5, 60);
 long_keep_alive!(v3_keep_alive_70_s, Transport::Tcp, Protocol::V311, 70);
-long_keep_alive!(v5_keep_alive_70_s, Transport::Tcp, Protocol::V5, 70);
 
 const READ_TIMEOUT_TEXT: &str = "The broker stopped in the middle of a packet.";
 
 /// TCP and TLS, keep alive 0: the broker sends a started packet and stops. A half packet ends at
-/// the first rate check of the frame read rate (10 s), plus timer step, shutdown and rounding: in
-/// at most 13 s (plan, "A started packet that stops cannot block us"). `first` is what the broker
-/// sends: half a fixed header, or a PUBLISH header and 10 bytes of its payload.
-async fn half_frame(t: Transport, v: Protocol, first: Vec<u8>) {
+/// the first rate check of the frame read rate, plus timer step, shutdown and rounding: in at
+/// most check time + 3 s (plan, "A started packet that stops cannot block us"). `first` is what
+/// the broker sends: half a fixed header, or a PUBLISH header and 10 bytes of its payload.
+async fn half_frame(t: Transport, v: Protocol, first: Vec<u8>, timers: Timers) {
+    let check = timers.frame_check.as_secs_f64();
+    let (lo, hi) = ((check - 1.0).max(check / 2.0), check + 3.0);
     let f = Fake::start(t, v, Options::default(), move |_, mut conn| {
         if conn.accept_connect().is_ok() && conn.send_raw(&first).is_ok() {
             conn.hold(Duration::from_secs(20));
         }
     });
-    let mut net = Net::start(NetLimits::default());
+    let mut net = start(timers);
     connect(&mut net, config(&f, t, v, 0)).await;
     let started = Instant::now();
-    let lost = status_where(&mut net, Duration::from_secs(14), |s| {
+    let lost = status_where(&mut net, Duration::from_secs_f64(hi + 1.0), |s| {
         s.state != ConnState::Connected
     })
     .await;
-    let took = started.elapsed();
-    assert!(
-        took >= Duration::from_secs(9) && took <= Duration::from_secs(13),
-        "ended after {took:?}"
-    );
+    let took = started.elapsed().as_secs_f64();
+    assert!((lo..=hi).contains(&took), "ended after {took} s");
     assert!(
         matches!(&lost.state, ConnState::Reconnecting { attempt: 1, reason } if reason == READ_TIMEOUT_TEXT),
         "{lost:?}"
@@ -493,23 +496,48 @@ async fn half_frame(t: Transport, v: Protocol, first: Vec<u8>) {
     net.shutdown().await;
 }
 
+/// Half a fixed header: the first byte of a PUBLISH, and a length byte with the continuation bit.
+/// The decoder keeps the bytes, so the frame read rate (the same one for each version and for
+/// TCP and TLS; TLS only adds the record layer) must end the wait.
 async fn half_fixed_header(t: Transport, v: Protocol) {
-    // The first byte of a PUBLISH, and a length byte with the continuation bit.
-    half_frame(t, v, vec![0x30, 0x80]).await;
+    half_frame(t, v, vec![0x30, 0x80], short()).await;
 }
-stream_wires!(half_fixed_header);
+wires!(half_fixed_header: v5_tcp Tcp V5, v3_tls Tls V311);
 
-async fn half_payload(t: Transport, v: Protocol) {
-    // A PUBLISH of 1000 bytes: the header and 10 bytes (topic "t/a" and 5 payload bytes).
-    // MQTT 5 adds an empty property length (0x00) before the payload.
+/// A PUBLISH of 1000 bytes: the header and 10 bytes (topic "t/a" and 5 payload bytes). MQTT 5
+/// adds an empty property length (0x00) before the payload.
+fn half_payload_bytes(v: Protocol) -> Vec<u8> {
     let mut first = vec![0x30, 0xe8, 0x07, 0x00, 0x03, b't', b'/', b'a'];
     if v == Protocol::V5 {
         first.push(0x00);
     }
     first.extend([b'x'; 5]);
-    half_frame(t, v, first).await;
+    first
 }
-stream_wires!(half_payload);
+
+/// REAL VALUE of the frame read-rate check (10 s): the half payload ends in at most 13 s.
+#[tokio::test(flavor = "current_thread")]
+async fn v5_tcp_half_payload_with_the_real_frame_check() {
+    half_frame(
+        Transport::Tcp,
+        Protocol::V5,
+        half_payload_bytes(Protocol::V5),
+        Timers::default(),
+    )
+    .await;
+}
+
+/// The v3 payload has no property length: its own decoder path (`ntex-mqtt` v3 codec).
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_half_payload() {
+    half_frame(
+        Transport::Tls,
+        Protocol::V311,
+        half_payload_bytes(Protocol::V311),
+        short(),
+    )
+    .await;
+}
 
 /// WS and WSS: the WebSocket layer keeps an incomplete frame until it is whole, so the frame read
 /// rate does not run. Keep alive finds the stall: a binary frame that stops in the middle ends in
@@ -542,42 +570,25 @@ async fn half_binary_frame(t: Transport, v: Protocol) {
     net.disconnect();
     net.shutdown().await;
 }
+wires!(half_binary_frame: v5_ws Ws V5, v3_wss Wss V311);
 
-macro_rules! ws_wires {
-    ($case:ident) => {
-        mod $case {
-            use super::*;
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_ws() {
-                super::$case(Transport::Ws, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_wss() {
-                super::$case(Transport::Wss, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_ws() {
-                super::$case(Transport::Ws, Protocol::V5).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_wss() {
-                super::$case(Transport::Wss, Protocol::V5).await
-            }
-        }
-    };
-}
-ws_wires!(half_binary_frame);
-
-/// A payload that arrives at more than 256 bytes in each 10 s and never completes ends at the 60 s
-/// cap (plan, same table row: at most 6 x 11 + 2 = 68 s). It runs 60 s, so it is `#[ignore]`: run
-/// it with `--ignored`.
-async fn trickle(t: Transport, v: Protocol) {
+/// A payload that arrives at more than 256 bytes in each check and never completes ends at the
+/// cap of the frame read rate (plan, same table row: at most (cap / check) x (check + 1) + 2 s).
+/// The broker sends 512 bytes every half check time.
+async fn trickle(t: Transport, v: Protocol, timers: Timers) {
+    let (check, cap) = (
+        timers.frame_check.as_secs_f64(),
+        timers.frame_cap.as_secs_f64(),
+    );
+    let (lo, hi) = (cap - 1.0, (cap / check) * (check + 1.0) + 2.0);
+    let step = Duration::from_secs_f64(check / 2.0);
+    let rounds = (hi / (check / 2.0)).ceil() as usize + 2;
     let f = Fake::start(t, v, Options::default(), move |_, mut conn| {
         if conn.accept_connect().is_err() {
             return;
         }
         // A PUBLISH of 100 000 bytes: topic "t/a", for MQTT 5 an empty property list, then
-        // payload bytes that arrive 512 at a time every 5 s.
+        // payload bytes that arrive 512 at a time.
         let mut head = vec![0x30, 0xa0, 0x8d, 0x06, 0x00, 0x03, b't', b'/', b'a'];
         if v == Protocol::V5 {
             head.push(0x00);
@@ -585,26 +596,23 @@ async fn trickle(t: Transport, v: Protocol) {
         if conn.send_raw(&head).is_err() {
             return;
         }
-        for _ in 0..16 {
-            std::thread::sleep(Duration::from_secs(5));
+        for _ in 0..rounds {
+            std::thread::sleep(step);
             if conn.send_raw(&[b'x'; 512]).is_err() {
                 return;
             }
         }
         conn.hold(Duration::from_secs(5));
     });
-    let mut net = Net::start(NetLimits::default());
+    let mut net = start(timers);
     connect(&mut net, config(&f, t, v, 0)).await;
     let started = Instant::now();
-    let lost = status_where(&mut net, Duration::from_secs(70), |s| {
+    let lost = status_where(&mut net, Duration::from_secs_f64(hi + 2.0), |s| {
         s.state != ConnState::Connected
     })
     .await;
-    let took = started.elapsed();
-    assert!(
-        took >= Duration::from_secs(59) && took <= Duration::from_secs(68),
-        "ended after {took:?}"
-    );
+    let took = started.elapsed().as_secs_f64();
+    assert!((lo..=hi).contains(&took), "ended after {took} s");
     assert!(
         matches!(&lost.state, ConnState::Reconnecting { attempt: 1, reason } if reason == READ_TIMEOUT_TEXT),
         "{lost:?}"
@@ -612,7 +620,19 @@ async fn trickle(t: Transport, v: Protocol) {
     net.disconnect();
     net.shutdown().await;
 }
-stream_wires!(trickle, #[ignore = "runs 60 s: the cap of the frame read rate"]);
+
+/// REAL VALUE of the frame read-rate cap (60 s, check 10 s): ends at the cap, in at most 68 s. It
+/// runs 60 s, so it is `#[ignore]`: run it with `--ignored`.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "runs 60 s: the cap of the frame read rate"]
+async fn v5_tcp_trickle_with_the_real_cap() {
+    trickle(Transport::Tcp, Protocol::V5, Timers::default()).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_trickle() {
+    trickle(Transport::Tls, Protocol::V311, short()).await;
+}
 
 /// The broker takes a QoS 1 PUBLISH and never answers. A disconnect ends the wait at once: the
 /// publish is `LostOnDisconnect` and the state is `Disconnected` in at most 3 s (plan, "Disconnect
@@ -665,18 +685,30 @@ async fn ack_wait_cancelled_by_close(t: Transport, v: Protocol) {
     }
     net.shutdown().await;
 }
-all_wires!(ack_wait_cancelled_by_close);
+wires!(ack_wait_cancelled_by_close: v5_tcp Tcp V5, v3_tls Tls V311, v5_ws Ws V5, v3_wss Wss V311);
 
-/// A server that finishes the TLS handshake and never answers the WebSocket upgrade. ntex ends
-/// the upgrade after 5 s: a temporary timeout (plan, row "One deadline"; S1 finding 9). The WS
-/// case without TLS is `a_stalled_websocket_upgrade_is_a_temporary_timeout` in `net.rs`.
-async fn stalled_upgrade_over_wss(v: Protocol) {
-    let f = Fake::start(Transport::Wss, v, Options::default(), |_, mut conn| {
-        conn.hold(Duration::from_secs(12));
-    });
+/// REAL VALUE of the WebSocket upgrade timeout (5 s). A server that finishes the TLS handshake and
+/// never answers the WebSocket upgrade: ntex ends the upgrade after 5 s, a temporary timeout (plan,
+/// row "One deadline"; S1 finding 9). The upgrade timer is the same for WS and WSS and for both
+/// versions: it runs before any MQTT byte.
+#[tokio::test(flavor = "current_thread")]
+async fn v5_wss_stalled_upgrade_is_a_temporary_timeout_with_the_real_timer() {
+    let f = Fake::start(
+        Transport::Wss,
+        Protocol::V5,
+        Options::default(),
+        |_, mut conn| {
+            conn.hold(Duration::from_secs(12));
+        },
+    );
     let mut net = Net::start(NetLimits::default());
-    net.send(Command::Connect(Box::new(config(&f, Transport::Wss, v, 0))))
-        .expect("send");
+    net.send(Command::Connect(Box::new(config(
+        &f,
+        Transport::Wss,
+        Protocol::V5,
+        0,
+    ))))
+    .expect("send");
     let started = Instant::now();
     let lost = status_where(&mut net, Duration::from_secs(11), |s| {
         matches!(
@@ -689,8 +721,9 @@ async fn stalled_upgrade_over_wss(v: Protocol) {
         matches!(&lost.state, ConnState::Reconnecting { attempt: 1, reason } if reason == "The connection timed out."),
         "{lost:?}"
     );
+    // Between the upgrade timer (5 s) and the connect deadline (10 s), with rounding.
     assert!(
-        started.elapsed() >= Duration::from_secs(4),
+        (Duration::from_secs(4)..=Duration::from_secs(7)).contains(&started.elapsed()),
         "{:?}",
         started.elapsed()
     );
@@ -698,25 +731,19 @@ async fn stalled_upgrade_over_wss(v: Protocol) {
     net.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn v3_a_stalled_upgrade_over_wss_is_a_temporary_timeout() {
-    stalled_upgrade_over_wss(Protocol::V311).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_a_stalled_upgrade_over_wss_is_a_temporary_timeout() {
-    stalled_upgrade_over_wss(Protocol::V5).await;
-}
-
 const CLIENT_CERT_TEXT: &str =
     "The broker needs a client certificate. Add your certificate and key.";
 
-/// The Mosquitto config has no mTLS listener over WebSocket, so the fake serves one. With the
-/// client certificate the connect works; without it the attempt fails with the client-certificate
-/// text.
-async fn mtls_over_wss(v: Protocol) {
+/// A deliberate twin of `broker_matrix::mtls_over_secure_websocket` (real Mosquitto, port 18838):
+/// the broker tests run only on Linux until step 9, and this case found the Windows TLS reset
+/// bug, so it stays as the Windows and macOS smoke test for client certificates over WSS with
+/// vendored OpenSSL. With the client certificate the connect works; without it the attempt fails
+/// with the client-certificate text.
+#[tokio::test(flavor = "current_thread")]
+async fn v5_mtls_over_wss() {
+    let (t, v) = (Transport::Wss, Protocol::V5);
     let f = Fake::start(
-        Transport::Wss,
+        t,
         v,
         Options {
             require_client_cert: true,
@@ -729,7 +756,7 @@ async fn mtls_over_wss(v: Protocol) {
         },
     );
     let mut net = Net::start(NetLimits::default());
-    let mut with = config(&f, Transport::Wss, v, 0);
+    let mut with = config(&f, t, v, 0);
     with.profile.client_cert = Some(f.certs.client_cert.clone());
     with.profile.client_key = Some(f.certs.client_key.clone());
     connect(&mut net, with).await;
@@ -739,7 +766,7 @@ async fn mtls_over_wss(v: Protocol) {
     })
     .await;
 
-    net.send(Command::Connect(Box::new(config(&f, Transport::Wss, v, 0))))
+    net.send(Command::Connect(Box::new(config(&f, t, v, 0))))
         .expect("send");
     let s = status_where(&mut net, Duration::from_secs(10), |s| {
         matches!(s.state, ConnState::Failed(_) | ConnState::Connected)
@@ -781,35 +808,8 @@ async fn missing_cert_with_reset(t: Transport, v: Protocol) {
     net.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn v3_tls_missing_cert_with_reset() {
-    missing_cert_with_reset(Transport::Tls, Protocol::V311).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_tls_missing_cert_with_reset() {
-    missing_cert_with_reset(Transport::Tls, Protocol::V5).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v3_wss_missing_cert_with_reset() {
-    missing_cert_with_reset(Transport::Wss, Protocol::V311).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_wss_missing_cert_with_reset() {
-    missing_cert_with_reset(Transport::Wss, Protocol::V5).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v3_mtls_over_wss() {
-    mtls_over_wss(Protocol::V311).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_mtls_over_wss() {
-    mtls_over_wss(Protocol::V5).await;
-}
+// TLS and WSS once each: the reset reaches the TLS set-up of both (`wire.rs`, `SETUP_CLOSE_TEXT`).
+wires!(missing_cert_with_reset: v5_tls Tls V5, v3_wss Wss V311);
 
 /// A disconnect while a half frame waits is prompt: `Disconnected` in at most 3 s (graceful close,
 /// at most 2 s, then `force_close()`), and the attempt did not fail (plan, "Disconnect and stop are
@@ -867,7 +867,7 @@ async fn disconnect_while_a_half_frame_waits(t: Transport, v: Protocol) {
     assert!(!failed, "the attempt failed before it was disconnected");
     net.shutdown().await;
 }
-all_wires!(disconnect_while_a_half_frame_waits);
+wires!(disconnect_while_a_half_frame_waits: v5_tcp Tcp V5, v3_tls Tls V311, v5_ws Ws V5, v3_wss Wss V311);
 
 /// A PUBLISH whose Remaining Length is 2 MiB, with a 1 MiB limit: the connection ends at the fixed
 /// header, at once, before the payload arrives (plan, "Bounded memory"). The text is the size
@@ -920,7 +920,7 @@ async fn big_header(t: Transport, v: Protocol) {
     net.disconnect();
     net.shutdown().await;
 }
-stream_wires!(big_header);
+wires!(big_header: v5_tcp Tcp V5, v3_tls Tls V311);
 
 /// WS and WSS framing. A packet in three frames (binary, continuation, continuation) is
 /// delivered. A Ping gets one Pong with the same payload; an unsolicited Pong is ignored. A Text
@@ -996,31 +996,32 @@ async fn websocket_frames(t: Transport, v: Protocol) {
     net.disconnect();
     net.shutdown().await;
 }
-ws_wires!(websocket_frames);
+wires!(websocket_frames: v5_ws Ws V5, v3_wss Wss V311);
 
-/// Silent CONNACK: the broker reads CONNECT and never answers. Our connect deadline (10 s) ends
-/// it in at most 11 s (plan, row "One deadline"), with the text for a late CONNACK, as a
+/// Silent CONNACK: the broker reads CONNECT and never answers. Our connect deadline ends it in at
+/// most deadline + 1 s (plan, row "One deadline"), with the text for a late CONNACK, as a
 /// temporary error.
-async fn silent_connack(t: Transport, v: Protocol) {
-    let f = Fake::start(t, v, Options::default(), |_, mut conn| {
+async fn silent_connack(t: Transport, v: Protocol, timers: Timers) {
+    let deadline = timers.connect.as_secs_f64();
+    let f = Fake::start(t, v, Options::default(), move |_, mut conn| {
         let _ = conn.read_packet();
-        conn.hold(Duration::from_secs(14));
+        conn.hold(Duration::from_secs_f64(deadline + 4.0));
     });
-    let mut net = Net::start(NetLimits::default());
+    let mut net = start(timers);
     let started = Instant::now();
     net.send(Command::Connect(Box::new(config(&f, t, v, 0))))
         .expect("send");
-    let s = status_where(&mut net, Duration::from_secs(12), |s| {
+    let s = status_where(&mut net, Duration::from_secs_f64(deadline + 2.0), |s| {
         matches!(
             s.state,
             ConnState::Reconnecting { .. } | ConnState::Failed(_)
         )
     })
     .await;
-    let took = started.elapsed();
+    let took = started.elapsed().as_secs_f64();
     assert!(
-        took >= Duration::from_secs(9) && took <= Duration::from_secs(11),
-        "{took:?}"
+        (deadline - 1.0..=deadline + 1.0).contains(&took),
+        "{took} s"
     );
     assert!(
         matches!(&s.state, ConnState::Reconnecting { attempt: 1, reason } if reason == "The broker did not answer the connection request."),
@@ -1029,35 +1030,47 @@ async fn silent_connack(t: Transport, v: Protocol) {
     net.disconnect();
     net.shutdown().await;
 }
-stream_wires!(silent_connack);
+
+/// Short connect deadline (the real value is `a_black_hole_dial_ends_with_the_real_connect_deadline`).
+#[tokio::test(flavor = "current_thread")]
+async fn v5_tcp_silent_connack() {
+    silent_connack(Transport::Tcp, Protocol::V5, short()).await;
+}
+
+/// TLS, v3: the deadline also covers the MQTT 3.1.1 handshake (`wire.rs`, v3 connect).
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_silent_connack() {
+    silent_connack(Transport::Tls, Protocol::V311, short()).await;
+}
 
 /// A server that accepts the TCP connection and never answers the TLS handshake. The TLS
-/// handshake timeout of `ntex-tls` (5 s) ends it before our deadline: a temporary timeout (S1
-/// finding 9).
-async fn stalled_tls(t: Transport, v: Protocol) {
+/// handshake timeout ends it before our deadline: a temporary timeout (S1 finding 9). It ends in
+/// at most handshake timeout + 2 s.
+async fn stalled_tls(t: Transport, v: Protocol, timers: Timers) {
+    let tls = timers.tls_handshake.as_secs_f64();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let holder = std::thread::spawn(move || {
         let (_sock, _) = listener.accept().expect("accept");
-        std::thread::sleep(Duration::from_secs(8));
+        std::thread::sleep(Duration::from_secs_f64(tls + 3.0));
     });
     let f = Fake::start(t, v, Options::default(), |_, _| {});
     let mut c = config(&f, t, v, 0);
     c.profile.port = port;
-    let mut net = Net::start(NetLimits::default());
+    let mut net = start(timers);
     let started = Instant::now();
     net.send(Command::Connect(Box::new(c))).expect("send");
-    let s = status_where(&mut net, Duration::from_secs(9), |s| {
+    let s = status_where(&mut net, Duration::from_secs_f64(tls + 4.0), |s| {
         matches!(
             s.state,
             ConnState::Reconnecting { .. } | ConnState::Failed(_)
         )
     })
     .await;
-    let took = started.elapsed();
+    let took = started.elapsed().as_secs_f64();
     assert!(
-        took >= Duration::from_secs(4) && took <= Duration::from_secs(7),
-        "{took:?}"
+        ((tls - 1.0).max(tls / 2.0)..=tls + 2.0).contains(&took),
+        "{took} s"
     );
     assert!(
         matches!(&s.state, ConnState::Reconnecting { attempt: 1, reason } if reason == "The connection timed out."),
@@ -1068,30 +1081,23 @@ async fn stalled_tls(t: Transport, v: Protocol) {
     holder.join().expect("holder");
 }
 
-macro_rules! tls_wires {
-    ($case:ident) => {
-        mod $case {
-            use super::*;
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_tls() {
-                super::$case(Transport::Tls, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v3_wss() {
-                super::$case(Transport::Wss, Protocol::V311).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_tls() {
-                super::$case(Transport::Tls, Protocol::V5).await
-            }
-            #[tokio::test(flavor = "current_thread")]
-            async fn v5_wss() {
-                super::$case(Transport::Wss, Protocol::V5).await
-            }
-        }
-    };
+/// REAL VALUE of the TLS handshake timeout (5 s).
+#[tokio::test(flavor = "current_thread")]
+async fn v5_tls_stalled_handshake_with_the_real_timer() {
+    stalled_tls(Transport::Tls, Protocol::V5, Timers::default()).await;
 }
-tls_wires!(stalled_tls);
+
+/// WSS: the TLS handshake runs below the WebSocket upgrade, so the same timer must end it. The
+/// connect deadline is 5 s, above the bound of the handshake timer (3 s), so only the handshake
+/// timer can end the attempt in time.
+#[tokio::test(flavor = "current_thread")]
+async fn v3_wss_stalled_handshake() {
+    let timers = Timers {
+        connect: Duration::from_secs(5),
+        ..short()
+    };
+    stalled_tls(Transport::Wss, Protocol::V311, timers).await;
+}
 
 /// A loopback listener whose accept queue is full, so new SYNs are dropped: a dial hangs. Linux
 /// behaviour; the tests that use it run on Linux only.
@@ -1137,9 +1143,10 @@ mod black_hole {
         }
     }
 
-    /// A dial to a black hole ends with our 10 s deadline, in at most 11 s.
+    /// REAL VALUE of the outer connect deadline (10 s): a dial to a black hole ends with it, in
+    /// at most 11 s. No other timer can end the dial, so the end shows the outer deadline.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_black_hole_dial_ends_with_the_connect_deadline() {
+    async fn a_black_hole_dial_ends_with_the_real_connect_deadline() {
         let hole = make().await;
         let f = Fake::start(Transport::Tcp, Protocol::V5, Options::default(), |_, _| {});
         let mut c = config(&f, Transport::Tcp, Protocol::V5, 0);
@@ -1168,138 +1175,38 @@ mod black_hole {
     }
 }
 
-/// MQTT 5: the client follows the Server Keep Alive of the CONNACK, not the 60 s of the profile.
-/// 5 s (profile 60 s): the first PINGREQ comes at about 5 s. 0 (profile 2 s): no PINGREQ at all (plan, row "A dead
-/// peer is found": "Server Keep Alive 0 and 5 s: the client follows it").
-async fn server_keep_alive(server_secs: u16) {
-    let pings = Arc::new(Mutex::new(Vec::<Instant>::new()));
+/// MQTT 5: the CONNACK has Server Keep Alive 0, so the client sends no PINGREQ, whatever the
+/// profile says (plan, row "A dead peer is found": "Server Keep Alive 0 and 5 s: the client
+/// follows it"). Mosquitto cannot send 0, so this stays a fake; the 5 s case is real
+/// (`broker_matrix::v5_server_keep_alive_5_s_is_followed`). The profile asks 1 s, so a client
+/// that ignored the broker would ping within 1.2 s.
+#[tokio::test(flavor = "current_thread")]
+async fn v5_server_keep_alive_0_sends_no_ping() {
+    let pings = Arc::new(Mutex::new(0usize));
     let seen = pings.clone();
     let f = Fake::start(
         Transport::Tcp,
         Protocol::V5,
         Options::default(),
         move |_, mut conn| {
-            let [hi, lo] = server_secs.to_be_bytes();
-            // CONNACK: flags, reason 0, 3 bytes of properties: Server Keep Alive (0x13).
+            // CONNACK: flags, reason 0, 3 bytes of properties: Server Keep Alive (0x13) = 0.
             if conn
-                .accept_connect_with(&[0x20, 6, 0, 0, 3, 0x13, hi, lo])
+                .accept_connect_with(&[0x20, 6, 0, 0, 3, 0x13, 0, 0])
                 .is_ok()
             {
-                conn.read_until_close(Duration::from_secs(12), |head, _| {
+                conn.read_until_close(Duration::from_secs(6), |head, _| {
                     if head == 0xc0 {
-                        conn_ping(&seen);
+                        *seen.lock().expect("lock") += 1;
                     }
                 });
             }
         },
     );
     let mut net = Net::start(NetLimits::default());
-    // For 0 the profile asks 2 s, so a client that ignored the broker would ping within 8 s.
-    let profile_secs = if server_secs == 0 { 2 } else { 60 };
-    connect(
-        &mut net,
-        config(&f, Transport::Tcp, Protocol::V5, profile_secs),
-    )
-    .await;
-    let up = Instant::now();
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    connect(&mut net, config(&f, Transport::Tcp, Protocol::V5, 1)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(net.status.borrow().state, ConnState::Connected);
-    let pings = pings.lock().expect("lock").clone();
-    if server_secs == 0 {
-        assert!(pings.is_empty(), "{pings:?}");
-    } else {
-        let first = pings.first().expect("a PINGREQ").duration_since(up);
-        assert!(
-            (Duration::from_millis(4_500)..=Duration::from_millis(6_500)).contains(&first),
-            "{first:?}"
-        );
-    }
-    net.disconnect();
-    net.shutdown().await;
-}
-
-fn conn_ping(seen: &Arc<Mutex<Vec<Instant>>>) {
-    seen.lock().expect("lock").push(Instant::now());
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_server_keep_alive_5_s_is_followed() {
-    server_keep_alive(5).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn v5_server_keep_alive_0_sends_no_ping() {
-    server_keep_alive(0).await;
-}
-
-/// MQTT 5: the CONNACK announces a Maximum Packet Size. A PUBLISH of exactly that size is sent;
-/// one byte more is refused before the send, with the text of `publish::validate_outgoing`. A v5
-/// broker that announces none gets any size, as before (plan, row "Publish size", S1 finding 4).
-#[tokio::test(flavor = "current_thread")]
-async fn a_v5_publish_over_the_announced_maximum_packet_size_is_refused_before_the_send() {
-    const LIMIT: usize = 4096;
-    let (tx, rx) = mpsc::channel::<u8>();
-    let tx = Mutex::new(tx);
-    let f = Fake::start(
-        Transport::Tcp,
-        Protocol::V5,
-        Options::default(),
-        move |_, mut conn| {
-            // CONNACK with Maximum Packet Size (0x27) = 4096.
-            let ack = [0x20, 8, 0, 0, 5, 0x27, 0, 0, 0x10, 0];
-            if conn.accept_connect_with(&ack).is_err() {
-                return;
-            }
-            while let Ok((head, body)) = conn.read_packet() {
-                let _ = tx.lock().expect("lock").send(head);
-                if head & 0xf0 == 0x30 {
-                    // PUBACK for the packet ID after the topic "t/m".
-                    let _ = conn.send(&[0x40, 2, body[5], body[6]]);
-                }
-            }
-        },
-    );
-    let mut net = Net::start(NetLimits::default());
-    connect(&mut net, config(&f, Transport::Tcp, Protocol::V5, 0)).await;
-    // The limit is published with the `Connected` state.
-    assert_eq!(net.broker_max_packet(), Some(LIMIT as u32));
-    let message = |op_id: u64, total: usize| {
-        Command::Publish(Box::new(Outgoing {
-            op_id,
-            topic: "t/m".into(),
-            // Fixed header 1, length 2, topic 2 + 3, packet ID 2, empty properties 1.
-            payload: Bytes::from(vec![b'x'; total - (1 + 2 + 2 + 3 + 2 + 1)]),
-            qos: Qos::AtLeastOnce,
-            retain: false,
-            props: MsgProps::default(),
-        }))
-    };
-    net.send(message(1, LIMIT)).expect("send");
-    net.send(message(2, LIMIT + 1)).expect("send");
-    let mut results = Vec::new();
-    while results.len() < 2 {
-        match tokio::time::timeout(Duration::from_secs(3), net.events.recv()).await {
-            Ok(Some(Event::Published { op_id, result, .. })) => results.push((op_id, result)),
-            Ok(Some(_)) => {}
-            other => panic!("expected a publish result, got {other:?}"),
-        }
-    }
-    results.sort_by_key(|(id, _)| *id);
-    assert_eq!(
-        results,
-        vec![
-            (1, PublishResult::Acknowledged),
-            (
-                2,
-                PublishResult::Rejected(
-                    "The message needs 4097 bytes. The broker accepts 4096 bytes at most.".into()
-                )
-            ),
-        ]
-    );
-    // The broker saw exactly one PUBLISH (QoS 1, first byte 0x32) and nothing else.
-    assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(0x32));
-    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+    assert_eq!(*pings.lock().expect("lock"), 0);
     net.disconnect();
     net.shutdown().await;
 }
@@ -1308,7 +1215,9 @@ async fn a_v5_publish_over_the_announced_maximum_packet_size_is_refused_before_t
 /// (plan, row "Incoming size": "else the MQTT maximum"). The local incoming limit (`max_packet`,
 /// 1 MiB) must not apply. A PUBLISH one byte over `max_packet`, and one of 2 x `max_packet`, go
 /// out whole and get a PUBACK. The fake measures the whole packets that it reads. A message over
-/// the MQTT maximum (256 MiB) is refused before the send.
+/// the MQTT maximum (256 MiB) is refused before the send. This stays a fake: Mosquitto 2.1 always
+/// announces a Maximum Packet Size (2 000 000 bytes by default; the minimum for `max_packet_size`
+/// is 20), so Mosquitto cannot answer without one.
 #[tokio::test(flavor = "current_thread")]
 async fn a_v5_publish_over_the_local_limit_is_sent_when_the_broker_announces_none() {
     let limit = NetLimits::default().max_packet;
@@ -1387,7 +1296,7 @@ fn len_bytes(total: usize) -> usize {
 
 /// A disconnect while a write is blocked is prompt: `Disconnected` in at most 3 s, no failure, and
 /// every blocked send reports `LostOnDisconnect` (none `TimedOut`: the disconnect comes before the
-/// 10 s timers). The v5 TCP case is also in `net_blocked_write.rs`.
+/// timers).
 async fn disconnect_during_a_blocked_write(t: Transport, v: Protocol) {
     const SENDS: usize = 24;
     let f = Fake::start(t, v, Options::default(), |_, mut conn| {
@@ -1444,7 +1353,7 @@ async fn disconnect_during_a_blocked_write(t: Transport, v: Protocol) {
     );
     net.shutdown().await;
 }
-all_wires!(disconnect_during_a_blocked_write);
+wires!(disconnect_during_a_blocked_write: v5_tcp Tcp V5, v3_tls Tls V311, v5_ws Ws V5, v3_wss Wss V311);
 
 /// MQTT 5, Receive Maximum 2 in the CONNACK: 1000 QoS 1 publishes go out with at most 2 unanswered
 /// at any time, and the results come in the order of the sends (plan, row "Bounded outgoing").

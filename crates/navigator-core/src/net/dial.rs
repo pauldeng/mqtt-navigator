@@ -2,7 +2,7 @@
 //! resolved address in order, then `from_tcp_stream`, then TLS with `ntex-tls` when needed.
 //! It is the connector for MQTT over TCP and TLS, and for `WsClient` (WS and WSS).
 //!
-//! The caller wraps every use in one deadline (`CONNECT_TIMEOUT`). A cancel drops the future:
+//! The caller wraps every use in one deadline (`Timers::connect`). A cancel drops the future:
 //! the TCP dial and the wait for DNS end at once. The OS lookup itself cannot stop, so it keeps
 //! the only permit of a one-slot semaphore until it returns.
 

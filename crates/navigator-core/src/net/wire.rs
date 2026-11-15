@@ -42,8 +42,8 @@ use ntex_util::time::{Millis, Seconds};
 
 use super::dial::{Dialer, Target};
 use super::{
-    CONNECT_TIMEOUT, ConnectConfig, ConnectionDetails, IO_CLOSED_TEXT, Ingest, NetLimits, Outcome,
-    Outgoing, PANIC_TEXT, Protocol, PublishResult, Transport, V5Details, io_outcome,
+    ConnectConfig, ConnectionDetails, IO_CLOSED_TEXT, Ingest, NetLimits, Outcome, Outgoing,
+    PANIC_TEXT, Protocol, PublishResult, Transport, V5Details, io_outcome,
 };
 use crate::model::{Incoming, MsgProps, Qos};
 use crate::profile::SubOptions;
@@ -53,13 +53,13 @@ use crate::tls::TlsDiag;
 
 /// Time that a graceful close may take before the session forces it.
 pub(super) const CLOSE_GRACE: Duration = Duration::from_secs(2);
-/// A write that stays blocked this long ends the connection (the attempt reconnects).
-const WRITE_TIMEOUT: Seconds = Seconds(10);
-/// The handshake timeout of ntex. Our own deadline ([`CONNECT_TIMEOUT`]) is the same length.
-const HANDSHAKE_TIMEOUT: Seconds = Seconds(10);
-/// Frame read rate: the timeout of one check, the limit for a whole packet, the least bytes for
-/// each check. A started packet that stops cannot hold the connection.
-const FRAME_RATE: (Seconds, Seconds, u32) = (Seconds(10), Seconds(60), 256);
+/// Frame read rate: the least bytes for each check. A started packet that stops cannot hold the
+/// connection (the times are in [`Timers`]).
+const FRAME_RATE_LEAST: u32 = 256;
+/// ntex counts these limits in whole seconds.
+fn secs(d: Duration) -> Seconds {
+    Seconds(d.as_secs_f64().ceil().min(f64::from(u16::MAX)) as u16)
+}
 /// Incoming topic aliases that we accept. This is the limit of the ntex client dispatcher.
 const TOPIC_ALIAS_MAX: u16 = 16;
 /// Receive Maximum that we announce in CONNECT, and the limit of in-flight QoS 1 messages.
@@ -411,31 +411,32 @@ pub(super) struct Connected {
 
 /// The shared configuration of one connection: ntex reads each limit from here, so the limits
 /// are per connection and nothing is global.
-fn shared_cfg(max_packet: usize, protocol: Protocol) -> SharedCfg {
+fn shared_cfg(limits: &NetLimits, protocol: Protocol) -> SharedCfg {
+    let (max_packet, t) = (limits.max_packet, limits.timers);
     let ws = WsClientConfig::new()
         .set_max_frame_size(max_packet)
         .set_max_message_size(max_packet)
         .set_protocols(["mqtt"])
         .expect("the constant protocol name is valid")
+        .set_handshake_timeout(Millis(t.ws_upgrade.as_millis() as u32))
         .set_close_timeout(Millis(2000));
     let mut mqtt = MqttServiceConfig::new()
-        .set_handshake_timeout(HANDSHAKE_TIMEOUT)
+        .set_handshake_timeout(secs(t.connect))
         .set_max_receive(RECEIVE_MAX)
         .set_max_send(RECEIVE_MAX);
     if protocol == Protocol::V311 {
         // v3 limits the Remaining Length, in both directions. v5 sets it in CONNECT.
         mqtt = mqtt.set_max_size(v3_max_remaining(max_packet));
     }
-    let (check, cap, least) = FRAME_RATE;
     SharedCfg::new("navigator")
         .add(
             IoConfig::new()
-                .set_connect_timeout(Millis(10_000))
-                .set_write_timeout(WRITE_TIMEOUT)
-                .set_frame_read_rate(check, cap, least),
+                .set_connect_timeout(Millis(t.connect.as_millis() as u32))
+                .set_write_timeout(secs(t.write))
+                .set_frame_read_rate(secs(t.frame_check), secs(t.frame_cap), FRAME_RATE_LEAST),
         )
         .add(mqtt)
-        .add(TlsConfig::new())
+        .add(TlsConfig::new().set_handshake_timeout(secs(t.tls_handshake)))
         .add(ws)
         .build()
 }
@@ -453,7 +454,7 @@ pub(super) struct Params<'a> {
 /// Connects under one deadline. The error is the outcome of the attempt.
 pub(super) async fn connect(p: Params<'_>) -> Result<Connected, Outcome> {
     let up = Rc::new(Cell::new(false));
-    match tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(&p, up.clone())).await {
+    match tokio::time::timeout(p.limits.timers.connect, connect_inner(&p, up.clone())).await {
         Ok(result) => result,
         // After the transport is up, a missing CONNACK is the broker's fault.
         Err(_) if up.get() => Err(Outcome::Retry(
@@ -537,7 +538,7 @@ fn transport(
 }
 
 async fn connect_inner(p: &Params<'_>, up: Rc<Cell<bool>>) -> Result<Connected, Outcome> {
-    let cfg = shared_cfg(p.limits.max_packet, p.config.protocol);
+    let cfg = shared_cfg(&p.limits, p.config.protocol);
     let connector = transport(p, &cfg, up);
     match p.config.protocol {
         Protocol::V5 => connect_v5(p, cfg, connector).await,

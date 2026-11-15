@@ -1,14 +1,23 @@
-# Ports on 127.0.0.1: 18830 to 18837 Mosquitto (see mosquitto.conf), 18840 and 18841 EMQX,
-# 18850 and 18851 HiveMQ CE. Images are pinned by digest.
+# Ports on 127.0.0.1: 18830 to 18838 Mosquitto (see mosquitto.conf), 18840 and 18841 EMQX,
+# 18850 and 18851 HiveMQ CE, 18860 a second Mosquitto (mosquitto-limits.conf). Images are pinned by
+# digest.
 name: navigator-broker
 services:
   mosquitto:
     image: eclipse-mosquitto:2.1.2-alpine@sha256:75d6662dee52c947dc9dd9c29f1d8d7ffef78ddaf38001caa09755681e8bbc98
     ports:
-      - "127.0.0.1:18830-18837:18830-18837"
+      - "127.0.0.1:18830-18838:18830-18838"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ./certs:/certs:ro
+
+  # The same image with the limits that are global in Mosquitto (max_keepalive, max_inflight_messages, max_packet_size).
+  mosquitto-limits:
+    image: eclipse-mosquitto:2.1.2-alpine@sha256:75d6662dee52c947dc9dd9c29f1d8d7ffef78ddaf38001caa09755681e8bbc98
+    ports:
+      - "127.0.0.1:18860:18860"
+    volumes:
+      - ./mosquitto-limits.conf:/mosquitto/config/mosquitto.conf:ro
 
   # EMQX 6.3.2 (the latest stable release when this file was written). Anonymous access is the
   # default. 18840: TCP, 18841: WebSocket (path /mqtt).

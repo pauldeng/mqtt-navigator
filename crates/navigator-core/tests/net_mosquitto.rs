@@ -278,11 +278,19 @@ async fn publish_plain(topic: &str, payload: Vec<u8>) {
     publisher.shutdown().await;
 }
 
+/// MQTT 5 incoming limit (`max_packet` 1024, announced in CONNECT as Maximum Packet Size): a
+/// packet of exactly the limit is delivered. A packet one byte over never reaches the UI: Mosquitto
+/// 2.1.2 sends it anyway, and the client ends the session with the size text (the v3 half is
+/// `v3_an_incoming_packet_over_the_limit_ends_the_session`). The first copy of a message that Mosquitto forwards
+/// has a Topic Alias property: 4 bytes (the length byte is 3 instead of 0, then 0x23 and 2
+/// bytes), so each message has its own topic (same length) and the copy is 3 bytes larger than
+/// the packet that the publisher sent.
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_packet_is_not_delivered() {
+    const MAX: usize = 1024;
     require_broker();
     let limits = NetLimits {
-        max_packet: 1024,
+        max_packet: MAX,
         ..NetLimits::default()
     };
     let mut net = Net::start(limits);
@@ -293,23 +301,24 @@ async fn oversized_packet_is_not_delivered() {
         Event::Subscribed { result: Ok(_), .. }
     ));
 
-    publish_plain(&format!("{p}/big"), vec![b'x'; 4096]).await;
-    publish_plain(&format!("{p}/small"), b"ok".to_vec()).await;
-
-    // A compliant broker (mosquitto) does not send packets above the advertised maximum.
-    // A non-compliant one makes the client end the session. Both are fine. A 4096 byte message
-    // must never reach the UI.
-    let mut got_small = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while let Ok(Some(m)) = tokio::time::timeout_at(deadline, net.incoming.recv()).await {
-        assert!(m.payload.len() <= 1024, "oversized payload delivered");
-        got_small |= *m.topic == *format!("{p}/small");
-    }
-    let state = net.status.borrow().state.clone();
-    assert!(
-        got_small || matches!(state, ConnState::Failed(_)),
-        "state {state:?}"
+    // The copy: fixed header 1, length 2 bytes, topic 2 + n, packet ID 2, properties 4, payload.
+    let copy_overhead = 1 + 2 + 2 + format!("{p}/ok").len() + 2 + 4;
+    let exact = MAX - copy_overhead;
+    publish_plain(&format!("{p}/ok"), vec![b'x'; exact]).await;
+    let first = next_incoming(&mut net).await;
+    assert_eq!(
+        (&*first.topic, first.payload.len()),
+        (&*format!("{p}/ok"), exact)
     );
+    assert_eq!(first.protocol, Protocol::V5);
+    publish_plain(&format!("{p}/xx"), vec![b'y'; exact + 1]).await;
+    // Mosquitto sends it, and the client ends the session with the size text.
+    wait_state(&mut net, |s| matches!(s, ConnState::Failed(_))).await;
+    assert_eq!(
+        net.status.borrow().state,
+        ConnState::Failed("The broker sent a packet that is larger than the allowed size.".into())
+    );
+    assert!(net.incoming.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -351,41 +360,6 @@ async fn full_queue_drops_and_bounds_memory() {
     assert!(n <= 4, "got {n}");
     assert_eq!(queued, cost);
     assert_eq!(net.queued_bytes(), 0);
-}
-
-/// A fake broker that ignores the advertised maximum packet size, like a hostile one.
-#[tokio::test(flavor = "current_thread")]
-async fn hostile_broker_oversized_packet_fails_session() {
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let server = std::thread::spawn(move || {
-        let (mut sock, _) = listener.accept().expect("accept");
-        let mut buf = [0u8; 512];
-        let _ = sock.read(&mut buf); // CONNECT
-        let _ = sock.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00]); // CONNACK success
-        // PUBLISH QoS 0, topic "t", 8000 payload bytes (remaining length 8003 as a varint).
-        let mut packet = vec![0x30, 0xC3, 0x3E, 0x00, 0x01, b't', 0x00];
-        packet.extend(vec![b'x'; 8000]);
-        let _ = sock.write_all(&packet);
-        std::thread::sleep(Duration::from_millis(500));
-    });
-    let mut net = Net::start(NetLimits {
-        max_packet: 1024,
-        ..NetLimits::default()
-    });
-    let mut p = profile(&[]);
-    p.port = port;
-    net.send(Command::Connect(Box::new(p.into())))
-        .expect("send");
-    wait_state(&mut net, |s| matches!(s, ConnState::Failed(_))).await;
-    let state = net.status.borrow().state.clone();
-    assert!(
-        matches!(&state, ConnState::Failed(t) if t.contains("larger")),
-        "{state:?}"
-    );
-    assert!(net.incoming.try_recv().is_err());
-    server.join().expect("server");
 }
 
 /// Messages with an empty payload and many user properties must count against the byte budget.
@@ -971,10 +945,18 @@ async fn removal_while_offline(protocol: Protocol) {
     let mut config = ConnectConfig::from(v);
     config.protocol = protocol;
     let generation = connect(&mut net, config).await;
-    assert!(matches!(
-        next_event(&mut net).await,
-        Event::Subscribed { result: Ok(_), .. }
-    ));
+    // The subscription is granted, and the session is reported for the profile (v3 too: Clean
+    // Session off has no session expiry, D3).
+    let (mut granted, mut reported) = (false, false);
+    while !(granted && reported) {
+        match next_event_raw(&mut net).await {
+            Event::Subscribed { result: Ok(_), .. } => granted = true,
+            Event::SessionFilters { filters, .. } if filters == [topic.as_str()] => {
+                reported = true;
+            }
+            _ => {}
+        }
+    }
 
     // Cable pull. The net thread waits in the backoff, and nothing listens on the port.
     proxy.cut();
@@ -1023,125 +1005,15 @@ async fn expect_silence(net: &mut Net) {
     assert!(got.is_err(), "the removed filter still delivers: {got:?}");
 }
 
-/// The user removes a filter after a manual Disconnect. The next Connect resumes the broker
-/// session, which still holds the filter. The net thread must remove it.
-async fn a_removal_after_a_manual_disconnect_reaches_the_next_session_with(protocol: Protocol) {
-    require_broker();
-    let p = prefix();
-    let topic = format!("{p}/x");
-    let mut net = Net::start(NetLimits::default());
-    let first = persistent(&[&topic], 18830, protocol);
-    connect(&mut net, first.clone()).await;
-    assert!(matches!(
-        next_event(&mut net).await,
-        Event::Subscribed { result: Ok(_), .. }
-    ));
-    net.disconnect();
-    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
-    // Nothing is connected: the net thread answers with an error, and the UI keeps the removal.
-    net.send(Command::Unsubscribe {
-        filter: topic.clone(),
-    })
-    .expect("unsubscribe");
-    assert!(matches!(
-        next_event(&mut net).await,
-        Event::Unsubscribed { result: Err(_), .. }
-    ));
-    // The same session (host, port, client ID), now without the filter.
-    connect(
-        &mut net,
-        Profile {
-            subscriptions: vec![],
-            ..first
-        },
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    publish_plain(&topic, b"must not arrive".to_vec()).await;
-    expect_silence(&mut net).await;
-    net.shutdown().await;
-}
-
+/// A clean session holds nothing, so the same steps need no removal and still work. (MQTT 3.1.1
+/// shares the code: `v3_clean_session_keeps_nothing` covers its Clean Session flag.)
 #[tokio::test(flavor = "current_thread")]
-async fn a_removal_after_a_manual_disconnect_reaches_the_next_session() {
-    a_removal_after_a_manual_disconnect_reaches_the_next_session_with(Protocol::V5).await;
-}
-
-/// The same test on MQTT 3.1.1: Clean Session off keeps the session (D3).
-#[tokio::test(flavor = "current_thread")]
-async fn v3_a_removal_after_a_manual_disconnect_reaches_the_next_session() {
-    a_removal_after_a_manual_disconnect_reaches_the_next_session_with(Protocol::V311).await;
-}
-
-/// A live UNSUBSCRIBE that never reaches the broker (the connection is cut first). The next
-/// connection resumes the session, and the net thread removes the filter then.
-async fn a_lost_unsubscribe_is_retried_on_the_resumed_session_with(protocol: Protocol) {
-    require_broker();
-    let p = prefix();
-    let topic = format!("{p}/lost");
-    let proxy = CuttableProxy::start();
-    let port = proxy.port;
-    let mut net = Net::start(NetLimits::default());
-    let generation = connect(&mut net, persistent(&[&topic], port, protocol)).await;
-    assert!(matches!(
-        next_event(&mut net).await,
-        Event::Subscribed { result: Ok(_), .. }
-    ));
-    // Cut the cable, and send the UNSUBSCRIBE at once: the broker cannot get it.
-    proxy.cut();
-    net.send(Command::Unsubscribe {
-        filter: topic.clone(),
-    })
-    .expect("unsubscribe");
-    let _ = next_event(&mut net).await; // Ok (offline) or the error of the lost request
-    let _proxy2 = CuttableProxy::start_on(port);
-    // First wait for the loss. The error of the lost request can arrive before the status leaves
-    // `Connected`, so waiting for `Connected` alone can return at once, and the publish below
-    // would then reach the broker while the session is still offline and subscribed.
-    tokio::time::timeout(
-        WAIT * 2,
-        net.status.wait_for(|s| {
-            s.generation == generation && matches!(s.state, ConnState::Reconnecting { .. })
-        }),
-    )
-    .await
-    .expect("the loss is noticed")
-    .expect("status");
-    tokio::time::timeout(
-        WAIT * 2,
-        net.status
-            .wait_for(|s| s.generation == generation && s.state == ConnState::Connected),
-    )
-    .await
-    .expect("reconnects")
-    .expect("status");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    publish_plain(&topic, b"must not arrive".to_vec()).await;
-    expect_silence(&mut net).await;
-    net.shutdown().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_lost_unsubscribe_is_retried_on_the_resumed_session() {
-    a_lost_unsubscribe_is_retried_on_the_resumed_session_with(Protocol::V5).await;
-}
-
-/// The same test on MQTT 3.1.1: Clean Session off keeps the session (D3).
-#[tokio::test(flavor = "current_thread")]
-async fn v3_a_lost_unsubscribe_is_retried_on_the_resumed_session() {
-    a_lost_unsubscribe_is_retried_on_the_resumed_session_with(Protocol::V311).await;
-}
-
-/// A clean session holds nothing, so the same steps need no removal and still work.
-async fn a_clean_session_forgets_the_filters_with(protocol: Protocol) {
+async fn a_clean_session_forgets_the_filters() {
     require_broker();
     let p = prefix();
     let topic = format!("{p}/clean");
     let mut net = Net::start(NetLimits::default());
-    let first = Profile {
-        protocol,
-        ..profile(&[&topic])
-    };
+    let first = profile(&[&topic]);
     connect(&mut net, first.clone()).await;
     assert!(matches!(
         next_event(&mut net).await,
@@ -1176,116 +1048,132 @@ async fn a_clean_session_forgets_the_filters_with(protocol: Protocol) {
     net.shutdown().await;
 }
 
+/// The removal of a filter reaches a persistent session that the broker keeps (v5; MQTT 3.1.1 has
+/// the same code, and `v3_a_removal_while_offline_reaches_a_resumed_session` covers it). One
+/// client ID and one cuttable forwarder serve four steps, each with its own topic:
+/// 1. the user removes the filter after a manual Disconnect;
+/// 2. an UNSUBSCRIBE is lost when the connection is cut, and the next connection retries it;
+/// 3. the app restarts after the removal: the saved session filters seed a new `Net`;
+/// 4. a new profile with the same client ID gets the cached set, so a later restart still works.
 #[tokio::test(flavor = "current_thread")]
-async fn a_clean_session_forgets_the_filters() {
-    a_clean_session_forgets_the_filters_with(Protocol::V5).await;
-}
-
-/// The same test on MQTT 3.1.1: Clean Session off keeps the session (D3).
-#[tokio::test(flavor = "current_thread")]
-async fn v3_a_clean_session_forgets_the_filters() {
-    a_clean_session_forgets_the_filters_with(Protocol::V311).await;
-}
-
-/// The app starts again between the removal and the reconnect: a NEW `Net` has no memory. The
-/// saved set (from `Event::SessionFilters`) seeds it, so it still removes the filter from the
-/// resumed session.
-async fn a_removal_survives_a_restart_with_the_saved_session_filters_with(protocol: Protocol) {
+async fn a_removal_reaches_the_resumed_session() {
     require_broker();
     let p = prefix();
-    let topic = format!("{p}/restart");
-    let first = persistent(&[&topic], 18830, protocol);
+    let [t1, t2, t3, t4] = ["one", "two", "three", "four"].map(|n| format!("{p}/{n}"));
+    let mut proxy = CuttableProxy::start();
+    let port = proxy.port;
+    let base = persistent(&[], port, Protocol::V5);
+    let with = |topic: &str| Profile {
+        subscriptions: vec![(topic.to_owned(), Qos::AtLeastOnce)],
+        ..base.clone()
+    };
     let mut net = Net::start(NetLimits::default());
-    connect(&mut net, first.clone()).await;
-    // The report comes after the SUBSCRIBE was sent. The app would save this set.
-    let saved = next_session_filters(&mut net, |f| f.contains(&topic)).await;
-    net.shutdown().await;
 
-    // The user removed the filter (the new profile has no subscriptions), and the app restarts.
+    // 1. A removal after a manual Disconnect.
+    connect(&mut net, with(&t1)).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    net.disconnect();
+    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    // Nothing is connected: the net thread answers with an error, and the UI keeps the removal.
+    net.send(Command::Unsubscribe { filter: t1.clone() })
+        .expect("unsubscribe");
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Unsubscribed { result: Err(_), .. }
+    ));
+    connect(&mut net, base.clone()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    publish_plain(&t1, b"must not arrive".to_vec()).await;
+    expect_silence(&mut net).await;
+
+    // 2. A live UNSUBSCRIBE that never reaches the broker.
+    let generation = connect(&mut net, with(&t2)).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    proxy.cut();
+    net.send(Command::Unsubscribe { filter: t2.clone() })
+        .expect("unsubscribe");
+    let _ = next_event(&mut net).await; // Ok (offline) or the error of the lost request
+    proxy = CuttableProxy::start_on(port);
+    // First wait for the loss. The error of the lost request can arrive before the status leaves
+    // `Connected`, so waiting for `Connected` alone can return at once, and the publish below
+    // would then reach the broker while the session is still offline and subscribed.
+    tokio::time::timeout(
+        WAIT * 2,
+        net.status.wait_for(|s| {
+            s.generation == generation && matches!(s.state, ConnState::Reconnecting { .. })
+        }),
+    )
+    .await
+    .expect("the loss is noticed")
+    .expect("status");
+    tokio::time::timeout(
+        WAIT * 2,
+        net.status
+            .wait_for(|s| s.generation == generation && s.state == ConnState::Connected),
+    )
+    .await
+    .expect("reconnects")
+    .expect("status");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    publish_plain(&t2, b"must not arrive".to_vec()).await;
+    expect_silence(&mut net).await;
+
+    // 3. The app starts again between the removal and the reconnect: a NEW `Net` has no memory.
+    // The saved set (from `Event::SessionFilters`) seeds it, so it still removes the filter.
+    connect(&mut net, with(&t3)).await;
+    // The report comes after the SUBSCRIBE was sent. The app would save this set.
+    let saved = next_session_filters(&mut net, |f| f.contains(&t3)).await;
+    net.shutdown().await;
     let mut fresh = Net::start(NetLimits::default());
     let config = ConnectConfig {
         session_filters: saved,
-        ..ConnectConfig::from(Profile {
-            subscriptions: vec![],
-            ..first
-        })
+        ..ConnectConfig::from(base.clone())
     };
     fresh
         .send(Command::Connect(Box::new(config)))
         .expect("connect");
     wait_state(&mut fresh, |s| s == &ConnState::Connected).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    publish_plain(&topic, b"must not arrive".to_vec()).await;
+    publish_plain(&t3, b"must not arrive".to_vec()).await;
     expect_silence(&mut fresh).await;
     // The set is empty now: the UNSUBACK was reported.
     next_session_filters(&mut fresh, |f| f.is_empty()).await;
-    fresh.shutdown().await;
-}
 
-#[tokio::test(flavor = "current_thread")]
-async fn a_removal_survives_a_restart_with_the_saved_session_filters() {
-    a_removal_survives_a_restart_with_the_saved_session_filters_with(Protocol::V5).await;
-}
-
-/// The same test on MQTT 3.1.1: Clean Session off keeps the session (D3).
-#[tokio::test(flavor = "current_thread")]
-async fn v3_a_removal_survives_a_restart_with_the_saved_session_filters() {
-    a_removal_survives_a_restart_with_the_saved_session_filters_with(Protocol::V311).await;
-}
-
-/// A new profile shares the broker session of an older one (an imported copy with the same
-/// client ID). The net thread has the set in its cache and nothing changes, but the new profile
-/// must still get the set to save it. Without it, a restart after a removal forgets the filter.
-async fn a_new_profile_on_a_shared_session_gets_the_cached_set_with(protocol: Protocol) {
-    require_broker();
-    let p = prefix();
-    let topic = format!("{p}/shared");
-    let original = persistent(&[&topic], 18830, protocol);
-    let mut net = Net::start(NetLimits::default());
-    connect(&mut net, original.clone()).await;
-    next_session_filters(&mut net, |f| f.contains(&topic)).await;
-    net.disconnect();
-    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
-
-    // The imported copy: a new ID, the same broker and client ID, no saved set.
+    // 4. A new profile shares the broker session of an older one (an imported copy with the same
+    // client ID). The net thread has the set in its cache and nothing changes, but the new
+    // profile must still get the set to save it.
+    connect(&mut fresh, with(&t4)).await;
+    next_session_filters(&mut fresh, |f| f.contains(&t4)).await;
+    fresh.disconnect();
+    wait_state(&mut fresh, |s| s == &ConnState::Disconnected).await;
     let copy = Profile {
         id: uuid::Uuid::new_v4(),
         session_filters: vec![],
-        ..original
+        ..with(&t4)
     };
-    connect(&mut net, copy.clone()).await;
-    // Nothing changed in the cached set, and it is reported anyway.
-    let saved = next_session_filters(&mut net, |f| f.contains(&topic)).await;
-    net.shutdown().await;
-
+    connect(&mut fresh, copy).await;
+    let saved = next_session_filters(&mut fresh, |f| f.contains(&t4)).await;
+    fresh.shutdown().await;
     // The user removes the filter from the copy, and the app restarts with the saved set.
-    let mut fresh = Net::start(NetLimits::default());
+    let mut last = Net::start(NetLimits::default());
     let config = ConnectConfig {
         session_filters: saved,
-        ..ConnectConfig::from(Profile {
-            subscriptions: vec![],
-            ..copy
-        })
+        ..ConnectConfig::from(base)
     };
-    fresh
-        .send(Command::Connect(Box::new(config)))
+    last.send(Command::Connect(Box::new(config)))
         .expect("connect");
-    wait_state(&mut fresh, |s| s == &ConnState::Connected).await;
+    wait_state(&mut last, |s| s == &ConnState::Connected).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    publish_plain(&topic, b"must not arrive".to_vec()).await;
-    expect_silence(&mut fresh).await;
-    fresh.shutdown().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_new_profile_on_a_shared_session_gets_the_cached_set() {
-    a_new_profile_on_a_shared_session_gets_the_cached_set_with(Protocol::V5).await;
-}
-
-/// The same test on MQTT 3.1.1: Clean Session off keeps the session (D3).
-#[tokio::test(flavor = "current_thread")]
-async fn v3_a_new_profile_on_a_shared_session_gets_the_cached_set() {
-    a_new_profile_on_a_shared_session_gets_the_cached_set_with(Protocol::V311).await;
+    publish_plain(&t4, b"must not arrive".to_vec()).await;
+    expect_silence(&mut last).await;
+    last.shutdown().await;
+    drop(proxy);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1313,72 +1201,6 @@ async fn published(net: &mut Net, op_id: u64) -> PublishResult {
             return result;
         }
     }
-}
-
-/// Connect, subscribe (granted QoS 1), publish QoS 0 and QoS 1, receive both.
-#[tokio::test(flavor = "current_thread")]
-async fn v3_subscribe_publish_receive_and_disconnect() {
-    require_broker();
-    let p = prefix();
-    let topic = format!("{p}/x");
-    let mut net = Net::start(NetLimits::default());
-    let generation = connect(&mut net, v3(&[&topic], "v3-basic", false)).await;
-    assert!(matches!(
-        next_event(&mut net).await,
-        Event::Subscribed { result: Ok(Qos::AtLeastOnce), filter, .. } if filter == topic
-    ));
-    for (id, qos, want) in [
-        (1, Qos::AtMostOnce, PublishResult::Sent),
-        (2, Qos::AtLeastOnce, PublishResult::Acknowledged),
-    ] {
-        net.send(out(id, &topic, b"hello", qos)).expect("send");
-        let m = next_incoming(&mut net).await;
-        assert_eq!(&*m.topic, topic);
-        assert_eq!(&m.payload[..], b"hello");
-        assert_eq!(m.generation, generation);
-        assert_eq!(m.props, MsgProps::default(), "no properties on v3");
-        assert_eq!(published(&mut net, id).await, want);
-    }
-    net.disconnect();
-    wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
-    net.shutdown().await;
-}
-
-/// Clean Session off: the broker keeps the subscription and queues a QoS 1 message while the
-/// client is away. The new connection gets it, and the session is reported for the profile.
-#[tokio::test(flavor = "current_thread")]
-async fn v3_persistent_session_resumes_with_the_queued_message() {
-    require_broker();
-    let p = prefix();
-    let topic = format!("{p}/persist");
-    let id = format!("v3-persist-{}", std::process::id());
-
-    let mut first = Net::start(NetLimits::default());
-    connect(&mut first, v3(&[&topic], &id, true)).await;
-    assert!(matches!(
-        next_event(&mut first).await,
-        Event::Subscribed { result: Ok(_), .. }
-    ));
-    // D3: a v3 session with Clean Session off is reported (it has no session expiry).
-    let filters = next_session_filters(&mut first, |f| f == [topic.as_str()]).await;
-    assert_eq!(filters, [topic.as_str()]);
-    first.shutdown().await;
-
-    let mut other = Net::start(NetLimits::default());
-    connect(&mut other, v3(&[], "v3-persist-other", false)).await;
-    other
-        .send(out(1, &topic, b"queued", Qos::AtLeastOnce))
-        .expect("send");
-    assert_eq!(published(&mut other, 1).await, PublishResult::Acknowledged);
-    other.shutdown().await;
-
-    // The same client ID and Clean Session off: the broker resumes the session. The profile has
-    // no filters, so only the session can deliver.
-    let mut again = Net::start(NetLimits::default());
-    connect(&mut again, v3(&[], &id, true)).await;
-    let m = next_incoming(&mut again).await;
-    assert_eq!((&*m.topic, &m.payload[..]), (&*topic, &b"queued"[..]));
-    again.shutdown().await;
 }
 
 /// The control: with Clean Session on, the broker keeps nothing.
@@ -1489,6 +1311,7 @@ async fn v3_an_incoming_packet_over_the_limit_ends_the_session() {
     );
     let m = next_incoming(&mut sub).await;
     assert_eq!(m.payload.len(), LIMIT - (1 + 3 + 2 + topic.len() + 2));
+    assert_eq!(m.protocol, Protocol::V311);
 
     publisher
         .send(v3_message(2, &topic, LIMIT + 1))
@@ -1502,6 +1325,10 @@ async fn v3_an_incoming_packet_over_the_limit_ends_the_session() {
     assert_eq!(
         state,
         ConnState::Failed("The broker sent a packet that is larger than the allowed size.".into())
+    );
+    assert!(
+        sub.incoming.try_recv().is_err(),
+        "the packet over the limit was delivered"
     );
     publisher.shutdown().await;
     sub.shutdown().await;
@@ -1639,6 +1466,36 @@ async fn retain_handling_decides_whether_a_retained_message_comes_at_subscribe()
         net.disconnect();
         wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
     }
+    // The same SUBSCRIBE again on one connection: handling 0 (control) sends the retained message
+    // again; handling 1 does not, because the subscription exists.
+    for (handling, again) in [
+        (RetainHandling::OnSubscribe, true),
+        (RetainHandling::OnNewSubscription, false),
+    ] {
+        let options = SubOptions {
+            retain_handling: handling,
+            ..SubOptions::default()
+        };
+        let mut net = Net::start(NetLimits::default());
+        connect(&mut net, profile_with_options(&[(&topic, options)])).await;
+        subscribed(&mut net, 1).await;
+        next_incoming(&mut net).await;
+        net.send(Command::Subscribe {
+            filter: topic.clone(),
+            qos: Qos::AtLeastOnce,
+            options,
+            req: 5,
+        })
+        .expect("send");
+        subscribed(&mut net, 1).await;
+        if again {
+            next_incoming(&mut net).await;
+        } else {
+            nothing_arrives(&mut net).await;
+        }
+        net.disconnect();
+        wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    }
     // Clear the retained message.
     publisher.send(retained(2, &topic, b"")).expect("send");
     assert_eq!(
@@ -1768,5 +1625,232 @@ async fn connection_details_come_once_for_each_connect() {
     no_event(&mut net).await;
     net.disconnect();
     wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    net.shutdown().await;
+}
+
+/// A live Subscribe with the given options and `req`.
+fn live_subscribe(net: &Net, filter: &str, options: SubOptions, req: u64) {
+    net.send(Command::Subscribe {
+        filter: filter.into(),
+        qos: Qos::AtLeastOnce,
+        options,
+        req,
+    })
+    .expect("send");
+}
+
+/// The next `Subscribed` result as (filter, req, granted). Skips `Reconnected`.
+async fn next_subscribed(net: &mut Net) -> (String, u64, bool) {
+    loop {
+        match next_event(net).await {
+            Event::Subscribed {
+                filter,
+                req,
+                result,
+                ..
+            } => return (filter, req, result.is_ok()),
+            Event::Reconnected { .. } => {}
+            other => panic!("expected Subscribed, got {other:?}"),
+        }
+    }
+}
+
+/// A lost connection and the retry, with the real broker behind a cuttable forwarder. Steps:
+/// 1. Live subscribes before the cut: a local refusal (No Local on a shared filter), the same
+///    filter twice (each result has its own `req`), and changed options (No Local).
+/// 2. Subscribe and Unsubscribe while the net thread waits for the retry change the next
+///    resubscribe.
+/// 3. After the reconnect the broker has exactly the latest state: each filter has the `req`
+///    of its latest accepted Subscribe, the changed options stay (No Local hides our own
+///    message), and the removed filter delivers nothing.
+/// 4. A Disconnect in the backoff cancels it at once, and nothing starts again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reconnect_resubscribes_the_latest_filters_options_and_reqs() {
+    require_broker();
+    let p = prefix();
+    let [a, b, c] = ["a", "b", "c"].map(|n| format!("{p}/{n}"));
+    let no_local = SubOptions {
+        no_local: true,
+        ..SubOptions::default()
+    };
+    let mut proxy = CuttableProxy::start();
+    let port = proxy.port;
+    let mut net = Net::start(NetLimits::default());
+    let mut first = profile(&[&a]);
+    first.port = port;
+    let generation = connect(&mut net, first).await;
+
+    // 1. Before the cut.
+    let mut seen = vec![next_subscribed(&mut net).await];
+    live_subscribe(&net, "$share/g/t", no_local, 7);
+    seen.push(next_subscribed(&mut net).await);
+    live_subscribe(&net, &a, SubOptions::default(), 11);
+    seen.push(next_subscribed(&mut net).await);
+    live_subscribe(&net, &a, no_local, 12);
+    seen.push(next_subscribed(&mut net).await);
+    // The same filter again with the same options: its result has its own `req`.
+    live_subscribe(&net, &a, no_local, 14);
+    seen.push(next_subscribed(&mut net).await);
+    live_subscribe(&net, &b, SubOptions::default(), 9);
+    seen.push(next_subscribed(&mut net).await);
+    assert_eq!(
+        seen,
+        [
+            (a.clone(), 0, true),
+            ("$share/g/t".to_owned(), 7, false),
+            (a.clone(), 11, true),
+            (a.clone(), 12, true),
+            (a.clone(), 14, true),
+            (b.clone(), 9, true),
+        ]
+    );
+
+    // 2. The cable is pulled. The net thread waits in the backoff.
+    proxy.cut();
+    wait_state(&mut net, |s| matches!(s, ConnState::Reconnecting { .. })).await;
+    live_subscribe(&net, &c, SubOptions::default(), 13);
+    net.send(Command::Unsubscribe { filter: b.clone() })
+        .expect("unsubscribe");
+    proxy = CuttableProxy::start_on(port);
+
+    // 3. The resubscribe. The local refusal and the SUBACKs come in any order. The last result
+    // of each filter counts (a Subscribe made while offline can also have a result at once).
+    tokio::time::timeout(
+        WAIT * 2,
+        net.status
+            .wait_for(|s| s.generation == generation && s.state == ConnState::Connected),
+    )
+    .await
+    .expect("reconnects")
+    .expect("status");
+    let mut last = std::collections::BTreeMap::new();
+    let mut unsubscribed = vec![];
+    while let Ok(event) =
+        tokio::time::timeout(Duration::from_millis(700), next_event_raw(&mut net)).await
+    {
+        match event {
+            Event::Subscribed {
+                filter,
+                req,
+                result,
+                ..
+            } => {
+                last.insert(filter, (req, result.is_ok()));
+            }
+            Event::Unsubscribed { filter, result, .. } => {
+                assert_eq!(result, Ok(()));
+                unsubscribed.push(filter);
+            }
+            Event::Reconnected { .. }
+            | Event::SessionFilters { .. }
+            | Event::ConnectionDetails { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(unsubscribed, std::slice::from_ref(&b));
+    assert_eq!(
+        last,
+        [
+            ("$share/g/t".to_owned(), (7, false)),
+            (a.clone(), (14, true)),
+            (c.clone(), (13, true)),
+        ]
+        .into_iter()
+        .collect()
+    );
+    // What the broker holds: a (No Local), c. Our own message on `a` is hidden, one from another
+    // client arrives; the removed `b` delivers nothing; our own message on `c` arrives.
+    net.send(out(1, &a, b"own-a", Qos::AtLeastOnce))
+        .expect("send");
+    assert_eq!(published(&mut net, 1).await, PublishResult::Acknowledged);
+    publish_plain(&a, b"other-a".to_vec()).await;
+    publish_plain(&b, b"other-b".to_vec()).await;
+    net.send(out(2, &c, b"own-c", Qos::AtLeastOnce))
+        .expect("send");
+    assert_eq!(published(&mut net, 2).await, PublishResult::Acknowledged);
+    let m = next_incoming(&mut net).await;
+    assert_eq!((&*m.topic, &m.payload[..]), (&*a, &b"other-a"[..]));
+    let m = next_incoming(&mut net).await;
+    assert_eq!((&*m.topic, &m.payload[..]), (&*c, &b"own-c"[..]));
+    expect_silence(&mut net).await;
+
+    // 4. Disconnect in the backoff.
+    proxy.cut();
+    wait_state(&mut net, |s| matches!(s, ConnState::Reconnecting { .. })).await;
+    let started = std::time::Instant::now();
+    net.disconnect();
+    let ended = wait_state(&mut net, |s| s == &ConnState::Disconnected).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the cancel waited for the backoff"
+    );
+    assert_eq!(ended, generation);
+    // The first retry would come after 1 s. Nothing starts again.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(net.status.borrow().state, ConnState::Disconnected);
+    net.shutdown().await;
+}
+
+/// After `Disconnect` the net thread queues nothing, though the broker still sends: a second
+/// client floods the topic with QoS 0 messages before, during and after the disconnect. The queue
+/// is empty at `Disconnected`, stays empty, and the byte count is 0.
+#[tokio::test(flavor = "current_thread")]
+async fn nothing_is_queued_after_disconnect() {
+    require_broker();
+    let p = prefix();
+    let topic = format!("{p}/flood");
+    let mut net = Net::start(NetLimits::default());
+    connect(&mut net, profile(&[&topic])).await;
+    assert!(matches!(
+        next_event(&mut net).await,
+        Event::Subscribed { result: Ok(_), .. }
+    ));
+    let mut publisher = Publisher::connect("127.0.0.1", 18830)
+        .await
+        .expect("second client cannot connect");
+    // Sends a burst, and lets the net thread run.
+    async fn burst(publisher: &mut Publisher, topic: &str) {
+        for _ in 0..20 {
+            publisher
+                .send(topic, Bytes::from(vec![b'x'; 1024]), Qos::AtMostOnce)
+                .await
+                .expect("publish");
+        }
+        tokio::task::yield_now().await;
+    }
+    let state = |net: &Net| net.status.borrow().state.clone();
+    for _ in 0..50 {
+        burst(&mut publisher, &topic).await;
+    }
+    let first = next_incoming(&mut net).await;
+    assert_eq!(&*first.topic, topic);
+    net.disconnect();
+    // From `Disconnecting` on, the net thread queues nothing. Empty the queue then. The flood
+    // goes on until the end.
+    while !matches!(
+        state(&net),
+        ConnState::Disconnecting | ConnState::Disconnected
+    ) {
+        burst(&mut publisher, &topic).await;
+    }
+    while let Ok(m) = net.incoming.try_recv() {
+        net.release(&m);
+    }
+    let end = tokio::time::Instant::now() + WAIT;
+    while state(&net) != ConnState::Disconnected {
+        assert!(tokio::time::Instant::now() < end, "no Disconnected");
+        burst(&mut publisher, &topic).await;
+    }
+    // The flood goes on after the end too.
+    let after = tokio::time::Instant::now() + Duration::from_millis(200);
+    while tokio::time::Instant::now() < after {
+        burst(&mut publisher, &topic).await;
+    }
+    assert!(
+        net.incoming.try_recv().is_err(),
+        "a message came after Disconnected"
+    );
+    assert_eq!(net.queued_bytes(), 0);
+    publisher.shutdown().await;
     net.shutdown().await;
 }

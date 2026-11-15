@@ -1115,3 +1115,161 @@ The owner approved a push of `feat/ntex-mqtt` (no merge, no tag) so that CI runs
 **Tests:** the fake has `Options::reset_on_handshake_failure` (drops the alert, then closes with data unread). `{v3,v5}_{tls,wss}_missing_cert_with_reset` expect the new text in `Reconnecting`. Without the option the fake drains and shuts down cleanly, so `{v3,v5}_mtls_over_wss` is deterministic on every OS.
 
 Real-broker check after the fix (orchestrator): `broker_compat` 24, `broker_matrix` 38, `net_mosquitto` 36 passed, 0 failed (`--test-threads=1`). Codex: NO ISSUES (round 1).
+
+## Test clean-up
+
+The owner approved a list of test changes (steps 1 to 8; step 9, native Mosquitto jobs on macOS and Windows, is later). The rules: lean tests, no duplicate checks, no version or transport twin where the code path is shared (a twin stays only where the code differs, and a comment names that code), tests that share a fixture are one test, a real broker wherever it can make the case, and less run time. Each transport (TCP, TLS, WS, WSS) and each MQTT version is used at least once. The plan wording now says so.
+
+Commit 663bc59 is the base. No commit was made. Logs: `clean-*.txt` in the scratchpad.
+
+### The timer hook
+
+`NetLimits` has a new field `timers: Timers` (`net.rs`). `Timers::default()` holds the shipped values, so production code is unchanged. Only tests set other values.
+
+| Field | Shipped value | Used for |
+| --- | --- | --- |
+| `connect` | 10 s | The one deadline for transport set-up and CONNACK; the ntex connect and MQTT handshake timeouts (rounded up to whole seconds) |
+| `op` | 10 s (300 ms in unit tests, as before) | One publish, subscribe or unsubscribe |
+| `write` | 10 s | The ntex write timeout |
+| `tls_handshake` | 5 s | `TlsConfig` handshake timeout (5 s is the ntex-tls default; now set in our code) |
+| `ws_upgrade` | 5 s | `WsClientConfig` handshake timeout (5 s is the ntex default; now set in our code) |
+| `frame_check` | 10 s | Frame read rate, time of one check |
+| `frame_cap` | 60 s | Frame read rate, time for a whole packet |
+
+ntex counts the write, TLS handshake and frame-rate limits in whole seconds, so a short value is at least 1 s. The end texts keep the text of the real value ("10 s"). Keep alive is a profile value, so it needed no hook.
+
+`net_fake.rs` has `short()`: connect 2 s, op 2 s, write 2 s, TLS 1 s, WS upgrade 1 s, frame check 1 s, frame cap 3 s. The bounds of the short cases are scaled from the timer value with the formulas of the plan (for example write timeout + 2.5 s, check + 3 s, deadline + 1 s).
+
+Each limit has exactly one case at the real value. The comment of that case says so.
+
+| Limit | Real-value test |
+| --- | --- |
+| write timeout (10 s) | `net_fake::v5_write_timeout_alone_is_a_temporary_failure` (operation timeout 60 s, so only the write timeout can end it) |
+| operation timeout (10 s) | `net_fake::v5_tcp_stalled_write_with_the_real_operation_timeout` (write timeout 60 s, so only the operation timer can end it) |
+| connect deadline (10 s, outer) | `net_fake::black_hole::a_black_hole_dial_ends_with_the_real_connect_deadline` (Linux only; no other timer can end the dial) |
+| TLS handshake (5 s) | `net_fake::v5_tls_stalled_handshake_with_the_real_timer` |
+| WS upgrade (5 s) | `net_fake::v5_wss_stalled_upgrade_is_a_temporary_timeout_with_the_real_timer` (ends in 4 to 7 s, below the 10 s connect deadline) |
+| frame read-rate check (10 s) | `net_fake::v5_tcp_half_payload_with_the_real_frame_check` |
+| frame read-rate cap (60 s) | `net_fake::v5_tcp_trickle_with_the_real_cap` (`#[ignore]`, 60 s) |
+| keep alive (60 s and 70 s) | `net_fake::v5_keep_alive_60_s` and `v3_keep_alive_70_s` (`#[ignore]`) |
+
+The three `#[ignore]` real-value tests ran once after the clean-up: 3 passed in 147.7 s (`clean-final-ignored.txt`). The race of the two equal timers (write = operation) is in the short cases `v3_tls_stalled_write`, `v5_ws_stalled_write`, `v3_wss_stalled_write` and `v5_stalled_write_with_keep_alive_2_s` (2 s each); the silent CONNACK cases (`v5_tcp_silent_connack`, `v3_tls_silent_connack`) use the short connect deadline. `v3_wss_stalled_handshake` sets the connect deadline to 5 s, above its bound of 3 s, so only the TLS handshake timer can end it.
+
+Mutation check of the two real tests: the write timeout fixed at 60 s fails `v5_write_timeout_alone_is_a_temporary_failure` only; the operation timeout fixed at 60 s fails `v5_tcp_stalled_write_with_the_real_operation_timeout` only. The code was restored (byte-equal to the backup).
+
+### What changed in each step
+
+1. **Duplicates.** Deleted `tests/net_blocked_write.rs` (`net_fake::disconnect_during_a_blocked_write` checks the same). Deleted 7 unit tests in `net.rs` (reconnect and resubscribe, untrusted certificate, stalled upgrade, missing PINGRESP, v3 UNSUBACK, v3 maximum packet, v5 options byte). Their covers were opened first. Two assertions moved: `broker_compat::restart_reconnects_and_resubscribes` now also adds a live filter, checks the `Reconnected` event and the generation, and checks that both filters come back; `broker_matrix` v3 TCP now sends an UNSUBSCRIBE and checks `Unsubscribed(Ok)` (the v3 UNSUBACK path).
+2. **`broker_matrix.rs`.** Deleted the v3 twins of the TLS failure tests, of the TLS, mTLS, WS, DNS-name and one-MiB round trips, and the restart test (`broker_compat` has it). The anonymous TCP round trip, the WebSocket round trip and the five TLS failures are one test (`anonymous_transports_and_tls_failures`, `tokio::join!`). The write lock of the file is gone, because no test restarts the broker there.
+3. **`net_mosquitto.rs`.** Deleted `v3_subscribe_publish_receive_and_disconnect` (granted QoS 1 is asserted by `wait_subscribed` in the matrix v3 test), `v3_persistent_session_resumes_with_the_queued_message` (`broker_compat` has the queued message; the v3 session report moved into `removal_while_offline`), and four v3 session twins. The four v5 session tests are one test with four numbered steps, one client ID and one cuttable forwarder (`a_removal_reaches_the_resumed_session`).
+4. **`net_fake.rs`.** The 8-wire cases are a diagonal now (v5 TCP, v3 TLS, v5 WS, v3 WSS), the TCP/TLS-only cases are v5 TCP and v3 TLS, and the WS-only cases are v5 WS and v3 WSS. The timer hook and `short()` went in with this step.
+5. **`net_fd_leak.rs`.** MQTT 5 only, 3 rounds for each transport, and the test polls the descriptor count instead of fixed sleeps. It also checks that the dial opened a socket.
+6. **`net.rs` units.** The two full-log tests are one test with a signal instead of the 8 s and 2.5 s fake sleeps. The CONNACK tests (not authorized, server unavailable, the five v3 return codes, v5 0x84) are one table test.
+7. **Real instead of fake.** New: Mosquitto listener 18838 (WSS, client certificate required) and a second Mosquitto service `mosquitto-limits` (18860: `max_keepalive 5`, `max_inflight_messages 2`, `max_packet_size 4096`; these are global in Mosquitto). `up.sh` checks both and starts the second service with `mosquitto`; `compose.yml`, `mosquitto-limits.conf` and the README follow. Moved to the real broker and deleted the fake: `mtls_over_wss` (x2; one fake v5 stays as the cross-OS smoke test), the announced Maximum Packet Size test, `v5_server_keep_alive_5_s_is_followed` (now through the sniffing proxy, with the Receive Maximum 2 of the broker checked in the details), `net_keepalive_tasks` (now Mosquitto 18830), and 8 `net.rs` units (the three reconnect tests and the backoff cancel are one `net_mosquitto` test; the flood after disconnect; the v5 incoming packet limit; the two connection-details tests are in `connack_probe`, which now asserts every Mosquitto value with `assert_eq` and the v3 details for all three brokers).
+8. **CI.** `net_mosquitto`, `broker_matrix`, `broker_compat` and the new `net_keepalive_tasks` run in one `cargo test` without `--test-threads=1`. `load_ci`: `LOAD_WARMUP_SECS` 15, `LOAD_SECS` 60. Fuzz: `parse_hex` and `topic_matches` 20 s, `decode_render` and `profile_import` 60 s; no change for the `cargo-fuzz` install: `taiki-e/install-action` has no `cargo-fuzz` manifest, and `Swatinem/rust-cache` already caches `${CARGO_HOME}/bin` (`cache-bin` is `true` by default), so `cargo install` ends at once on a later run. A comment in `ci.yml` says so. `ci.yml` was checked by reading and a YAML parse; no push.
+
+### Test counts
+
+| Binary | Before | After |
+| --- | --- | --- |
+| `navigator-core` lib | 183 (1 ignored) | 164 (1 ignored) |
+| `net_fake` | 97 (8 ignored) | 50 (3 ignored) |
+| `net_blocked_write` | 1 | deleted |
+| `net_fd_leak` | 1 | 1 |
+| `net_keepalive_tasks` | 1 (no broker) | 1 (Mosquitto) |
+| `net_mosquitto` | 36 | 27 |
+| `broker_matrix` | 38 | 22 |
+| `broker_compat` | 24 | 24 |
+| `load_ci`, `soak` | 1, 1 | 1, 1 |
+
+`cargo test --workspace`: 430 passed and 9 ignored before; 367 passed and 4 ignored after the round 1 fixes (`clean-final4-workspace.txt`).
+
+### Times
+
+| Measure | Before | After |
+| --- | --- | --- |
+| `cargo test --workspace`, test time (sum of "finished in") | about 126 s | 28.9 s; `time`: 32.9 s wall with no build |
+| `net_fake`, wall | about 84 s | 23.1 s (5 runs: 23.08 to 23.09 s) |
+| `net_fake`, serial (`--test-threads=1`) | 426 s | 125.9 s |
+| `net_fd_leak` | 25.0 s | 1.0 s |
+| `net_blocked_write` | 1.55 s | deleted |
+| lib tests | 10.0 s | 5.0 s |
+| `net_mosquitto`, serial | 56 s | 44 s (parallel: 12.5 to 12.8 s, 8 runs; CI runs it in parallel) |
+| `broker_matrix` | 27 s | 5.4 s parallel (17 s serial) |
+| `broker_compat` | 32 s | 27 to 45 s parallel (the three broker restarts dominate; 5 runs) |
+| `load_ci` (debug) | 361 s | 75.7 s with the CI values (15 s and 60 s) |
+| Full broker suite, serial, `--no-fail-fast` | about 16 min | 193.7 s and 184.2 s (2 runs; `net_mosquitto` serial, the rest parallel, `LOAD_*` as in CI) |
+| CI broker job | about 265 s | not measured (no push); the load test is 75 s of run time instead of 150 s, and `broker_matrix` and `broker_compat` run in parallel |
+
+### Coverage
+
+Every behaviour of the plan and `AGENTS.md` that a deleted test proved is proved by a test that stays. Checks that moved are listed in "What changed".
+
+| Behaviour | Test that proves it now |
+| --- | --- |
+| Blocked write ends the attempt; operation timer; write timeout alone | `net_fake` stalled write (v5 TCP real; v3 TLS, v5 WS, v3 WSS short), `v5_stalled_write_with_keep_alive_2_s`, `v5_write_timeout_alone_is_a_temporary_failure` |
+| Disconnect during a blocked write, an unanswered PUBLISH, or a half frame is prompt | `net_fake::disconnect_during_a_blocked_write`, `ack_wait_cancelled_by_close`, `disconnect_while_a_half_frame_waits` (4 wires each) |
+| Half frame, trickle: frame read rate | `net_fake::half_fixed_header`, `half_payload`, `trickle`, `half_binary_frame` (WS and WSS: keep alive finds it) |
+| Dead peer (missing PINGRESP), keep alive 60 s and 70 s | `net_fake::missing_pingresp` (4 wires), `v5_missing_pingresp_with_publishes`, the two `#[ignore]` keep-alive tests |
+| Server Keep Alive 5 s and 0 | `broker_matrix::v5_server_keep_alive_5_s_is_followed` (real); `net_fake::v5_server_keep_alive_0_sends_no_ping` (Mosquitto cannot send 0) |
+| Old keep-alive tasks end | `net_keepalive_tasks::old_keep_alive_tasks_end` |
+| One connect deadline, silent CONNACK, black hole | `net_fake::a_black_hole_dial_ends_with_the_real_connect_deadline`, `v5_tcp_silent_connack`, `v3_tls_silent_connack` |
+| TLS handshake timeout; WS upgrade timeout | `net_fake::v5_tls_stalled_handshake_with_the_real_timer`, `v3_wss_stalled_handshake`; `v5_wss_stalled_upgrade_is_a_temporary_timeout_with_the_real_timer` |
+| 2 MiB header ends at once; WS framing | `net_fake::big_header`, `websocket_frames` |
+| Incoming packet limit, v5 and v3 | `net_mosquitto::oversized_packet_is_not_delivered` (exact limit passes, one more byte ends the session), `v3_an_incoming_packet_over_the_limit_ends_the_session` |
+| Outgoing size: announced limit, v3 limit, MQTT maximum | `broker_matrix::a_v5_publish_over_the_announced_maximum_packet_size_is_refused_before_the_send` (real); `net_mosquitto::v3_a_packet_of_one_mib_round_trips_and_one_byte_more_is_refused`; `net_fake::a_v5_publish_over_the_local_limit_is_sent_when_the_broker_announces_none` |
+| One MiB round trip, forwarded Topic Alias | `broker_matrix::one_mib_over_*`, `v5_forwarded_copy_carries_a_topic_alias` |
+| TLS failures, mTLS (missing and mismatched key), verify off, DNS name | `broker_matrix::anonymous_transports_and_tls_failures`, `tls_verify_off_accepts_untrusted_certificates`, `mtls_with_client_certificate`, `tls_with_a_dns_name`, `secure_websocket_with_a_dns_name` |
+| mTLS over WSS, with and without certificate, v3 and v5 | `broker_matrix::mtls_over_secure_websocket` (real, port 18838) |
+| Missing client certificate with a TLS reset (Windows fix) | `net_fake::missing_cert_with_reset::{v5_tls, v3_wss}` |
+| Wrong password, v3 and v5 codes | `broker_matrix::wrong_password_fails_without_retry`, `v3_wrong_password_fails_without_retry` |
+| Reconnect, same generation, resubscribe of profile and live filters, after a broker restart | `broker_compat::*::restart_reconnects_and_resubscribes` (Mosquitto, EMQX, HiveMQ) |
+| Filters, options and `req` echo after a reconnect; changes during the backoff; cancel in the backoff | `net_mosquitto::a_reconnect_resubscribes_the_latest_filters_options_and_reqs` |
+| Persistent session, retained messages | `broker_compat::*::persistent_session_keeps_queued_message`, `v3_persistent_session_keeps_queued_message`, `retained_delivery_and_clear`, `v3_retained_delivery_and_clear` |
+| A removal reaches a resumed session (manual disconnect, lost UNSUBSCRIBE, restart with the saved set, new profile on a shared session) | `net_mosquitto::a_removal_reaches_the_resumed_session` (v5), `a_removal_while_offline_reaches_a_resumed_session` and the v3 twin (the v3 session report is checked there) |
+| Clean session keeps nothing | `net_mosquitto::a_clean_session_forgets_the_filters` (v5), `v3_clean_session_keeps_nothing` |
+| Subscription options on the wire | `net_mosquitto::no_local_hides_our_own_publish`, `retain_handling_decides_whether_a_retained_message_comes_at_subscribe`, `retain_as_published_keeps_the_retain_flag_of_a_live_message` |
+| v3 granted QoS 1, v3 UNSUBACK is done, v5 UNSUBACK reason | `broker_matrix::v3_anonymous_tcp`, `net_mosquitto::unsuback_reason_is_checked` |
+| CONNACK texts and retry rule (v3 codes, v5 0x84, 0x87, 0x88) | `net.rs::connack_refusals_have_plain_text_and_the_right_retry_rule` |
+| Connection details (v5 all values, v3 session flag) | `broker_compat::*::connack_probe` (exact for Mosquitto), `net.rs::connection_details_come_from_the_connack` |
+| Details wait for room in a full log and are not lost; only the latest connection's details | `net.rs::a_full_log_keeps_the_details_of_the_latest_connection_and_loses_none` |
+| Nothing is queued after Disconnect | `net_mosquitto::nothing_is_queued_after_disconnect` |
+| Receive Maximum 2 keeps two in flight; invalid topic alias | `net_fake::a_thousand_publishes_at_receive_maximum_2_keep_to_two_in_flight`, `a_v5_publish_with_an_invalid_topic_alias_is_not_delivered` |
+| Bounded queues, slow UI | `net_mosquitto::full_queue_drops_and_bounds_memory`, `pending_operations_are_capped`, `slow_ui_still_gets_every_publish_result`, `many_filters_and_a_slow_ui_lose_no_result` |
+| A cancelled dial leaves no file descriptor | `net_fd_leak::a_cancelled_black_hole_dial_leaves_no_file_descriptor` |
+
+### Deviations from the list
+
+- **Maximum Packet Size "none".** The list moved `a_v5_publish_over_the_local_limit_is_sent_when_the_broker_announces_none` to Mosquitto 18830. Mosquitto 2.1.2 always announces a Maximum Packet Size (2 000 000 bytes by default; `max_packet_size` must be at least 20), so no listener answers without one. The test stays a fake, with a comment that says why.
+- **`max_packet_size` is global in Mosquitto**, not per listener. The 4096 limit and `max_keepalive 5` are on the second service (18860), not on a listener 18839 of the first.
+- **Mosquitto does not enforce the client's Maximum Packet Size.** `oversized_packet_is_not_delivered` found that Mosquitto sends a packet one byte over the announced limit, and the client ends the session with the size text. The v5 test asserts that one end (exact limit delivered; one byte more ends the session with the size text). It passed 5 parallel runs, so the near-twin fake `hostile_broker_oversized_packet_fails_session` was deleted.
+- **The v3 twin of `a_clean_session_forgets_the_filters`** was deleted too (the list named five session tests; `v3_clean_session_keeps_nothing` covers the v3 clean session).
+- **`net_mosquitto` runs in parallel in CI** too (no `--test-threads=1`). 5 more local parallel runs passed (12.5 to 12.8 s against 44.8 s serial; `clean-final3-net_mosquitto-5x.txt`).
+- **`net_keepalive_tasks` now needs the broker** (`broker-tests`), so it left `cargo test --workspace` and runs in the CI broker job.
+- **`removal_while_offline`** also checks the v3 session report (moved from the deleted v3 persistent-session test).
+- **`nothing_is_queued_after_disconnect`** floods the topic before, during and after the disconnect. The disconnect of the net thread takes milliseconds, so the socket is closed at once; the check is the same as with the fake (the queue is empty after `Disconnecting` and stays empty), with 560 to 830 messages drained at that time in 3 runs.
+- **Windows and macOS.** These tests ran in the 3-OS `test` job before and now run only in the Linux broker job (until step 9): the 8 unit tests that moved from `net.rs`, the real `mtls_over_wss` (the fake `v5_mtls_over_wss` found the Windows TLS reset bug), the announced maximum packet test, Server Keep Alive 5 s and `net_keepalive_tasks`. The fake `missing_cert_with_reset` tests (TLS and WSS) stay in the 3-OS job, and one fake `net_fake::v5_mtls_over_wss` stays as a deliberate twin of the real test: it is the Windows and macOS smoke test for client certificates over WSS with vendored OpenSSL. The new short-timer `net_fake` cases have run on Linux only; Windows and macOS CI have not seen them yet (the Windows `net_fake` run was 133 s before). Check the first CI run.
+- `cargo-fuzz` has no prebuilt install action; the job relies on the cache of `${CARGO_HOME}/bin` (not testable without a push).
+- The second Mosquitto service (`mosquitto-limits`) stays running with `mosquitto`; EMQX and HiveMQ were stopped.
+
+### Commands run
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed after each step and at the end. `cargo deny check`: advisories, bans, licenses and sources ok. Broker: `tests/broker/up.sh` (Mosquitto 18830 to 18838 and 18860), EMQX and HiveMQ for the full suite; stopped with `docker compose -f tests/broker/compose.yml stop emqx hivemq`.
+
+### Clean-up round 1 fixes
+
+Measurements in the "Times" table were taken during the work, before round 1; the counts and the final run below are from the end.
+
+1. **Reconnect test.** `a_reconnect_resubscribes_the_latest_filters_options_and_reqs` now sends an identical subscription (same filter, same options) with a new `req` (14) and asserts that `req` in the result after the reconnect (restores the deleted `req` echo check).
+2. **Connect deadline.** The black hole dial is the real-value test for the outer 10 s deadline (`a_black_hole_dial_ends_with_the_real_connect_deadline`, 9 to 11 s). The silent CONNACK cases use the short timer. Mutation check: the outer `tokio` deadline set to 20 s fails the black hole test; restored (`cmp` equal).
+3. **WS upgrade.** The real test now also asserts an end in 4 to 7 s, below the 10 s connect deadline. Mutation check: an upgrade timer of 9 s fails it; restored.
+4. **Counts.** The workspace count after the round 1 fixes is 367 passed and 4 ignored (the earlier 366 was before the fake `v5_mtls_over_wss` came back). `net_fake` is 47 run and 3 ignored; `net_mosquitto` is 27.
+5. **Full suite before round 1** (orchestrator, `clean-final-suite.txt`): 161 s wall. The test binaries run one after another; the tests run in parallel inside each binary; the restart lock of `broker_compat` is per process. CI load values; lib 163, `broker_compat` 24, `broker_matrix` 22, `load_ci` 1, `net_fake` 47 and 3 ignored, `net_fd_leak` 1, `net_keepalive_tasks` 1, `net_mosquitto` 27. All passed.
+
+Gate after the fixes: fmt and clippy ok; `cargo test --workspace` 367 passed; `net_fake` 3 of 3 runs passed (25.1 s); `net_mosquitto` passed once (12.4 s). No commit, no push.
+
+### Clean-up round 2 fixes
+
+1. **Retain Handling 1.** `retain_handling_decides_whether_a_retained_message_comes_at_subscribe` now also repeats the SUBSCRIBE on one connection: handling 0 (control) sends the retained message again; handling 1 sends nothing. Mutation check: handling 1 encoded as 0 (`wire.rs`) fails it; restored (`cmp` equal).
+2. **Over-limit failure.** `v3_an_incoming_packet_over_the_limit_ends_the_session` asserts `sub.incoming.try_recv().is_err()` before the shutdown.
+3. **Final full suite on the final code** (`clean-final5-suite.txt`): `tests/broker/up.sh`, then `LOAD_WARMUP_SECS=15 LOAD_SECS=60 cargo test -p navigator-core --features broker-tests --no-fail-fast`. Wall 162.4 s (the binaries run one after another). lib 163 (1 ignored), `broker_compat` 24, `broker_matrix` 22, `load_ci` 1, `net_fake` 47 (3 ignored), `net_fd_leak` 1, `net_keepalive_tasks` 1, `net_mosquitto` 27, `soak` 1 ignored; 0 failed. Workspace: 367 passed, 4 ignored. fmt and clippy ok. EMQX and HiveMQ stopped afterwards.
