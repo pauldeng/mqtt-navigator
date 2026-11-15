@@ -324,14 +324,37 @@ async fn v5_write_timeout_alone_is_a_temporary_failure() {
         results.iter().all(|(_, r)| *r == PublishResult::Sent),
         "{results:?}"
     );
-    let ended = status_where(&mut net, Duration::from_secs_f64(write + 4.0), |s| {
-        s.state != ConnState::Connected
-    })
-    .await;
+    // Keep taking the results while we wait for the end: a late `Sent` can start the last write
+    // period, so the upper bound must count from the last `Sent` before the end.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(write + 4.0);
+    let ended = loop {
+        let now = net.status.borrow_and_update().clone();
+        if now.state != ConnState::Connected {
+            break now;
+        }
+        tokio::select! {
+            changed = net.status.changed() => changed.expect("status"),
+            event = net.events.recv() => match event {
+                Some(Event::Published { result, .. }) => results.push((started.elapsed(), result)),
+                Some(_) => {}
+                None => panic!("events closed"),
+            },
+            () = tokio::time::sleep_until(deadline) => panic!("the attempt did not end in time"),
+        }
+    };
+    // The stall starts between the burst and the last `Sent`: the buffers took that message, so
+    // the write timer cannot start before the burst or long after it. The OS sets how long the
+    // buffers take bytes (Windows CI: the attempt ended 12.9 s after the burst), so the upper bound
+    // counts from the last `Sent`.
     let took = started.elapsed().as_secs_f64();
+    let last_sent = results
+        .iter()
+        .rfind(|(_, r)| *r == PublishResult::Sent)
+        .map_or(0.0, |(at, _)| at.as_secs_f64());
     assert!(
-        (write - 1.0..=write + 2.5).contains(&took),
-        "the attempt ended {took} s after the burst ({ended:?})"
+        took >= write - 1.0 && took - last_sent <= write + 2.5,
+        "the attempt ended {took} s after the burst, {} s after the last Sent ({ended:?})",
+        took - last_sent
     );
     assert!(
         matches!(&ended.state, ConnState::Reconnecting { attempt: 1, reason } if reason == WRITE_TIMEOUT_TEXT),
