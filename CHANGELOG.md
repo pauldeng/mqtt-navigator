@@ -21,6 +21,10 @@ All notable changes to this project are in this file. The format follows [Keep a
 - The connection ends with new plain texts when the broker stops reading, or stops in the middle of a packet.
 - The release file is 2.2% larger than 0.1.1 (35 699 608 B against 34 943 904 B on Linux).
 
+### Fixed
+
+- A TLS or WSS connection with no client certificate that the broker closes during set-up now says "The broker closed the connection during set-up. If the broker needs a client certificate, add one to the connection." The broker can reset the connection and drop the TLS alert (always on Windows). Before, the text said only that the broker closed the connection.
+
 ### Known limitations
 
 - QoS 2 is not supported.

@@ -1103,3 +1103,15 @@ The Unreleased "Known limitations" now also list the memory after an overload, t
 ### Push
 
 The owner approved a push of `feat/ntex-mqtt` (no merge, no tag) so that CI runs on the three OSes.
+
+## Windows TLS reset fix
+
+**Symptom:** CI run 43671349501, job `test (windows-2022)`, attempt 1: `net_fake::v5_mtls_over_wss` failed at `net_fake.rs:41` ("the state did not come in time"). `v3_mtls_over_wss` passed. The log has no per-test start time, so it does not show which of the three waits ended. The failure is a missing `Failed` state: the client was in `Reconnecting`.
+
+**Cause (reproduced on Linux):** with TLS 1.3 the client ends its handshake and sends the next data (WS upgrade or CONNECT) at once. The broker rejects the missing certificate, sends an alert and closes with that data unread. This sends a reset. Windows drops unread receive data on a reset, so the alert is lost. The client saw a close, and `io_outcome` and `connect_outcome` made a temporary "The broker closed the connection." Linux keeps the alert, so only a fake that drops the alert shows the bug there.
+
+**Fix:** `connect_outcome` (`net/wire.rs`, the one place for v3 and v5, TLS, WSS) maps a plain close during set-up, over TLS or WSS, with no client certificate, to the temporary text "The broker closed the connection during set-up. If the broker needs a client certificate, add one to the connection." With a client certificate, or over TCP and WS, the old texts stay. No real alert is available after a reset, so the text names the likely cause. No delay is added.
+
+**Tests:** the fake has `Options::reset_on_handshake_failure` (drops the alert, then closes with data unread). `{v3,v5}_{tls,wss}_missing_cert_with_reset` expect the new text in `Reconnecting`. Without the option the fake drains and shuts down cleanly, so `{v3,v5}_mtls_over_wss` is deterministic on every OS.
+
+Real-broker check after the fix (orchestrator): `broker_compat` 24, `broker_matrix` 38, `net_mosquitto` 36 passed, 0 failed (`--test-threads=1`). Codex: NO ISSUES (round 1).

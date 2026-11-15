@@ -412,6 +412,7 @@ The settings file is `settings.json` in the `mqtt-navigator` folder of your syst
 | The server certificate expired on …. Renew it, or turn off verification. | Renew the certificate on the broker. |
 | The server certificate is not valid yet. Check the clock of this computer and of the broker. | Correct the clock. |
 | The broker needs a client certificate. Add your certificate and key. | Set the client certificate and key. |
+| The broker closed the connection during set-up. If the broker needs a client certificate, add one to the connection. | The app retries. If it keeps failing, set the client certificate and key. Some brokers (and Windows) hide the reason when they need a client certificate. Also check the address and the port. |
 | The client certificate and key do not match. | Choose the key that belongs to the certificate. |
 | The client key is encrypted. Enter the key passphrase, or use a key without a passphrase. | Type the passphrase in **Key passphrase**. |
 | The client key passphrase is wrong, or the key is not valid. | Correct the passphrase, or choose another key. |

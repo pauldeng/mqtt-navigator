@@ -720,6 +720,7 @@ async fn mtls_over_wss(v: Protocol) {
         v,
         Options {
             require_client_cert: true,
+            ..Options::default()
         },
         |_, mut conn| {
             if conn.accept_connect().is_ok() {
@@ -746,6 +747,58 @@ async fn mtls_over_wss(v: Protocol) {
     .await;
     assert_eq!(s.state, ConnState::Failed(CLIENT_CERT_TEXT.into()), "{s:?}");
     net.shutdown().await;
+}
+
+const SETUP_CLOSE_TEXT: &str = "The broker closed the connection during set-up. If the broker needs a client certificate, add one to the connection.";
+
+/// A broker that needs a client certificate resets the connection after it rejects the client
+/// (the data of the client is unread), so the alert can be lost. The text must name the likely
+/// cause, and the attempt must stay temporary (a broker restart recovers).
+async fn missing_cert_with_reset(t: Transport, v: Protocol) {
+    let f = Fake::start(
+        t,
+        v,
+        Options {
+            require_client_cert: true,
+            reset_on_handshake_failure: true,
+        },
+        |_, _| {},
+    );
+    let mut net = Net::start(NetLimits::default());
+    net.send(Command::Connect(Box::new(config(&f, t, v, 0))))
+        .expect("send");
+    let s = status_where(&mut net, Duration::from_secs(10), |s| {
+        matches!(
+            s.state,
+            ConnState::Failed(_) | ConnState::Reconnecting { .. }
+        )
+    })
+    .await;
+    match &s.state {
+        ConnState::Reconnecting { reason, .. } => assert_eq!(reason, SETUP_CLOSE_TEXT),
+        other => panic!("{other:?}"),
+    }
+    net.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_tls_missing_cert_with_reset() {
+    missing_cert_with_reset(Transport::Tls, Protocol::V311).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v5_tls_missing_cert_with_reset() {
+    missing_cert_with_reset(Transport::Tls, Protocol::V5).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v3_wss_missing_cert_with_reset() {
+    missing_cert_with_reset(Transport::Wss, Protocol::V311).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v5_wss_missing_cert_with_reset() {
+    missing_cert_with_reset(Transport::Wss, Protocol::V5).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

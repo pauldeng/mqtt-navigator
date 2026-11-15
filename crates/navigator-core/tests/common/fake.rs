@@ -109,16 +109,47 @@ impl Certs {
     }
 }
 
+/// The socket of a TLS server. With `lossy` it drops every write after the first read that follows
+/// a write. That is the alert after a failed handshake: the client never sees it, as after a
+/// reset on Windows (Linux still hands over the data that came before a reset). Use `lossy` only
+/// with clients that fail the handshake.
+struct Gate {
+    tcp: TcpStream,
+    lossy: bool,
+    wrote: bool,
+    swallow: bool,
+}
+
+impl Read for Gate {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.swallow |= self.lossy && self.wrote;
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for Gate {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.swallow {
+            return Ok(buf.len());
+        }
+        self.wrote = true;
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
 enum Stream {
     Tcp(TcpStream),
-    Tls(Box<SslStream<TcpStream>>),
+    Tls(Box<SslStream<Gate>>),
 }
 
 impl Stream {
     fn tcp(&self) -> &TcpStream {
         match self {
             Self::Tcp(s) => s,
-            Self::Tls(s) => s.get_ref(),
+            Self::Tls(s) => &s.get_ref().tcp,
         }
     }
 }
@@ -384,6 +415,26 @@ impl Conn {
 #[derive(Default)]
 pub struct Options {
     pub require_client_cert: bool,
+    /// After a failed TLS handshake, lose the alert and close with the data of the client still
+    /// unread (a reset). Windows loses the alert in this case; see `Gate`. The default models a
+    /// broker that sends the alert and closes cleanly (it drains first).
+    pub reset_on_handshake_failure: bool,
+}
+
+/// A handshake failed and the alert is sent. Close the socket in one of two ways (see `Options`).
+fn end_failed_handshake(sock: &TcpStream, reset: bool) {
+    let mut buf = [0u8; 1024];
+    if reset {
+        // Wait until the client has sent its next data (the WS upgrade or CONNECT). Then close
+        // with that data unread.
+        sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let _ = sock.peek(&mut buf);
+        return;
+    }
+    let _ = sock.shutdown(std::net::Shutdown::Write);
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let mut s = sock;
+    while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
 }
 
 pub struct Fake {
@@ -410,6 +461,7 @@ impl Fake {
         let acceptor = tls.then(|| Arc::new(certs.acceptor(options.require_client_cert)));
         let handler = Arc::new(handler);
         let stop2 = stop.clone();
+        let reset = options.reset_on_handshake_failure;
         std::thread::spawn(move || {
             for (n, sock) in listener.incoming().flatten().enumerate() {
                 if stop2.load(Ordering::SeqCst) {
@@ -418,8 +470,17 @@ impl Fake {
                 let (acceptor, handler) = (acceptor.clone(), handler.clone());
                 std::thread::spawn(move || {
                     let stream = match acceptor {
-                        Some(a) => match a.accept(sock) {
+                        Some(a) => match a.accept(Gate {
+                            tcp: sock,
+                            lossy: reset,
+                            wrote: false,
+                            swallow: false,
+                        }) {
                             Ok(s) => Stream::Tls(Box::new(s)),
+                            Err(openssl::ssl::HandshakeError::Failure(mid)) => {
+                                end_failed_handshake(&mid.get_ref().tcp, reset);
+                                return;
+                            }
                             Err(_) => return,
                         },
                         None => Stream::Tcp(sock),

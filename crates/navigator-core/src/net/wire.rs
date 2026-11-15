@@ -42,8 +42,8 @@ use ntex_util::time::{Millis, Seconds};
 
 use super::dial::{Dialer, Target};
 use super::{
-    CONNECT_TIMEOUT, ConnectConfig, ConnectionDetails, Ingest, NetLimits, Outcome, Outgoing,
-    PANIC_TEXT, Protocol, PublishResult, Transport, V5Details, io_outcome,
+    CONNECT_TIMEOUT, ConnectConfig, ConnectionDetails, IO_CLOSED_TEXT, Ingest, NetLimits, Outcome,
+    Outgoing, PANIC_TEXT, Protocol, PublishResult, Transport, V5Details, io_outcome,
 };
 use crate::model::{Incoming, MsgProps, Qos};
 use crate::profile::SubOptions;
@@ -79,6 +79,7 @@ const TOO_LARGE_TEXT: &str = "The broker sent a packet that is larger than the a
 const WRITE_TIMEOUT_TEXT: &str = "The broker did not read our data for 10 s.";
 const READ_TIMEOUT_TEXT: &str = "The broker stopped in the middle of a packet.";
 /// The broker closed the connection before the CONNACK. This is not a claim about the version.
+const SETUP_CLOSE_TEXT: &str = "The broker closed the connection during set-up. If the broker needs a client certificate, add one to the connection.";
 const CLOSED_BEFORE_CONNACK_TEXT: &str = "The broker closed the connection before it accepted it. Check the address, the TLS settings and the Protocol.";
 const NOT_V5_TEXT: &str = "The broker sent a reply that is not MQTT 5. If the broker supports only MQTT 3.1.1, set Protocol to MQTT 3.1.1.";
 const NO_V5_TEXT: &str = "This broker does not support MQTT 5. Set Protocol to MQTT 3.1.1.";
@@ -595,6 +596,7 @@ async fn connect_v5(
             &e,
             p.diag,
             profile.client_cert.is_some(),
+            profile.transport,
             Protocol::V5,
             |a| connack_outcome(a),
         )
@@ -692,6 +694,7 @@ async fn connect_v3(
             &e,
             p.diag,
             profile.client_cert.is_some(),
+            profile.transport,
             Protocol::V311,
             |a| connack_outcome_v3(a.return_code),
         )
@@ -1021,10 +1024,11 @@ fn connect_outcome<T: std::fmt::Debug>(
     e: &NtexError<MqttClientError<T>>,
     diag: Option<&TlsDiag>,
     has_client_cert: bool,
+    transport: Transport,
     protocol: Protocol,
     ack: impl FnOnce(&T) -> Outcome,
 ) -> Outcome {
-    match &**e {
+    let out = match &**e {
         // The peer cut the connection during the MQTT handshake (a reset, as a clean EOF is
         // `Disconnected(None)`). A TLS diagnosis still wins.
         MqttClientError::Disconnected(Some(io))
@@ -1054,6 +1058,20 @@ fn connect_outcome<T: std::fmt::Debug>(
             Outcome::Retry("The broker did not answer the connection request.".into())
         }
         MqttClientError::Ack(a) => ack(a),
+    };
+    // A broker that needs a client certificate may reset the connection after it rejects the
+    // client. A reset drops the TLS alert (always on Windows). So a plain close during set-up
+    // over TLS, with no client certificate, names the likely cause. It stays temporary: a
+    // broker restart recovers.
+    match &out {
+        Outcome::Retry(t)
+            if !has_client_cert
+                && matches!(transport, Transport::Tls | Transport::Wss)
+                && (t == CLOSED_BEFORE_CONNACK_TEXT || t == IO_CLOSED_TEXT) =>
+        {
+            Outcome::Retry(SETUP_CLOSE_TEXT.into())
+        }
+        _ => out,
     }
 }
 

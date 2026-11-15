@@ -1552,6 +1552,7 @@ async fn drain(ops: &mut JoinSet<()>) {
     .await;
 }
 
+pub(crate) const IO_CLOSED_TEXT: &str = "The broker closed the connection.";
 const CLIENT_CERT_TEXT: &str =
     "The broker needs a client certificate. Add your certificate and key.";
 /// Queues incoming publishes for the UI. Never waits for the UI.
@@ -1844,7 +1845,7 @@ fn io_outcome(e: &std::io::Error, diag: Option<&TlsDiag>, has_client_cert: bool)
         // The WebSocket upgrade timeout of ntex has no kind: its text is exactly "Timeout".
         K::Other if text == "Timeout" => Outcome::Retry("The connection timed out.".into()),
         K::UnexpectedEof | K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe => {
-            Outcome::Retry("The broker closed the connection.".into())
+            Outcome::Retry(IO_CLOSED_TEXT.into())
         }
         K::NetworkUnreachable | K::HostUnreachable | K::NetworkDown => {
             Outcome::Retry("The network is not reachable.".into())
@@ -1858,7 +1859,7 @@ fn io_outcome(e: &std::io::Error, diag: Option<&TlsDiag>, has_client_cert: bool)
             || lower.contains("connection reset")
             || lower.contains("broken pipe") =>
         {
-            Outcome::Retry("The broker closed the connection.".into())
+            Outcome::Retry(IO_CLOSED_TEXT.into())
         }
         // No local verify failure was recorded, so a certificate alert comes from the peer. It
         // rejects our side of the handshake.
