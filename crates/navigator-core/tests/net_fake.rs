@@ -283,11 +283,11 @@ async fn v5_stalled_write_with_keep_alive_2_s() {
 /// REAL VALUE of the write timeout (10 s). The write timeout alone: the operation timeout is 60 s,
 /// so only the write timeout can end the attempt. ntex starts its write timeout when the write
 /// buffer goes above the high watermark and does not drain. The fake broker reads nothing after
-/// CONNECT. The test sends QoS 0 messages one at a time and takes the first one that gets no
-/// result in 0.4 s: the buffer is full, so the stall began at about that send. The write timeout
-/// ends the attempt at 10 s to 12 s after the stall (the timer can be up to 1 s late, then up to
+/// CONNECT. The test sends a burst of QoS 0 messages; some get no result, so the buffer is full
+/// and the stall began during the burst. The write timeout ends the attempt at 10 s to 12 s after
+/// the stall (the timer can be up to 1 s late, then up to
 /// 1 s of I/O shutdown). The end is temporary (`Reconnecting`) with the write timeout text, and
-/// the blocked send is `LostOnDisconnect`, not `TimedOut`. Without the write timeout, nothing
+/// a blocked send is `LostOnDisconnect`, not `TimedOut`. Without the write timeout, nothing
 /// ends the attempt in that time and the test fails (mutation check in the S3 report).
 #[tokio::test(flavor = "current_thread")]
 async fn v5_write_timeout_alone_is_a_temporary_failure() {
@@ -308,49 +308,53 @@ async fn v5_write_timeout_alone_is_a_temporary_failure() {
     );
     let mut net = start(timers);
     connect(&mut net, config(&f, Transport::Tcp, Protocol::V5, 0)).await;
-    let mut blocked_at = None;
-    'sends: for op_id in 0..60u64 {
-        let submitted = Instant::now();
+    // Like `stalled_write`: send a burst that is far more than the buffers hold, and take the
+    // results until none comes for 500 ms. A slow runner cannot make a send look blocked: fewer
+    // results than sends means that at least one send waits for the blocked write. The stall
+    // began during the burst, so the bound is measured from before it.
+    const SENDS: usize = 24;
+    let started = Instant::now();
+    for op_id in 0..SENDS as u64 {
         net.send(big_publish(op_id, Qos::AtMostOnce)).expect("send");
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
-        loop {
-            match tokio::time::timeout_at(deadline, net.events.recv()).await {
-                Ok(Some(Event::Published { result, .. })) => {
-                    assert_eq!(result, PublishResult::Sent);
-                    break;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("events closed"),
-                Err(_) => {
-                    blocked_at = Some(submitted);
-                    break 'sends;
-                }
-            }
-        }
     }
-    let blocked_at = blocked_at.expect("the write never blocked");
+    let mut results = Vec::new();
+    drain_until_quiet(&mut net, started, &mut results).await;
+    assert!(results.len() < SENDS, "no send is blocked: {results:?}");
+    assert!(
+        results.iter().all(|(_, r)| *r == PublishResult::Sent),
+        "{results:?}"
+    );
     let ended = status_where(&mut net, Duration::from_secs_f64(write + 4.0), |s| {
         s.state != ConnState::Connected
     })
     .await;
-    let took = blocked_at.elapsed().as_secs_f64();
+    let took = started.elapsed().as_secs_f64();
     assert!(
         (write - 1.0..=write + 2.5).contains(&took),
-        "the attempt ended {took} s after the blocked send ({ended:?})"
+        "the attempt ended {took} s after the burst ({ended:?})"
     );
     assert!(
         matches!(&ended.state, ConnState::Reconnecting { attempt: 1, reason } if reason == WRITE_TIMEOUT_TEXT),
         "{ended:?}"
     );
-    let mut results = Vec::new();
-    while results.is_empty() {
+    let mut results: Vec<PublishResult> = results.into_iter().map(|(_, r)| r).collect();
+    while results.len() < SENDS {
         match tokio::time::timeout(Duration::from_secs(2), net.events.recv()).await {
             Ok(Some(Event::Published { result, .. })) => results.push(result),
             Ok(Some(_)) => {}
-            other => panic!("expected the result of the blocked send, got {other:?}"),
+            other => panic!("expected a publish result, got {other:?}"),
         }
     }
-    assert_eq!(results, [PublishResult::LostOnDisconnect]);
+    assert!(
+        results
+            .iter()
+            .all(|r| matches!(r, PublishResult::Sent | PublishResult::LostOnDisconnect)),
+        "{results:?}"
+    );
+    assert!(
+        results.contains(&PublishResult::LostOnDisconnect),
+        "no blocked send reported LostOnDisconnect: {results:?}"
+    );
     net.disconnect();
     net.shutdown().await;
 }
