@@ -1076,3 +1076,30 @@ I did not run `cargo build --release` and did not touch `target/release`. I did 
 | 4 | The 1 MiB incoming limit omitted the v3 exception | The user guide states that on MQTT 3.1.1 a non-minimal length encoding can make a packet up to 3 bytes larger (plan line 34). |
 
 Gate after the fixes: `cargo fmt --all --check` ok; `cargo clippy --workspace --all-targets --all-features -- -D warnings` ok; `cargo test --workspace`: 426 passed, 0 failed, 9 ignored. The broker suite was not rerun: the change is UI text and docs only.
+
+## S6 preparation: owner decisions (2026-11-15)
+
+### Memory after an overload
+
+The owner asked: is it a leak, does it come down, is it freed at exit? Measured on the HEAD release binary (f92cda4 code, same `src/` as S5 except UI text). Logs: `mem-*.txt`, write-up `mem-report.md` in the scratchpad `ntex/` folder.
+
+- **Not a leak.** Four cycles of (100k msg/s for 60 s, idle 60 s): RSS after each idle 329, 302, 302, 302 MiB (v0.1.1: 331, 336, 339, 340 MiB). The store holds 115 MiB after 100k, inside its 128 MiB budget.
+- **Freed memory held by glibc is small.** `malloc_trim(0)` (app started under gdb; `ptrace_scope` was not changed) gave back about 20 MiB of 329 MiB (337 220 KiB). glibc `malloc_stats` shows about 59 MiB more live allocation after 100k than after 10k at similar store bytes. What holds it is not found.
+- **It does not come down while idle.** RSS was 337 412 KiB in all 21 samples over 10 minutes.
+- **It is freed at exit.** The process ended in less than 1 s with no leftover thread, and the system "used" memory fell by 283 MiB.
+
+**Decision:** the owner accepts it. The P1 plan criterion now says that RSS stays bounded and does not grow over repeated overloads. The user guide states the limit. The open question "RSS after an overload" is closed.
+
+**Numbering note:** with the two closed questions removed, the open items "Test gaps from the removed ntex spike" and "Version 0.1.x refuses a settings file with schema 2" are now items 6 and 7 in `docs/open-questions.md`. The S5 section above uses the old numbers (6 to 9) as history.
+
+### macOS minimum version
+
+**Decision:** 15.0. `crates/navigator-app/Cargo.toml` `minimum-system-version` changed from 13.0 to 15.0. The open question "macOS minimum version" is closed.
+
+### CHANGELOG
+
+The Unreleased "Known limitations" now also list the memory after an overload, the 0.1.x refusal of a schema 2 file, and macOS 15.
+
+### Push
+
+The owner approved a push of `feat/ntex-mqtt` (no merge, no tag) so that CI runs on the three OSes.

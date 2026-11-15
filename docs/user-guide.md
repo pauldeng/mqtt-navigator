@@ -394,6 +394,7 @@ The settings file is `settings.json` in the `mqtt-navigator` folder of your syst
 - MQTT 3.1.1 has no message properties, no reason codes, no subscription options and no session expiry. See [MQTT 3.1.1 connections](#mqtt-311-connections).
 - The app finds a lost connection in about 2 times the keep alive, plus timer and shutdown delays (keep alive 60 s: at most 145 s).
 - The largest incoming packet is 1 MiB. The app closes the connection if a packet is larger. One exception: on MQTT 3.1.1 the app checks the Remaining Length, so a packet with a non-minimal length encoding can be up to 3 bytes larger.
+- After a very high message rate (far above 10 000 messages per second), the app can keep more memory than at a normal rate until it exits. In a Linux test it stayed the same over repeated overloads.
 - No proxy support.
 - No message export. Only connection profiles export.
 - No accessibility support for screen readers.

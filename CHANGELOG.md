@@ -25,6 +25,9 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 - QoS 2 is not supported.
 - Keep alive 0 turns off the detection of a silent broker, unless an MQTT 5 broker sets its own keep alive.
+- After a very high message rate, the app can keep more memory than at a normal rate until it exits. In a Linux test it stayed the same over repeated overloads. Version 0.1.1 does the same.
+- If you go back to 0.1.x, it does not load the 0.2.0 settings file. It leaves the file unchanged, uses default settings and does not save.
+- The macOS app needs macOS 15 or later.
 
 ## [0.1.1] - 2026-11-12
 

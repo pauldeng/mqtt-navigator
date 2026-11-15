@@ -58,7 +58,7 @@ binaries = [{ path = "mqtt-navigator", main = true }]
 installer-mode = "currentUser"
 
 [package.metadata.packager.macos]
-minimum-system-version = "13.0"
+minimum-system-version = "15.0"
 signing-identity = "-"
 
 # The packager names the desktop entry and the icons after the main binary. The window app id is

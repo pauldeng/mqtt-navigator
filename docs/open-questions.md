@@ -9,18 +9,18 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
 3. Licence check for the Ayu and Gruvbox themes. Add them only if the licence allows it.
 4. A person has not checked the UI in a real window. Every phase report lists UI checks that were not run.
 5. The Linux keyring (Secret Service) is not tested (no Secret Service on the development machine). The software renderer was checked on Linux on 2026-11-11: with the Mesa lavapipe Vulkan driver the app starts (first frame 238 ms); with no Vulkan driver it still starts and connects, but which renderer it used was not confirmed (no screenshot). Windows (WARP) is not checked.
-6. RSS after an overload (owner decision at the S6 stop). The plan wants RSS to return to normal within 10 s after an overload. Neither v0.1.1 nor the ntex build meets this: after 100k msg/s, RSS stays about 93 MiB above the plateau for at least 15 s (S4, Round 1 finding 5). The cause is not profiled. Accept it and change the criterion, or ask for a fix (for example `malloc_trim` after the queues drain, which needs `unsafe` or a dependency).
-7. macOS minimum version. The docs and AGENTS.md say macOS 15 (gpui-kit). The packager setting `minimum-system-version` in `crates/navigator-app/Cargo.toml` is 13.0. Decide which value is right and make both the same.
-8. Test gaps from the removed ntex spike (phase 8, S5). Each one needs a host set-up that the repo does not have, or a measurement that no test makes:
+6. Test gaps from the removed ntex spike (phase 8, S5). Each one needs a host set-up that the repo does not have, or a measurement that no test makes:
    - A broker that negotiates only TLS 1.2, an IPv6-only host, and the `getaddrinfo` order for `localhost`.
    - Keep alive 60 s and 70 s while the app publishes. The tests run these two values without publishes, and keep alive 2 s with publishes.
    - The RSS during the 2 MiB-header case. The test checks the time and the text. The S1 spike measured the RSS once.
    - A 3.1.1 load run (10k msg/s) and a load run on EMQX or HiveMQ. S4 measured MQTT 5 on Mosquitto only.
    - The new fake-broker tests on Windows and macOS (first CI run at S6).
-9. Version 0.1.x refuses a settings file with schema 2 (read-only, default settings). A user who goes back from 0.2.0 to 0.1.x sees this text. Decide at S6 if a note in the release text is enough.
+7. Version 0.1.x refuses a settings file with schema 2 (read-only, default settings). A user who goes back from 0.2.0 to 0.1.x sees this text. Decide at S6 if a note in the release text is enough.
 
 ## Closed
 
+- 2026-11-15: RSS after an overload → accepted. After 100k msg/s, RSS stays about 93 MiB above the 10k plateau until the app exits. It is bounded, it does not grow over repeated overloads, and the OS frees it at exit (memory check, phase 8). v0.1.1 does the same. The overload criterion is changed. Finding what holds the extra live memory is a later task.
+- 2026-11-15: macOS minimum version → 15.0 (gpui-kit). The packager setting is now 15.0.
 - 2026-11-11: First CI run on `main` passed on Ubuntu, macOS 15 and Windows 2022 (build, clippy, tests, vendored OpenSSL), plus fuzz and the broker tests.
 - 2026-11-11: Updater → our own updater on `ureq`, `minisign-verify` and `sha2`, with a rollback of a bad version (ADR 0005; the separate launcher is gone since 2026-11-12).
 - 2026-11-11: Authenticode signing → ship the Windows files unsigned for now. The workflow signs them when the secret `WINDOWS_PFX_BASE64` is set (ADR 0005).
