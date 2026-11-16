@@ -111,6 +111,19 @@ One commit. fmt, clippy (-D warnings) and `cargo test --workspace` passed (logs 
 
 Deviation 8 (the palette entry "Show or hide the details") stays, now with the shared close path.
 
+### Window checks of the Codex round 1 gaps
+
+Done with `xdotool` on Xvfb (keys; a mouse click only to put the focus in a pane or to open a tab). The first run found two defects. Both are fixed in the commit of this round.
+
+| Check | Result | Screenshots |
+|---|---|---|
+| (a) History recall by keyboard | **Defect:** Tab reached an entry, but Enter closed the dialog without recalling, because the dialog takes Enter as "confirm". Fix: a `HistoryList` key context binds Enter to `NoAction`, so the entry gets it. After the fix: Tab, Enter put the sent entry "first" in the composer (Space worked before the fix). | `r2-a-tab.png`, `r2-a-recalled.png` (before), `r2-a-enter.png` (after) |
+| (b) Jump to newest by keyboard | **Defect:** Tab reached the strip button, but Enter did nothing, because the list context binds Enter to "open details". Fix: a `JumpStrip` context binds Enter to `NoAction`. After the fix: Enter jumped to the top, and Down then selected the next row (focus in the list). | `r2-b-focus.png`, `r2-b-jumped.png`, `r2-b-after.png` |
+| (c) Show latest by keyboard | Passed. Tab reached **Show latest**, Enter showed the latest value (`"v": 2`), and `Esc` then closed the pane, so the focus was in the Value area. | `r2-c-tab.png`, `r2-c-latest.png`, `r2-c-esc.png` |
+| (d) Show or hide the details, wide | Passed. The palette entry closed the pane. Down then selected the next row and the pane opened again, so the focus was in the list. | `r2-d-wide-closed.png`, `r2-d-wide-down.png` |
+| (d) narrow (1000 px) | Enter opened the sheet. Closing the sheet (click outside) and then Down and Enter opened it again, so `sheet_open` was cleared. The palette entry opens the sheet in a narrow window. **Not reachable:** the palette entry cannot close an open sheet, because `Ctrl+K` does nothing while the sheet has the focus. That branch has no screenshot. | `r2-d-n1-open.png`, `r2-d-n4-reopen-after-close.png`, `r2-d-n5-palette-opens.png` |
+| (e) Result in the details | Acknowledged: a QoS 1 message shows "Result: Acknowledged". Rejected: **not captured**; the test Mosquitto accepts every publish. | `r2-e-ack.png` |
+
 ## Manual checks for the owner
 
 Use a broker that you trust. A narrow window is below 1 100 px.

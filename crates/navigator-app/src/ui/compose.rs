@@ -543,6 +543,7 @@ impl Navigator {
                 .child(
                     v_flex()
                         .id("history-list")
+                        .key_context("HistoryList")
                         .gap_2()
                         .max_h(ui(360.))
                         .overflow_y_scroll()

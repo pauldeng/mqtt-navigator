@@ -106,6 +106,12 @@ pub fn init(cx: &mut App) {
         // filter) handles it first and does not pass it on (design 8).
         KeyBinding::new("escape", CloseComposer, Some("Composer")),
         KeyBinding::new("escape", CloseDetails, Some("DetailsPane")),
+        // In the History list of the composer, Enter must reach the focused entry. Without this
+        // the dialog takes it as "confirm" and closes before the entry recalls.
+        KeyBinding::new("enter", NoAction, Some("HistoryList")),
+        // The jump button is inside the list area, whose Enter opens the details. Let the button
+        // take its own Enter.
+        KeyBinding::new("enter", NoAction, Some("JumpStrip")),
         // In a narrow window, Enter opens the details sheet of the selected row.
         KeyBinding::new("enter", OpenDetails, Some(LIST_CONTEXT)),
         // The payload editor inserts a newline for Ctrl+Enter and a tab for Tab. In the
@@ -2951,6 +2957,7 @@ impl Navigator {
             .when(jump, |d| {
                 d.child(
                     h_flex()
+                        .key_context("JumpStrip")
                         .flex_none()
                         .justify_center()
                         .py_1()
