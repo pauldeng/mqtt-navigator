@@ -38,7 +38,7 @@ impl Navigator {
             Cmd::ClearFilters => self.clear_filters(window, cx),
             Cmd::FocusFilter => self.filter_input.update(cx, |i, cx| i.focus(window, cx)),
             Cmd::Pause | Cmd::Resume => self.toggle_pause(cx),
-            Cmd::JumpToNewest => self.jump_to_newest(cx),
+            Cmd::JumpToNewest => self.jump_to_newest(window, cx),
             Cmd::RowHeight1 => self.set_row_height(false, cx),
             Cmd::RowHeight2 => self.set_row_height(true, cx),
             Cmd::ToggleDetails => self.toggle_details(window, cx),

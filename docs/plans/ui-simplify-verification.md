@@ -93,6 +93,24 @@ No existing assertion was removed or weakened. The new behaviour changed these t
 
 `cargo build --release -p navigator-app` finished in 4 min 14 s (log: `release-build.log`). The binary `target/release/mqtt-navigator` is 35 683 224 B. The CI gate `MAX_BYTES` is 37 317 165 B, so the build is 1 633 941 B (4.4%) under the limit. The size on 2026-11-11 was 33 924 696 B; the previous local release binary (before this work) was 35 724 888 B, so this work did not add size. The size is from a Linux build on this machine, as `stat -c %s` in the CI step.
 
+## Codex round 1 fixes
+
+One commit. fmt, clippy (-D warnings) and `cargo test --workspace` passed (logs `stepr1-*.log`).
+
+| # | Fix | Test | Screenshot |
+|---|---|---|---|
+| 1 | The History dialog lists Drafts and Sent as buttons. They are tab stops: Tab moves, Enter or Space recalls. | `a_history_entry_is_recalled_by_its_sequence_number` (model). The key path itself is gpui and has no automated test. | none |
+| 2 | The Value tab shows "Result: <status>" for the selected sent message (`sent_status`, read from the store row, not the composer). A failed result is red. | the status texts are covered by `a_row_shows_a_result_only_when_it_is_not_routine` and `status_text_follows_the_design` | `r1-details-result.png` |
+| 3 | A profile change sets `follow` to its default together with the new store. The next selection then starts the count again. | `a_profile_change_restarts_follow_and_its_counter_together` | none |
+| 4 | "Properties (N)" comes from the small property fields (`PropPresence`), not from `read_draft`. On MQTT 3.1.1 the count is not computed. | `the_flag_count_equals_the_draft_count` | none |
+| 5 | "Jump to newest" has its own strip above the list. No overlay. | none (layout) | `r1-jump-strip.png` |
+| 6 | After Jump the focus goes to the list. After Show latest it goes to the Value area. | none (focus is gpui). Checked in a window: after clicking Jump, the Down key selected the top row (`r1-after-jump-down.png`). | `r1-after-jump-down.png` |
+| 7 | "Show or hide the details" uses one close (`close_details_area`): focus returns to the list, and in a narrow window `sheet_open` is cleared, so later opens work. | none (window state) | none |
+| 8 | Follow turns off only when the scroll offset has left the top (`left_the_top`). | `only_a_scroll_that_leaves_the_top_turns_follow_off`. Checked in a window: wheel up at the top shows no strip, wheel down does (`r1-scroll-up-at-top.png`, `r1-jump-strip.png`). | `r1-scroll-up-at-top.png` |
+| 9 | The security tag has the warning fill and the theme text colour that reads best on it (`readable_on`). Measured contrast from the screenshots: dark 9.5:1, light 7.9:1 (was about 1.8:1). | `a_tag_takes_the_text_colour_that_reads_on_its_fill` | `r1-tag-dark.png`, `r1-tag-light.png`, `r1-tag-dark-zoom.png`, `r1-tag-light-zoom.png` |
+
+Deviation 8 (the palette entry "Show or hide the details") stays, now with the shared close path.
+
 ## Manual checks for the owner
 
 Use a broker that you trust. A narrow window is below 1 100 px.

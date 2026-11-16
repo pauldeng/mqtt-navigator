@@ -13,7 +13,8 @@ use navigator_core::publish::{validate_outgoing, validate_v3_size};
 
 use super::*;
 use crate::composer::{
-    ComposerModel, Draft, LineKeep, PayloadMode, PropKind, PropShown, Visibility, property_count,
+    ComposerModel, Draft, LineKeep, PayloadMode, PropKind, PropPresence, PropShown, Visibility,
+    property_count,
 };
 use crate::inspector::size_text;
 
@@ -411,6 +412,25 @@ impl Navigator {
         cx.notify();
     }
 
+    /// The number in "Properties (N)", from the property fields only.
+    fn props_count(&self, cx: &App) -> usize {
+        let c = &self.comp;
+        let filled = |i: &Entity<InputState>| !i.read(cx).value().is_empty();
+        PropPresence {
+            payload_format: c.utf8,
+            content_type: c.content_type_empty || filled(&c.content_type.input),
+            response_topic: filled(&c.response_topic.input),
+            correlation: c.correlation_empty || filled(&c.correlation),
+            expiry: filled(&c.expiry),
+            user: c
+                .rows
+                .iter()
+                .filter(|r| r.keep_empty || filled(&r.key.input) || filled(&r.value.input))
+                .count(),
+        }
+        .count()
+    }
+
     /// Adds a property to the section. It shows at once, also while it is empty.
     fn add_prop(&mut self, kind: PropKind, window: &mut Window, cx: &mut Context<Self>) {
         // The focus goes to the new field, so that the user can type at once.
@@ -503,9 +523,12 @@ impl Navigator {
                         .children(items.iter().map(|(seq, label)| {
                             let (weak, seq) = (weak.clone(), *seq);
                             let id = (if is_draft { "draft" } else { "sent" }, seq as usize);
-                            ListItem::new(id)
-                                .px_2()
-                                .child(div().text_sm().truncate().child(label.clone()))
+                            // A button is a tab stop: Tab moves, Enter or Space recalls.
+                            Button::new(id)
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .label(label.clone())
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
                                     weak.update(cx, |v, cx| v.recall(seq, is_draft, window, cx))
@@ -715,7 +738,8 @@ impl Navigator {
             .as_ref()
             .map(|(_, t)| t.clone())
             .unwrap_or_default();
-        let count = property_count(&self.read_draft(cx));
+        // Only for MQTT 5, and from the small property fields: no payload copy in a frame.
+        let count = if v5 { self.props_count(cx) } else { 0 };
         let hex = self.comp.mode == PayloadMode::Hex;
         let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();

@@ -707,18 +707,31 @@ impl Navigator {
         cx.notify();
     }
 
+    /// The palette entry "Show or hide the details". Every close goes through the shared
+    /// close, so the focus returns to the list and `sheet_open` stays right.
     pub(super) fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.narrow {
-            if self.insp.sheet_open {
-                window.close_sheet(cx);
-            } else {
-                self.details_open = true;
-                self.open_details_sheet(window, cx);
-            }
+        let open = if self.narrow {
+            self.insp.sheet_open
         } else {
-            self.details_open = !self.details_open;
+            self.details_open
+        };
+        if open {
+            self.close_details_area(window, cx);
+        } else {
+            self.open_details(window, cx);
         }
-        cx.notify();
+    }
+
+    /// The one close for the pane and the sheet. The focus returns to the list.
+    fn close_details_area(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.narrow {
+            // `close_sheet` does not call the callback of the sheet: clear the flag here.
+            self.close_details_sheet(window, cx);
+            self.list_focus.focus(window, cx);
+            cx.notify();
+        } else {
+            self.close_details(window, cx);
+        }
     }
 
     /// "Details: Open": the pane in a wide window, the sheet in a narrow one.
@@ -1011,6 +1024,10 @@ impl Navigator {
         let muted = theme.muted_foreground;
         let m = &s.msg;
         let sent = s.direction == Direction::Sent;
+        // The selected publish keeps its result here, also after the composer shows a newer one.
+        let result = self
+            .sent_status()
+            .map(|st| (format!("Result: {}", status_text(&st)), status_failed(&st)));
         let meta = format!(
             "{} · {}",
             format_time(m.received_at, self.utc_offset, true),
@@ -1119,14 +1136,24 @@ impl Navigator {
                             Button::new("show-latest")
                                 .xsmall()
                                 .label("Show latest")
-                                .on_click(cx.listener(|v, _, _, cx| {
+                                .on_click(cx.listener(|v, _, window, cx| {
                                     v.insp.hist_pick = None;
+                                    // The button goes away: the focus moves to the Value area.
+                                    v.insp.value_focus.focus(window, cx);
                                     cx.notify();
                                 })),
                         ),
                 )
             })
             .child(toolbar)
+            .when_some(result, |d, (text, failed)| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(if failed { theme.danger } else { muted })
+                        .child(text),
+                )
+            })
             .child(
                 h_flex()
                     .gap_1()
@@ -1408,6 +1435,22 @@ impl Navigator {
             self.insp.tab = DetailTab::Value;
             self.insp.value_focus.focus(window, cx);
             cx.notify();
+        }
+    }
+
+    /// The current result of the selected sent message. `None`: no sent row is selected, a
+    /// History row shows, or the row is gone.
+    fn sent_status(&self) -> Option<SendStatus> {
+        if self.insp.hist_pick.is_some() || self.detail_of != DetailOf::Message {
+            return None;
+        }
+        let s = self.sel_msg.as_ref()?;
+        if s.direction != Direction::Sent {
+            return None;
+        }
+        match self.store.list_row(self.store.list_index_of(s.id)?)? {
+            RowView::Message { status, .. } => status.cloned(),
+            _ => None,
         }
     }
 

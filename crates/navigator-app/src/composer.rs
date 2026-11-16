@@ -533,12 +533,38 @@ impl PropShown {
 /// The number in the "Properties (N)" tag: the properties that the message would carry. A
 /// present but empty property ("Send empty") counts. A field that is shown but empty does not.
 pub fn property_count(d: &Draft) -> usize {
-    usize::from(d.utf8)
-        + usize::from(d.content_type.is_some())
-        + usize::from(!d.response_topic.is_empty())
-        + usize::from(d.correlation.is_some())
-        + usize::from(!d.expiry.is_empty())
-        + d.user.len()
+    PropPresence {
+        payload_format: d.utf8,
+        content_type: d.content_type.is_some(),
+        response_topic: !d.response_topic.is_empty(),
+        correlation: d.correlation.is_some(),
+        expiry: !d.expiry.is_empty(),
+        user: d.user.len(),
+    }
+    .count()
+}
+
+/// Which properties are present, as flags. The window builds it from the small property fields
+/// at each frame, without a `Draft`: a draft copies the whole payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PropPresence {
+    pub payload_format: bool,
+    pub content_type: bool,
+    pub response_topic: bool,
+    pub correlation: bool,
+    pub expiry: bool,
+    pub user: usize,
+}
+
+impl PropPresence {
+    pub fn count(&self) -> usize {
+        usize::from(self.payload_format)
+            + usize::from(self.content_type)
+            + usize::from(self.response_topic)
+            + usize::from(self.correlation)
+            + usize::from(self.expiry)
+            + self.user
+    }
 }
 
 /// History and the "unsent" flag of the composer.
@@ -598,8 +624,8 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
         ComposerModel, Draft, History, LineKeep, MAX_DRAFTS, MAX_SENT, NOT_STORED, PayloadMode,
-        PropKind, PropShown, Visibility, edit_unavailable, hidden_chars_note, line_breaks_note,
-        property_count, v3_drops_properties,
+        PropKind, PropPresence, PropShown, Visibility, edit_unavailable, hidden_chars_note,
+        line_breaks_note, property_count, v3_drops_properties,
     };
     use bytes::Bytes;
     use navigator_core::net::Protocol;
@@ -688,6 +714,24 @@ mod tests {
     }
 
     #[test]
+    fn a_history_entry_is_recalled_by_its_sequence_number() {
+        // The History list is a column of buttons (Tab, then Enter or Space). A button gives
+        // the sequence number of its entry to `take_draft` or `sent_draft`.
+        let mut m = ComposerModel::default();
+        m.edited();
+        m.before_replace(draft("a", "one"));
+        m.loaded(true);
+        m.sent(draft("b", "two"));
+        let d = m.history.drafts().next().expect("a draft").seq;
+        let s = m.history.sent().next().expect("a sent entry").seq;
+        assert_eq!(m.history.sent_draft(s).expect("sent").payload, "two");
+        assert_eq!(m.history.sent().count(), 1, "Sent keeps its entry");
+        assert_eq!(m.history.take_draft(d).expect("draft").payload, "one");
+        assert_eq!(m.history.drafts().count(), 0, "a draft leaves Drafts");
+        assert!(m.history.take_draft(d).is_none());
+    }
+
+    #[test]
     fn the_composer_is_closed_by_default_and_one_close_serves_all() {
         let mut v = Visibility::default();
         assert!(!v.open && !v.props);
@@ -724,6 +768,25 @@ mod tests {
             [PropKind::User],
             "only the user property is left"
         );
+    }
+
+    #[test]
+    fn the_flag_count_equals_the_draft_count() {
+        let mut d = draft("t", "payload");
+        let flags = |d: &Draft| PropPresence {
+            payload_format: d.utf8,
+            content_type: d.content_type.is_some(),
+            response_topic: !d.response_topic.is_empty(),
+            correlation: d.correlation.is_some(),
+            expiry: !d.expiry.is_empty(),
+            user: d.user.len(),
+        };
+        assert_eq!(PropPresence::default().count(), 0);
+        d.content_type = Some(String::new());
+        d.utf8 = true;
+        d.user = vec![("a".into(), "b".into()), (String::new(), String::new())];
+        assert_eq!(flags(&d).count(), property_count(&d));
+        assert_eq!(property_count(&d), 4);
     }
 
     #[test]

@@ -315,6 +315,8 @@ impl Navigator {
         self.sel_topic = None;
         self.detail_of = DetailOf::Nothing;
         self.anchor = None;
+        // The new store does not count rows: Follow and its counter start again together.
+        self.follow = Follow::default();
         self.reconnected_at = None;
         self.last_result = None;
         self.sub_error = None;

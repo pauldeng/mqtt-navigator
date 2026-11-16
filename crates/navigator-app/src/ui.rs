@@ -354,6 +354,41 @@ impl Follow {
     }
 }
 
+/// The list has left its top: the scroll offset (zero at the top, negative below) is past a
+/// small tolerance. A wheel event at the top changes nothing, so it does not count.
+fn left_the_top(offset_y: f32) -> bool {
+    offset_y < -0.5
+}
+
+/// WCAG relative luminance of a colour.
+fn luminance(c: Hsla) -> f32 {
+    let c = Rgba::from(c);
+    let lin = |v: f32| {
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG contrast ratio of two colours (1 to 21).
+fn contrast(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// The one of two theme colours that reads better on `fill`. A theme can pair a fill with a
+/// foreground that is too close to it (a warning fill with an orange text).
+fn readable_on(fill: Hsla, a: Hsla, b: Hsla) -> Hsla {
+    if contrast(fill, a) >= contrast(fill, b) {
+        a
+    } else {
+        b
+    }
+}
+
 /// The text of the "Jump to newest" button. `new` counts the messages since Follow went off.
 fn jump_label(new: u64) -> String {
     if new == 0 {
@@ -1641,8 +1676,10 @@ impl Navigator {
     }
 
     /// "Jump to newest": scroll to the top, keep the selection, turn Follow on.
-    fn jump_to_newest(&mut self, cx: &mut Context<Self>) {
+    fn jump_to_newest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.follow.jump();
+        // The button goes away: the focus moves to the list, so that the keys keep working.
+        self.list_focus.focus(window, cx);
         self.store.watch_new(false);
         self.list_scroll
             .scroll_to_item_strict(0, ScrollStrategy::Top);
@@ -2899,37 +2936,39 @@ impl Navigator {
             .on_action(cx.listener(|v, _: &ExpandNode, _, cx| v.expand_selected(true, cx)))
             .on_action(cx.listener(|v, _: &CollapseNode, _, cx| v.expand_selected(false, cx)))
             .on_action(cx.listener(|v, _: &OpenDetails, window, cx| v.enter_on_row(window, cx)))
-            // A user scroll turns Follow off.
+            // A scroll that leaves the top turns Follow off. The list handles the wheel event
+            // first, so the offset is the new one here.
             .on_scroll(cx.listener(|v, _, _, cx| {
-                if v.view == View::Messages && v.follow.on && v.list_scroll.is_scrollable() {
-                    v.leave_follow();
-                    cx.notify();
+                if v.view == View::Messages && v.follow.on {
+                    let y = f32::from(v.list_scroll.0.borrow().base_handle.offset().y);
+                    if left_the_top(y) {
+                        v.leave_follow();
+                        cx.notify();
+                    }
                 }
             }))
-            .relative()
-            .child(body)
+            // The button has its own strip: it never covers a row.
             .when(jump, |d| {
                 d.child(
-                    div()
-                        .absolute()
-                        .top_2()
-                        .left_0()
-                        .right_0()
-                        .flex()
+                    h_flex()
+                        .flex_none()
                         .justify_center()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
                         .child(
-                            // `occlude`: a click on the button must not reach the row below.
-                            div().occlude().child(
-                                Button::new("jump-to-newest")
-                                    .small()
-                                    .primary()
-                                    .icon(IconName::ArrowUp)
-                                    .label(jump_label(self.store.watched_new()))
-                                    .on_click(cx.listener(|v, _, _, cx| v.jump_to_newest(cx))),
-                            ),
+                            Button::new("jump-to-newest")
+                                .small()
+                                .primary()
+                                .icon(IconName::ArrowUp)
+                                .label(jump_label(self.store.watched_new()))
+                                .on_click(
+                                    cx.listener(|v, _, window, cx| v.jump_to_newest(window, cx)),
+                                ),
                         ),
                 )
             })
+            .child(body)
     }
 
     fn render_messages(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3330,7 +3369,10 @@ impl Navigator {
         let theme = cx.theme();
         let mut left = h_flex().gap_3().text_xs().child(self.url());
         if let Some(text) = show.security {
-            left = left.child(Tag::warning().xsmall().child(text));
+            // The warning fill, with the theme text colour that reads best on it.
+            let fill = theme.warning;
+            let text_colour = readable_on(fill, theme.foreground, theme.background);
+            left = left.child(Tag::custom(fill, text_colour, fill).xsmall().child(text));
         }
         if show.reconnect {
             let id = self.profile.as_ref().map(|p| p.id);
@@ -4055,6 +4097,46 @@ mod tests {
         let mut off = Follow::default();
         off.leave(false);
         assert!(!off.leave(true) && !off.on);
+    }
+
+    #[test]
+    fn a_profile_change_restarts_follow_and_its_counter_together() {
+        use super::Follow;
+        let mut f = Follow::default();
+        // Follow goes off: the store starts to count (`leave` is true once).
+        assert!(f.leave(false));
+        // The profile changes: a new store does not count, and Follow is on again.
+        f = Follow::default();
+        assert!(f.on && !f.jump_visible(false));
+        // The next selection starts the count again.
+        assert!(f.leave(false));
+    }
+
+    #[test]
+    fn a_tag_takes_the_text_colour_that_reads_on_its_fill() {
+        use super::{contrast, readable_on};
+        use gpui_kit::hsla;
+        let (amber, black, white) = (
+            hsla(0.12, 0.9, 0.5, 1.),
+            hsla(0., 0., 0.05, 1.),
+            hsla(0., 0., 0.98, 1.),
+        );
+        // Either order of the two candidates gives the darker text on amber.
+        assert_eq!(readable_on(amber, white, black), black);
+        assert_eq!(readable_on(amber, black, white), black);
+        assert!(contrast(amber, black) >= 4.5);
+        // On a dark fill the light one wins.
+        let navy = hsla(0.6, 0.6, 0.15, 1.);
+        assert_eq!(readable_on(navy, black, white), white);
+    }
+
+    #[test]
+    fn only_a_scroll_that_leaves_the_top_turns_follow_off() {
+        use super::left_the_top;
+        assert!(!left_the_top(0.0), "a wheel event at the top");
+        assert!(!left_the_top(-0.2));
+        assert!(left_the_top(-1.0));
+        assert!(left_the_top(-300.0));
     }
 
     #[test]
