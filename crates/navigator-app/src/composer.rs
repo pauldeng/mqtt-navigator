@@ -417,6 +417,130 @@ impl History {
     }
 }
 
+/// Whether the composer shows, and its Properties section. The composer is closed by default.
+/// Closing keeps the editors and the draft: this type holds the visibility only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Visibility {
+    pub open: bool,
+    /// The Properties section is open (MQTT 5).
+    pub props: bool,
+}
+
+impl Visibility {
+    /// Opens the composer. True if it was closed.
+    pub fn open(&mut self) -> bool {
+        !std::mem::replace(&mut self.open, true)
+    }
+
+    /// The one close operation (the Close item, `Esc` and the palette). True if the composer was
+    /// open: then the caller must move the focus to the message list, so that the focus does
+    /// not stay on a control that is gone. The Properties section keeps its state.
+    pub fn close(&mut self) -> bool {
+        std::mem::replace(&mut self.open, false)
+    }
+}
+
+/// The MQTT 5 properties that the user can add to a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropKind {
+    PayloadFormat,
+    ContentType,
+    ResponseTopic,
+    Correlation,
+    Expiry,
+    User,
+}
+
+impl PropKind {
+    /// The order of the "Add property" menu.
+    pub const ALL: [PropKind; 6] = [
+        PropKind::PayloadFormat,
+        PropKind::ContentType,
+        PropKind::ResponseTopic,
+        PropKind::Correlation,
+        PropKind::Expiry,
+        PropKind::User,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PropKind::PayloadFormat => "Payload format (UTF-8)",
+            PropKind::ContentType => "Content type",
+            PropKind::ResponseTopic => "Response topic",
+            PropKind::Correlation => "Correlation data",
+            PropKind::Expiry => "Message expiry",
+            PropKind::User => "User property",
+        }
+    }
+}
+
+/// Which single-field properties the Properties section shows. This is a state of its own,
+/// separate from the text of the field: a field that the user adds stays visible while it is
+/// empty. User properties are rows, so they need no flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PropShown {
+    pub payload_format: bool,
+    pub content_type: bool,
+    pub response_topic: bool,
+    pub correlation: bool,
+    pub expiry: bool,
+}
+
+impl PropShown {
+    /// A draft shows the properties that it has (a History recall, Edit and publish, Reply).
+    pub fn of_draft(d: &Draft) -> Self {
+        Self {
+            payload_format: d.utf8,
+            content_type: d.content_type.is_some(),
+            response_topic: !d.response_topic.is_empty(),
+            correlation: d.correlation.is_some(),
+            expiry: !d.expiry.is_empty(),
+        }
+    }
+
+    fn flag(&mut self, kind: PropKind) -> Option<&mut bool> {
+        match kind {
+            PropKind::PayloadFormat => Some(&mut self.payload_format),
+            PropKind::ContentType => Some(&mut self.content_type),
+            PropKind::ResponseTopic => Some(&mut self.response_topic),
+            PropKind::Correlation => Some(&mut self.correlation),
+            PropKind::Expiry => Some(&mut self.expiry),
+            PropKind::User => None,
+        }
+    }
+
+    pub fn set(&mut self, kind: PropKind, shown: bool) {
+        if let Some(f) = self.flag(kind) {
+            *f = shown;
+        }
+    }
+
+    pub fn is_shown(&self, kind: PropKind) -> bool {
+        let mut me = *self;
+        me.flag(kind).is_some_and(|f| *f)
+    }
+
+    /// The kinds that "Add property" offers: the single fields that are not shown, and the user
+    /// property (any number of rows).
+    pub fn addable(&self) -> Vec<PropKind> {
+        PropKind::ALL
+            .into_iter()
+            .filter(|k| *k == PropKind::User || !self.is_shown(*k))
+            .collect()
+    }
+}
+
+/// The number in the "Properties (N)" tag: the properties that the message would carry. A
+/// present but empty property ("Send empty") counts. A field that is shown but empty does not.
+pub fn property_count(d: &Draft) -> usize {
+    usize::from(d.utf8)
+        + usize::from(d.content_type.is_some())
+        + usize::from(!d.response_topic.is_empty())
+        + usize::from(d.correlation.is_some())
+        + usize::from(!d.expiry.is_empty())
+        + d.user.len()
+}
+
 /// History and the "unsent" flag of the composer.
 #[derive(Debug, Default)]
 pub struct ComposerModel {
@@ -474,7 +598,8 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
         ComposerModel, Draft, History, LineKeep, MAX_DRAFTS, MAX_SENT, NOT_STORED, PayloadMode,
-        edit_unavailable, hidden_chars_note, line_breaks_note, v3_drops_properties,
+        PropKind, PropShown, Visibility, edit_unavailable, hidden_chars_note, line_breaks_note,
+        property_count, v3_drops_properties,
     };
     use bytes::Bytes;
     use navigator_core::net::Protocol;
@@ -560,6 +685,59 @@ mod tests {
         // An MQTT 5 target sends properties: no notice. A source without properties: no notice.
         assert!(!v3_drops_properties(Protocol::V5, &only_response_topic));
         assert!(!v3_drops_properties(Protocol::V311, &MsgProps::default()));
+    }
+
+    #[test]
+    fn the_composer_is_closed_by_default_and_one_close_serves_all() {
+        let mut v = Visibility::default();
+        assert!(!v.open && !v.props);
+        assert!(v.open(), "New message opens it");
+        assert!(!v.open(), "opening again changes nothing");
+        v.props = true;
+        // Close (the item, Esc and the palette) reports that the focus must leave.
+        assert!(v.close());
+        assert!(!v.open && v.props, "the section keeps its state");
+        assert!(!v.close(), "nothing to close: Esc has no work here");
+    }
+
+    #[test]
+    fn a_property_shows_by_presence_not_by_text() {
+        let mut d = draft("t", "");
+        assert_eq!(PropShown::of_draft(&d), PropShown::default());
+        assert_eq!(property_count(&d), 0);
+        // An empty but present content type ("Send empty") shows and counts.
+        d.content_type = Some(String::new());
+        d.correlation = Some(String::new());
+        d.user = vec![(String::new(), String::new())];
+        let shown = PropShown::of_draft(&d);
+        assert!(shown.content_type && shown.correlation && !shown.expiry);
+        assert_eq!(property_count(&d), 3);
+        // A response topic and an expiry are present when they have text. UTF-8 is a flag.
+        d.response_topic = "r".into();
+        d.expiry = "60".into();
+        d.utf8 = true;
+        assert_eq!(property_count(&d), 6);
+        let shown = PropShown::of_draft(&d);
+        assert!(shown.response_topic && shown.expiry && shown.payload_format);
+        assert_eq!(
+            shown.addable(),
+            [PropKind::User],
+            "only the user property is left"
+        );
+    }
+
+    #[test]
+    fn a_field_that_the_user_adds_stays_visible_while_it_is_empty() {
+        let mut shown = PropShown::default();
+        assert_eq!(shown.addable().len(), 6);
+        shown.set(PropKind::ContentType, true);
+        // The draft has no text, so it has no property and the tag counts none.
+        assert_eq!(property_count(&draft("t", "")), 0);
+        assert!(shown.is_shown(PropKind::ContentType));
+        assert!(!shown.addable().contains(&PropKind::ContentType));
+        assert!(!shown.is_shown(PropKind::User), "user rows have no flag");
+        shown.set(PropKind::ContentType, false);
+        assert!(shown.addable().contains(&PropKind::ContentType));
     }
 
     #[test]

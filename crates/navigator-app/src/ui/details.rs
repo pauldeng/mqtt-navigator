@@ -420,6 +420,7 @@ impl Navigator {
             memory_mib: self.memory_mib(),
             check_updates: self.settings.ui.check_updates,
             sub_qos: self.show_only_sub().map(|s| s.qos),
+            composer_open: self.comp.vis.open,
             sub_failed: self
                 .show_only_sub()
                 .is_some_and(|s| matches!(s.state, SubState::Failed(_))),

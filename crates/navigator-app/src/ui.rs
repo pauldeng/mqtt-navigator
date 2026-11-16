@@ -62,6 +62,8 @@ actions!(
         FocusFilter,
         OpenPalette,
         NewConnection,
+        NewMessage,
+        CloseComposer,
         SendMessage,
         FocusNextField,
         FocusPrevField,
@@ -96,6 +98,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
         KeyBinding::new("ctrl-n", NewConnection, Some(CONTEXT)),
         KeyBinding::new("cmd-n", NewConnection, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-n", NewMessage, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-n", NewMessage, Some(CONTEXT)),
+        // `Esc` closes the area that has the focus. A control that uses `Esc` (a menu, the
+        // filter) handles it first and does not pass it on (design 8).
+        KeyBinding::new("escape", CloseComposer, Some("Composer")),
         // The payload editor inserts a newline for Ctrl+Enter and a tab for Tab. In the
         // composer, these keys send and move the focus.
         KeyBinding::new("ctrl-enter", SendMessage, Some("Composer > Input")),
@@ -3390,6 +3397,7 @@ impl Render for Navigator {
                 cx.listener(|v, _: &NewConnection, w, cx| v.run_cmd(Cmd::NewConnection, w, cx)),
             )
             .on_action(cx.listener(|v, _: &SendMessage, w, cx| v.run_cmd(Cmd::Send, w, cx)))
+            .on_action(cx.listener(|v, _: &NewMessage, w, cx| v.run_cmd(Cmd::NewMessage, w, cx)))
             .on_action(cx.listener(|_, _: &FocusNextField, window, cx| window.focus_next(cx)))
             .on_action(cx.listener(|_, _: &FocusPrevField, window, cx| window.focus_prev(cx)))
             .child(self.render_title(cx))

@@ -3,8 +3,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use gpui_kit::component::button::{DropdownButton, Toggle, ToggleGroup};
-use gpui_kit::component::collapsible::Collapsible;
+use gpui_kit::component::button::{Toggle, ToggleGroup};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::notification::Notification;
@@ -12,9 +11,10 @@ use gpui_kit::component::switch::Switch;
 use navigator_core::decode::{self, Decoder};
 use navigator_core::publish::{validate_outgoing, validate_v3_size};
 
-use super::profiles::display_name;
 use super::*;
-use crate::composer::{ComposerModel, Draft, LineKeep, PayloadMode};
+use crate::composer::{
+    ComposerModel, Draft, LineKeep, PayloadMode, PropKind, PropShown, Visibility, property_count,
+};
 use crate::inspector::size_text;
 
 /// Height of the payload editor (design pixels, see [`ui`]).
@@ -83,8 +83,10 @@ pub(super) struct Composer {
     pub(super) qos: Qos,
     retain: bool,
     utf8: bool,
-    props_open: bool,
-    pub(super) collapsed: bool,
+    /// Whether the composer and its Properties section show. Closed by default.
+    pub(super) vis: Visibility,
+    /// Which property fields show (separate from their text).
+    shown: PropShown,
     pub(super) model: ComposerModel,
     /// Why the last Send or conversion did not work. It shows under the composer.
     error: Option<String>,
@@ -145,8 +147,8 @@ impl Composer {
             qos: Qos::AtMostOnce,
             retain: false,
             utf8: false,
-            props_open: false,
-            collapsed: false,
+            vis: Visibility::default(),
+            shown: PropShown::default(),
             model: ComposerModel::default(),
             error: None,
             format_task: None,
@@ -164,6 +166,8 @@ impl Composer {
         self.retain = false;
         self.utf8 = false;
         self.rows.clear();
+        self.vis = Visibility::default();
+        self.shown = PropShown::default();
         self.content_type_empty = false;
         self.correlation_empty = false;
         for f in [
@@ -275,12 +279,9 @@ impl Navigator {
             .map(|(k, v)| self.new_row(k, v, true, window, cx))
             .collect();
         self.comp.rows = rows;
-        self.comp.props_open = d.content_type.is_some()
-            || !d.response_topic.is_empty()
-            || d.correlation.is_some()
-            || !d.expiry.is_empty()
-            || d.utf8
-            || !d.user.is_empty();
+        // A recall, an Edit or a Reply opens Properties when it fills a field.
+        self.comp.shown = PropShown::of_draft(d);
+        self.comp.vis.props |= property_count(d) > 0;
     }
 
     fn set_payload_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -319,7 +320,7 @@ impl Navigator {
         self.apply_draft(&d, window, cx);
         self.comp.model.loaded(unsent);
         self.comp.error = None;
-        self.comp.collapsed = false;
+        self.comp.vis.open();
         self.comp.payload.update(cx, |e, cx| e.focus(window, cx));
         cx.notify();
     }
@@ -370,18 +371,170 @@ impl Navigator {
         cx.notify();
     }
 
-    pub(super) fn toggle_composer(&mut self, cx: &mut Context<Self>) {
-        self.comp.collapsed = !self.comp.collapsed;
+    /// New message (`Ctrl/Cmd+Shift+N`, the button, the palette): opens the composer. The focus
+    /// goes to the topic when it is empty, else to the payload.
+    pub(super) fn open_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.comp.vis.open();
+        if self.comp.topic.get(cx).is_empty() {
+            self.comp
+                .topic
+                .input
+                .update(cx, |i, cx| i.focus(window, cx));
+        } else {
+            self.comp.payload.update(cx, |e, cx| e.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// The one close operation: the Close item, `Esc` and the palette. The draft stays. The
+    /// focus moves to the message list, so that it never stays on a control that is gone.
+    pub(super) fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comp.vis.close() {
+            self.list_focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// "Composer: Properties": opens the composer and the Properties section.
+    pub(super) fn open_properties(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_composer(window, cx);
+        self.comp.vis.props = true;
         cx.notify();
     }
 
     pub(super) fn focus_publish_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.comp.collapsed = false;
+        self.comp.vis.open();
         self.comp
             .topic
             .input
             .update(cx, |i, cx| i.focus(window, cx));
         cx.notify();
+    }
+
+    /// Adds a property to the section. It shows at once, also while it is empty.
+    fn add_prop(&mut self, kind: PropKind, window: &mut Window, cx: &mut Context<Self>) {
+        // The focus goes to the new field, so that the user can type at once.
+        let focus = match kind {
+            PropKind::User => {
+                let row = self.new_row("", "", false, window, cx);
+                let input = row.key.input.clone();
+                self.comp.rows.push(row);
+                Some(input)
+            }
+            PropKind::PayloadFormat => {
+                self.comp.utf8 = true;
+                self.comp.shown.set(kind, true);
+                None
+            }
+            _ => {
+                self.comp.shown.set(kind, true);
+                match kind {
+                    PropKind::ContentType => Some(self.comp.content_type.input.clone()),
+                    PropKind::ResponseTopic => Some(self.comp.response_topic.input.clone()),
+                    PropKind::Correlation => Some(self.comp.correlation.clone()),
+                    _ => Some(self.comp.expiry.clone()),
+                }
+            }
+        };
+        if let Some(input) = focus {
+            input.update(cx, |i, cx| i.focus(window, cx));
+        }
+        self.comp.vis.props = true;
+        self.comp.model.edited();
+        cx.notify();
+    }
+
+    /// Removes a property: it hides and its value is gone.
+    fn remove_prop(&mut self, kind: PropKind, window: &mut Window, cx: &mut Context<Self>) {
+        match kind {
+            PropKind::PayloadFormat => self.comp.utf8 = false,
+            PropKind::ContentType => {
+                self.comp.content_type.set("", window, cx);
+                self.comp.content_type_empty = false;
+            }
+            PropKind::ResponseTopic => self.comp.response_topic.set("", window, cx),
+            PropKind::Correlation => {
+                self.comp
+                    .correlation
+                    .update(cx, |i, cx| i.set_value("", window, cx));
+                self.comp.correlation_empty = false;
+            }
+            PropKind::Expiry => self
+                .comp
+                .expiry
+                .update(cx, |i, cx| i.set_value("", window, cx)),
+            PropKind::User => return,
+        }
+        self.comp.shown.set(kind, false);
+        self.comp.model.edited();
+        cx.notify();
+    }
+
+    /// "History…": opens the composer and a list of Drafts and Sent. A choice fills the composer.
+    pub(super) fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_composer(window, cx);
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let list = |items: Vec<(u64, SharedString)>| items;
+        let drafts = list(
+            self.comp
+                .model
+                .history
+                .drafts()
+                .map(|e| (e.seq, e.label.clone().into()))
+                .collect(),
+        );
+        let sent = list(
+            self.comp
+                .model
+                .history
+                .sent()
+                .map(|e| (e.seq, e.label.clone().into()))
+                .collect(),
+        );
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let group = |title: &'static str, items: &[(u64, SharedString)], is_draft: bool| {
+                (!items.is_empty()).then(|| {
+                    v_flex()
+                        .child(div().text_xs().text_color(muted).child(title))
+                        .children(items.iter().map(|(seq, label)| {
+                            let (weak, seq) = (weak.clone(), *seq);
+                            let id = (if is_draft { "draft" } else { "sent" }, seq as usize);
+                            ListItem::new(id)
+                                .px_2()
+                                .child(div().text_sm().truncate().child(label.clone()))
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    weak.update(cx, |v, cx| v.recall(seq, is_draft, window, cx))
+                                        .ok();
+                                })
+                        }))
+                })
+            };
+            let empty = drafts.is_empty() && sent.is_empty();
+            dialog
+                .title("History")
+                .child(
+                    v_flex()
+                        .id("history-list")
+                        .gap_2()
+                        .max_h(ui(360.))
+                        .overflow_y_scroll()
+                        .when(empty, |d| d.child(div().text_sm().child("No history yet.")))
+                        .children(group("Drafts", &drafts, true))
+                        .children(group("Sent", &sent, false)),
+                )
+                .footer(
+                    h_flex().justify_end().child(
+                        Button::new("history-close")
+                            .label("Close")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
     }
 
     /// Formats the payload as JSON. The work runs in the background. A result for text that the
@@ -528,110 +681,170 @@ impl Navigator {
 
     pub(super) fn render_composer(
         &mut self,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
+        if !self.comp.vis.open {
+            // Closed: one text button. The editors and the draft stay.
+            return h_flex()
+                .border_t_1()
+                .border_color(theme.border)
+                .p_2()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("new-message")
+                        .small()
+                        .label("New message")
+                        .on_click(cx.listener(|v, _, window, cx| v.open_composer(window, cx))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{}+Shift+N", crate::palette::MOD)),
+                )
+                .into_any_element();
+        }
         let connected = self.connected();
-        let collapsed = self.comp.collapsed;
+        let v5 = self.composer_protocol() == Protocol::V5;
         let result = self
             .last_result
             .as_ref()
             .map(|(_, t)| t.clone())
             .unwrap_or_default();
-        let target = self.profile.as_ref().map(display_name);
-
-        let drafts: Vec<(u64, SharedString)> = self
-            .comp
-            .model
-            .history
-            .drafts()
-            .map(|e| (e.seq, e.label.clone().into()))
-            .collect();
-        let sent: Vec<(u64, SharedString)> = self
-            .comp
-            .model
-            .history
-            .sent()
-            .map(|e| (e.seq, e.label.clone().into()))
-            .collect();
+        let count = property_count(&self.read_draft(cx));
+        let hex = self.comp.mode == PayloadMode::Hex;
+        let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();
-        let rem = window.rem_size();
-        let history = DropdownButton::new("composer-history")
-            .button(
-                Button::new("composer-history-button")
-                    .small()
-                    .ghost()
-                    .label("History")
-                    .dropdown_caret(true),
-            )
+        // The `⋯` menu: Format, History…, Properties (MQTT 5) and Close.
+        let more = Button::new("composer-more")
+            .small()
+            .ghost()
+            .icon(IconName::Ellipsis)
+            .tab_stop(true)
+            .tooltip("Composer actions")
             .dropdown_menu(move |menu, _, _| {
+                let item = |label: &'static str,
+                            run: fn(&mut Navigator, &mut Window, &mut Context<Navigator>)| {
+                    let weak = weak.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        weak.update(cx, |v, cx| run(v, window, cx)).ok();
+                    })
+                };
                 let mut menu = menu
-                    .min_w(ui(280.).to_pixels(rem))
-                    .max_w(ui(520.).to_pixels(rem))
-                    .max_h(ui(360.).to_pixels(rem))
-                    .scrollable(true);
-                if drafts.is_empty() && sent.is_empty() {
-                    return menu.item(PopupMenuItem::new("No history yet.").disabled(true));
+                    .item(item("Format", |v, w, cx| v.format_json(w, cx)).disabled(hex))
+                    .item(item("History…", |v, w, cx| v.open_history(w, cx)));
+                if v5 {
+                    menu = menu.item(
+                        item("Properties", |v, _, cx| {
+                            v.comp.vis.props = !v.comp.vis.props;
+                            cx.notify();
+                        })
+                        .checked(props_open),
+                    );
                 }
-                for (title, list, is_draft) in [("Drafts", &drafts, true), ("Sent", &sent, false)] {
-                    if list.is_empty() {
-                        continue;
-                    }
-                    menu = menu.label(title);
-                    for (seq, label) in list {
-                        let (weak, seq) = (weak.clone(), *seq);
-                        menu = menu.item(PopupMenuItem::new(label.clone()).on_click(
-                            move |_, window, cx| {
-                                weak.update(cx, |v, cx| v.recall(seq, is_draft, window, cx))
-                                    .ok();
-                            },
-                        ));
-                    }
-                }
-                menu
+                menu.separator()
+                    .item(item("Close", |v, w, cx| v.close_composer(w, cx)))
             });
 
         let topic_note = self.comp.topic.note("topic", cx);
         let header = h_flex()
             .gap_2()
             .items_center()
-            .child(div().text_xs().text_color(muted).child("Publish"))
             .child(
                 div()
                     .flex_1()
                     .child(Input::new(&self.comp.topic.input).small()),
             )
-            .child(history)
-            .child(
-                Button::new("composer-collapse")
-                    .small()
-                    .ghost()
-                    .icon(if collapsed {
-                        IconName::ChevronUp
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .tooltip(if collapsed {
-                        "Show the composer"
-                    } else {
-                        "Collapse the composer to one line"
-                    })
-                    .on_click(cx.listener(|v, _, _, cx| v.toggle_composer(cx))),
-            );
+            .when(v5 && count > 0, |d| {
+                d.child(
+                    Button::new("props-tag")
+                        .xsmall()
+                        .label(format!("Properties ({count})"))
+                        .tooltip("Show or hide the properties")
+                        .on_click(cx.listener(|v, _, _, cx| {
+                            v.comp.vis.props = !v.comp.vis.props;
+                            cx.notify();
+                        })),
+                )
+            });
 
-        let send = h_flex()
+        // The last result, or the error, as one line under the payload.
+        let line = if let Some(e) = self.comp.error.clone() {
+            div().text_xs().text_color(theme.danger).child(e)
+        } else {
+            div().text_xs().text_color(muted).child(if connected {
+                result
+            } else {
+                "Connect to a broker first.".into()
+            })
+        };
+
+        let mode_ix = usize::from(hex);
+        // A toggle group with a selected state. A click on the selected one keeps it.
+        let qos = ToggleGroup::new("qos")
+            .segmented()
+            .single()
+            .small()
+            .child(
+                Toggle::new("qos-0")
+                    .label("QoS 0")
+                    .checked(self.comp.qos == Qos::AtMostOnce),
+            )
+            .child(
+                Toggle::new("qos-1")
+                    .label("QoS 1")
+                    .checked(self.comp.qos == Qos::AtLeastOnce),
+            )
+            .on_click(cx.listener(|v, checks: &Vec<bool>, _, cx| {
+                if let Some(ix) = checks.iter().position(|c| *c) {
+                    v.comp.qos = if ix == 0 {
+                        Qos::AtMostOnce
+                    } else {
+                        Qos::AtLeastOnce
+                    };
+                    v.comp.model.edited();
+                    cx.notify();
+                }
+            }));
+        let controls = h_flex()
+            .flex_wrap()
             .gap_2()
             .items_center()
-            .when_some(target, |d, name| {
-                d.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("to {}", display_safe(&name))),
-                )
-            })
+            .child(
+                div().w(ui(110.)).child(
+                    TabBar::new("payload-mode")
+                        .segmented()
+                        .small()
+                        .selected_index(mode_ix)
+                        .on_click(cx.listener(|v, ix: &usize, window, cx| {
+                            let to = if *ix == 0 {
+                                PayloadMode::Text
+                            } else {
+                                PayloadMode::Hex
+                            };
+                            v.set_payload_mode(to, window, cx);
+                        }))
+                        .child("Text")
+                        .child("Hex"),
+                ),
+            )
+            .child(qos)
+            .child(
+                Switch::new("retain")
+                    .checked(self.comp.retain)
+                    .label("Retain")
+                    .on_click(cx.listener(|v, on: &bool, _, cx| {
+                        v.comp.retain = *on;
+                        v.comp.model.edited();
+                        cx.notify();
+                    })),
+            )
+            .child(div().flex_1())
+            .child(more)
             .child(
                 Button::new("send")
                     .small()
@@ -641,154 +854,46 @@ impl Navigator {
                     .on_click(cx.listener(|v, _, window, cx| v.send(window, cx))),
             );
 
-        let status = div()
-            .flex_1()
-            .min_w_0()
-            .text_xs()
-            .text_color(muted)
-            .child(if connected {
-                result
-            } else {
-                "Connect to a broker first.".into()
-            });
-
-        let body = if collapsed {
-            // The head of the text only: a large payload must not be copied for each frame.
-            let one_line = {
-                let rope = self.comp.payload.read(cx).text();
-                let head = rope.slice(..rope.len_chars().min(512)).to_string();
-                decode::preview(head.as_bytes(), 200)
-            };
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(muted)
-                        .child(one_line),
-                )
-                .child(send)
-                .into_any_element()
-        } else {
-            let mode_ix = usize::from(self.comp.mode == PayloadMode::Hex);
-            // A toggle group with a selected state. A click on the selected one keeps it.
-            let qos = ToggleGroup::new("qos")
-                .segmented()
-                .single()
-                .small()
-                .child(
-                    Toggle::new("qos-0")
-                        .label("QoS 0")
-                        .checked(self.comp.qos == Qos::AtMostOnce),
-                )
-                .child(
-                    Toggle::new("qos-1")
-                        .label("QoS 1")
-                        .checked(self.comp.qos == Qos::AtLeastOnce),
-                )
-                .on_click(cx.listener(|v, checks: &Vec<bool>, _, cx| {
-                    if let Some(ix) = checks.iter().position(|c| *c) {
-                        v.comp.qos = if ix == 0 {
-                            Qos::AtMostOnce
-                        } else {
-                            Qos::AtLeastOnce
-                        };
-                        v.comp.model.edited();
-                        cx.notify();
-                    }
-                }));
-            v_flex()
-                .gap_2()
-                .child(
-                    Editor::new(&self.comp.payload)
-                        .h(ui(PAYLOAD_HEIGHT))
-                        .bordered(true)
-                        .small(),
-                )
-                .child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div().w(ui(110.)).child(
-                                TabBar::new("payload-mode")
-                                    .segmented()
-                                    .small()
-                                    .selected_index(mode_ix)
-                                    .on_click(cx.listener(|v, ix: &usize, window, cx| {
-                                        let to = if *ix == 0 {
-                                            PayloadMode::Text
-                                        } else {
-                                            PayloadMode::Hex
-                                        };
-                                        v.set_payload_mode(to, window, cx);
-                                    }))
-                                    .child("Text")
-                                    .child("Hex"),
-                            ),
-                        )
-                        .child(
-                            Button::new("format-json")
-                                .small()
-                                .ghost()
-                                .label("Format")
-                                .disabled(self.comp.mode == PayloadMode::Hex)
-                                .on_click(
-                                    cx.listener(|v, _, window, cx| v.format_json(window, cx)),
-                                ),
-                        )
-                        .child(qos)
-                        .child(
-                            Switch::new("retain")
-                                .checked(self.comp.retain)
-                                .label("Retain")
-                                .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                    v.comp.retain = *on;
-                                    v.comp.model.edited();
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .when(self.composer_protocol() == Protocol::V5, |d| {
-                    d.child(self.render_props(cx))
-                })
-                .when_some(topic_note, |d, n| {
-                    d.child(div().text_xs().text_color(muted).child(n))
-                })
-                .when_some(self.comp.error.clone(), |d, e| {
-                    d.child(div().text_xs().text_color(theme.danger).child(e))
-                })
-                .child(h_flex().gap_2().items_center().child(status).child(send))
-                .into_any_element()
-        };
-
         v_flex()
             .key_context("Composer")
+            .on_action(cx.listener(|v, _: &CloseComposer, window, cx| v.close_composer(window, cx)))
             .border_t_1()
             .border_color(theme.border)
             .p_2()
             .gap_2()
             .child(header)
-            .child(body)
+            .when_some(topic_note, |d, n| {
+                d.child(div().text_xs().text_color(muted).child(n))
+            })
+            .child(
+                Editor::new(&self.comp.payload)
+                    .h(ui(PAYLOAD_HEIGHT))
+                    .bordered(true)
+                    .small(),
+            )
+            .child(line)
+            .when(v5 && props_open, |d| d.child(self.render_props(cx)))
+            .child(controls)
+            .into_any_element()
     }
 
-    /// The "Properties" section: content type, response topic, correlation data, message expiry,
-    /// payload format and user properties. "Send empty" keeps a property that is present but
-    /// empty. A line break or a hidden character in a text is kept (see [`LineKeep`]).
+    /// The "Properties" section: only the fields that are present, and an "Add property" menu
+    /// for the others. "Send empty" keeps a property that is present but empty. A line break or
+    /// a hidden character in a text is kept (see [`LineKeep`]).
     fn render_props(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let open = self.comp.props_open;
         let muted = cx.theme().muted_foreground;
+        let shown = self.comp.shown;
         let note = move |n: Option<String>| n.map(|n| div().text_xs().text_color(muted).child(n));
         let empty_switch =
             |id: &'static str, on: bool| Switch::new(id).checked(on).label("Send empty");
+        let remove = |kind: PropKind, cx: &mut Context<Self>| {
+            Button::new(("prop-remove", kind as usize))
+                .small()
+                .ghost()
+                .icon(IconName::Close)
+                .tooltip("Remove this property")
+                .on_click(cx.listener(move |v, _, window, cx| v.remove_prop(kind, window, cx)))
+        };
         let rows = self.comp.rows.iter().map(|r| {
             let id = r.id;
             let n = r.key.note("name", cx).or_else(|| r.value.note("value", cx));
@@ -825,89 +930,98 @@ impl Navigator {
                 )
                 .children(note(n))
         });
-        Collapsible::new()
-            .open(open)
-            .child(
-                Button::new("props-toggle")
-                    .xsmall()
-                    .ghost()
-                    .icon(if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .label("Properties")
-                    .on_click(cx.listener(|v, _, _, cx| {
-                        v.comp.props_open = !v.comp.props_open;
-                        cx.notify();
-                    })),
-            )
-            .content(
-                v_flex()
-                    .gap_1()
-                    .pt_1()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&self.comp.content_type.input).small()),
-                            )
-                            .child(
-                                empty_switch("content-type-empty", self.comp.content_type_empty)
-                                    .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                        v.comp.content_type_empty = *on;
-                                        v.comp.model.edited();
-                                        cx.notify();
-                                    })),
-                            ),
+        let rows: Vec<_> = rows.collect();
+        let addable = shown.addable();
+        let weak = cx.entity().downgrade();
+        let add = Button::new("add-prop")
+            .xsmall()
+            .ghost()
+            .icon(IconName::Plus)
+            .label("Add property")
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                addable.iter().fold(menu, |menu, kind| {
+                    let (weak, kind) = (weak.clone(), *kind);
+                    menu.item(
+                        PopupMenuItem::new(kind.label()).on_click(move |_, window, cx| {
+                            weak.update(cx, |v, cx| v.add_prop(kind, window, cx)).ok();
+                        }),
                     )
-                    .children(note(self.comp.content_type.note("value", cx)))
-                    .child(Input::new(&self.comp.response_topic.input).small())
-                    .children(note(self.comp.response_topic.note("value", cx)))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&self.comp.correlation).small()),
-                            )
-                            .child(
-                                empty_switch("correlation-empty", self.comp.correlation_empty)
-                                    .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                        v.comp.correlation_empty = *on;
-                                        v.comp.model.edited();
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(Input::new(&self.comp.expiry).small())
-                    .child(
-                        Switch::new("payload-utf8")
-                            .checked(self.comp.utf8)
-                            .label("Payload format: UTF-8")
-                            .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                v.comp.utf8 = *on;
-                                v.comp.model.edited();
-                                cx.notify();
-                            })),
-                    )
-                    .children(rows)
-                    .child(
-                        div().child(
-                            Button::new("add-user-prop")
-                                .xsmall()
-                                .icon(IconName::Plus)
-                                .label("Add property")
-                                .on_click(cx.listener(|v, _, window, cx| {
-                                    let row = v.new_row("", "", false, window, cx);
-                                    v.comp.rows.push(row);
+                })
+            });
+        v_flex()
+            .gap_1()
+            .when(shown.payload_format, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().text_sm().child("Payload format: UTF-8"))
+                        .child(remove(PropKind::PayloadFormat, cx)),
+                )
+            })
+            .when(shown.content_type, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.comp.content_type.input).small()),
+                        )
+                        .child(
+                            empty_switch("content-type-empty", self.comp.content_type_empty)
+                                .on_click(cx.listener(|v, on: &bool, _, cx| {
+                                    v.comp.content_type_empty = *on;
+                                    v.comp.model.edited();
                                     cx.notify();
                                 })),
-                        ),
-                    ),
-            )
+                        )
+                        .child(remove(PropKind::ContentType, cx)),
+                )
+                .children(note(self.comp.content_type.note("value", cx)))
+            })
+            .when(shown.response_topic, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.comp.response_topic.input).small()),
+                        )
+                        .child(remove(PropKind::ResponseTopic, cx)),
+                )
+                .children(note(self.comp.response_topic.note("value", cx)))
+            })
+            .when(shown.correlation, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.comp.correlation).small()),
+                        )
+                        .child(
+                            empty_switch("correlation-empty", self.comp.correlation_empty)
+                                .on_click(cx.listener(|v, on: &bool, _, cx| {
+                                    v.comp.correlation_empty = *on;
+                                    v.comp.model.edited();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(remove(PropKind::Correlation, cx)),
+                )
+            })
+            .when(shown.expiry, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(&self.comp.expiry).small()))
+                        .child(remove(PropKind::Expiry, cx)),
+                )
+            })
+            .children(rows)
+            .child(h_flex().child(add))
     }
 }

@@ -57,10 +57,15 @@ impl Navigator {
             Cmd::Reply => self.reply(window, cx),
             Cmd::ClearRetained => self.confirm_clear_retained(window, cx),
             Cmd::FocusPublishTopic => self.focus_publish_topic(window, cx),
+            // A closed composer opens first: the user must see the draft that goes out.
+            Cmd::Send if !self.comp.vis.open => self.open_composer(window, cx),
             Cmd::Send => self.send(window, cx),
             Cmd::PayloadMode(mode) => self.set_payload_mode(mode, window, cx),
             Cmd::FormatJson => self.format_json(window, cx),
-            Cmd::ToggleComposer => self.toggle_composer(cx),
+            Cmd::NewMessage => self.open_composer(window, cx),
+            Cmd::ComposerProperties => self.open_properties(window, cx),
+            Cmd::ComposerHistory => self.open_history(window, cx),
+            Cmd::CloseComposer => self.close_composer(window, cx),
             Cmd::SubQos(_) | Cmd::SubOptions | Cmd::SubRetry | Cmd::SubRemove => {
                 self.run_sub_cmd(cmd, window, cx)
             }
@@ -71,7 +76,6 @@ impl Navigator {
                 self.details_open = true;
                 self.insp.expanded = false;
                 self.expand_restore = None;
-                self.comp.collapsed = false;
                 // The next frame sets the pane widths: the details pane may be hidden now.
                 self.pane_reset = true;
                 cx.notify();

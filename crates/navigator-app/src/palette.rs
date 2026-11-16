@@ -50,7 +50,10 @@ pub enum Cmd {
     Send,
     PayloadMode(PayloadMode),
     FormatJson,
-    ToggleComposer,
+    NewMessage,
+    ComposerProperties,
+    ComposerHistory,
+    CloseComposer,
     /// The subscription in "Show only" (see `Facts::sub_qos`).
     SubQos(Qos),
     SubOptions,
@@ -112,6 +115,7 @@ pub struct Facts {
     pub sub_failed: bool,
     /// The connection uses MQTT 5 (subscription options).
     pub v5: bool,
+    pub composer_open: bool,
 }
 
 /// One row of the table.
@@ -522,11 +526,32 @@ pub static COMMANDS: &[Entry] = &[
         |f| f.payload_mode == PayloadMode::Text,
     ),
     e(
-        "toggle-composer",
-        "Collapse or expand the composer",
-        None,
-        Cmd::ToggleComposer,
+        "new-message",
+        "New message",
+        Some("Mod+Shift+N"),
+        Cmd::NewMessage,
         always,
+    ),
+    e(
+        "composer-properties",
+        "Composer: Properties",
+        None,
+        Cmd::ComposerProperties,
+        |f| f.v5,
+    ),
+    e(
+        "composer-history",
+        "Composer: History",
+        None,
+        Cmd::ComposerHistory,
+        always,
+    ),
+    e(
+        "close-composer",
+        "Close the composer",
+        None,
+        Cmd::CloseComposer,
+        |f| f.composer_open,
     ),
     e(
         "sub-qos-0",
@@ -879,6 +904,44 @@ mod tests {
             .contains(&"jump-to-newest")
         );
         assert!(!ids(&Facts::default()).contains(&"jump-to-newest"));
+    }
+
+    #[test]
+    fn the_composer_entries_open_it_and_close_shows_only_when_it_is_open() {
+        let closed = Facts::default();
+        let v = ids(&closed);
+        assert!(v.contains(&"new-message") && v.contains(&"composer-history"));
+        assert!(!v.contains(&"close-composer"), "nothing to close");
+        assert!(!v.contains(&"composer-properties"), "MQTT 5 only");
+        assert!(!v.contains(&"toggle-composer"), "collapse is gone");
+        let open = Facts {
+            composer_open: true,
+            v5: true,
+            ..closed
+        };
+        let v = ids(&open);
+        assert!(v.contains(&"close-composer") && v.contains(&"composer-properties"));
+        // New message has the shortcut, and no other entry takes it.
+        let rows: Vec<_> = COMMANDS
+            .iter()
+            .filter(|c| c.shortcut == Some("Mod+Shift+N"))
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cmd, Cmd::NewMessage);
+        assert_eq!(
+            shortcut_text(rows[0])
+                .expect("text")
+                .replace(super::MOD, "Mod"),
+            "Mod+Shift+N"
+        );
+        // Send stays listed for a connection: the window opens the composer first.
+        assert!(
+            ids(&Facts {
+                connected: true,
+                ..closed
+            })
+            .contains(&"send")
+        );
     }
 
     #[test]
