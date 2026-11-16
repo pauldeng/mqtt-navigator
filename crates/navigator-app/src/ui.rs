@@ -1876,23 +1876,8 @@ impl Navigator {
                         }),
                 )
                 .child(div().flex_1())
-                .child(
-                    div().w(ui(300.)).child(
-                        Input::new(&self.filter_input)
-                            .small()
-                            .prefix(IconName::Search),
-                    ),
-                )
                 .children(self.render_update_badge(cx))
-                .child(
-                    Button::new("palette")
-                        .small()
-                        .ghost()
-                        .label("Commands…")
-                        .tooltip(format!("Command palette ({}+K)", crate::palette::MOD))
-                        .on_click(cx.listener(|v, _, window, cx| v.open_palette(window, cx))),
-                )
-                .child(self.render_theme_menu(cx))
+                .child(self.render_settings_menu(cx))
                 .child(
                     Button::new("connect")
                         .small()
@@ -1906,20 +1891,28 @@ impl Navigator {
         )
     }
 
-    /// The title bar menu: "Appearance" (System, Light, Dark) and "Theme" (the presets). The
-    /// checked items show the current choice.
-    fn render_theme_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The settings menu of the title bar (the gear): Commands…, Appearance, Theme, Row height,
+    /// Memory budget and Reset the layout. The checked items show the current choice.
+    fn render_settings_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.settings.ui.theme_mode;
         let current = crate::themes::preset_by_id(&self.settings.ui.theme_preset);
+        let (two_lines, memory) = (self.two_lines, self.memory_mib());
         let weak = cx.entity().downgrade();
-        Button::new("theme")
+        Button::new("settings")
             .small()
             .ghost()
-            .icon(IconName::Palette)
-            .label(current.label)
-            .dropdown_caret(true)
+            .icon(IconName::Settings)
+            .tooltip("Settings")
             .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu.label("Appearance");
+                let w = weak.clone();
+                let mut menu = menu.item(
+                    PopupMenuItem::new(format!("Commands… ({}+K)", crate::palette::MOD)).on_click(
+                        move |_, window, cx| {
+                            w.update(cx, |v, cx| v.open_palette(window, cx)).ok();
+                        },
+                    ),
+                );
+                menu = menu.separator().label("Appearance");
                 for (label, m) in [
                     ("System", ThemeMode::System),
                     ("Light", ThemeMode::Light),
@@ -1944,7 +1937,36 @@ impl Navigator {
                             }),
                     );
                 }
-                menu
+                menu = menu.separator().label("Row height");
+                for (label, two) in [("1 line", false), ("2 lines", true)] {
+                    let weak = weak.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(two_lines == two)
+                            .on_click(move |_, _, cx| {
+                                weak.update(cx, |v, cx| v.set_row_height(two, cx)).ok();
+                            }),
+                    );
+                }
+                menu = menu.separator().label("Memory budget");
+                for mib in crate::palette::MEMORY_OPTIONS_MIB {
+                    let weak = weak.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(crate::palette::memory_text(mib))
+                            .checked(mib == memory)
+                            .on_click(move |_, _, cx| {
+                                weak.update(cx, |v, cx| v.set_memory_limit(mib, cx)).ok();
+                            }),
+                    );
+                }
+                let w = weak.clone();
+                menu.separator()
+                    .item(
+                        PopupMenuItem::new("Reset the layout").on_click(move |_, window, cx| {
+                            w.update(cx, |v, cx| v.run_cmd(Cmd::ResetLayout, window, cx))
+                                .ok();
+                        }),
+                    )
             })
     }
 
@@ -2180,43 +2202,99 @@ impl Navigator {
     }
 
     /// "Connection details" in the status bar: a popover with the facts of the CONNACK.
-    fn details_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let details = self.details.current(&self.status)?;
-        let lines = details_lines(details);
+    /// The Details button of the status bar. Its popover shows the CONNACK facts (while
+    /// connected), the topic count, the memory use with the budget control, and the drops.
+    fn details_button(&self, drops: u64, cx: &mut Context<Self>) -> AnyElement {
+        let lines = self
+            .details
+            .current(&self.status)
+            .map(details_lines)
+            .unwrap_or_default();
+        let stats = self.store.stats();
+        let (topics, used, current) = (stats.topics, stats.used_bytes, self.memory_mib());
+        let weak = cx.entity().downgrade();
         let theme = cx.theme();
-        let (muted, mono) = (theme.muted_foreground, theme.mono_font_family.clone());
-        Some(
-            Popover::new("connection-details")
-                .trigger(
-                    Button::new("connection-details-button")
-                        .xsmall()
-                        .ghost()
-                        .label("Connection details"),
-                )
-                .content(move |_, _, _| {
-                    let rows = lines.iter().map(|(label, value)| {
+        let (muted, mono, danger) = (
+            theme.muted_foreground,
+            theme.mono_font_family.clone(),
+            theme.danger,
+        );
+        Popover::new("status-details")
+            .anchor(gpui_kit::Anchor::BottomRight)
+            .trigger(
+                Button::new("status-details-button")
+                    .xsmall()
+                    .ghost()
+                    .label("Details"),
+            )
+            .content(move |_, _, _| {
+                let fact = |label: &'static str, value: String| {
+                    h_flex()
+                        .gap_3()
+                        .text_xs()
+                        .child(div().w(ui(170.)).text_color(muted).child(label))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(mono.clone())
+                                .child(value),
+                        )
+                };
+                let weak = weak.clone();
+                let budget = DropdownButton::new("memory-limit")
+                    .button(
+                        Button::new("memory-limit-button")
+                            .xsmall()
+                            .ghost()
+                            .label(crate::palette::memory_text(current)),
+                    )
+                    .dropdown_menu(move |menu, _, _| {
+                        crate::palette::MEMORY_OPTIONS_MIB.into_iter().fold(
+                            menu.label("Memory budget"),
+                            |menu, mib| {
+                                let weak = weak.clone();
+                                menu.item(
+                                    PopupMenuItem::new(crate::palette::memory_text(mib))
+                                        .checked(mib == current)
+                                        .on_click(move |_, _, cx| {
+                                            weak.update(cx, |v, cx| v.set_memory_limit(mib, cx))
+                                                .ok();
+                                        }),
+                                )
+                            },
+                        )
+                    });
+                v_flex()
+                    .gap_1()
+                    .p_1()
+                    .w(ui(380.))
+                    .when(!lines.is_empty(), |d| {
+                        d.child(div().text_sm().child("Connection details"))
+                            .children(lines.iter().map(|(l, v)| fact(l, v.clone())))
+                    })
+                    .child(div().text_sm().child("Store"))
+                    .child(fact("Topics", group_digits(topics as u64)))
+                    .child(
                         h_flex()
                             .gap_3()
                             .text_xs()
-                            .child(div().w(ui(170.)).text_color(muted).child(*label))
+                            .child(div().w(ui(170.)).text_color(muted).child("Memory"))
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
                                     .font_family(mono.clone())
-                                    .child(value.clone()),
+                                    .child(format!("{} MiB of", used / MIB)),
                             )
-                    });
-                    v_flex()
-                        .gap_1()
-                        .p_1()
-                        .w(ui(380.))
-                        .child(div().text_sm().child("Connection details"))
-                        .children(rows)
-                        .into_any_element()
-                })
-                .into_any_element(),
-        )
+                            .child(budget),
+                    )
+                    .child(
+                        div()
+                            .when(drops > 0, |d| d.text_color(danger))
+                            .child(fact("Dropped", format!("{drops} messages"))),
+                    )
+                    .into_any_element()
+            })
+            .into_any_element()
     }
 
     fn render_subs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2373,6 +2451,13 @@ impl Navigator {
                         }))
                         .child("Messages")
                         .child("Tree"),
+                ),
+            )
+            .child(
+                div().flex_1().min_w(ui(160.)).max_w(ui(360.)).child(
+                    Input::new(&self.filter_input)
+                        .small()
+                        .prefix(IconName::Search),
                 ),
             )
             .when(messages, |d| {
@@ -2927,36 +3012,6 @@ impl Navigator {
     }
 
     /// "used / limit". A click opens the list of limits (the same ones as in the palette).
-    fn render_memory(&self, used: usize, weak: WeakEntity<Self>) -> impl IntoElement {
-        let current = self.memory_mib();
-        DropdownButton::new("memory-limit")
-            .button(
-                Button::new("memory-limit-button")
-                    .xsmall()
-                    .ghost()
-                    .label(format!(
-                        "{} MiB / {}",
-                        used / MIB,
-                        crate::palette::memory_text(current)
-                    )),
-            )
-            .dropdown_menu(move |menu, _, _| {
-                crate::palette::MEMORY_OPTIONS_MIB.into_iter().fold(
-                    menu.label("Memory limit"),
-                    |menu, mib| {
-                        let weak = weak.clone();
-                        menu.item(
-                            PopupMenuItem::new(crate::palette::memory_text(mib))
-                                .checked(mib == current)
-                                .on_click(move |_, _, cx| {
-                                    weak.update(cx, |v, cx| v.set_memory_limit(mib, cx)).ok();
-                                }),
-                        )
-                    },
-                )
-            })
-    }
-
     /// Width limits of the panes in pixels: (initial, least, most) for the two side panes, and
     /// the least of the centre. The saved widths are clamped to them, and the sides never take
     /// the room that the centre needs. Rems give the limits, so that they follow the zoom.
@@ -3027,8 +3082,6 @@ impl Navigator {
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.store.stats();
-        let memory = self.render_memory(s.used_bytes, cx.entity().downgrade());
-        let details_button = self.details_button(cx);
         let drops = s.drops
             + s.topic_drops
             + self
@@ -3036,22 +3089,22 @@ impl Navigator {
                 .stats
                 .drops
                 .load(std::sync::atomic::Ordering::Relaxed);
+        let details_button = self.details_button(drops, cx);
+        let show = status_items(&StatusFacts {
+            encrypted: self.profile.as_ref().map(|p| p.transport.is_encrypted()),
+            verify_tls: self.profile.as_ref().is_none_or(|p| p.verify_tls),
+            drops,
+            list_drops: s.list_drops,
+            used: s.used_bytes,
+            budget: self.store.budget(),
+            reconnect: self.reconnect_pending && self.is_live(),
+        });
         let theme = cx.theme();
         let mut left = h_flex().gap_3().text_xs().child(self.url());
-        if let Some(p) = &self.profile {
-            if !p.transport.is_encrypted() {
-                left = left.child(Tag::warning().xsmall().child("Not encrypted"));
-            } else if !p.verify_tls {
-                left = left.child(Tag::warning().xsmall().child("Insecure TLS"));
-            }
+        if let Some(text) = show.security {
+            left = left.child(Tag::warning().xsmall().child(text));
         }
-        if self.reconnected_at.is_some() {
-            left = left.child("Reconnected");
-        }
-        if let Some(button) = details_button {
-            left = left.child(button);
-        }
-        if self.reconnect_pending && self.is_live() {
+        if show.reconnect {
             let id = self.profile.as_ref().map(|p| p.id);
             left = left.child(
                 h_flex()
@@ -3079,18 +3132,63 @@ impl Navigator {
                 .text_xs()
                 .font_family(theme.mono_font_family.clone())
                 .child(format!("{} msg/s", self.rate.per_sec))
-                .child(format!("{} topics", s.topics))
-                .child(format!("{} rows", s.list_rows))
-                .when(s.list_drops > 0, |d| {
-                    d.child(format!("{} rows evicted", s.list_drops))
+                .when(show.memory, |d| {
+                    d.child(div().text_color(theme.warning).child(format!(
+                        "{} MiB / {}",
+                        s.used_bytes / MIB,
+                        crate::palette::memory_text(self.memory_mib())
+                    )))
                 })
-                .child(memory)
-                .child(
-                    div()
-                        .when(drops > 0, |d| d.text_color(theme.danger))
-                        .child(format!("{drops} dropped")),
-                ),
+                .when(s.list_drops > 0 && show.list_drops, |d| {
+                    d.child(format!("{} rows removed (memory limit)", s.list_drops))
+                })
+                .when(show.drops, |d| {
+                    d.child(
+                        div()
+                            .text_color(theme.danger)
+                            .child(format!("{drops} dropped")),
+                    )
+                })
+                .child(details_button),
         )
+    }
+}
+
+/// The facts that decide which optional parts of the status bar show.
+struct StatusFacts {
+    /// `Some(false)`: the transport is not encrypted. `None`: no profile.
+    encrypted: Option<bool>,
+    verify_tls: bool,
+    drops: u64,
+    list_drops: u64,
+    used: usize,
+    budget: usize,
+    /// The active profile changed while the connection is live.
+    reconnect: bool,
+}
+
+/// What the status bar shows besides the URL, msg/s and Details (design 3).
+#[derive(Debug, PartialEq, Eq)]
+struct StatusItems {
+    security: Option<&'static str>,
+    drops: bool,
+    list_drops: bool,
+    memory: bool,
+    reconnect: bool,
+}
+
+fn status_items(f: &StatusFacts) -> StatusItems {
+    StatusItems {
+        security: match f.encrypted {
+            Some(false) => Some("Not encrypted"),
+            Some(true) if !f.verify_tls => Some("Insecure TLS"),
+            _ => None,
+        },
+        drops: f.drops > 0,
+        list_drops: f.list_drops > 0,
+        // Above 80% of the budget.
+        memory: f.used.saturating_mul(5) > f.budget.saturating_mul(4),
+        reconnect: f.reconnect,
     }
 }
 
@@ -3383,8 +3481,9 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
         COALESCE, ConnState, ConnectionDetails, DetailsCache, FRAME_BUDGET, GenGate, Protocol,
-        Status, SubState, Subs, WORK_RESERVE, coalesce_wait, connection_live, merge_budget,
-        scroll_top_of, send_error_text, top_row, ui, validate_filter,
+        Status, StatusFacts, StatusItems, SubState, Subs, WORK_RESERVE, coalesce_wait,
+        connection_live, merge_budget, scroll_top_of, send_error_text, status_items, top_row, ui,
+        validate_filter,
     };
     use gpui_kit::{px, rems};
     use navigator_core::Qos;
@@ -3826,6 +3925,47 @@ mod tests {
         // A status that skipped the Reconnecting state (attempt 8, no clear): attempt 7
         // details do not show.
         assert_eq!(shown(&c, &up(8)), None);
+    }
+
+    #[test]
+    fn the_status_bar_shows_an_optional_part_only_when_it_applies() {
+        let quiet = StatusFacts {
+            encrypted: Some(true),
+            verify_tls: true,
+            drops: 0,
+            list_drops: 0,
+            used: 80,
+            budget: 100,
+            reconnect: false,
+        };
+        let none = StatusItems {
+            security: None,
+            drops: false,
+            list_drops: false,
+            memory: false,
+            reconnect: false,
+        };
+        // Exactly 80% is not above 80%.
+        assert_eq!(status_items(&quiet), none);
+        let busy = status_items(&StatusFacts {
+            used: 81,
+            drops: 3,
+            list_drops: 5,
+            reconnect: true,
+            ..quiet
+        });
+        assert!(busy.memory && busy.drops && busy.list_drops && busy.reconnect);
+        let plain = |encrypted, verify_tls| {
+            status_items(&StatusFacts {
+                encrypted,
+                verify_tls,
+                ..quiet
+            })
+            .security
+        };
+        assert_eq!(plain(Some(false), true), Some("Not encrypted"));
+        assert_eq!(plain(Some(true), false), Some("Insecure TLS"));
+        assert_eq!(plain(None, true), None);
     }
 
     #[test]
