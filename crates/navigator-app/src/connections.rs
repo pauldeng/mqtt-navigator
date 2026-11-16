@@ -144,19 +144,38 @@ const FIELD_ORDER: [&str; 11] = [
     "username",
     "password",
     "client_cert",
-    "ws_path",
     "client_id",
+    "ws_path",
     "session_expiry",
     "keepalive",
     "will.topic",
 ];
-const ADVANCED: [&str; 5] = [
+const ADVANCED: [&str; 6] = [
+    "client_id",
     "ws_path",
     "session_expiry",
     "keepalive",
     "will.topic",
     "will.delay_secs",
 ];
+
+/// A collapsed section of the sheet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Advanced,
+    ClientCert,
+}
+
+/// The collapsed section that holds a field. `None`: the field is always visible.
+fn section_of(field: &str) -> Option<Section> {
+    if ADVANCED.contains(&field) {
+        Some(Section::Advanced)
+    } else if field == "client_cert" {
+        Some(Section::ClientCert)
+    } else {
+        None
+    }
+}
 
 fn err(field: &'static str, message: &str) -> FieldError {
     FieldError {
@@ -197,6 +216,8 @@ pub struct ConnectionSheet {
     clear_password: bool,
     clear_passphrase: bool,
     advanced: bool,
+    /// The collapsed "Client certificate" section (certificate, key, passphrase).
+    client_cert_open: bool,
     errors: Vec<FieldError>,
     name: Entity<InputState>,
     host: Entity<InputState>,
@@ -307,6 +328,7 @@ impl ConnectionSheet {
             clear_password: false,
             clear_passphrase: false,
             advanced: false,
+            client_cert_open: false,
             errors: Vec::new(),
             name,
             host,
@@ -484,6 +506,7 @@ impl ConnectionSheet {
         self.clear_password = false;
         self.clear_passphrase = false;
         self.advanced = false;
+        self.client_cert_open = false;
         self.errors.clear();
         self.is_new = is_new;
         self.origin = p;
@@ -594,7 +617,13 @@ impl ConnectionSheet {
             new
         });
         if !errors.is_empty() {
-            self.advanced |= errors.iter().any(|e| ADVANCED.contains(&e.field));
+            // A wrong field in a collapsed section opens that section first.
+            for section in errors.iter().filter_map(|e| section_of(e.field)) {
+                match section {
+                    Section::Advanced => self.advanced = true,
+                    Section::ClientCert => self.client_cert_open = true,
+                }
+            }
             let first = FIELD_ORDER
                 .iter()
                 .find(|f| errors.iter().any(|e| e.field == **f))
@@ -950,29 +979,6 @@ impl Render for ConnectionSheet {
                             )
                         }),
                 ),
-            )
-            .child(
-                field().label("Client ID").child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(div().flex_1().child(Input::new(&self.client_id).small()))
-                                .child(
-                                    Button::new("new-client-id")
-                                        .small()
-                                        .label("New ID")
-                                        .on_click(cx.listener(|s, _, window, cx| {
-                                            let id = Profile::new().client_id;
-                                            Self::set_text(&s.client_id, &id, window, cx);
-                                            s.errors.retain(|e| e.field != "client_id");
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .children(self.error_text("client_id", cx)),
-                ),
             );
 
         let warn = |text: &'static str| div().text_sm().text_color(warning).child(text);
@@ -988,8 +994,9 @@ impl Render for ConnectionSheet {
                         })),
                 ),
             )
-            .child(self.file_field("CA file", FileKind::Ca, &self.ca_file, cx))
-            .child(self.file_field("Client certificate", FileKind::Cert, &self.client_cert, cx))
+            .child(self.file_field("CA file", FileKind::Ca, &self.ca_file, cx));
+        let client_cert = v_form()
+            .child(self.file_field("Certificate", FileKind::Cert, &self.client_cert, cx))
             .child(
                 self.file_field("Client key", FileKind::Key, &self.client_key, cx)
                     .description("Set the certificate and the key together."),
@@ -1019,6 +1026,29 @@ impl Render for ConnectionSheet {
             );
 
         let advanced = v_form()
+            .child(
+                field().label("Client ID").child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(div().flex_1().child(Input::new(&self.client_id).small()))
+                                .child(
+                                    Button::new("new-client-id")
+                                        .small()
+                                        .label("New ID")
+                                        .on_click(cx.listener(|s, _, window, cx| {
+                                            let id = Profile::new().client_id;
+                                            Self::set_text(&s.client_id, &id, window, cx);
+                                            s.errors.retain(|e| e.field != "client_id");
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .children(self.error_text("client_id", cx)),
+                ),
+            )
             .child(self.input_field("WebSocket path", "ws_path", &self.ws_path, cx))
             .child(
                 field().child(
@@ -1113,26 +1143,53 @@ impl Render for ConnectionSheet {
                 ))
             })
             .when(encrypted, |d| {
+                let cert_open = self.client_cert_open;
+                let cert_set = self.client_cert.is_some() || self.client_key.is_some();
                 d.child(Self::section("TLS", cx))
                     .child(tls)
                     .when(!self.verify_tls, |d| {
                         d.child(warn("Certificate verification is off."))
                     })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("client-cert")
+                                    .small()
+                                    .ghost()
+                                    .label(if cert_open {
+                                        "Client certificate (hide)"
+                                    } else {
+                                        "Client certificate (show)"
+                                    })
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.client_cert_open = !s.client_cert_open;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(cert_set && !cert_open, |d| {
+                                d.child(div().text_xs().text_color(muted).child("In use"))
+                            }),
+                    )
+                    .when(cert_open, |d| d.child(client_cert))
                     .children(self.error_text("client_cert", cx))
             })
             .child(
-                Button::new("advanced")
-                    .small()
-                    .ghost()
-                    .label(if self.advanced {
-                        "Advanced (hide)"
-                    } else {
-                        "Advanced (show)"
-                    })
-                    .on_click(cx.listener(|s, _, _, cx| {
-                        s.advanced = !s.advanced;
-                        cx.notify();
-                    })),
+                h_flex().child(
+                    Button::new("advanced")
+                        .small()
+                        .ghost()
+                        .label(if self.advanced {
+                            "Advanced (hide)"
+                        } else {
+                            "Advanced (show)"
+                        })
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.advanced = !s.advanced;
+                            cx.notify();
+                        })),
+                ),
             )
             .when(self.advanced, |d| d.child(advanced))
             .children(self.error_text("subscriptions", cx))
@@ -1154,7 +1211,10 @@ impl Render for ConnectionSheet {
 mod tests {
     use navigator_core::net::Protocol;
 
-    use super::{clean_label, has_expiry_and_will_delay, keep_alive_is_off, number, seconds};
+    use super::{
+        Section, clean_label, has_expiry_and_will_delay, keep_alive_is_off, number, seconds,
+        section_of,
+    };
 
     #[test]
     fn a_hidden_session_field_keeps_its_edit_and_raises_no_error() {
@@ -1181,6 +1241,30 @@ mod tests {
         assert!(keep_alive_is_off(" "));
         assert!(!keep_alive_is_off("60"));
         assert!(!keep_alive_is_off("abc"));
+    }
+
+    #[test]
+    fn a_wrong_field_opens_the_collapsed_section_that_holds_it() {
+        // The client ID moved to Advanced. The client certificate has its own section.
+        for f in [
+            "client_id",
+            "ws_path",
+            "session_expiry",
+            "keepalive",
+            "will.topic",
+        ] {
+            assert_eq!(section_of(f), Some(Section::Advanced), "{f}");
+        }
+        assert_eq!(section_of("client_cert"), Some(Section::ClientCert));
+        // The basic fields are always visible: nothing to open.
+        for f in ["name", "host", "port", "username", "password"] {
+            assert_eq!(section_of(f), None, "{f}");
+        }
+        // Every field in the focus order is either basic or in a section that can open.
+        for f in super::FIELD_ORDER {
+            let basic = ["name", "host", "port", "username", "password"].contains(&f);
+            assert_eq!(section_of(f).is_none(), basic, "{f}");
+        }
     }
 
     #[test]

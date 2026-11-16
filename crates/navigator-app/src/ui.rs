@@ -388,6 +388,27 @@ fn chip_labels(show_only: Option<&str>, direction: DirectionFilter, view: View) 
     chips
 }
 
+/// Why a connected window has nothing to show, when the subscriptions are the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubsEmpty {
+    /// Every filter is gone (or none was ever added).
+    NoSubscriptions,
+    /// The only filter is `#`, and the broker rejected it.
+    HashRejected,
+}
+
+fn subs_empty(subs: &Subs) -> Option<SubsEmpty> {
+    let mut live = subs.rows.iter().filter(|s| !s.state.removal_accepted());
+    let Some(first) = live.next() else {
+        return Some(SubsEmpty::NoSubscriptions);
+    };
+    let rejected = |s: &Sub| matches!(s.state, SubState::Failed(_));
+    // Another filter may still bring messages: only an all-rejected list with `#` says it.
+    let all_rejected = rejected(first) && live.clone().all(rejected);
+    let has_hash = &*first.filter == "#" || live.any(|s| &*s.filter == "#");
+    (all_rejected && has_hash).then_some(SubsEmpty::HashRejected)
+}
+
 /// The answer to a change of subscription QoS (see `Subs::check_qos_change`).
 #[derive(Debug, PartialEq, Eq)]
 enum QosChange {
@@ -2796,6 +2817,33 @@ impl Navigator {
             );
         }
         if self.connected() {
+            let focus_input = |label: &'static str, cx: &mut Context<Self>| {
+                Button::new("focus-subscribe-empty")
+                    .small()
+                    .primary()
+                    .label(label)
+                    .on_click(cx.listener(|v, _, window, cx| {
+                        v.sub_input.update(cx, |i, cx| i.focus(window, cx))
+                    }))
+                    .into_any_element()
+            };
+            match subs_empty(&self.subs) {
+                Some(SubsEmpty::NoSubscriptions) => {
+                    return empty_state(
+                        "No subscriptions",
+                        "Subscribe to a topic filter to see messages.",
+                        [focus_input("Add a topic filter", cx)],
+                    );
+                }
+                Some(SubsEmpty::HashRejected) => {
+                    return empty_state(
+                        "The broker does not allow #.",
+                        "Subscribe to a narrower filter.",
+                        [focus_input("Add a topic filter", cx)],
+                    );
+                }
+                None => {}
+            }
             return empty_state(
                 "No messages yet",
                 "Messages show here when the broker sends them.",
@@ -3948,6 +3996,37 @@ mod tests {
 
     /// A QoS change uses the same request tracking as an options change: the row takes the QoS
     /// and the ID when the net thread accepts it, and only the result with that ID decides.
+    #[test]
+    fn the_two_empty_states_of_the_subscriptions() {
+        use super::{SubsEmpty, subs_empty};
+        let mut s = Subs::default();
+        assert_eq!(subs_empty(&s), Some(SubsEmpty::NoSubscriptions));
+        s.push("#", Qos::AtMostOnce);
+        // A pending or granted filter is not an empty state.
+        assert_eq!(subs_empty(&s), None);
+        s.on_subscribed("#", 0, Ok(Qos::AtMostOnce));
+        assert_eq!(subs_empty(&s), None);
+        // The broker rejects #.
+        s.on_subscribed("#", 0, Err("Not authorized to subscribe.".into()));
+        s.row("#").expect("row").state = SubState::Failed("no".into());
+        assert_eq!(subs_empty(&s), Some(SubsEmpty::HashRejected));
+        // Another filter that is not rejected may bring messages.
+        s.push("a/#", Qos::AtMostOnce);
+        assert_eq!(subs_empty(&s), None);
+        s.row("a/#").expect("row").state = SubState::Failed("no".into());
+        assert_eq!(subs_empty(&s), Some(SubsEmpty::HashRejected));
+        // A rejected filter other than # is only a failed row, not this state.
+        let mut t = Subs::default();
+        t.push("a/#", Qos::AtMostOnce);
+        t.row("a/#").expect("row").state = SubState::Failed("no".into());
+        assert_eq!(subs_empty(&t), None);
+        // A row in removal does not count: nothing is left.
+        let mut u = Subs::default();
+        u.push("a", Qos::AtMostOnce);
+        u.begin_remove("a");
+        assert_eq!(subs_empty(&u), Some(SubsEmpty::NoSubscriptions));
+    }
+
     #[test]
     fn follow_goes_off_by_the_user_and_comes_back_by_the_jump() {
         use super::Follow;
