@@ -39,7 +39,7 @@ The session uses `ntex-mqtt` ([ADR 0006](docs/adr/0006-ntex-mqtt.md)). Only `nav
 - ntex runs on the net thread, on tokio, inside one ntex reactor scope. The ntex types are not `Send`.
 - Two adapters (MQTT 3.1.1 and MQTT 5) sit behind one private interface. The supervisor, the queues and the timers do not know the version.
 - The supervisor owns reconnect. Each attempt makes one connector call and one client.
-- Our own dialer does DNS and TCP under one connect deadline. TLS uses OpenSSL (`tls.rs`) through `ntex-tls`. WebSocket uses `ntex::ws`.
+- Our own dialer does DNS and TCP under one connect deadline. TLS uses OpenSSL (`tls.rs`) through `ntex-tls`. Without a CA file, the trust is the system CA store, which `rustls-native-certs` reads once for each process (the vendored OpenSSL reads no OS store). With a CA file, the trust is only that file. WebSocket uses `ntex::ws`.
 - Every deadline is set in our code: connect, write, frame read rate, keep alive and operation. Each one has a fake-broker test.
 - `NetLimits.timers` (`Timers`) holds the time limits. The default is the shipped value: connect 10 s, operation 10 s, write 10 s, TLS handshake 5 s, WebSocket upgrade 5 s, frame check 10 s, whole packet 60 s. Only tests set shorter values.
 - The keep alive comes from the profile (default 60 s). The app finds a silent broker in about 2 times the keep alive, plus timer and shutdown delays. Keep alive 0 turns this off, unless an MQTT 5 broker sets its own.

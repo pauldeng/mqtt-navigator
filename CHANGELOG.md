@@ -4,6 +4,11 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- A TLS or WSS connection with no CA file now trusts the CA certificates of the operating system. Before, a broker with a valid public certificate (for example Let's Encrypt) showed "The server certificate is not trusted." The app loads the system CA certificates once for each run. If it finds none, the error text says so.
+- A CA file now replaces the system CA certificates. The app trusts only that file. Before, the user guide said that the app trusts both.
+
 ## [0.2.0] - 2026-11-15
 
 ### Added

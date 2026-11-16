@@ -23,6 +23,9 @@ ntex-service = "5.7.2"
 ntex-tls = { version = "4.8.0", features = ["openssl"] }
 ntex-util = "4.11.0"
 openssl = { version = "0.10.82", features = ["vendored"] }
+# The OS trust store (Windows store, macOS keychain, Linux files) for the default TLS trust. OpenSSL
+# reads none of them from a vendored build. Not rustls: it adds only rustls-pki-types.
+rustls-native-certs = "0.8.5"
 serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order: the JSON view keeps the key order of the payload.
 serde_json = { version = "1.0.154", features = ["preserve_order"] }

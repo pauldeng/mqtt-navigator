@@ -86,7 +86,7 @@ Open the sheet with **Manage connections…** in the profile menu of the title b
 
 Under **TLS** (TLS and WSS only):
 
-- **CA file:** a PEM file of the CA that signed the broker certificate. The app also trusts the system roots.
+- **CA file:** a PEM file of the CA that signed the broker certificate. Without a CA file, the app trusts the CA certificates of the operating system (the Windows certificate store, the macOS keychain, or the Linux CA files; `SSL_CERT_FILE` and `SSL_CERT_DIR` also work). With a CA file, the app trusts only that file. It does not trust the system CA certificates then.
 - **Client certificate:** a collapsed section. Open it to set the certificate and key (PEM files for mutual TLS). Set both or neither. For an encrypted key file, type its passphrase in **Key passphrase**. The app keeps it in the system keyring.
 
 Select a file with the system file dialog.

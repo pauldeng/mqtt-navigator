@@ -5,7 +5,7 @@ These files start real brokers in Docker: Mosquitto 2.x, EMQX and HiveMQ CE. The
 ## Run
 
 ```bash
-tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks && tests/broker/down.sh
+tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks --test net_system_ca && tests/broker/down.sh
 ```
 
 `up.sh` takes service names (`mosquitto`, `emqx`, `hivemq`). With no name, it starts all three. `mosquitto` starts two Mosquitto services: the main one and `mosquitto-limits`.

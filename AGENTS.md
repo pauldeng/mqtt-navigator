@@ -16,7 +16,7 @@ Broker tests need Docker. They run in parallel. See [tests/broker/README.md](tes
 
 ```bash
 tests/broker/up.sh             # Mosquitto (18830-18838, 18860), EMQX, HiveMQ CE
-cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks
+cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks --test net_system_ca
 LOAD_WARMUP_SECS=15 LOAD_SECS=60 cargo test --release -p navigator-core --features broker-tests --test load_ci -- --nocapture
 tests/broker/down.sh
 ```

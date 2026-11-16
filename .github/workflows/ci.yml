@@ -85,7 +85,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: tests/broker/up.sh
       # Each test has its own topics and client IDs, and a RwLock keeps the restart tests apart.
-      - run: cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks
+      - run: cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks --test net_system_ca
       - name: Load test (10 000 msg/s)
         env:
           LOAD_WARMUP_SECS: 15

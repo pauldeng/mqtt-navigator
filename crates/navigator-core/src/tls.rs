@@ -9,12 +9,14 @@
 //! unit tests below prove that.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use openssl::error::ErrorStack;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{SslConnector, SslConnectorBuilder, SslMethod, SslVerifyMode, SslVersion};
 use openssl::x509::X509;
+use openssl::x509::store::{X509Store, X509StoreBuilder};
+use openssl::x509::verify::X509VerifyFlags;
 
 /// First certificate problem that one connection attempt saw.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,7 +31,7 @@ pub struct VerifyFailure {
 
 /// Shared slot that the verify callback fills. One for each connection attempt.
 #[derive(Clone, Debug, Default)]
-pub struct TlsDiag(Arc<Mutex<Option<VerifyFailure>>>);
+pub struct TlsDiag(Arc<Mutex<Option<VerifyFailure>>>, bool);
 
 impl TlsDiag {
     pub(crate) fn record(&self, failure: VerifyFailure) {
@@ -43,9 +45,16 @@ impl TlsDiag {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// User text for the recorded problem.
+    /// User text for the recorded problem. With an empty system store, an untrusted server gets
+    /// the text that says so.
     pub fn text(&self) -> Option<String> {
-        self.failure().map(|f| verify_text(&f))
+        self.failure().map(|f| {
+            if self.1 && is_untrusted(f.code) {
+                NO_SYSTEM_CA_TEXT.into()
+            } else {
+                verify_text(&f)
+            }
+        })
     }
 }
 
@@ -60,6 +69,65 @@ const UNABLE_TO_VERIFY_LEAF_SIGNATURE: i32 = 21;
 const HOSTNAME_MISMATCH: i32 = 62;
 const IP_ADDRESS_MISMATCH: i32 = 64;
 
+const NO_SYSTEM_CA_TEXT: &str =
+    "No system CA certificates were found. Add a CA file, or turn off verification.";
+
+fn is_untrusted(code: i32) -> bool {
+    matches!(
+        code,
+        DEPTH_ZERO_SELF_SIGNED_CERT
+            | SELF_SIGNED_CERT_IN_CHAIN
+            | UNABLE_TO_GET_ISSUER_CERT
+            | UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+            | UNABLE_TO_VERIFY_LEAF_SIGNATURE
+    )
+}
+
+/// The root certificates of the operating system. The vendored OpenSSL has its own default
+/// folder (`/usr/local/ssl`) and never reads the Windows store or the macOS keychain, so we load
+/// them ourselves.
+struct SystemRoots {
+    certs: Vec<X509>,
+}
+
+/// Loads the system roots once for each process. This reads files or the OS store (some ms), so
+/// call it in a blocking task. A certificate that does not parse is skipped.
+fn system_roots() -> &'static SystemRoots {
+    static ROOTS: OnceLock<SystemRoots> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let loaded = rustls_native_certs::load_native_certs();
+        let mut skipped = loaded.errors.len();
+        let certs: Vec<X509> = loaded
+            .certs
+            .iter()
+            .filter_map(|der| {
+                let cert = X509::from_der(der.as_ref()).ok();
+                skipped += usize::from(cert.is_none());
+                cert
+            })
+            .collect();
+        tracing::info!(roots = certs.len(), skipped, "system CA store loaded");
+        SystemRoots { certs }
+    })
+}
+
+/// A new trust store with only `certs`. With `any_anchor`, each cert is a trust anchor, also a
+/// cert that is not self-signed (a trusted intermediate in the macOS keychain). The system roots
+/// need this. A CA file does not: its chain must reach a self-signed root, as before.
+fn store_of<'a>(
+    certs: impl IntoIterator<Item = &'a X509>,
+    any_anchor: bool,
+) -> Result<X509Store, ErrorStack> {
+    let mut store = X509StoreBuilder::new()?;
+    if any_anchor {
+        store.set_flags(X509VerifyFlags::PARTIAL_CHAIN)?;
+    }
+    for cert in certs {
+        store.add_cert(cert.clone())?;
+    }
+    Ok(store.build())
+}
+
 /// Plain text for a certificate problem.
 pub fn verify_text(f: &VerifyFailure) -> String {
     match f.code {
@@ -73,11 +141,7 @@ pub fn verify_text(f: &VerifyFailure) -> String {
             "The server certificate is not valid yet. Check the clock of this computer and of the broker."
                 .into()
         }
-        DEPTH_ZERO_SELF_SIGNED_CERT
-        | SELF_SIGNED_CERT_IN_CHAIN
-        | UNABLE_TO_GET_ISSUER_CERT
-        | UNABLE_TO_GET_ISSUER_CERT_LOCALLY
-        | UNABLE_TO_VERIFY_LEAF_SIGNATURE => {
+        code if is_untrusted(code) => {
             "The server certificate is not trusted. Add its CA file, or turn off verification."
                 .into()
         }
@@ -194,10 +258,14 @@ impl TlsMaterial {
         builder
             .set_min_proto_version(Some(SslVersion::TLS1_2))
             .map_err(tls)?;
-        let store = builder.cert_store_mut();
-        for cert in &self.ca {
-            store.add_cert(cert.clone()).map_err(tls)?;
-        }
+        // A custom CA file replaces the system roots. Without one, the system roots are the
+        // trust. Both start from a new store, so no OpenSSL default folder adds to it.
+        let system = self.ca.is_empty().then(system_roots);
+        let store = match system {
+            Some(roots) => store_of(&roots.certs, true),
+            None => store_of(&self.ca, false),
+        };
+        builder.set_cert_store(store.map_err(tls)?);
         if let Some(c) = &self.client {
             builder.set_certificate(&c.cert).map_err(tls)?;
             // OpenSSL 3 can already refuse a wrong key in `set_private_key`.
@@ -208,7 +276,7 @@ impl TlsMaterial {
                 builder.add_extra_chain_cert(extra.clone()).map_err(tls)?;
             }
         }
-        let diag = TlsDiag::default();
+        let diag = TlsDiag(Arc::default(), system.is_some_and(|r| r.certs.is_empty()));
         if self.verify {
             let slot = diag.clone();
             builder.set_verify_callback(SslVerifyMode::PEER, move |preverify_ok, ctx| {
@@ -381,6 +449,46 @@ mod tests {
                 .expect_err("must fail")
                 .contains("not valid PEM")
         );
+    }
+
+    #[test]
+    fn system_store_has_roots() {
+        // CI runners and developer machines have system roots on every OS.
+        assert!(!system_roots().certs.is_empty());
+    }
+
+    #[test]
+    fn system_store_trusts_an_intermediate_but_a_ca_file_needs_the_root() {
+        use openssl::stack::Stack;
+        use openssl::x509::X509StoreContext;
+        let (root_key, mid_key, leaf_key) = (key(), key(), key());
+        let root = cert("Root", &root_key, None, true, -1, 30);
+        let mid = cert("Mid", &mid_key, Some((&root, &root_key)), true, -1, 30);
+        let leaf = cert(
+            "localhost",
+            &leaf_key,
+            Some((&mid, &mid_key)),
+            false,
+            -1,
+            30,
+        );
+        let verifies = |any_anchor: bool| {
+            let store = store_of([&mid], any_anchor).expect("store");
+            let chain = Stack::new().expect("stack");
+            X509StoreContext::new()
+                .expect("ctx")
+                .init(&store, &leaf, &chain, |c| c.verify_cert())
+                .expect("verify")
+        };
+        assert!(verifies(true));
+        assert!(!verifies(false));
+    }
+
+    #[test]
+    fn empty_system_store_has_its_own_text() {
+        let diag = TlsDiag(Arc::default(), true);
+        diag.record(failure(UNABLE_TO_GET_ISSUER_CERT_LOCALLY, None));
+        assert!(diag.text().expect("text").starts_with("No system CA"));
     }
 
     #[test]

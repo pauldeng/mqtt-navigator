@@ -4218,6 +4218,7 @@ dependencies = [
  "ntex-tls",
  "ntex-util",
  "openssl",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tempfile",

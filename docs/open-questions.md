@@ -16,6 +16,7 @@ Add a question when a decision needs the owner. Move it to "Closed" with the ans
    - A 3.1.1 load run (10k msg/s) and a load run on EMQX or HiveMQ. S4 measured MQTT 5 on Mosquitto only.
 7. What holds the extra memory after an overload (above 10 000 msg/s)? RSS stays about 93 MiB above the 10k plateau until exit. The owner accepted this for 0.2.0. It is bounded and v0.1.1 does the same.
 8. Signing-key rotation. `scripts/sign-manifest.sh` verifies with the public key in the repository, so the workflow cannot make the bridge release that an old key must sign (see [Rotate the minisign key](release.md#rotate-the-minisign-key)). Decide how the script gets the old public key for verification before the first key rotation.
+9. The system CA store is tested end to end on Linux only (`SSL_CERT_FILE` against Mosquitto). The Windows store and the macOS keychain are not tested with a real broker. A unit test checks that each OS gives at least one root.
 
 ## Closed
 
