@@ -42,6 +42,7 @@ impl Navigator {
             Cmd::RowHeight1 => self.set_row_height(false, cx),
             Cmd::RowHeight2 => self.set_row_height(true, cx),
             Cmd::ToggleDetails => self.toggle_details(window, cx),
+            Cmd::DetailsOpen => self.open_details(window, cx),
             Cmd::ToggleExpand => self.set_expanded(!self.insp.expanded, window, cx),
             Cmd::Decoder(pick) => self.set_decoder(pick, window, cx),
             Cmd::NumberKind(kind) => self.set_number(Some(kind), None, window, cx),
@@ -73,7 +74,6 @@ impl Navigator {
             Cmd::ThemePreset(id) => self.set_preset(id, window, cx),
             Cmd::MemoryLimit(mib) => self.set_memory_limit(mib, cx),
             Cmd::ResetLayout => {
-                self.details_open = true;
                 self.insp.expanded = false;
                 self.expand_restore = None;
                 // The next frame sets the pane widths: the details pane may be hidden now.

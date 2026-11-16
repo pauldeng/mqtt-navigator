@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use navigator_core::decode::{self, Decoder, Endian, NumberKind};
 use navigator_core::publish::to_hex;
@@ -111,6 +112,18 @@ pub fn meta_line(qos: Qos, retain: bool, size: usize, stored: usize, truncated: 
         out.push_str(&format!(" · truncated: first {stored} B stored"));
     }
     out
+}
+
+/// The line above the Value tab when a History row is shown. `picked` is the arrival time of
+/// that row, `base` the one of the selected message (or the latest value of the topic), and
+/// `at` the clock text of `picked`. `None`: the tab shows the selection itself.
+pub fn history_note(picked: SystemTime, base: Option<SystemTime>, at: &str) -> Option<String> {
+    match base {
+        Some(b) if picked == b => None,
+        Some(b) if picked > b => Some(format!("Later message from {at}")),
+        Some(_) => Some(format!("Earlier message from {at}")),
+        None => Some(format!("Message from {at}")),
+    }
 }
 
 /// Shown instead of the property list for a message of an MQTT 3.1.1 connection.
@@ -236,13 +249,33 @@ impl Jobs {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
-        DecoderChoice, DecoderPick, Jobs, MAX_STEP, MIN_STEP, meta_line, next_cut, next_step,
-        no_properties_note, props_rows, size_text,
+        DecoderChoice, DecoderPick, Jobs, MAX_STEP, MIN_STEP, history_note, meta_line, next_cut,
+        next_step, no_properties_note, props_rows, size_text,
     };
     use bytes::Bytes;
     use navigator_core::decode::Decoder;
     use navigator_core::{MsgProps, Qos};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_history_row_is_earlier_later_or_the_selection_itself() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = |s| UNIX_EPOCH + Duration::from_secs(s);
+        assert_eq!(
+            history_note(t(10), Some(t(20)), "12:03:58").as_deref(),
+            Some("Earlier message from 12:03:58")
+        );
+        assert_eq!(
+            history_note(t(30), Some(t(20)), "12:04:08").as_deref(),
+            Some("Later message from 12:04:08")
+        );
+        // The same message as the selection: no note and no "Show latest".
+        assert_eq!(history_note(t(20), Some(t(20)), "12:04:00"), None);
+        assert_eq!(
+            history_note(t(5), None, "12:03:00").as_deref(),
+            Some("Message from 12:03:00")
+        );
+    }
 
     #[test]
     fn a_new_job_cancels_the_old_one_and_stale_results_are_dropped() {

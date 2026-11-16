@@ -64,6 +64,8 @@ actions!(
         NewConnection,
         NewMessage,
         CloseComposer,
+        CloseDetails,
+        OpenDetails,
         SendMessage,
         FocusNextField,
         FocusPrevField,
@@ -103,6 +105,9 @@ pub fn init(cx: &mut App) {
         // `Esc` closes the area that has the focus. A control that uses `Esc` (a menu, the
         // filter) handles it first and does not pass it on (design 8).
         KeyBinding::new("escape", CloseComposer, Some("Composer")),
+        KeyBinding::new("escape", CloseDetails, Some("DetailsPane")),
+        // In a narrow window, Enter opens the details sheet of the selected row.
+        KeyBinding::new("enter", OpenDetails, Some(LIST_CONTEXT)),
         // The payload editor inserts a newline for Ctrl+Enter and a tab for Tab. In the
         // composer, these keys send and move the focus.
         KeyBinding::new("ctrl-enter", SendMessage, Some("Composer > Input")),
@@ -1033,7 +1038,7 @@ impl Navigator {
             list_focus: cx.focus_handle(),
             gate: GenGate::default(),
             insp: details::Inspector::new(window, cx),
-            details_open: true,
+            details_open: false,
             narrow: false,
             comp: compose::Composer::new(window, cx),
             panes: cx.new(|_| ResizableState::default()),
@@ -1805,6 +1810,7 @@ impl Navigator {
         self.sel_msg = None;
         self.detail_of = DetailOf::Topic;
         self.insp.hist_pick = None;
+        self.reveal_details();
         if has_children {
             self.store.set_expanded(id, !expanded);
             // A paused tree takes a new snapshot: wake the frame loop for the work.
@@ -1836,9 +1842,27 @@ impl Navigator {
             });
             self.detail_of = DetailOf::Message;
             self.insp.hist_pick = None;
+            self.reveal_details();
             self.leave_follow();
             self.list_scroll.scroll_to_item(i, ScrollStrategy::Nearest);
             cx.notify();
+        }
+    }
+
+    /// A selection opens the details pane in a wide window, with the mouse or the keyboard. It
+    /// stays closed until the next selection. A narrow window keeps the focus in the list: a
+    /// click opens the sheet, and Enter does (`enter_on_row`).
+    fn reveal_details(&mut self) {
+        if !self.narrow {
+            self.details_open = true;
+        }
+    }
+
+    /// Enter in the list. A narrow window opens the details sheet for the selected row. A wide
+    /// window shows the pane already.
+    fn enter_on_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.narrow && self.detail_of != DetailOf::Nothing {
+            self.open_details_sheet(window, cx);
         }
     }
 
@@ -1878,6 +1902,7 @@ impl Navigator {
                     self.sel_msg = None;
                     self.detail_of = DetailOf::Topic;
                     self.insp.hist_pick = None;
+                    self.reveal_details();
                     if let Some(n) = next {
                         self.tree_scroll.scroll_to_item(n, ScrollStrategy::Nearest);
                     }
@@ -2825,6 +2850,7 @@ impl Navigator {
             .on_action(cx.listener(|v, _: &SelectNext, _, cx| v.step_selection(1, cx)))
             .on_action(cx.listener(|v, _: &ExpandNode, _, cx| v.expand_selected(true, cx)))
             .on_action(cx.listener(|v, _: &CollapseNode, _, cx| v.expand_selected(false, cx)))
+            .on_action(cx.listener(|v, _: &OpenDetails, window, cx| v.enter_on_row(window, cx)))
             // A user scroll turns Follow off.
             .on_scroll(cx.listener(|v, _, _, cx| {
                 if v.view == View::Messages && v.follow.on && v.list_scroll.is_scrollable() {
@@ -3034,7 +3060,7 @@ impl Navigator {
                         v.list_focus.focus(window, cx);
                         v.select_row(id, cx);
                         // A click opens the sheet. The keys (Up, Down) must keep the list focus.
-                        v.insp.want_sheet = v.narrow && v.details_open;
+                        v.insp.want_sheet = v.narrow;
                     }))
                     .into_any_element()
             }
@@ -3153,7 +3179,7 @@ impl Navigator {
                             .on_click(cx.listener(move |v, _, window, cx| {
                                 v.list_focus.focus(window, cx);
                                 v.select(id, generation, cx);
-                                v.insp.want_sheet = v.narrow && v.details_open;
+                                v.insp.want_sheet = v.narrow;
                             }))
                             .into_any_element()
                     })

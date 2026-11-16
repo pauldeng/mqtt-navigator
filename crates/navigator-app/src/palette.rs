@@ -31,6 +31,8 @@ pub enum Cmd {
     RowHeight1,
     RowHeight2,
     ToggleDetails,
+    /// Opens the details pane (a wide window) or sheet (a narrow one) for the selection.
+    DetailsOpen,
     ToggleExpand,
     Decoder(DecoderPick),
     /// The width of the Number decoder.
@@ -314,6 +316,13 @@ pub static COMMANDS: &[Entry] = &[
         None,
         Cmd::ToggleDetails,
         always,
+    ),
+    e(
+        "details-open",
+        "Details: Open",
+        None,
+        Cmd::DetailsOpen,
+        |f| !f.details_open,
     ),
     e(
         "toggle-expand",
@@ -904,6 +913,18 @@ mod tests {
             .contains(&"jump-to-newest")
         );
         assert!(!ids(&Facts::default()).contains(&"jump-to-newest"));
+    }
+
+    #[test]
+    fn details_open_is_listed_while_the_details_are_closed() {
+        let closed = Facts::default();
+        assert!(ids(&closed).contains(&"details-open"));
+        let open = Facts {
+            details_open: true,
+            ..closed
+        };
+        assert!(!ids(&open).contains(&"details-open"));
+        assert!(ids(&open).contains(&"toggle-expand"));
     }
 
     #[test]
