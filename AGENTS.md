@@ -38,7 +38,7 @@ tests/broker/down.sh
 
 ### Clean room
 
-- mqtt-pathfinder (CC BY-ND 4.0) and Argus (AGPL-3.0) are references for behaviour only.
+- mqtt-pathfinder (CC BY-ND 4.0), Argus (AGPL-3.0) and mqtt-viewer (GPL-3.0) are references for behaviour and ideas only.
 - Do not copy their code, text, icons or other assets.
 
 ### Engineering

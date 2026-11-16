@@ -56,7 +56,7 @@ If you start the app again, it adds the entry again. On X11 the window icon come
 1. Start the app. It opens with the message "Add a broker to start" The screen also has **Connect to localhost:1883 (not encrypted)** for a broker on your own computer.
 2. Select **New connection…** (`Ctrl/Cmd+N`). Fill in the host. Select **Save and connect**.
 3. A new connection subscribes to `#`. Messages appear at once.
-4. Select a row. The details pane shows the payload.
+4. Select a row. In a wide window, the details pane opens and shows the payload.
 
 To test without a broker of your own, use a public test broker. Use TLS, and do not send private data.
 
@@ -73,7 +73,6 @@ Open the sheet with **Manage connections…** in the profile menu of the title b
 | Protocol | MQTT 3.1.1 (default for a new connection) or MQTT 5. Set it to the version that the broker supports. A connection that you saved before this setting existed uses MQTT 5. See [MQTT 3.1.1 connections](#mqtt-311-connections). |
 | Port | Follows the transport: TLS 8883, WSS 443, TCP 1883, WS 80. The port changes only if it is still the default of the old transport. |
 | Username, Password | Optional. |
-| Client ID | The app makes one. You can edit it. |
 
 **Save and connect** is also the connection test. If it fails, the title bar shows the cause. **Save** keeps the connection and does not connect.
 
@@ -88,7 +87,7 @@ Open the sheet with **Manage connections…** in the profile menu of the title b
 Under **TLS** (TLS and WSS only):
 
 - **CA file:** a PEM file of the CA that signed the broker certificate. The app also trusts the system roots.
-- **Client certificate and key:** PEM files for mutual TLS. Set both or neither. For an encrypted key file, type its passphrase in **Key passphrase**. The app keeps it in the system keyring.
+- **Client certificate:** a collapsed section. Open it to set the certificate and key (PEM files for mutual TLS). Set both or neither. For an encrypted key file, type its passphrase in **Key passphrase**. The app keeps it in the system keyring.
 
 Select a file with the system file dialog.
 
@@ -101,10 +100,11 @@ Select a file with the system file dialog.
 
 ### Advanced (collapsed)
 
-Select **Advanced (show)** to open this part.
+Select **Advanced (show)** to open this part. If a field in a collapsed section is not valid, the sheet opens that section and moves the focus to the field.
 
 | Field | Default | Notes |
 |---|---|---|
+| Client ID | generated | The app makes one. Edit it here. Keep the same ID to keep a session. |
 | WebSocket path | `/mqtt` | For WS and WSS. It must start with `/`. |
 | Clean start | on | The broker keeps no session for you. |
 | Session expiry (seconds) | 0 | Seconds the broker keeps the session after a disconnect. |
@@ -149,16 +149,19 @@ QoS 1 does not guarantee that the app shows each message. If the app queue or th
 
 The left pane lists the subscriptions.
 
-1. Type a topic filter in the input. Press **Enter**.
-2. Set the QoS with the **Q0 | Q1** switch before you press Enter. The default is QoS 0.
+1. Type a topic filter in the input.
+2. Set the QoS with the **Q0 ▾** select at the end of the input. The default is QoS 0.
+3. Press **Enter**.
 
 Rules:
 
 - A new connection starts with `#`. When you add a narrower filter, a hint asks "Remove # to receive only your filters?".
 - An invalid filter (for example `a/#/b`) shows an error under the input. The app does not send it. A filter that is in the list shows "You are already subscribed to …".
-- A row has a colour dot, the filter, a **Q0** or **Q1** tag and a status line. The tag is the QoS that you asked for. The row has no message count.
-- The status line shows "Subscribing…" (or "Waiting for connection" while you are offline). Then it shows "Granted QoS 0" or "Granted QoS 1". This is the QoS that the broker granted. If the broker refuses the filter, the row shows the reason, for example "Refused (0x80)" for MQTT 3.1.1. It can be lower than the tag.
-- If the broker rejects a filter, the status line shows the reason in red. Select **Retry** or **Remove**. The SUBACK reasons show as:
+- A row has a status dot, the filter, a **Q1** tag (only for QoS 1) and a **⋯** button. The row has no message count. The dot has the colour of the subscription. A red ✗ replaces it when the broker rejected the filter.
+- A status line shows under the row only when there is something to say: "Subscribing…" (or "Waiting for connection" while you are offline), the rejection reason, or "Granted QoS 0" when the broker grants less than you asked for. If the broker refuses the filter, the row shows the reason, for example "Refused (0x80)" for MQTT 3.1.1.
+- The **⋯** button (tooltip "Subscription actions") opens a menu: **Show only**, **QoS 0**, **QoS 1**, **Options…** (MQTT 5 only), **Retry** (only when the broker rejected the filter) and **Remove**. The button is in the Tab order. The same actions are in the command palette.
+- A QoS change sends the subscription again, and the row shows "Subscribing…".
+- If the broker rejects a filter, the status line shows the reason in red. Choose **Retry** or **Remove** in the menu. The SUBACK reasons show as:
   - "Not authorized to subscribe."
   - "The broker says the topic filter is not valid."
   - "The subscription quota is exceeded."
@@ -167,14 +170,14 @@ Rules:
   - "The broker refused the subscription: <reason name>." (any other reason)
   - "The broker sent an empty SUBACK."
 - If the broker does not answer in 10 s, see [Troubleshooting](#other-connection-problems).
-- **Remove** (×) unsubscribes. The row stays until the broker confirms. If the removal fails, the row shows the cause and **Retry remove**.
-- **Show only:** select a row to show only the messages whose topic matches its filter. Select it again to show all. This does not unsubscribe.
-- The colour dot is not a control. The colour comes from the position of the row and repeats after 10 rows. If you remove a row, the rows below it move up and change colour. A message takes the colour of the first subscription (from the top) that matches its topic. A message that matches no subscription has an empty dot.
+- **Remove** unsubscribes. The row stays until the broker confirms. If the removal fails, the row shows the cause and the menu has **Retry remove**.
+- **Show only:** select a row, or choose **Show only** in its menu, to show only the messages whose topic matches its filter. Do it again to show all. This does not unsubscribe.
+- The colour comes from the position of the row and repeats after 10 rows. If you remove a row, the rows below it move up and change colour. A message takes the colour of the first subscription (from the top) that matches its topic. With one subscription, the message rows show no colour edge.
 - Shared subscriptions (`$share/group/filter`) work.
 
 #### Subscription options (MQTT 5)
 
-With MQTT 5, each row has an **Options** button. MQTT 3.1.1 has no such options, so the button is not there.
+With MQTT 5, the **⋯** menu of a row has **Options…**. MQTT 3.1.1 has no such options, so the item is not there.
 
 - **No Local:** the broker does not send you the messages that you publish yourself. MQTT 5 does not allow this option on a shared subscription. The app shows "No Local is not allowed on a shared subscription ($share/...)." and does not send the change.
 - **Retain As Published:** the broker keeps the retain flag of a message when it forwards it. Without this option, the broker clears the flag on a live message.
@@ -186,7 +189,7 @@ The app saves the subscriptions in the connection.
 
 ## Connection details
 
-While you are connected, the status bar has a **Connection details** button. It opens a list of values from the broker's CONNACK.
+The status bar has a **Details** button. While you are connected, its popover starts with **Connection details**, a list of values from the broker's CONNACK. Below that, it shows the topic count, the memory use with the budget control, and the dropped count.
 
 - MQTT 3.1.1: "Session present" only.
 - MQTT 5: "Session present", "Assigned client ID", "Keep alive", "Receive maximum", "Maximum packet size", "Maximum QoS", "Retained messages", "Wildcard subscriptions", "Shared subscriptions", "Subscription identifiers", "Topic alias maximum", "Server reference", "Response information" and "Reason string".
@@ -201,12 +204,13 @@ The centre pane has two views. Switch with **Messages | Tree**, `Ctrl/Cmd+1` or 
 
 ### Messages
 
+- The header has one row: **Messages | Tree**, the filter field, the direction menu and **Pause**.
 - The newest message is at the top. The order is always by time. There is no sorting.
-- Each row shows time, subscription colour, topic, QoS, retained mark (R), size and a preview of the payload.
-- Sent messages show in the same list, with an arrow, "Sent" and the result of the send.
+- Each message has two lines. Line 1 shows the topic, **R** if the message is retained, and the time. Line 2 shows a preview of the payload. QoS and size are in the details pane. If you have more than one subscription, a colour edge at the left shows the subscription.
+- Sent messages show in the same list, with an arrow. A sent message shows its result only when the result is not routine: "Sending…", "Rejected: <reason>", "Timed out" or "Lost on disconnect". "Sent" and "Acknowledged" show in the details and in the composer.
 - Marker rows show "Reconnected" with the time, and "Removed (memory limit)".
-- **All | Received | Sent** filters the list.
-- **Row height:** the header button shows "1 line" or "2 lines". Select it to switch. The default is 2 lines. With 1 line, the preview follows the topic. With 2 lines, the preview is on the second line. A long payload ends with "…". A payload that is not valid UTF-8 shows as `bin` and at most its first 16 bytes in hex, for example `bin ff 00 10`.
+- The **All ▾** menu next to the filter selects All, Received or Sent. A choice other than All shows as a tag.
+- **Row height:** "1 line" or "2 lines". Use the settings menu (the gear in the title bar) or the command palette. The default is 2 lines. With 1 line, the preview follows the topic. A long payload ends with "…". A payload that is not valid UTF-8 shows as `bin` and at most its first 16 bytes in hex, for example `bin ff 00 10`.
 
 ### Tree
 
@@ -215,7 +219,7 @@ The centre pane has two views. Switch with **Messages | Tree**, `Ctrl/Cmd+1` or 
 
 ### Filters
 
-The filter field is in the title bar (`Ctrl/Cmd+F`).
+The filter field is in the centre header (`Ctrl/Cmd+F`). Its hint says what it searches: "Filter by topic or payload" in Messages, "Filter by topic" in Tree.
 
 | Filter | Messages view | Tree view |
 |---|---|---|
@@ -223,58 +227,67 @@ The filter field is in the title bar (`Ctrl/Cmd+F`).
 | Show only | Messages whose topic matches that subscription | Topics that match that subscription |
 | All, Received, Sent | Yes | Not shown |
 
-Each active filter is a tag under the header. **Clear filters** removes all of them. `Esc` in the filter field clears the text.
+Each active Show only or direction filter is a tag under the header. **Clear filters** removes all of them. `Esc` in the filter field clears the text.
 
 ### Pause and Follow
 
-- **Pause** freezes the view. The button then reads **Resume**. The app still receives messages inside the memory limit. The header shows how many are new, for example "Paused · 1 240 new".
-- **Follow** (Messages view only, on by default) keeps the newest row in view. Selecting a row or scrolling turns Follow off. The reading position then stays still.
+- **Follow** has no switch. It is on when the list opens, and the newest row stays in view. If you scroll away from the top or select a row, Follow turns off. The reading position then stays still, and a **Jump to newest (N)** button shows over the list. N is the number of messages that arrived since Follow turned off. Select the button to go to the top and turn Follow on. The selection stays.
+- **Pause** freezes the view. The button then reads **Resume**. The app still receives messages inside the memory limit. The header shows how many are new, for example "Paused · 1 240 new". **Jump to newest** does not show while you pause. **Resume** returns to the Follow state from before the pause.
 - If the memory limit removed messages while you paused, a marker row says "Older messages were removed (memory limit)".
 
 ### Details pane
 
-The right pane has two tabs: **Value** and **History**. The **Details** button in the header shows or hides it. It opens as a sheet when the window is narrower than 1 100 px. Use the expand button (tooltip "Expand the details") to widen it.
+The right pane has two tabs: **Value** and **History**.
 
-- **Value:** the full payload. Choose a **decoder**: Auto, Text, JSON, Hex, Base64 or Number. Auto decides in this order:
+- In a window that is 1 100 px wide or more, the pane opens when you select a message or a topic. Its close button closes it. It stays closed until the next selection. To open it again, use "Details: Open" in the command palette.
+- In a narrower window, a click opens the details as a sheet. If you select with the keyboard, the focus stays in the list. Press **Enter** to open the sheet for the selected row. When you close the sheet, the focus returns to the list.
+- The header shows the full topic (you can select the text) and a **⋯** menu. **Edit and publish** is the one action button.
+- The **⋯** menu has: **Copy topic**, **Copy payload**, **Publish to this topic**, **Reply** (only when the message has a Response Topic), **Decoder**, **Wrap**, **Expand** and **Clear retained…**. Use **Expand** to widen the pane.
+- **Value:** the full payload. Choose a **decoder** in the **⋯** menu: Auto, Text, JSON, Hex, Base64 or Number. Auto decides in this order:
   1. JSON, if the content type is `application/json` or ends with `+json`, or if the payload starts and ends like `{…}` or `[…]` (spaces around it do not count).
   2. Text, if the payload format flag says UTF-8, or if the payload is valid UTF-8.
   3. Hex, for all other payloads.
 
   Auto never picks Number. For Number, set the type (int8, uint8, int16, uint16, int32, uint32, int64, uint64, float32 or float64) and the byte order (LE or BE).
+- One muted line under the payload shows QoS, retained, size and arrival time.
 - If a decoder cannot show the payload, the pane shows the cause and **Use Hex**.
-- JSON shows pretty-printed. **Wrap** turns line wrapping on or off. **Copy** copies the whole formatted text. **Copy topic** copies the topic.
+- JSON shows pretty-printed. Wrap is on. **Copy payload** copies the whole formatted text.
 - **Long payloads:** the pane shows the first 256 KiB and a **Show all** button. It formats in the background. For very long text, it shows the first part and **Show more (+N KiB)**. Each press adds more.
-- MQTT 5 properties show under the value (MQTT 3.1.1 messages have none): content type, response topic, correlation data (hex), message expiry, payload format and user properties.
-- **History:** the last 100 messages of the topic (each stored up to 64 KiB). Select a row to show it in the Value tab. You can also click in the list, use Up and Down to move the cursor, and press Enter to show the row in the Value tab.
+- MQTT 5 properties show in a **Properties** section under the payload (MQTT 3.1.1 messages have none). It is collapsed. It has: content type, response topic, correlation data (hex), message expiry, payload format and user properties.
+- **History:** the last 100 messages of the topic (each stored up to 64 KiB). Select a row to show it in the Value tab. The focus moves to the Value tab. The tab then shows "Earlier message from 12:03:58" and a **Show latest** button. The button returns to the selected message or to the latest value of the topic. You can also use Up and Down to move the cursor, and press Enter to show the row.
 - If the memory limit removed the selected message, the pane says "Removed from the message list (memory limit)."
 
 ## Publish
 
-The composer is at the bottom of the centre pane. It is always visible.
+The composer is closed by default. The bottom of the centre pane then shows one button, **New message** (`Ctrl/Cmd+Shift+N`).
 
-1. Type the topic.
-2. Type the payload.
-3. Set QoS 0 or 1, and **Retain** if you need it.
-4. Press **Send** or `Ctrl/Cmd+Enter`.
+1. Select **New message**.
+2. Type the topic.
+3. Type the payload.
+4. Set QoS 0 or 1, and **Retain** if you need it.
+5. Press **Send** or `Ctrl/Cmd+Enter`.
 
-The result shows below the payload and in the list row. It is short: "Sending…", "Sent" (QoS 0), "Acknowledged" (QoS 1), or "Rejected: <ReasonName>", for example "Rejected: NotAuthorized". If the broker sent a reason string, the text is "Rejected: <ReasonName>: <reason string>". The app shows no hex code. A message can also end with "No acknowledgement after 10 s." or "Not sent: the connection closed." The app checks the message before it sends it. An error then shows under the composer, for example "Connect to a broker first." When you are not connected, Send is off. The 10 s timeout also ends the session (see [Troubleshooting](#other-connection-problems)).
+The composer stays open after Send. To close it, use **Close** in its **⋯** menu, or press `Esc`. The focus moves to the message list. The draft stays. When you open the composer again, the draft is there. Closing does not put the draft in History.
 
-- **Text or Hex:** a Hex payload sends exact bytes. Write the bytes as hex digits. Spaces are ignored.
+The result shows as one line below the payload and, if it is not routine, in the list row. It is short: "Sending…", "Sent" (QoS 0), "Acknowledged" (QoS 1), or "Rejected: <ReasonName>", for example "Rejected: NotAuthorized". If the broker sent a reason string, the text is "Rejected: <ReasonName>: <reason string>". The app shows no hex code. A message can also end with "No acknowledgement after 10 s." or "Not sent: the connection closed." The app checks the message before it sends it. An error then shows under the composer, for example "Connect to a broker first." When you are not connected, Send is off. The 10 s timeout also ends the session (see [Troubleshooting](#other-connection-problems)).
+
+- **Text or Hex:** the switch is always visible. A Hex payload sends exact bytes. Write the bytes as hex digits. Spaces are ignored.
+- The **⋯** menu of the composer has: **Format**, **History…**, **Properties** (MQTT 5) and **Close**.
 - **Format** pretty-prints JSON. It works up to 1 MiB.
-- **Properties** (MQTT 5): content type, response topic, correlation data (hex), message expiry, **Payload format: UTF-8** and user properties. **Send empty** keeps an empty property in the message.
+- **Properties** (MQTT 5): a **Properties (N)** tag shows next to the topic when a property is present. Select it to open the section. The section shows only the properties that are present. Use **Add property** to add: **Payload format: UTF-8**, content type, response topic, correlation data (hex), message expiry or user property. **Send empty** keeps an empty property in the message. A property that you add stays visible while it is empty.
 - **History** menu: **Drafts** (the last 5 drafts that you replaced) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. A draft leaves **Drafts** when you choose it. The app does not save History to disk. It clears History when you change the connection.
 - The composer saves the old content as a draft before something replaces it. These actions replace it: a choice in History, Edit and publish, Reply, Publish to this topic, Format and the Text/Hex switch. The app saves the old content only if it is unsent, it is not empty (a topic alone is empty) and it is at most 1 MiB. A larger draft is dropped, and the app says "The old draft is larger than 1 MiB. It is not kept."
 - Drafts and Sent share a budget of 1 MiB. The app removes the oldest entries first.
-- The composer can collapse to one line.
+- The command palette entry **Send** opens the composer first when it is closed. It does not send a draft that you cannot see.
 
-**Publish to this topic**, **Edit and publish** and **Reply** fill the composer. They never send. **Clear retained…** is different: after you confirm, it publishes an empty retained message at QoS 1.
+**Publish to this topic**, **Edit and publish** and **Reply** open the composer and fill it. They never send. **Clear retained…** is different: after you confirm, it publishes an empty retained message at QoS 1.
 
 | Action | Effect |
 |---|---|
-| Publish to this topic | Sets the topic. Keeps the payload. |
-| Edit and publish | Copies topic, exact payload bytes, QoS, retain and properties (MQTT 3.1.1: no properties). A payload that is not valid UTF-8 opens in Hex mode. Off when the full payload is not stored ("The full payload is not stored."). |
-| Reply | Shows only when the message has a Response Topic. Sets that topic and copies the correlation data (MQTT 3.1.1: no correlation data). The payload is empty. |
-| Clear retained… | Shows only while you are connected and the topic has a retained message. After you confirm, it sends an empty retained message at QoS 1. |
+| Publish to this topic | In the details **⋯** menu. Sets the topic. Keeps the payload. |
+| Edit and publish | The button in the details pane. Copies topic, exact payload bytes, QoS, retain and properties (MQTT 3.1.1: no properties). A payload that is not valid UTF-8 opens in Hex mode. Off when the full payload is not stored ("The full payload is not stored."). |
+| Reply | In the details **⋯** menu. Shows only when the message has a Response Topic. Sets that topic and copies the correlation data (MQTT 3.1.1: no correlation data). The payload is empty. |
+| Clear retained… | In the details **⋯** menu. Shows only while you are connected and the topic has a retained message. After you confirm, it sends an empty retained message at QoS 1. |
 
 ## Memory limit
 
@@ -285,14 +298,14 @@ When the store is full:
 - The app removes the oldest data in batches, down to 90% of the limit. It removes the oldest history first, then the oldest list rows, then the oldest latest values.
 - Rarely updated topics leave the tree when the topic count is near its cap.
 - Saving a message never blocks. Above the limit plus 25%, the app drops new messages and counts them.
-- The status bar shows the use against the limit, for example "34 MiB / 128 MiB". A limit of 1024 or 2048 MiB shows as "1 GiB" or "2 GiB", for example "340 MiB / 1 GiB".
-- The Messages list keeps 10 000 rows at most. The status bar shows "N rows evicted" when rows leave.
+- The **Details** popover of the status bar shows the use against the limit, for example "34 MiB / 128 MiB", and the limit control. A limit of 1024 or 2048 MiB shows as "1 GiB" or "2 GiB". The status bar itself shows the memory only when it is above 80% of the limit.
+- The Messages list keeps 10 000 rows at most. The status bar shows "N rows removed (memory limit)" when rows leave.
 
 ## Themes and appearance
 
 - **Appearance:** System (default), Light or Dark. System follows the operating system.
 - **Theme:** Default, Catppuccin, Solarized, Everforest, Flexoki, Mellifluous, macOS Classic, Tokyo Night. Each theme has a light and a dark variant. Tokyo Night uses the Default light variant.
-- Use the theme button in the title bar, or the command palette ("Appearance: …", "Theme: …").
+- Use the settings menu (the gear in the title bar), or the command palette ("Appearance: …", "Theme: …"). The settings menu also has **Commands…**, **Row height**, **Memory budget** and **Reset the layout**.
 - The app saves the choice and applies it before the first window.
 - The layout follows the font size of the theme.
 
@@ -327,9 +340,10 @@ Version 0.1.x does not load a schema 2 settings file. It leaves the file unchang
 
 | Keys | Action |
 |---|---|
-| `Ctrl+K` | Command palette. Most actions are also here. Not in the palette: subscribe, remove and retry a subscription, the publish QoS and Retain, Reconnect, and the connection sheet actions (Save, Export, Import, Delete). |
+| `Ctrl+K` | Command palette. Most actions are also here. Subscription actions (QoS, Options…, Retry, Remove) work on the subscription in Show only. Not in the palette: add a subscription, the publish QoS and Retain, Reconnect, and the connection sheet actions (Save, Export, Import, Delete). |
 | `Ctrl+F` | Focus the filter |
-| `Esc` | In the filter: clear it. Elsewhere: close the top layer (menu, dialog, sheet). |
+| `Esc` | Close the top layer (menu, popover, dialog, sheet). In the filter: clear it. Else close the area that has the focus: the composer (the draft stays) or the details pane. The focus moves to the list. |
+| `Ctrl+Shift+N` | New message (opens the composer) |
 | `Ctrl+1` / `Ctrl+2` | Messages view / Tree view |
 | `Ctrl+Enter` | Send (in the composer) |
 | `Ctrl+N` | New connection |
@@ -339,7 +353,7 @@ Version 0.1.x does not load a schema 2 settings file. It leaves the file unchang
 | `Left` / `Right` | In the tree only: collapse / expand the selected topic |
 | `Up`, `Down`, `Enter` (History tab) | Move the cursor, and show the row in the Value tab. Click the History list first. |
 
-`Enter` does nothing in the Messages list and in the tree. Pause, Follow, Edit and publish, Reply, Publish to this topic and the details pane have no shortcut. Use the buttons or the command palette. Pane widths change with the mouse. "Reset the layout" is in the command palette.
+In a narrow window, `Enter` in the Messages list or the tree opens the details sheet for the selected row. In a wide window, it does nothing. Pause, Edit and publish, Reply, Publish to this topic and the details pane have no shortcut. Use the buttons or the command palette. Pane widths change with the mouse. "Reset the layout" is in the command palette.
 
 ## Command line options
 
