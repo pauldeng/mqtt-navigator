@@ -124,6 +124,17 @@ Done with `xdotool` on Xvfb (keys; a mouse click only to put the focus in a pane
 | (d) narrow (1000 px) | Enter opened the sheet. Closing the sheet (click outside) and then Down and Enter opened it again, so `sheet_open` was cleared. The palette entry opens the sheet in a narrow window. **Not reachable:** the palette entry cannot close an open sheet, because `Ctrl+K` does nothing while the sheet has the focus. That branch has no screenshot. | `r2-d-n1-open.png`, `r2-d-n4-reopen-after-close.png`, `r2-d-n5-palette-opens.png` |
 | (e) Result in the details | Acknowledged: a QoS 1 message shows "Result: Acknowledged". Rejected: **not captured**; the test Mosquitto accepts every publish. | `r2-e-ack.png` |
 
+## Codex round 2 fixes
+
+Commits 6478d9e (items 1 and 2) and the commit after it (items 3 and 4). fmt, clippy (-D warnings) and `cargo test --workspace` passed (`stepr2-*.log`, `stepr3-*.log`).
+
+1. **History dialog Enter.** A `HistoryList` key context binds Enter to `NoAction`, so the dialog does not confirm before the focused entry gets the key. The app has no `gpui_kit::test` UI tests, so the key path is checked in a window: Tab, Enter put the entry in the composer (`r3-a-recalled.png`; the failing run before the fix is `r2-a-recalled.png`).
+2. **Jump to newest Enter.** A `JumpStrip` context binds Enter to `NoAction`, so the list's "open details" binding does not take it. In a window: Tab, Enter jumped, and Down then moved the selection, so the focus is in the list (`r3-b-after.png`).
+3. **Send result by row id.** `TopicStore::row_send_status(id)` reads the status of a row regardless of the list filter or a pause. The details use it. Test: `a_sent_row_keeps_its_status_when_a_filter_hides_it` (the result is `Sending`, stays while a filter hides the row, then becomes `Acknowledged`). In a window: with the filter "Received" the sent row is hidden and the details still show "Result: Acknowledged" (`r3-e-filtered.png`).
+4. **Property removal focus.** Removing a property (single field or user row) focuses the payload editor, which stays. In a window: after removing Content type, typed text went to the payload (`r3-after-remove.png`). The user-property row uses the same call; it was not exercised in a window.
+
+Checks (c) and (d) of the first list (Show latest, details toggle, narrow sheet) were not repeated after round 2, because round 2 did not change those paths. Rejected results are still not captured (the test broker accepts every publish).
+
 ## Manual checks for the owner
 
 Use a broker that you trust. A narrow window is below 1 100 px.

@@ -1448,10 +1448,8 @@ impl Navigator {
         if s.direction != Direction::Sent {
             return None;
         }
-        match self.store.list_row(self.store.list_index_of(s.id)?)? {
-            RowView::Message { status, .. } => status.cloned(),
-            _ => None,
-        }
+        // By row id: a list filter must not hide the result of the selected message.
+        self.store.row_send_status(s.id).cloned()
     }
 
     /// The arrival time that the Value tab compares a History row with: the selected message,

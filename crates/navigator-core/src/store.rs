@@ -1536,6 +1536,16 @@ impl TopicStore {
         view
     }
 
+    /// The current send status of a sent row, by id. It does not depend on the list filter or
+    /// on a pause: a row that a filter hides still has its status. `None`: the row is gone or
+    /// it is not a sent message.
+    pub fn row_send_status(&self, id: RowId) -> Option<&SendStatus> {
+        match self.row(id).map(Row::view)? {
+            RowView::Message { status, .. } => status,
+            _ => None,
+        }
+    }
+
     /// True if the store removed the row (memory budget, list cap or `clear`): its id is older
     /// than the oldest row that the store keeps. False if the row is still in the list, even if
     /// a filter hides it, and for an id that the store has not issued yet. Paused: a row that is
@@ -3939,6 +3949,30 @@ mod tests {
         assert_eq!(view_ids(&s).len(), s.stats().list_rows);
         assert!(!view_ids(&s).contains(&u64::MAX));
         audit(&s);
+    }
+
+    #[test]
+    fn a_sent_row_keeps_its_status_when_a_filter_hides_it() {
+        let mut s = TopicStore::new(big());
+        let Insert::Recorded(id) = sent(&mut s, 1, "a/1", b"x") else {
+            panic!("a sent row");
+        };
+        assert_eq!(s.row_send_status(id), Some(&SendStatus::Sending));
+        s.set_list_filter(ListFilter {
+            show_only: Some("b/#".into()),
+            ..ListFilter::default()
+        });
+        drain(&mut s);
+        assert_eq!(s.list_index_of(id), None, "the filter hides the row");
+        assert_eq!(s.row_send_status(id), Some(&SendStatus::Sending));
+        // The result changes while the row is hidden.
+        assert!(s.set_send_status(1, SendStatus::Acknowledged));
+        assert_eq!(s.row_send_status(id), Some(&SendStatus::Acknowledged));
+        // A received row has no send status.
+        let Insert::Stored(_) = s.insert(msg("b/1", b"x")) else {
+            panic!("stored");
+        };
+        assert_eq!(s.row_send_status(RowId(u64::MAX)), None);
     }
 
     #[test]

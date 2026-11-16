@@ -487,6 +487,8 @@ impl Navigator {
         }
         self.comp.shown.set(kind, false);
         self.comp.model.edited();
+        // The remove button is gone: the focus moves to the payload, which stays.
+        self.comp.payload.update(cx, |e, cx| e.focus(window, cx));
         cx.notify();
     }
 
@@ -946,9 +948,11 @@ impl Navigator {
                                 .ghost()
                                 .icon(IconName::Close)
                                 .tooltip("Remove this property")
-                                .on_click(cx.listener(move |v, _, _, cx| {
+                                .on_click(cx.listener(move |v, _, window, cx| {
                                     v.comp.rows.retain(|r| r.id != id);
                                     v.comp.model.edited();
+                                    // The row and its button are gone: focus a control that stays.
+                                    v.comp.payload.update(cx, |e, cx| e.focus(window, cx));
                                     cx.notify();
                                 })),
                         ),
