@@ -419,6 +419,11 @@ impl Navigator {
             preset: crate::themes::preset_by_id(&self.settings.ui.theme_preset).id,
             memory_mib: self.memory_mib(),
             check_updates: self.settings.ui.check_updates,
+            sub_qos: self.show_only_sub().map(|s| s.qos),
+            sub_failed: self
+                .show_only_sub()
+                .is_some_and(|s| matches!(s.state, SubState::Failed(_))),
+            v5: self.composer_protocol() == Protocol::V5,
         }
     }
 

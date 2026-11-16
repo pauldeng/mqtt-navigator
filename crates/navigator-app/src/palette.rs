@@ -6,6 +6,7 @@ use navigator_core::settings::ThemeMode;
 
 use crate::composer::PayloadMode;
 use crate::inspector::DecoderPick;
+use navigator_core::Qos;
 
 /// What an action does. The window runs it (`Navigator::run_cmd`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +51,11 @@ pub enum Cmd {
     PayloadMode(PayloadMode),
     FormatJson,
     ToggleComposer,
+    /// The subscription in "Show only" (see `Facts::sub_qos`).
+    SubQos(Qos),
+    SubOptions,
+    SubRetry,
+    SubRemove,
     Theme(ThemeMode),
     /// A colour theme preset, by id (see `crate::themes`).
     ThemePreset(&'static str),
@@ -100,6 +106,12 @@ pub struct Facts {
     pub memory_mib: u32,
     /// The check for a new version at start is on.
     pub check_updates: bool,
+    /// The QoS of the subscription in "Show only". `None`: no subscription is in Show only.
+    pub sub_qos: Option<Qos>,
+    /// The subscription in Show only was rejected.
+    pub sub_failed: bool,
+    /// The connection uses MQTT 5 (subscription options).
+    pub v5: bool,
 }
 
 /// One row of the table.
@@ -516,6 +528,41 @@ pub static COMMANDS: &[Entry] = &[
         always,
     ),
     e(
+        "sub-qos-0",
+        "Subscription: QoS 0",
+        None,
+        Cmd::SubQos(Qos::AtMostOnce),
+        always,
+    ),
+    e(
+        "sub-qos-1",
+        "Subscription: QoS 1",
+        None,
+        Cmd::SubQos(Qos::AtLeastOnce),
+        always,
+    ),
+    e(
+        "sub-options",
+        "Subscription: Options…",
+        None,
+        Cmd::SubOptions,
+        |f| f.v5,
+    ),
+    e(
+        "sub-retry",
+        "Subscription: Retry",
+        None,
+        Cmd::SubRetry,
+        always,
+    ),
+    e(
+        "sub-remove",
+        "Subscription: Remove",
+        None,
+        Cmd::SubRemove,
+        always,
+    ),
+    e(
         "theme-system",
         "Appearance: System",
         None,
@@ -684,6 +731,17 @@ pub fn available(f: &Facts) -> Vec<&'static Entry> {
     COMMANDS.iter().filter(|c| c.available(f)).collect()
 }
 
+/// The reason why a listed action cannot run now. The palette shows the row with this text.
+pub fn disabled_reason(e: &Entry, f: &Facts) -> Option<&'static str> {
+    const SELECT: &str = "Select a subscription first.";
+    match (e.cmd, f.sub_qos) {
+        (Cmd::SubQos(_) | Cmd::SubOptions | Cmd::SubRetry | Cmd::SubRemove, None) => Some(SELECT),
+        (Cmd::SubQos(q), Some(now)) if q == now => Some("The subscription has this QoS already."),
+        (Cmd::SubRetry, Some(_)) if !f.sub_failed => Some("The subscription did not fail."),
+        _ => None,
+    }
+}
+
 /// The shortcut text for the current platform: `Mod+K` shows as `Ctrl+K` (`Cmd+K` on macOS).
 pub fn shortcut_text(e: &Entry) -> Option<String> {
     e.shortcut.map(|s| s.replace("Mod", MOD))
@@ -693,9 +751,11 @@ pub fn shortcut_text(e: &Entry) -> Option<String> {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
-        COMMANDS, Cmd, Facts, MEMORY_OPTIONS_MIB, available, is_current, memory_text, shortcut_text,
+        COMMANDS, Cmd, Facts, MEMORY_OPTIONS_MIB, available, disabled_reason, is_current,
+        memory_text, shortcut_text,
     };
     use crate::composer::PayloadMode;
+    use navigator_core::Qos;
     use navigator_core::decode::{Endian, NumberKind};
     use std::collections::HashSet;
 
@@ -793,6 +853,53 @@ mod tests {
             })
             .contains(&"direction-sent")
         );
+    }
+
+    #[test]
+    fn subscription_actions_need_a_subscription_in_show_only() {
+        let reason = |id: &str, f: &Facts| {
+            let e = COMMANDS.iter().find(|c| c.id == id).expect("entry");
+            disabled_reason(e, f)
+        };
+        let none = Facts::default();
+        for id in ["sub-qos-0", "sub-qos-1", "sub-retry", "sub-remove"] {
+            assert!(ids(&none).contains(&id), "{id} is listed");
+            assert_eq!(
+                reason(id, &none),
+                Some("Select a subscription first."),
+                "{id}"
+            );
+        }
+        // Options are an MQTT 5 feature: with 3.1.1 the entry is not listed at all.
+        assert!(!ids(&none).contains(&"sub-options"));
+        let v5 = Facts { v5: true, ..none };
+        assert!(ids(&v5).contains(&"sub-options"));
+        assert_eq!(
+            reason("sub-options", &v5),
+            Some("Select a subscription first.")
+        );
+        let one = Facts {
+            sub_qos: Some(Qos::AtLeastOnce),
+            v5: true,
+            ..none
+        };
+        assert_eq!(reason("sub-qos-0", &one), None);
+        assert_eq!(
+            reason("sub-qos-1", &one),
+            Some("The subscription has this QoS already.")
+        );
+        assert_eq!(reason("sub-remove", &one), None);
+        assert_eq!(reason("sub-options", &one), None);
+        // Retry works for a rejected subscription only.
+        assert_eq!(
+            reason("sub-retry", &one),
+            Some("The subscription did not fail.")
+        );
+        let failed = Facts {
+            sub_failed: true,
+            ..one
+        };
+        assert_eq!(reason("sub-retry", &failed), None);
     }
 
     #[test]

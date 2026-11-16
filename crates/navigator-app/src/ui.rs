@@ -310,6 +310,30 @@ enum OptionsChange {
     Go(Qos),
 }
 
+/// The answer to a change of subscription QoS (see `Subs::check_qos_change`).
+#[derive(Debug, PartialEq, Eq)]
+enum QosChange {
+    /// No such row, the row is being removed, or the same QoS.
+    Ignore,
+    /// Send a SUBSCRIBE with the new QoS and these options.
+    Go(SubOptions),
+}
+
+/// The status line of a row, and whether it is a problem. `None`: the row needs no line.
+fn sub_status(state: &SubState, asked: Qos, connected: bool) -> Option<(String, bool)> {
+    match state {
+        SubState::Pending if connected => Some(("Subscribing…".into(), false)),
+        SubState::Pending => Some(("Waiting for connection".into(), false)),
+        // Only a grant below the request is worth a line.
+        SubState::Active(q) if *q != asked => Some((granted_text(*q), false)),
+        SubState::Active(_) => None,
+        SubState::Failed(e) | SubState::RemoveFailed(e) | SubState::NotRemoved(e) => {
+            Some((e.clone(), true))
+        }
+        SubState::Removing => Some(("Removing…".into(), false)),
+    }
+}
+
 /// The subscription rows. Free of gpui types, so that tests can run it.
 ///
 /// `index` finds a row by filter in O(1). It holds the row `seq`, and the row is then found by
@@ -375,6 +399,29 @@ impl Subs {
         match options.check(filter) {
             Err(text) => OptionsChange::Refused(text),
             Ok(()) => OptionsChange::Go(sub.qos),
+        }
+    }
+
+    fn get(&self, filter: &str) -> Option<&Sub> {
+        self.pos(filter).and_then(|i| self.rows.get(i))
+    }
+
+    /// Checks a change of QoS. Like `check_options_change`, it changes nothing.
+    fn check_qos_change(&mut self, filter: &str, qos: Qos) -> QosChange {
+        match self.row(filter) {
+            Some(s) if !s.state.removal_accepted() && s.qos != qos => QosChange::Go(s.options),
+            _ => QosChange::Ignore,
+        }
+    }
+
+    /// The row takes `qos`. `req`: as in `commit_options`.
+    fn commit_qos(&mut self, filter: &str, qos: Qos, req: Option<u64>) {
+        if let Some(s) = self.row(filter) {
+            s.qos = qos;
+            if let Some(req) = req {
+                s.req = req;
+                s.state = SubState::Pending;
+            }
         }
     }
 
@@ -1152,6 +1199,31 @@ impl Navigator {
         cx.notify();
     }
 
+    /// The user changed the QoS of a row. It is sent as a new SUBSCRIBE with a new request ID,
+    /// with the same rules as `set_sub_options`: the row takes the QoS and the ID only when the
+    /// net thread accepted the command.
+    fn set_sub_qos(&mut self, filter: &str, qos: Qos, cx: &mut Context<Self>) {
+        let QosChange::Go(options) = self.subs.check_qos_change(filter, qos) else {
+            return;
+        };
+        self.sub_error = None;
+        if self.is_live() {
+            let req = self.subs.new_req();
+            match self.send_subscribe(filter, qos, options, req) {
+                Ok(()) => self.subs.commit_qos(filter, qos, Some(req)),
+                Err(e) => {
+                    if let Some(s) = self.subs.row(filter) {
+                        s.state = SubState::Failed(send_error_text(e).into());
+                    }
+                }
+            }
+        } else {
+            self.subs.commit_qos(filter, qos, None);
+        }
+        self.persist_subs();
+        cx.notify();
+    }
+
     fn retry_sub(&mut self, filter: &str, cx: &mut Context<Self>) {
         let Some((qos, options)) = self.subs.row(filter).map(|s| (s.qos, s.options)) else {
             return;
@@ -1438,6 +1510,11 @@ impl Navigator {
         self.show_only = None;
         self.direction = DirectionFilter::All;
         self.apply_filters(cx);
+    }
+
+    /// The subscription in "Show only": the target of the subscription actions of the palette.
+    fn show_only_sub(&self) -> Option<&Sub> {
+        self.subs.get(self.show_only.as_deref()?)
     }
 
     fn toggle_show_only(&mut self, filter: &str, cx: &mut Context<Self>) {
@@ -1905,7 +1982,7 @@ impl Navigator {
             .tooltip("Settings")
             .dropdown_menu(move |menu, _, _| {
                 let w = weak.clone();
-                let mut menu = menu.item(
+                let mut menu = menu.scrollable(true).item(
                     PopupMenuItem::new(format!("Commands… ({}+K)", crate::palette::MOD)).on_click(
                         move |_, window, cx| {
                             w.update(cx, |v, cx| v.open_palette(window, cx)).ok();
@@ -1975,37 +2052,28 @@ impl Navigator {
         let Some(s) = self.subs.rows.get(i) else {
             return div().into_any_element();
         };
-        let state: SharedString = match &s.state {
-            SubState::Pending if self.connected() => "Subscribing…".into(),
-            SubState::Pending => "Waiting for connection".into(),
-            SubState::Active(q) => granted_text(*q).into(),
-            SubState::Failed(e) | SubState::RemoveFailed(e) | SubState::NotRemoved(e) => {
-                e.clone().into()
-            }
-            SubState::Removing => "Removing…".into(),
-        };
-        let retry_remove = matches!(s.state, SubState::RemoveFailed(_) | SubState::NotRemoved(_));
-        let failed = retry_remove || matches!(s.state, SubState::Failed(_));
-        // The button of a failed row repeats the action that failed.
-        let retry_label = if retry_remove {
-            "Retry remove"
-        } else {
-            "Retry"
-        };
+        let status = sub_status(&s.state, s.qos, self.connected());
+        let rejected = matches!(s.state, SubState::Failed(_));
         // The ids come from the filter, not from the index: they stay when rows move.
         let row_id = ElementId::from(s.filter.clone());
-        let (retry, remove, pick) = (s.filter.clone(), s.filter.clone(), s.filter.clone());
+        let pick = s.filter.clone();
         let active = self.show_only.as_deref() == Some(&*s.filter);
         let line = h_flex()
             .w_full()
             .gap_2()
-            .child(
+            .child(if rejected {
+                Icon::new(IconName::Close)
+                    .xsmall()
+                    .text_color(theme.danger)
+                    .into_any_element()
+            } else {
                 div()
                     .flex_none()
                     .size_2()
                     .rounded_full()
-                    .bg(chip_colour(i, theme)),
-            )
+                    .bg(chip_colour(i, theme))
+                    .into_any_element()
+            })
             .child(
                 div()
                     .flex_1()
@@ -2017,61 +2085,27 @@ impl Navigator {
                     .text_ellipsis()
                     .child(safe(&s.filter)),
             )
-            .child(Tag::secondary().xsmall().child(match s.qos {
-                Qos::AtMostOnce => "Q0",
-                Qos::AtLeastOnce => "Q1",
-            }))
-            .when(self.composer_protocol() == Protocol::V5, |d| {
-                let locked = s.state.removal_accepted();
-                d.child(self.options_button(&row_id, &s.filter, s.options, locked, cx))
+            .when(s.qos == Qos::AtLeastOnce, |d| {
+                d.child(Tag::secondary().xsmall().child("Q1"))
             })
-            .child(
-                Button::new((row_id.clone(), "remove"))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Close)
-                    .tooltip("Remove subscription")
-                    .disabled(s.state == SubState::Removing)
-                    .on_click(cx.listener(move |v, _, _, cx| {
-                        // The row itself toggles "Show only": keep this click on the button.
-                        cx.stop_propagation();
-                        v.remove_sub(&remove, cx)
-                    })),
-            );
-        let status = h_flex()
-            .w_full()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(if failed {
-                        theme.danger
-                    } else if active {
-                        theme.accent_foreground
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(state),
-            )
-            .when(failed, |d| {
-                d.child(
-                    Button::new((row_id.clone(), "retry"))
-                        .xsmall()
-                        .label(retry_label)
-                        .on_click(cx.listener(move |v, _, _, cx| {
-                            cx.stop_propagation();
-                            if retry_remove {
-                                v.remove_sub(&retry, cx)
-                            } else {
-                                v.retry_sub(&retry, cx)
-                            }
-                        })),
-                )
-            });
+            .child(self.sub_menu(&row_id, s, active, cx));
+        let status_line = status.map(|(text, problem)| {
+            div()
+                .w_full()
+                .text_xs()
+                .text_color(if problem {
+                    theme.danger
+                } else if active {
+                    theme.accent_foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .child(text)
+        });
         // Click the row to show only its messages. Click again to show all. The state of the
         // row (selected) is the fill of the row.
         ListItem::new(row_id)
+            .w_full()
             .h(ui(SUB_ROW_H))
             .flex_none()
             .overflow_hidden()
@@ -2080,128 +2114,185 @@ impl Navigator {
             .py_0p5()
             .selected(active)
             .on_click(cx.listener(move |v, _, _, cx| v.toggle_show_only(&pick, cx)))
-            .child(v_flex().w_full().child(line).child(status))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .w_full()
+                    .child(line)
+                    .children(status_line),
+            )
             .into_any_element()
     }
 
-    /// The "Options" popover of a subscription row (MQTT 5): No Local, Retain As Published and
-    /// Retain Handling. Each change sends a new SUBSCRIBE (`set_sub_options`).
-    fn options_button(
+    /// The `⋯` menu of a row: Show only, QoS, Options…, Retry and Remove.
+    fn sub_menu(
         &self,
         row_id: &ElementId,
-        filter: &SharedString,
-        options: SubOptions,
-        locked: bool,
+        s: &Sub,
+        active: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak = cx.entity().downgrade();
-        let filter = filter.clone();
+        let (filter, qos, state) = (s.filter.clone(), s.qos, s.state.clone());
+        let v5 = self.composer_protocol() == Protocol::V5;
         // A click on the button must not toggle "Show only" on the row.
         div()
-            .id((row_id.clone(), "options-wrap"))
+            .id((row_id.clone(), "menu-wrap"))
             .flex_none()
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(
-                Popover::new((row_id.clone(), "options"))
-                    .trigger(
-                        Button::new((row_id.clone(), "options-button"))
-                            .ghost()
-                            .xsmall()
-                            .label("Options")
-                            .tooltip(options_text(&options)),
-                    )
-                    .content(move |_, _, _| {
-                        let id = ElementId::from(filter.clone());
-                        let change = {
-                            let (weak, filter) = (weak.clone(), filter.clone());
-                            move |next: SubOptions, cx: &mut App| {
-                                weak.update(cx, |v, cx| v.set_sub_options(&filter, next, cx))
-                                    .ok();
-                            }
-                        };
-                        let (on_nl, on_rap, on_rh) =
-                            (change.clone(), change.clone(), change.clone());
-                        v_flex()
-                            .gap_2()
-                            .p_1()
-                            .w(ui(280.))
-                            .child(
-                                Switch::new((id.clone(), "no-local"))
-                                    .checked(options.no_local)
-                                    .disabled(locked)
-                                    .label("No Local")
-                                    .on_click(move |on: &bool, _, cx| {
-                                        on_nl(
-                                            SubOptions {
-                                                no_local: *on,
-                                                ..options
-                                            },
-                                            cx,
-                                        );
-                                    }),
-                            )
-                            .child(
-                                Switch::new((id.clone(), "rap"))
-                                    .checked(options.retain_as_published)
-                                    .disabled(locked)
-                                    .label("Retain As Published")
-                                    .on_click(move |on: &bool, _, cx| {
-                                        on_rap(
-                                            SubOptions {
-                                                retain_as_published: *on,
-                                                ..options
-                                            },
-                                            cx,
-                                        );
-                                    }),
-                            )
-                            .child(div().text_xs().child("Retained messages at subscribe"))
-                            .child(
-                                ToggleGroup::new((id.clone(), "rh"))
-                                    .segmented()
-                                    .single()
-                                    .small()
-                                    .disabled(locked)
-                                    .child(
-                                        Toggle::new((id.clone(), "rh-0")).label("Always").checked(
-                                            options.retain_handling == RetainHandling::OnSubscribe,
-                                        ),
-                                    )
-                                    .child(
-                                        Toggle::new((id.clone(), "rh-1")).label("If new").checked(
-                                            options.retain_handling
-                                                == RetainHandling::OnNewSubscription,
-                                        ),
-                                    )
-                                    .child(
-                                        Toggle::new((id, "rh-2")).label("Never").checked(
-                                            options.retain_handling == RetainHandling::Never,
-                                        ),
-                                    )
-                                    .on_click(move |checks: &Vec<bool>, _, cx| {
-                                        let Some(ix) = checks.iter().position(|c| *c) else {
-                                            return;
-                                        };
-                                        let retain_handling = [
-                                            RetainHandling::OnSubscribe,
-                                            RetainHandling::OnNewSubscription,
-                                            RetainHandling::Never,
-                                        ][ix.min(2)];
-                                        on_rh(
-                                            SubOptions {
-                                                retain_handling,
-                                                ..options
-                                            },
-                                            cx,
-                                        );
-                                    }),
-                            )
-                            .into_any_element()
+                Button::new((row_id.clone(), "menu"))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Ellipsis)
+                    .tab_stop(true)
+                    .tooltip("Subscription actions")
+                    .dropdown_menu(move |menu, _, _| {
+                        sub_menu_items(menu, &weak, &filter, qos, &state, active, v5)
                     }),
             )
     }
 
-    /// "Connection details" in the status bar: a popover with the facts of the CONNACK.
+    /// The form of the subscription options (MQTT 5): No Local, Retain As Published and Retain
+    /// Handling. Each change sends a new SUBSCRIBE (`set_sub_options`).
+    fn options_form(
+        weak: WeakEntity<Self>,
+        filter: SharedString,
+        options: SubOptions,
+        locked: bool,
+    ) -> AnyElement {
+        let id = ElementId::from(filter.clone());
+        let change = {
+            let (weak, filter) = (weak.clone(), filter.clone());
+            move |next: SubOptions, cx: &mut App| {
+                weak.update(cx, |v, cx| v.set_sub_options(&filter, next, cx))
+                    .ok();
+            }
+        };
+        let (on_nl, on_rap, on_rh) = (change.clone(), change.clone(), change.clone());
+        v_flex()
+            .gap_2()
+            .p_1()
+            .w(ui(280.))
+            .child(
+                Switch::new((id.clone(), "no-local"))
+                    .checked(options.no_local)
+                    .disabled(locked)
+                    .label("No Local")
+                    .on_click(move |on: &bool, _, cx| {
+                        on_nl(
+                            SubOptions {
+                                no_local: *on,
+                                ..options
+                            },
+                            cx,
+                        );
+                    }),
+            )
+            .child(
+                Switch::new((id.clone(), "rap"))
+                    .checked(options.retain_as_published)
+                    .disabled(locked)
+                    .label("Retain As Published")
+                    .on_click(move |on: &bool, _, cx| {
+                        on_rap(
+                            SubOptions {
+                                retain_as_published: *on,
+                                ..options
+                            },
+                            cx,
+                        );
+                    }),
+            )
+            .child(div().text_xs().child("Retained messages at subscribe"))
+            .child(
+                ToggleGroup::new((id.clone(), "rh"))
+                    .segmented()
+                    .single()
+                    .small()
+                    .disabled(locked)
+                    .child(
+                        Toggle::new((id.clone(), "rh-0"))
+                            .label("Always")
+                            .checked(options.retain_handling == RetainHandling::OnSubscribe),
+                    )
+                    .child(
+                        Toggle::new((id.clone(), "rh-1"))
+                            .label("If new")
+                            .checked(options.retain_handling == RetainHandling::OnNewSubscription),
+                    )
+                    .child(
+                        Toggle::new((id, "rh-2"))
+                            .label("Never")
+                            .checked(options.retain_handling == RetainHandling::Never),
+                    )
+                    .on_click(move |checks: &Vec<bool>, _, cx| {
+                        let Some(ix) = checks.iter().position(|c| *c) else {
+                            return;
+                        };
+                        let retain_handling = [
+                            RetainHandling::OnSubscribe,
+                            RetainHandling::OnNewSubscription,
+                            RetainHandling::Never,
+                        ][ix.min(2)];
+                        on_rh(
+                            SubOptions {
+                                retain_handling,
+                                ..options
+                            },
+                            cx,
+                        );
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Opens the options of a subscription in a dialog (row menu and command palette).
+    fn open_sub_options(&mut self, filter: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_protocol() != Protocol::V5 || window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(filter) = self.subs.get(filter).map(|s| s.filter.clone()) else {
+            return;
+        };
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            // Read the row at each draw: a change sends a SUBSCRIBE and the options move.
+            let (options, locked) = weak
+                .upgrade()
+                .and_then(|v| {
+                    v.read(cx)
+                        .subs
+                        .get(&filter)
+                        .map(|s| (s.options, s.state.removal_accepted()))
+                })
+                .unwrap_or_default();
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title(format!("Options of {}", display_safe(&filter)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(options_text(&options)),
+                )
+                .child(Self::options_form(
+                    weak.clone(),
+                    filter.clone(),
+                    options,
+                    locked,
+                ))
+                .footer(
+                    h_flex().justify_end().child(
+                        Button::new("sub-options-close")
+                            .label("Close")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
+    }
+
     /// The Details button of the status bar. Its popover shows the CONNACK facts (while
     /// connected), the topic count, the memory use with the budget control, and the drops.
     fn details_button(&self, drops: u64, cx: &mut Context<Self>) -> AnyElement {
@@ -2214,10 +2305,11 @@ impl Navigator {
         let (topics, used, current) = (stats.topics, stats.used_bytes, self.memory_mib());
         let weak = cx.entity().downgrade();
         let theme = cx.theme();
-        let (muted, mono, danger) = (
+        let (muted, mono, danger, ui_font) = (
             theme.muted_foreground,
             theme.mono_font_family.clone(),
             theme.danger,
+            theme.font_family.clone(),
         );
         Popover::new("status-details")
             .anchor(gpui_kit::Anchor::BottomRight)
@@ -2269,6 +2361,7 @@ impl Navigator {
                     .gap_1()
                     .p_1()
                     .w(ui(380.))
+                    .font_family(ui_font.clone())
                     .when(!lines.is_empty(), |d| {
                         d.child(div().text_sm().child("Connection details"))
                             .children(lines.iter().map(|(l, v)| fact(l, v.clone())))
@@ -2299,32 +2392,30 @@ impl Navigator {
 
     fn render_subs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        // A toggle group with a selected state: QoS 0 or QoS 1. A click on the selected one
-        // keeps it.
-        let qos = ToggleGroup::new("sub-qos")
-            .segmented()
-            .single()
-            .small()
-            .child(
-                Toggle::new("sub-qos-0")
-                    .label("Q0")
-                    .checked(self.sub_qos == Qos::AtMostOnce),
-            )
-            .child(
-                Toggle::new("sub-qos-1")
-                    .label("Q1")
-                    .checked(self.sub_qos == Qos::AtLeastOnce),
-            )
-            .on_click(cx.listener(|v, checks: &Vec<bool>, _, cx| {
-                if let Some(ix) = checks.iter().position(|c| *c) {
-                    v.sub_qos = if ix == 0 {
-                        Qos::AtMostOnce
-                    } else {
-                        Qos::AtLeastOnce
-                    };
-                    cx.notify();
-                }
-            }));
+        // The QoS of the next subscription: a small menu at the end of the input.
+        let (current, weak) = (self.sub_qos, cx.entity().downgrade());
+        let qos = Button::new("sub-qos")
+            .ghost()
+            .xsmall()
+            .label(format!("Q{}", current.as_u8()))
+            .dropdown_caret(true)
+            .tooltip("QoS of the new subscription")
+            .dropdown_menu(move |menu, _, _| {
+                [("QoS 0", Qos::AtMostOnce), ("QoS 1", Qos::AtLeastOnce)]
+                    .into_iter()
+                    .fold(menu, |menu, (label, q)| {
+                        let weak = weak.clone();
+                        menu.item(PopupMenuItem::new(label).checked(current == q).on_click(
+                            move |_, _, cx| {
+                                weak.update(cx, |v, cx| {
+                                    v.sub_qos = q;
+                                    cx.notify();
+                                })
+                                .ok();
+                            },
+                        ))
+                    })
+            });
         let has_hash = self.subs.contains("#");
         v_flex()
             .size_full()
@@ -2363,12 +2454,7 @@ impl Navigator {
                         ),
                 )
             })
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(div().flex_1().child(Input::new(&self.sub_input).small()))
-                    .child(qos),
-            )
+            .child(Input::new(&self.sub_input).small().suffix(qos))
             .when_some(self.sub_error.clone(), |d, e| {
                 d.child(div().text_xs().text_color(theme.danger).child(e))
             })
@@ -3345,6 +3431,55 @@ pub(crate) fn empty_state(
         .into_any_element()
 }
 
+/// The items of the `⋯` menu of a subscription row.
+fn sub_menu_items(
+    menu: gpui_kit::component::menu::PopupMenu,
+    weak: &WeakEntity<Navigator>,
+    filter: &SharedString,
+    qos: Qos,
+    state: &SubState,
+    active: bool,
+    v5: bool,
+) -> gpui_kit::component::menu::PopupMenu {
+    let item =
+        |label: &'static str,
+         run: fn(&mut Navigator, &str, &mut Window, &mut Context<Navigator>)| {
+            let (weak, filter) = (weak.clone(), filter.clone());
+            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                weak.update(cx, |v, cx| run(v, &filter, window, cx)).ok();
+            })
+        };
+    let removing = *state == SubState::Removing;
+    let locked = state.removal_accepted();
+    let retry_remove = matches!(state, SubState::RemoveFailed(_) | SubState::NotRemoved(_));
+    let mut menu =
+        menu.item(item("Show only", |v, f, _, cx| v.toggle_show_only(f, cx)).checked(active));
+    menu = menu.separator();
+    menu = menu.item(
+        item("QoS 0", |v, f, _, cx| v.set_sub_qos(f, Qos::AtMostOnce, cx))
+            .checked(qos == Qos::AtMostOnce)
+            .disabled(locked),
+    );
+    menu = menu.item(
+        item("QoS 1", |v, f, _, cx| {
+            v.set_sub_qos(f, Qos::AtLeastOnce, cx)
+        })
+        .checked(qos == Qos::AtLeastOnce)
+        .disabled(locked),
+    );
+    if v5 {
+        menu = menu
+            .item(item("Options…", |v, f, w, cx| v.open_sub_options(f, w, cx)).disabled(locked));
+    }
+    if matches!(state, SubState::Failed(_)) {
+        menu = menu.item(item("Retry", |v, f, _, cx| v.retry_sub(f, cx)));
+    } else if retry_remove {
+        menu = menu.item(item("Retry remove", |v, f, _, cx| v.remove_sub(f, cx)));
+    }
+    menu.separator()
+        .item(item("Remove", |v, f, _, cx| v.remove_sub(f, cx)).disabled(removing))
+}
+
 /// A stable number for the element id of a tree row. `NodeId` keeps its fields private, and the
 /// default hasher has fixed keys, so the same id gives the same number.
 fn node_key(id: NodeId) -> u64 {
@@ -3713,6 +3848,77 @@ mod tests {
         assert_eq!(
             s.row("t").expect("row").state,
             SubState::Active(Qos::AtLeastOnce)
+        );
+    }
+
+    /// A QoS change uses the same request tracking as an options change: the row takes the QoS
+    /// and the ID when the net thread accepts it, and only the result with that ID decides.
+    #[test]
+    fn a_qos_change_is_tracked_by_its_request_id() {
+        use super::QosChange;
+        let o = opts(true, false);
+        let mut s = Subs::default();
+        s.push("t", Qos::AtMostOnce);
+        accepted(&mut s, "t", o);
+        let r1 = s.row("t").expect("row").req;
+        // The same QoS, a missing row and a row in removal change nothing.
+        assert_eq!(s.check_qos_change("t", Qos::AtMostOnce), QosChange::Ignore);
+        assert_eq!(s.check_qos_change("x", Qos::AtLeastOnce), QosChange::Ignore);
+        // A new QoS keeps the options for the new SUBSCRIBE.
+        assert_eq!(s.check_qos_change("t", Qos::AtLeastOnce), QosChange::Go(o));
+        // The send fails: the row keeps its QoS and its ID and shows the failure.
+        s.row("t").expect("row").state = SubState::Failed("The queue is full.".into());
+        let row = s.row("t").expect("row");
+        assert_eq!((row.qos, row.req), (Qos::AtMostOnce, r1));
+        // The send works: the row takes the QoS, a new ID, and waits.
+        let r2 = s.new_req();
+        s.commit_qos("t", Qos::AtLeastOnce, Some(r2));
+        let row = s.row("t").expect("row");
+        assert_eq!(
+            (row.qos, row.req, row.state.clone()),
+            (Qos::AtLeastOnce, r2, SubState::Pending)
+        );
+        // The result of the older request does not decide. The new one does.
+        s.on_subscribed("t", r1, Ok(Qos::AtMostOnce));
+        assert_eq!(s.row("t").expect("row").state, SubState::Pending);
+        s.on_subscribed("t", r2, Ok(Qos::AtMostOnce));
+        assert_eq!(
+            s.row("t").expect("row").state,
+            SubState::Active(Qos::AtMostOnce)
+        );
+        // Offline: only the row (and the profile) change.
+        s.commit_qos("t", Qos::AtMostOnce, None);
+        assert_eq!(s.row("t").expect("row").req, r2);
+        s.begin_remove("t");
+        assert_eq!(s.check_qos_change("t", Qos::AtLeastOnce), QosChange::Ignore);
+    }
+
+    #[test]
+    fn a_row_shows_a_status_line_only_for_a_problem_or_a_change() {
+        use super::sub_status;
+        let (q0, q1) = (Qos::AtMostOnce, Qos::AtLeastOnce);
+        assert_eq!(sub_status(&SubState::Active(q1), q1, true), None);
+        assert_eq!(sub_status(&SubState::Active(q0), q0, true), None);
+        // The broker grants less than the request.
+        assert_eq!(
+            sub_status(&SubState::Active(q0), q1, true),
+            Some(("Granted QoS 0".into(), false))
+        );
+        assert_eq!(
+            sub_status(&SubState::Pending, q0, true),
+            Some(("Subscribing…".into(), false))
+        );
+        assert_eq!(
+            sub_status(&SubState::Pending, q0, false),
+            Some(("Waiting for connection".into(), false))
+        );
+        assert_eq!(
+            sub_status(
+                &SubState::Failed("Not authorized to subscribe.".into()),
+                q0,
+                true
+            ),
+            Some(("Not authorized to subscribe.".into(), true))
         );
     }
 

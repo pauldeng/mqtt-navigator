@@ -12,7 +12,13 @@ use crate::diagnostics::{self, Info};
 use crate::palette::{self, Cmd};
 
 /// Id, label, shortcut text and "is the current choice" of one palette row.
-type PaletteRow = (&'static str, &'static str, Option<String>, bool);
+type PaletteRow = (
+    &'static str,
+    &'static str,
+    Option<String>,
+    bool,
+    Option<&'static str>,
+);
 
 impl Navigator {
     /// Runs one action. Every action of the table is handled here.
@@ -58,6 +64,9 @@ impl Navigator {
             Cmd::PayloadMode(mode) => self.set_payload_mode(mode, window, cx),
             Cmd::FormatJson => self.format_json(window, cx),
             Cmd::ToggleComposer => self.toggle_composer(cx),
+            Cmd::SubQos(_) | Cmd::SubOptions | Cmd::SubRetry | Cmd::SubRemove => {
+                self.run_sub_cmd(cmd, window, cx)
+            }
             Cmd::Theme(mode) => self.set_appearance(mode, window, cx),
             Cmd::ThemePreset(id) => self.set_preset(id, window, cx),
             Cmd::MemoryLimit(mib) => self.set_memory_limit(mib, cx),
@@ -79,6 +88,20 @@ impl Navigator {
                 cx.notify();
             }
             Cmd::Quit => cx.quit(),
+        }
+    }
+
+    /// A subscription action of the palette. It acts on the subscription in Show only.
+    fn run_sub_cmd(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(filter) = self.show_only.clone() else {
+            return;
+        };
+        match cmd {
+            Cmd::SubQos(qos) => self.set_sub_qos(&filter, qos, cx),
+            Cmd::SubOptions => self.open_sub_options(&filter, window, cx),
+            Cmd::SubRetry => self.retry_sub(&filter, cx),
+            Cmd::SubRemove => self.remove_sub(&filter, cx),
+            _ => {}
         }
     }
 
@@ -131,6 +154,7 @@ impl Navigator {
                         e.label,
                         palette::shortcut_text(e),
                         palette::is_current(e, &facts),
+                        palette::disabled_reason(e, &facts),
                     )
                 })
                 .collect(),
@@ -142,8 +166,9 @@ impl Navigator {
             if first.replace(false) {
                 state.update(cx, |s, cx| s.focus(window, cx));
             }
-            let items = rows.iter().map(|(id, label, shortcut, current)| {
-                let (shortcut, label, id, current) = (shortcut.clone(), *label, *id, *current);
+            let items = rows.iter().map(|(id, label, shortcut, current, reason)| {
+                let (shortcut, label, id, current, reason) =
+                    (shortcut.clone(), *label, *id, *current, *reason);
                 CommandItem::new()
                     .label(label)
                     .keywords([id])
@@ -154,12 +179,15 @@ impl Navigator {
                             .gap_2()
                             .child(div().flex_1().child(label))
                             .when(current, |d| d.child(Icon::new(IconName::Check).small()))
+                            .when_some(reason, |d, r| {
+                                d.child(div().text_xs().text_color(muted).child(r))
+                            })
                             .when_some(shortcut.clone(), |d, s| {
                                 d.child(div().text_xs().text_color(muted).child(s))
                             })
                     })
             });
-            let (cmds, weak) = (cmds.clone(), weak.clone());
+            let (cmds, weak, rows) = (cmds.clone(), weak.clone(), rows.clone());
             dialog.child(
                 PaletteList::new(&state)
                     .items(items)
@@ -169,6 +197,10 @@ impl Navigator {
                             return;
                         };
                         window.close_dialog(cx);
+                        if let Some(Some(reason)) = rows.get(ix.row).map(|r| r.4) {
+                            window.push_notification(Notification::warning(reason), cx);
+                            return;
+                        }
                         let weak = weak.clone();
                         // The action may open a dialog or move the focus: run it after the
                         // palette has closed.
