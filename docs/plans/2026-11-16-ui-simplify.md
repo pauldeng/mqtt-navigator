@@ -1,6 +1,6 @@
 # Plan: a simpler UI
 
-Status: proposal for owner review (2026-11-16). Nothing is built yet.
+Status: approved by the owner (2026-11-16). Owner decisions: the composer is closed by default; the direction filter is a small menu; the details pane opens on selection in a wide window; saved message collections are not for this app.
 
 Owner request: "I want a simple and intuitive UI and UX design. The current design is still very busy. Try to simplify it." Review [mqtt-viewer](https://github.com/mqtt-viewer/mqtt-viewer) and take what fits.
 
@@ -205,9 +205,9 @@ Data model, store, network, the narrow-window rule, the connection sheet section
 7. Connection sheet and empty states (4.7, 4.8).
 8. Each step: gpui-kit APIs from the pinned source, unit tests for the logic (Follow and its counter, the direction filter, visibility rules, `Esc` order, palette targets), fmt, clippy, tests, Codex review, and a check in a real window by the owner (we have no screenshot tool).
 
-## 10. Questions for the owner
+## 10. Owner decisions (2026-11-16)
 
-1. Composer closed by default (4.4): yes, or keep it open as today?
-2. Direction filter as a small menu next to the filter (4.3): yes, or keep the All / Received / Sent switch?
-3. Details pane opens on selection in a wide window (4.5): yes?
-4. Saved message collections (not taken now): add later as a separate feature?
+1. Composer closed by default (4.4): yes.
+2. Direction filter as a small menu next to the filter (4.3): yes.
+3. Details pane opens on selection in a wide window (4.5): yes.
+4. Saved message collections: no. History and Drafts are enough.
