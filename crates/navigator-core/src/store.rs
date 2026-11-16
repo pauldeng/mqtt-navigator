@@ -726,6 +726,9 @@ pub struct TopicStore {
     /// Paused: ids below this one are in the frozen list.
     cutoff: u64,
     paused_new: u64,
+    /// The view watches the new rows (Follow is off). `watched_new` counts them.
+    watch_new: bool,
+    watched_new: u64,
     /// Paused: ids (ascending) of frozen rows that the store removed.
     removed: Vec<RowId>,
     snap_rows: Vec<NodeId>,
@@ -798,6 +801,8 @@ impl TopicStore {
             paused: false,
             cutoff: 0,
             paused_new: 0,
+            watch_new: false,
+            watched_new: 0,
             removed: Vec::new(),
             snap_rows: Vec::new(),
             snap: HashMap::new(),
@@ -1574,6 +1579,7 @@ impl TopicStore {
         self.matched = VecDeque::new();
         self.scanning = self.lf.active;
         self.scan_below = self.next_row;
+        self.watched_new = 0;
         self.restart_baseline();
     }
 
@@ -1703,6 +1709,20 @@ impl TopicStore {
     /// the messages that the store removed later. It does not count drops and markers.
     pub fn paused_new(&self) -> u64 {
         self.paused_new
+    }
+
+    /// Starts or stops the count of new list rows (for "Jump to newest"). Both calls set the
+    /// count to 0. Unlike `paused_new`, it counts also when the store is not paused.
+    pub fn watch_new(&mut self, on: bool) {
+        self.watch_new = on;
+        self.watched_new = 0;
+    }
+
+    /// The messages (received and sent) that the store admitted since `watch_new(true)`, or
+    /// since the last list filter change, and that match the list filter. It also counts the
+    /// messages that the store removed later. It does not count drops and markers.
+    pub fn watched_new(&self) -> u64 {
+        self.watched_new
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2074,6 +2094,9 @@ impl TopicStore {
         }
         if self.paused && counts_new && m {
             self.paused_new += 1;
+        }
+        if self.watch_new && counts_new && m {
+            self.watched_new += 1;
         }
         self.list_bytes += charge;
         self.list.push_back(row);
@@ -3916,6 +3939,35 @@ mod tests {
         assert_eq!(view_ids(&s).len(), s.stats().list_rows);
         assert!(!view_ids(&s).contains(&u64::MAX));
         audit(&s);
+    }
+
+    #[test]
+    fn watched_new_counts_while_not_paused_and_only_matching_rows() {
+        let mut s = TopicStore::new(big());
+        s.insert(msg("a/1", b"x"));
+        assert_eq!(s.watched_new(), 0);
+        s.watch_new(true);
+        s.insert(msg("a/2", b"x"));
+        sent(&mut s, 1, "b/1", b"x");
+        s.mark_reconnected(std::time::SystemTime::now());
+        assert_eq!(s.watched_new(), 2, "received and sent; no markers");
+        assert_eq!(s.paused_new(), 0, "the pause counter is separate");
+        // A filter change starts again.
+        s.set_list_filter(ListFilter {
+            show_only: Some("a/#".into()),
+            ..ListFilter::default()
+        });
+        assert_eq!(s.watched_new(), 0);
+        drain(&mut s);
+        s.insert(msg("a/3", b"x"));
+        s.insert(msg("b/2", b"x"));
+        assert_eq!(s.watched_new(), 1, "only the rows that match the filter");
+        // Off, and on again, set the count to 0.
+        s.watch_new(false);
+        s.insert(msg("a/4", b"x"));
+        assert_eq!(s.watched_new(), 0);
+        s.watch_new(true);
+        assert_eq!(s.watched_new(), 0);
     }
 
     #[test]

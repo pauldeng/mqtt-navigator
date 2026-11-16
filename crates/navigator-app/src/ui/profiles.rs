@@ -104,6 +104,7 @@ impl Navigator {
             ViewMode::Messages => View::Messages,
             ViewMode::Tree => View::Tree,
         };
+        self.sync_filter_placeholder(window, cx);
         self.two_lines = ui.row_height == RowHeight::TwoLines;
         // Core clamps the saved value. The clamped one shows. A lower limit makes work.
         self.apply_memory_limit(ui.store_budget_mib);

@@ -227,7 +227,7 @@ The filter field is in the centre header (`Ctrl/Cmd+F`). Its hint says what it s
 | Show only | Messages whose topic matches that subscription | Topics that match that subscription |
 | All, Received, Sent | Yes | Not shown |
 
-Each active Show only or direction filter is a tag under the header. **Clear filters** removes all of them. `Esc` in the filter field clears the text.
+Each active Show only or direction filter is a tag under the header. Its **×** button clears it. **Clear filters** in the command palette removes all filters, including the text. `Esc` in the filter field clears the text.
 
 ### Pause and Follow
 

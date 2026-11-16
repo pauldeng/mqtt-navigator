@@ -62,6 +62,18 @@ pub fn status_text(status: &SendStatus) -> String {
     }
 }
 
+/// The result that a sent row shows in the list. A routine result ("Sent", "Acknowledged")
+/// shows in the details and in the composer, not on the row.
+pub fn row_result(status: &SendStatus) -> Option<String> {
+    match status {
+        SendStatus::Sent | SendStatus::Acknowledged => None,
+        SendStatus::Sending => Some("Sending…".into()),
+        SendStatus::Rejected(r) => Some(format!("Rejected: {r}")),
+        SendStatus::TimedOut => Some("Timed out".into()),
+        SendStatus::LostOnDisconnect => Some("Lost on disconnect".into()),
+    }
+}
+
 /// The status of a subscription that the broker accepted. `granted` is the QoS of the SUBACK.
 pub fn granted_text(granted: navigator_core::Qos) -> String {
     format!("Granted QoS {}", granted.as_u8())
@@ -139,7 +151,7 @@ mod tests {
 
     use super::{
         colour_slot, details_lines, format_time, granted_text, group_digits, options_text,
-        status_from_result, status_text,
+        row_result, status_from_result, status_text,
     };
     use navigator_core::net::PublishResult;
     use navigator_core::store::SendStatus;
@@ -183,6 +195,28 @@ mod tests {
         assert_eq!(
             granted_text(navigator_core::Qos::AtLeastOnce),
             "Granted QoS 1"
+        );
+    }
+
+    #[test]
+    fn a_row_shows_a_result_only_when_it_is_not_routine() {
+        assert_eq!(row_result(&SendStatus::Sent), None);
+        assert_eq!(row_result(&SendStatus::Acknowledged), None);
+        assert_eq!(
+            row_result(&SendStatus::Sending).as_deref(),
+            Some("Sending…")
+        );
+        assert_eq!(
+            row_result(&SendStatus::Rejected("NotAuthorized".into())).as_deref(),
+            Some("Rejected: NotAuthorized")
+        );
+        assert_eq!(
+            row_result(&SendStatus::TimedOut).as_deref(),
+            Some("Timed out")
+        );
+        assert_eq!(
+            row_result(&SendStatus::LostOnDisconnect).as_deref(),
+            Some("Lost on disconnect")
         );
     }
 

@@ -47,7 +47,7 @@ use uuid::Uuid;
 
 use crate::connections::{Choice, ConnectionSheet, ProfileItem, SheetEvent};
 use crate::messages::{
-    colour_slot, details_lines, format_time, granted_text, group_digits, options_text,
+    colour_slot, details_lines, format_time, granted_text, group_digits, options_text, row_result,
     status_failed, status_from_result, status_text,
 };
 use crate::palette::Cmd;
@@ -176,9 +176,7 @@ enum RowData {
         node: Option<NodeId>,
         topic: SharedString,
         time: SystemTime,
-        qos: u8,
         retain: bool,
-        size: usize,
         preview: SharedString,
         sent: Option<SendStatus>,
         colour: Option<usize>,
@@ -308,6 +306,74 @@ enum OptionsChange {
     Refused(&'static str),
     /// The row has the new options. Send a SUBSCRIBE with this QoS.
     Go(Qos),
+}
+
+/// Follow keeps the newest row in view. It has no switch: it is on when the list opens, and it
+/// goes off when the user scrolls away or selects a row. "Jump to newest" turns it on again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Follow {
+    on: bool,
+}
+
+impl Default for Follow {
+    fn default() -> Self {
+        Self { on: true }
+    }
+}
+
+impl Follow {
+    /// The user scrolled away or selected a row. Returns true when Follow went off now. While
+    /// the view is paused it does not move, so Follow keeps the state from before the pause.
+    fn leave(&mut self, paused: bool) -> bool {
+        let was = self.on;
+        if !paused {
+            self.on = false;
+        }
+        was && !self.on
+    }
+
+    fn jump(&mut self) {
+        self.on = true;
+    }
+
+    /// "Jump to newest" shows when Follow is off and the view is not paused.
+    fn jump_visible(&self, paused: bool) -> bool {
+        !self.on && !paused
+    }
+}
+
+/// The text of the "Jump to newest" button. `new` counts the messages since Follow went off.
+fn jump_label(new: u64) -> String {
+    if new == 0 {
+        "Jump to newest".into()
+    } else {
+        format!("Jump to newest ({})", group_digits(new))
+    }
+}
+
+/// The hint of the filter input. It says what the filter searches in.
+fn filter_placeholder(view: View) -> &'static str {
+    match view {
+        View::Messages => "Filter by topic or payload",
+        View::Tree => "Filter by topic",
+    }
+}
+
+/// The filter chips that show: "Show only" and a direction other than All (Messages view
+/// only). The text filter shows in its own input.
+fn chip_labels(show_only: Option<&str>, direction: DirectionFilter, view: View) -> Vec<String> {
+    let mut chips = Vec::new();
+    if let Some(f) = show_only {
+        chips.push(format!("Only: {}", display_safe(f)));
+    }
+    if view == View::Messages {
+        match direction {
+            DirectionFilter::All => {}
+            DirectionFilter::Received => chips.push("Received".into()),
+            DirectionFilter::Sent => chips.push("Sent".into()),
+        }
+    }
+    chips
 }
 
 /// The answer to a change of subscription QoS (see `Subs::check_qos_change`).
@@ -740,7 +806,7 @@ pub struct Navigator {
     /// What the details pane shows.
     detail_of: DetailOf,
     /// Keep the newest row at the top of the Messages view.
-    follow: bool,
+    follow: Follow,
     two_lines: bool,
     /// The update badge, and the check that runs.
     update: update::UpdateUi,
@@ -846,7 +912,7 @@ impl Navigator {
         let sub_input = cx.new(|cx| InputState::new(window, cx).placeholder("Topic filter"));
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Filter topics and payloads")
+                .placeholder(filter_placeholder(View::Messages))
                 .clean_on_escape()
         });
         // Each change restarts the debounce timer. Escape clears the text and sends a change too.
@@ -946,7 +1012,7 @@ impl Navigator {
             sel_msg: None,
             detail_of: DetailOf::Nothing,
             sel_topic: None,
-            follow: true,
+            follow: Follow::default(),
             two_lines: true,
             update: update::UpdateUi::default(),
             direction: DirectionFilter::All,
@@ -1332,7 +1398,7 @@ impl Navigator {
     /// Follow and a pause need no anchor. A scroll that is not yet drawn has no valid offset.
     fn capture_anchor(&mut self) {
         self.anchor = None;
-        if self.follow || self.store.is_paused() {
+        if self.follow.on || self.store.is_paused() {
             return;
         }
         let top = {
@@ -1524,6 +1590,30 @@ impl Navigator {
             Some(filter.to_string())
         };
         self.apply_filters(cx);
+    }
+
+    /// The hint of the filter input says what the filter searches in the current view.
+    fn sync_filter_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hint = filter_placeholder(self.view);
+        self.filter_input
+            .update(cx, |i, cx| i.set_placeholder(hint, window, cx));
+    }
+
+    /// The user scrolled away from the top or selected a row. Follow goes off, and the store
+    /// starts to count the new rows for "Jump to newest (N)". A pause keeps the state.
+    fn leave_follow(&mut self) {
+        if self.follow.leave(self.store.is_paused()) {
+            self.store.watch_new(true);
+        }
+    }
+
+    /// "Jump to newest": scroll to the top, keep the selection, turn Follow on.
+    fn jump_to_newest(&mut self, cx: &mut Context<Self>) {
+        self.follow.jump();
+        self.store.watch_new(false);
+        self.list_scroll
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
+        cx.notify();
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -1739,7 +1829,7 @@ impl Navigator {
             });
             self.detail_of = DetailOf::Message;
             self.insp.hist_pick = None;
-            self.follow = false;
+            self.leave_follow();
             self.list_scroll.scroll_to_item(i, ScrollStrategy::Nearest);
             cx.notify();
         }
@@ -1806,11 +1896,12 @@ impl Navigator {
 
     /// Changes the view. The selected message goes with the user: the tree selects its topic,
     /// and the list highlights its row if the row still exists. The details keep the message.
-    fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+    fn set_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
         if self.view == view {
             return;
         }
         self.view = view;
+        self.sync_filter_placeholder(window, cx);
         self.settings.ui.view = match view {
             View::Messages => ViewMode::Messages,
             View::Tree => ViewMode::Tree,
@@ -2507,16 +2598,13 @@ impl Navigator {
         }
     }
 
-    /// The centre header: view switch, direction filter, pause, follow and row height.
+    /// The centre header: view switch, filter, direction menu and pause.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let paused = self.store.is_paused();
         let messages = self.view == View::Messages;
-        let dir_ix = match self.direction {
-            DirectionFilter::All => 0,
-            DirectionFilter::Received => 1,
-            DirectionFilter::Sent => 2,
-        };
+        let direction = self.direction;
+        let weak = cx.entity().downgrade();
         h_flex()
             .flex_wrap()
             .items_center()
@@ -2532,15 +2620,16 @@ impl Navigator {
                         .segmented()
                         .small()
                         .selected_index(usize::from(!messages))
-                        .on_click(cx.listener(|v, ix: &usize, _, cx| {
-                            v.set_view(if *ix == 0 { View::Messages } else { View::Tree }, cx)
+                        .on_click(cx.listener(|v, ix: &usize, window, cx| {
+                            let view = if *ix == 0 { View::Messages } else { View::Tree };
+                            v.set_view(view, window, cx)
                         }))
                         .child("Messages")
                         .child("Tree"),
                 ),
             )
             .child(
-                div().flex_1().min_w(ui(160.)).max_w(ui(360.)).child(
+                div().flex_1().min_w(ui(160.)).child(
                     Input::new(&self.filter_input)
                         .small()
                         .prefix(IconName::Search),
@@ -2548,34 +2637,36 @@ impl Navigator {
             )
             .when(messages, |d| {
                 d.child(
-                    div().flex_none().w(ui(210.)).child(
-                        TabBar::new("direction")
-                            .segmented()
-                            .small()
-                            .selected_index(dir_ix)
-                            .on_click(cx.listener(|v, ix: &usize, _, cx| {
-                                v.direction = match *ix {
-                                    1 => DirectionFilter::Received,
-                                    2 => DirectionFilter::Sent,
-                                    _ => DirectionFilter::All,
-                                };
-                                v.apply_filters(cx);
-                            }))
-                            .child("All")
-                            .child("Received")
-                            .child("Sent"),
-                    ),
+                    Button::new("direction")
+                        .small()
+                        .ghost()
+                        .label(match direction {
+                            DirectionFilter::All => "All",
+                            DirectionFilter::Received => "Received",
+                            DirectionFilter::Sent => "Sent",
+                        })
+                        .dropdown_caret(true)
+                        .tooltip("Show received or sent messages")
+                        .dropdown_menu(move |menu, _, _| {
+                            [
+                                ("All", DirectionFilter::All),
+                                ("Received", DirectionFilter::Received),
+                                ("Sent", DirectionFilter::Sent),
+                            ]
+                            .into_iter()
+                            .fold(menu, |menu, (label, d)| {
+                                let weak = weak.clone();
+                                menu.item(
+                                    PopupMenuItem::new(label).checked(direction == d).on_click(
+                                        move |_, _, cx| {
+                                            weak.update(cx, |v, cx| v.set_direction(d, cx)).ok();
+                                        },
+                                    ),
+                                )
+                            })
+                        }),
                 )
             })
-            .child(div().flex_1())
-            .child(
-                Button::new("toggle-details")
-                    .small()
-                    .ghost()
-                    .icon(IconName::PanelRight)
-                    .label("Details")
-                    .on_click(cx.listener(|v, _, window, cx| v.toggle_details(window, cx))),
-            )
             .when(paused, |d| {
                 d.child(div().text_xs().text_color(theme.warning).child(format!(
                     "Paused · {} new",
@@ -2594,59 +2685,16 @@ impl Navigator {
                     .label(if paused { "Resume" } else { "Pause" })
                     .on_click(cx.listener(|v, _, _, cx| v.toggle_pause(cx))),
             )
-            .when(messages, |d| {
-                d.child(
-                    // A toggle with a selected state, not a primary/ghost swap.
-                    Toggle::new("follow")
-                        .small()
-                        .icon(IconName::ArrowDown)
-                        .label("Follow")
-                        .checked(self.follow)
-                        .on_click(cx.listener(|v, on: &bool, _, cx| {
-                            v.follow = *on;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("row-height")
-                        .small()
-                        .ghost()
-                        .label(if self.two_lines { "2 lines" } else { "1 line" })
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.two_lines = !v.two_lines;
-                            v.settings.ui.row_height = if v.two_lines {
-                                RowHeight::TwoLines
-                            } else {
-                                RowHeight::OneLine
-                            };
-                            v.persist();
-                            cx.notify();
-                        })),
-                )
-            })
     }
 
-    /// Active filters as small chips, with one "Clear filters" button.
+    /// Active filters as small chips, each with a clear button. The text filter has its own
+    /// input, so it has no chip.
     fn render_chips(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.filters_active() {
+        let chips = chip_labels(self.show_only.as_deref(), self.direction, self.view);
+        if chips.is_empty() {
             return None;
         }
         let theme = cx.theme();
-        let list = self.store.list_filter();
-        let mut chips: Vec<String> = Vec::new();
-        if !list.text.is_empty() {
-            chips.push(format!("Text: {}", display_safe(&list.text)));
-        }
-        if let Some(f) = &list.show_only {
-            chips.push(format!("Only: {}", display_safe(f)));
-        }
-        if self.view == View::Messages {
-            match list.direction {
-                DirectionFilter::All => {}
-                DirectionFilter::Received => chips.push("Received".into()),
-                DirectionFilter::Sent => chips.push("Sent".into()),
-            }
-        }
         Some(
             h_flex()
                 .flex_wrap()
@@ -2656,22 +2704,36 @@ impl Navigator {
                 .py_1()
                 .border_b_1()
                 .border_color(theme.border)
-                .children(chips.into_iter().map(|c| {
-                    Tag::secondary()
-                        .small()
-                        .max_w(ui(260.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(c)
+                .children(chips.into_iter().enumerate().map(|(i, c)| {
+                    // "Show only" is the first chip when it is set. The direction is the other.
+                    let is_only = c.starts_with("Only: ");
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            Tag::secondary()
+                                .small()
+                                .max_w(ui(260.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(c),
+                        )
+                        .child(
+                            Button::new(("clear-chip", i))
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::Close)
+                                .tooltip("Clear this filter")
+                                .on_click(cx.listener(move |v, _, _, cx| {
+                                    if is_only {
+                                        v.show_only = None;
+                                        v.apply_filters(cx);
+                                    } else {
+                                        v.set_direction(DirectionFilter::All, cx);
+                                    }
+                                })),
+                        )
                 }))
-                .child(
-                    Button::new("clear-filters")
-                        .xsmall()
-                        .ghost()
-                        .label("Clear filters")
-                        .on_click(cx.listener(|v, _, window, cx| v.clear_filters(window, cx))),
-                )
                 .into_any_element(),
         )
     }
@@ -2744,6 +2806,9 @@ impl Navigator {
             View::Messages => self.render_messages(cx),
             View::Tree => self.render_tree(cx),
         };
+        let jump = self.view == View::Messages
+            && self.store.list_len() > 0
+            && self.follow.jump_visible(self.store.is_paused());
         v_flex()
             .flex_1()
             .min_h_0()
@@ -2755,12 +2820,35 @@ impl Navigator {
             .on_action(cx.listener(|v, _: &CollapseNode, _, cx| v.expand_selected(false, cx)))
             // A user scroll turns Follow off.
             .on_scroll(cx.listener(|v, _, _, cx| {
-                if v.view == View::Messages && v.follow && v.list_scroll.is_scrollable() {
-                    v.follow = false;
+                if v.view == View::Messages && v.follow.on && v.list_scroll.is_scrollable() {
+                    v.leave_follow();
                     cx.notify();
                 }
             }))
+            .relative()
             .child(body)
+            .when(jump, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            // `occlude`: a click on the button must not reach the row below.
+                            div().occlude().child(
+                                Button::new("jump-to-newest")
+                                    .small()
+                                    .primary()
+                                    .icon(IconName::ArrowUp)
+                                    .label(jump_label(self.store.watched_new()))
+                                    .on_click(cx.listener(|v, _, _, cx| v.jump_to_newest(cx))),
+                            ),
+                        ),
+                )
+            })
     }
 
     fn render_messages(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -2768,7 +2856,7 @@ impl Navigator {
         if count == 0 {
             return self.render_empty(cx);
         }
-        if self.follow && !self.store.is_paused() {
+        if self.follow.on && !self.store.is_paused() {
             self.list_scroll
                 .scroll_to_item_strict(0, ScrollStrategy::Top);
         }
@@ -2792,9 +2880,7 @@ impl Navigator {
                             node,
                             topic: topic.to_string().into(),
                             time: msg.received_at,
-                            qos: msg.qos.as_u8(),
                             retain: msg.retain,
-                            size: msg.original_size,
                             // Built for the visible rows only.
                             preview: preview(&msg.payload, 240).into(),
                             sent: status.cloned(),
@@ -2841,28 +2927,22 @@ impl Navigator {
                 node: _,
                 topic,
                 time,
-                qos,
                 retain,
-                size,
                 preview,
                 sent,
                 colour,
             } => {
                 let selected = self.sel_msg.as_ref().is_some_and(|s| s.id == id);
-                let chip = div()
-                    .flex_none()
-                    .size_2()
-                    .rounded_full()
-                    .map(|d| match colour {
-                        Some(c) => d.bg(chip_colour(c, theme)),
-                        None => d.border_1().border_color(theme.border),
-                    });
+                // The subscription colour is a thin edge, and only with more than one
+                // subscription.
+                let edge = (self.subs.rows.len() > 1)
+                    .then(|| colour.map(|c| chip_colour(c, theme)))
+                    .flatten();
                 let topic = div()
                     .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .font_family(mono.clone())
                     .text_sm()
                     .map(|d| {
                         if self.two_lines {
@@ -2872,38 +2952,37 @@ impl Navigator {
                         }
                     })
                     .child(safe(&topic));
+                let result = sent.as_ref().and_then(row_result).map(|text| {
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(if status_failed(sent.as_ref().expect("sent")) {
+                            theme.danger
+                        } else {
+                            muted
+                        })
+                        .child(text)
+                });
+                let preview_el = || {
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_family(mono.clone())
+                        .text_xs()
+                        .text_color(muted)
+                        .child(preview.clone())
+                };
                 let line = h_flex()
                     .w_full()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family(mono.clone())
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format_time(time, self.utc_offset, true)),
-                    )
-                    .child(chip)
                     .when(sent.is_some(), |d| {
-                        d.child(
-                            h_flex()
-                                .flex_none()
-                                .gap_0p5()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(Icon::new(IconName::ArrowUp).xsmall())
-                                .child("Sent"),
-                        )
+                        d.child(Icon::new(IconName::ArrowUp).xsmall().text_color(muted))
                     })
                     .child(topic)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("QoS {qos}")),
-                    )
+                    .when(!self.two_lines, |d| d.child(preview_el().flex_1()))
                     .when(retain, |d| {
                         d.child(
                             div()
@@ -2913,53 +2992,35 @@ impl Navigator {
                                 .child("R"),
                         )
                     })
-                    .when_some(sent, |d, st| {
-                        d.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(if status_failed(&st) {
-                                    theme.danger
-                                } else {
-                                    muted
-                                })
-                                .child(status_text(&st)),
-                        )
-                    });
-                let preview = div()
+                    .children(result)
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(mono.clone())
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format_time(time, self.utc_offset, true)),
+                    );
+                let content = v_flex()
+                    .flex_1()
                     .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .font_family(mono.clone())
-                    .text_xs()
-                    .text_color(muted)
-                    .child(preview);
-                let size = div()
-                    .flex_none()
-                    .w(ui(64.))
-                    .flex()
-                    .justify_end()
-                    .font_family(mono)
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!("{size} B"));
-                let content = if self.two_lines {
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .child(line.child(size))
-                        .child(preview.w_full())
-                } else {
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .child(line.child(preview.flex_1()).child(size))
-                };
-                content
+                    .h_full()
+                    .px_2()
+                    .justify_center()
+                    .child(line)
+                    .when(self.two_lines, |d| d.child(preview_el().w_full()));
+                h_flex()
                     .id(("msg", id.0 as usize))
                     .h(height)
-                    .px_2()
+                    .w_full()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(2.))
+                            .h_full()
+                            .when_some(edge, |d, c| d.bg(c)),
+                    )
+                    .child(content)
                     .when(selected, |d| d.bg(theme.accent))
                     .hover(|d| d.bg(theme.muted))
                     .on_click(cx.listener(move |v, _, window, cx| {
@@ -3853,6 +3914,64 @@ mod tests {
 
     /// A QoS change uses the same request tracking as an options change: the row takes the QoS
     /// and the ID when the net thread accepts it, and only the result with that ID decides.
+    #[test]
+    fn follow_goes_off_by_the_user_and_comes_back_by_the_jump() {
+        use super::Follow;
+        let mut f = Follow::default();
+        assert!(f.on, "Follow is on when the list opens");
+        assert!(!f.jump_visible(false));
+        // A scroll or a selection turns it off once. The button shows then.
+        assert!(f.leave(false));
+        assert!(!f.on && f.jump_visible(false));
+        assert!(
+            !f.leave(false),
+            "the second move does not start a new count"
+        );
+        // While paused the button is off.
+        assert!(!f.jump_visible(true));
+        f.jump();
+        assert!(f.on && !f.jump_visible(false));
+    }
+
+    #[test]
+    fn a_pause_keeps_the_follow_state_from_before_the_pause() {
+        use super::Follow;
+        let mut on = Follow::default();
+        assert!(!on.leave(true), "paused: the move does not change Follow");
+        assert!(on.on);
+        let mut off = Follow::default();
+        off.leave(false);
+        assert!(!off.leave(true) && !off.on);
+    }
+
+    #[test]
+    fn the_jump_button_names_the_new_messages() {
+        use super::jump_label;
+        assert_eq!(jump_label(0), "Jump to newest");
+        assert_eq!(jump_label(7), "Jump to newest (7)");
+        assert_eq!(jump_label(1240), "Jump to newest (1 240)");
+    }
+
+    #[test]
+    fn the_filter_hint_and_the_chips_follow_the_view() {
+        use super::{View, chip_labels, filter_placeholder};
+        use navigator_core::store::DirectionFilter as D;
+        assert_eq!(
+            filter_placeholder(View::Messages),
+            "Filter by topic or payload"
+        );
+        assert_eq!(filter_placeholder(View::Tree), "Filter by topic");
+        // No filter, no chip. The text filter never has a chip.
+        assert!(chip_labels(None, D::All, View::Messages).is_empty());
+        assert_eq!(chip_labels(None, D::Sent, View::Messages), ["Sent"]);
+        assert_eq!(
+            chip_labels(Some("a/#"), D::Received, View::Messages),
+            ["Only: a/#", "Received"]
+        );
+        // The direction does not apply to the tree.
+        assert_eq!(chip_labels(Some("a/#"), D::Sent, View::Tree), ["Only: a/#"]);
+    }
+
     #[test]
     fn a_qos_change_is_tracked_by_its_request_id() {
         use super::QosChange;

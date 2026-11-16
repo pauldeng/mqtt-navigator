@@ -30,18 +30,15 @@ impl Navigator {
             Cmd::ManageConnections => self.open_sheet(None, false, window, cx),
             Cmd::NewConnection => self.open_sheet(None, true, window, cx),
             Cmd::FocusSubscribe => self.sub_input.update(cx, |i, cx| i.focus(window, cx)),
-            Cmd::ViewMessages => self.set_view(View::Messages, cx),
-            Cmd::ViewTree => self.set_view(View::Tree, cx),
+            Cmd::ViewMessages => self.set_view(View::Messages, window, cx),
+            Cmd::ViewTree => self.set_view(View::Tree, window, cx),
             Cmd::DirectionAll => self.set_direction(DirectionFilter::All, cx),
             Cmd::DirectionReceived => self.set_direction(DirectionFilter::Received, cx),
             Cmd::DirectionSent => self.set_direction(DirectionFilter::Sent, cx),
             Cmd::ClearFilters => self.clear_filters(window, cx),
             Cmd::FocusFilter => self.filter_input.update(cx, |i, cx| i.focus(window, cx)),
             Cmd::Pause | Cmd::Resume => self.toggle_pause(cx),
-            Cmd::FollowOn | Cmd::FollowOff => {
-                self.follow = cmd == Cmd::FollowOn;
-                cx.notify();
-            }
+            Cmd::JumpToNewest => self.jump_to_newest(cx),
             Cmd::RowHeight1 => self.set_row_height(false, cx),
             Cmd::RowHeight2 => self.set_row_height(true, cx),
             Cmd::ToggleDetails => self.toggle_details(window, cx),
@@ -105,7 +102,7 @@ impl Navigator {
         }
     }
 
-    fn set_direction(&mut self, d: DirectionFilter, cx: &mut Context<Self>) {
+    pub(super) fn set_direction(&mut self, d: DirectionFilter, cx: &mut Context<Self>) {
         self.direction = d;
         self.apply_filters(cx);
     }

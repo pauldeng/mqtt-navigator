@@ -90,7 +90,7 @@ The window has one place for each job. A control shows when it can act. Rare act
     - "Jump to newest" scrolls to the top, keeps the selection and turns Follow on again.
     - Pause freezes the view. Ingest continues inside the memory budget. The header shows "Paused · 1 240 new". "Jump to newest" does not show while paused. Resume returns to the Follow state from before the pause.
     - If the budget removed messages while paused, a marker row says "Older messages were removed (memory limit)".
-  - **Filters** (section 3.2) show as `Tag`s only when active (Show only, direction), with one **Clear filters** action. The text filter shows in its own input.
+  - **Filters** (section 3.2) show as `Tag`s only when active (Show only, direction), each with a clear button. The command palette and the empty state have **Clear filters**. The text filter shows in its own input.
 - **Bottom of the centre pane, Publish (major feature 2):**
   - The composer is **closed** by default. Then the bottom of the centre pane shows one text button, **New message** (`Ctrl/Cmd+Shift+N`). This is the only New message button.
   - Closing keeps the editors and the draft. Opening restores them. Closing does not move the draft into History.

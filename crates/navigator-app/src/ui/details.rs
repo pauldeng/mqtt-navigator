@@ -394,7 +394,7 @@ impl Navigator {
             messages_view: self.view == View::Messages,
             filters_active: self.filters_active(),
             paused: self.store.is_paused(),
-            follow: self.follow,
+            follow: self.follow.on,
             two_lines: self.two_lines,
             details_open: self.details_open,
             has_value: shown.is_some(),

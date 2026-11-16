@@ -26,8 +26,8 @@ pub enum Cmd {
     FocusFilter,
     Pause,
     Resume,
-    FollowOn,
-    FollowOff,
+    /// Scrolls to the newest message and turns Follow on.
+    JumpToNewest,
     RowHeight1,
     RowHeight2,
     ToggleDetails,
@@ -283,12 +283,13 @@ pub static COMMANDS: &[Entry] = &[
     ),
     e("pause", "Pause", None, Cmd::Pause, |f| !f.paused),
     e("resume", "Resume", None, Cmd::Resume, |f| f.paused),
-    e("follow-on", "Follow on", None, Cmd::FollowOn, |f| {
-        f.messages_view && !f.follow
-    }),
-    e("follow-off", "Follow off", None, Cmd::FollowOff, |f| {
-        f.messages_view && f.follow
-    }),
+    e(
+        "jump-to-newest",
+        "Jump to newest",
+        None,
+        Cmd::JumpToNewest,
+        |f| f.messages_view && !f.follow && !f.paused,
+    ),
     e(
         "row-height-1",
         "Row height: 1 line",
@@ -853,6 +854,31 @@ mod tests {
             })
             .contains(&"direction-sent")
         );
+    }
+
+    #[test]
+    fn jump_to_newest_shows_only_when_follow_is_off_and_the_view_runs() {
+        let base = Facts {
+            messages_view: true,
+            ..Facts::default()
+        };
+        // Follow is on: nothing to jump to. There is no "Follow on/off" any more.
+        let on = ids(&Facts {
+            follow: true,
+            ..base
+        });
+        assert!(!on.contains(&"jump-to-newest"));
+        assert!(!on.iter().any(|id| id.starts_with("follow-")));
+        assert!(ids(&base).contains(&"jump-to-newest"));
+        // A pause freezes the view, and the Tree view has no Follow.
+        assert!(
+            !ids(&Facts {
+                paused: true,
+                ..base
+            })
+            .contains(&"jump-to-newest")
+        );
+        assert!(!ids(&Facts::default()).contains(&"jump-to-newest"));
     }
 
     #[test]
