@@ -934,6 +934,7 @@ pub struct Navigator {
     next_op: u64,
     last_result: Option<(u64, String)>,
     rate: Rate,
+    counts: IngestCounts,
     metrics: Metrics,
     /// Metrics only: `MQTT_NAVIGATOR_AUTOSELECT=<topic>` (ignored without
     /// `MQTT_NAVIGATOR_METRICS`). When this topic arrives, the app selects it and applies Show
@@ -941,6 +942,20 @@ pub struct Navigator {
     /// measure the frame time of a large payload without UI automation.
     autoselect: Option<String>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Totals of the ingest path since the start of the session. They tell the cause of a drop:
+/// `dequeued = stale + admitted + store drops + topic drops` (the store counts the last two).
+#[derive(Clone, Copy, Debug, Default)]
+struct IngestCounts {
+    /// Messages that the merge took from the net queue.
+    dequeued: u64,
+    /// Messages of an old connection generation. The merge rejects them.
+    stale: u64,
+    /// Messages that the store accepted (a row in the list and a node value).
+    admitted: u64,
+    /// Longest wait of the first message of a merge in the net queue, since the last log line.
+    age_max: Duration,
 }
 
 #[derive(Default)]
@@ -1123,6 +1138,7 @@ impl Navigator {
             next_op: 1,
             last_result: None,
             rate: Rate::default(),
+            counts: IngestCounts::default(),
             metrics: Metrics::from_env(),
             autoselect: std::env::var("MQTT_NAVIGATOR_AUTOSELECT")
                 .ok()
@@ -1543,21 +1559,31 @@ impl Navigator {
         let mut n = 0u64;
         let mut metrics_line = None;
         let mut next = first;
+        if let Some(m) = &next {
+            let age = SystemTime::now()
+                .duration_since(m.received_at)
+                .unwrap_or_default();
+            self.counts.age_max = self.counts.age_max.max(age);
+        }
         while let Some(msg) = next.take() {
             self.net.release(&msg);
+            self.counts.dequeued += 1;
             if self.accept(msg.generation) {
                 let pick = self.autoselect.as_deref() == Some(&*msg.topic);
-                if let Insert::Stored(id) = self.store.insert(msg)
-                    && pick
-                {
-                    self.sel_topic = Some(id);
-                    self.sel_msg = None;
-                    self.detail_of = DetailOf::Topic;
-                    self.details_open = true;
-                    self.insp.hist_pick = None;
-                    self.insp.set_auto_all();
+                if let Insert::Stored(id) = self.store.insert(msg) {
+                    self.counts.admitted += 1;
+                    if pick {
+                        self.sel_topic = Some(id);
+                        self.sel_msg = None;
+                        self.detail_of = DetailOf::Topic;
+                        self.details_open = true;
+                        self.insp.hist_pick = None;
+                        self.insp.set_auto_all();
+                    }
                 }
                 n += 1;
+            } else {
+                self.counts.stale += 1;
             }
             if Instant::now() < deadline {
                 next = rx.try_recv().ok();
@@ -1583,16 +1609,21 @@ impl Navigator {
         self.metrics.merge(now - start);
         if self.metrics.due(now) {
             let s = self.store.stats();
-            let drops = s.drops
-                + s.topic_drops
-                + self
-                    .net
-                    .stats
-                    .drops
-                    .load(std::sync::atomic::Ordering::Relaxed);
+            let net_drops = self
+                .net
+                .stats
+                .drops
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let drops = s.drops + s.topic_drops + net_drops;
+            let queue = QueueView {
+                msgs: self.net.queued_msgs(),
+                bytes: self.net.queued_bytes(),
+                net_drops,
+            };
             let line = self
                 .metrics
-                .line(self.rate.per_sec, drops, s.topics, s.used_bytes, now);
+                .line(self.rate.per_sec, drops, &s, &self.counts, queue, now);
+            self.counts.age_max = Duration::ZERO;
             metrics_line = Some(line);
         }
         let r = &mut self.rate;
@@ -3706,6 +3737,16 @@ struct Metrics {
     frame_ms: std::rc::Rc<std::cell::RefCell<Vec<f32>>>,
     last: Instant,
     first_frame_logged: bool,
+    /// Counters at the last log line, for the rates.
+    prev: IngestCounts,
+}
+
+/// The net queue as the merge sees it.
+struct QueueView {
+    msgs: u64,
+    bytes: usize,
+    /// Messages that the net thread dropped because the queue was full.
+    net_drops: u64,
 }
 
 impl Metrics {
@@ -3716,6 +3757,7 @@ impl Metrics {
             frame_ms: Default::default(),
             last: Instant::now(),
             first_frame_logged: false,
+            prev: IngestCounts::default(),
         }
     }
 
@@ -3766,7 +3808,15 @@ impl Metrics {
     }
 
     /// Returns one log line (without RSS). The caller writes it on a background thread.
-    fn line(&mut self, rate: u64, drops: u64, topics: usize, used: usize, now: Instant) -> String {
+    fn line(
+        &mut self,
+        rate: u64,
+        drops: u64,
+        s: &navigator_core::store::StoreStats,
+        c: &IngestCounts,
+        q: QueueView,
+        now: Instant,
+    ) -> String {
         fn p95(v: &mut [f32]) -> (f32, f32) {
             if v.is_empty() {
                 return (0., 0.);
@@ -3774,12 +3824,35 @@ impl Metrics {
             v.sort_by(f32::total_cmp);
             (v[(v.len() - 1) * 95 / 100], v[v.len() - 1])
         }
+        let merges = self.merge_ms.len();
         let (mp, mm) = p95(&mut self.merge_ms);
         let (fp, fm) = p95(&mut self.frame_ms.borrow_mut());
+        let secs = now.duration_since(self.last).as_secs_f64().max(0.001);
+        let per_sec = |a: u64, b: u64| (a.saturating_sub(b) as f64 / secs) as u64;
+        let (dq_rate, adm_rate) = (
+            per_sec(c.dequeued, self.prev.dequeued),
+            per_sec(c.admitted, self.prev.admitted),
+        );
+        self.prev = *c;
+        // `drops` is the status bar total. The next fields split it by cause.
         let line = format!(
-            "metrics rate={rate}/s drops={drops} topics={topics} store={}MiB \
-             merge_p95={mp:.2}ms merge_max={mm:.2}ms frame_p95={fp:.2}ms frame_max={fm:.2}ms frames={}",
-            used / (1024 * 1024),
+            "metrics rate={rate}/s drops={drops} topics={} store={}MiB \
+             dequeued={} admitted={} stale={} net_drops={} mem_drops={} topic_drops={} \
+             list_drops={} dequeue_rate={dq_rate}/s admit_rate={adm_rate}/s \
+             queue={} queue_kib={} queue_age_max={:.1}ms \
+             merges={merges} merge_p95={mp:.2}ms merge_max={mm:.2}ms frame_p95={fp:.2}ms frame_max={fm:.2}ms frames={}",
+            s.topics,
+            s.used_bytes / (1024 * 1024),
+            c.dequeued,
+            c.admitted,
+            c.stale,
+            q.net_drops,
+            s.drops,
+            s.topic_drops,
+            s.list_drops,
+            q.msgs,
+            q.bytes / 1024,
+            c.age_max.as_secs_f32() * 1000.,
             self.frame_ms.borrow().len(),
         );
         self.merge_ms.clear();

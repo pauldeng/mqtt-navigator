@@ -263,6 +263,8 @@ pub struct V5Details {
 pub struct NetStats {
     /// Messages dropped because a queue was full (the byte budget or the message count).
     pub drops: AtomicU64,
+    /// Messages in the queue to the UI that the UI has not released yet.
+    pub queued_msgs: AtomicU64,
     /// Events dropped because the event log was full. This stays 0 while the UI drains the log
     /// (see [`EVENTS_CAP`]). It can grow only if the UI stops draining during many reconnects.
     pub event_drops: AtomicU64,
@@ -645,6 +647,17 @@ impl Net {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(n))
             });
+        let _ = self
+            .stats
+            .queued_msgs
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// Messages in `incoming` that the UI has not released yet.
+    pub fn queued_msgs(&self) -> u64 {
+        self.stats.queued_msgs.load(Ordering::Acquire)
     }
 
     /// Bytes ([`queue_cost`]) in `incoming` that the UI has not released yet.
@@ -1618,10 +1631,13 @@ impl Ingest {
             s.queued_bytes.load(Ordering::Acquire).saturating_add(cost) <= s.limits.queue_bytes;
         if fits {
             s.queued_bytes.fetch_add(cost, Ordering::AcqRel);
+            // The count goes up first: the UI can release the message at once.
+            s.stats.queued_msgs.fetch_add(1, Ordering::AcqRel);
             if s.incoming.try_send(message).is_ok() {
                 return;
             }
             s.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+            s.stats.queued_msgs.fetch_sub(1, Ordering::AcqRel);
         }
         s.stats.drops.fetch_add(1, Ordering::Relaxed);
     }
@@ -2467,6 +2483,46 @@ mod tests {
         shared.set_status(1, ConnState::Connecting);
         shared.active.set(0);
         assert!(!shared.set_connected(1, 2));
+    }
+
+    /// The queue length counter goes up on a queued message and never counts a dropped one.
+    #[test]
+    fn queue_length_counts_queued_messages_only() {
+        let (incoming, mut incoming_rx) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(4);
+        let (status, _status_rx) = watch::channel(Status::default());
+        let shared = Rc::new(Shared {
+            incoming,
+            events,
+            status,
+            stats: Arc::default(),
+            queued_bytes: Arc::default(),
+            broker_max_packet: Arc::default(),
+            drained: Arc::default(),
+            details: RefCell::default(),
+            limits: NetLimits::default(),
+            active: Cell::new(1),
+        });
+        let ingest = Ingest {
+            shared: shared.clone(),
+            generation: 1,
+            token: 1,
+        };
+        let publish = |g: u64| Incoming {
+            generation: g,
+            topic: Arc::from("t"),
+            payload: Bytes::from_static(b"x"),
+            qos: Qos::AtMostOnce,
+            retain: false,
+            props: MsgProps::default(),
+            received_at: SystemTime::now(),
+            protocol: Protocol::V5,
+        };
+        ingest.queue(publish);
+        ingest.queue(publish); // the channel holds one message: this is a drop
+        assert_eq!(shared.stats.queued_msgs.load(Ordering::Acquire), 1);
+        assert_eq!(shared.stats.drops.load(Ordering::Relaxed), 1);
+        assert!(incoming_rx.try_recv().is_ok());
     }
 
     #[test]

@@ -1634,6 +1634,11 @@ impl TopicStore {
     // Work
     // ---------------------------------------------------------------------------------------
 
+    /// True while the used bytes are above the memory budget (eviction is due).
+    pub fn over_budget(&self) -> bool {
+        self.used() > self.limits.budget
+    }
+
     /// True while `work` has something to do (a filter rebuild, a snapshot, or the list is above
     /// its cap).
     pub fn has_work(&self) -> bool {
