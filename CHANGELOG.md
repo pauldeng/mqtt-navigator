@@ -4,10 +4,51 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-18
+
+### Added
+
+- A settings menu (the gear in the title bar): Commands…, Appearance, Theme, Row height, Memory budget and Reset the layout.
+- The last line of the settings menu shows the renderer: GPU or software, and the drawing API. "Copy diagnostics" also names the API.
+- A **Details** popover in the status bar. It holds the parts that the status bar no longer shows.
+- **Follow** keeps the newest message in view. It has no switch. When the list leaves the top, Follow stops and a **Jump to newest (N)** button shows.
+- **New message** (`Ctrl/Cmd+Shift+N`) opens the publish composer.
+- Subscriptions: each row has a menu with Show only, QoS, Options, Retry and Remove. The add field has a QoS menu. A QoS change sends a new SUBSCRIBE. The command palette has the subscription actions too, and it shows a reason when an action cannot run.
+- Each active Show only or direction filter is a tag under the header, with its own **×** button.
+- Empty states for a connection with no subscriptions and for a broker that rejects `#`.
+- The details show the result of a sent message.
+- The metrics log line counts each drop cause (net queue, store memory, topic limit, list rows) and shows the net queue length, size and age.
+
+### Changed
+
+- A simpler UI:
+  - The title bar has the profile, the state, the settings menu and one main action. The filter moves to the centre header.
+  - The status bar shows a part only when it applies.
+  - A subscription row has a status dot, the filter, a Q1 tag and a menu.
+  - The centre header has one row: the view switch, the filter, a direction menu and Pause.
+  - A message row has the topic, R and the time on the first line, and the preview on the second line. A row shows a send result only while it is pending or when it failed. It no longer shows "Sent" or "Acknowledged".
+  - The publish composer is closed at start. When open, it shows Text or Hex, QoS, Retain, a menu and Send. Properties show only when present, with an **Add property** menu. Closing the composer keeps the draft. **Send** in the command palette opens a closed composer first, so it never sends a draft that you cannot see. `Esc` closes the focused composer or details pane and moves the focus to the list.
+  - In a wide window, the details open when you select a message or a topic. In a narrow window, `Enter` opens the details sheet.
+  - The details header has the topic, which you can select, and a menu. **Edit and publish** is the one action button. Properties are collapsed. When you choose a History entry, the Value tab shows a note and a **Show latest** button.
+  - The connection sheet moves the client ID to Advanced, and the client certificate, key and passphrase to a collapsed section.
+  - The security tag is easier to read.
+- Faster ingest under a large backlog: while the net queue is deep, the app merges once for each display frame, not each 33 ms. We tested it on a software renderer (22 frames/s) with 100-byte messages:
+  - At 25 000 msg/s and less, the app accepted the same number of messages.
+  - At 50 000 msg/s, the app accepted 24 % more messages. At 75 000 msg/s, it accepted 121 % more.
+  - With a text filter at 50 000 msg/s, it accepted 9 % more.
+  - With an expanded tree at 50 000 msg/s, it accepted 19 % fewer. One of the two runs gives most of this drop. We did not find its cause.
+  - Under overload, messages wait in the net queue (up to about 1.5 s). Without a filter or an expanded tree, the net queue drops the excess. With a filter or an expanded tree, the store can also drop messages.
+- The store does its clean-up in smaller rounds (32 items, before 256), so one round stays in the frame budget.
+
 ### Fixed
 
 - A TLS or WSS connection with no CA file now trusts the CA certificates of the operating system. Before, a broker with a valid public certificate (for example Let's Encrypt) showed "The server certificate is not trusted." The app loads the system CA certificates once for each run. If it finds none, the error text says so.
 - A CA file now replaces the system CA certificates. The app trusts only that file. Before, the user guide said that the app trusts both.
+
+### Known limitations
+
+- Under heavy load, a merge can take more than the 4 ms frame budget (up to about 6 ms, and once 8.8 ms). We measured this on a software renderer. We did not measure it on a GPU.
+- On macOS, "Copy diagnostics" does not name the graphics adapter.
 
 ## [0.2.0] - 2026-11-15
 
@@ -116,7 +157,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/pauldeng/mqtt-navigator/releases/tag/v0.1.0
