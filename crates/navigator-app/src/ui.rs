@@ -208,9 +208,31 @@ use crate::ingest;
 
 /// Least time between two frames, so that many messages make one render.
 const COALESCE: Duration = Duration::from_millis(33);
-/// The least time between two allocations that start from frame callbacks. Frames of a display
-/// below 125 Hz are not limited by it.
-const FRAME_GAP: Duration = Duration::from_millis(8);
+
+/// Who asks for an allocation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    /// The frame loop: a normal frame, or the fallback of backlog mode.
+    Loop,
+    /// The next-frame callback of `render` (backlog mode).
+    Frame,
+}
+
+/// The one rule for the frame budget. A frame callback allocates only if no allocation started
+/// since the previous callback, so there is at most one allocation in a display interval. The
+/// loop allocates only `COALESCE` after the last allocation, so it adds one only when frames stall.
+/// `last_frame` is the time of the previous callback.
+fn may_allocate(
+    caller: Caller,
+    now: Instant,
+    last_alloc: Option<Instant>,
+    last_frame: Option<Instant>,
+) -> bool {
+    match caller {
+        Caller::Frame => last_frame.is_none_or(|f| last_alloc.is_none_or(|a| a <= f)),
+        Caller::Loop => last_alloc.is_none_or(|a| now - a >= COALESCE),
+    }
+}
 
 /// How long the next frame waits, `since_last` after the start of the last one. `None`: no wait.
 /// The first message after a quiet time gets a frame at once, and a flood gets one frame in each
@@ -933,6 +955,10 @@ pub struct Navigator {
     /// Start of the last allocation. `allocate` uses it to keep one frame budget for the loop and
     /// the frame callbacks.
     last_alloc: Option<Instant>,
+    /// Time of the previous frame callback (see `may_allocate`).
+    last_frame: Option<Instant>,
+    /// A frame callback is registered. `arm_frame` keeps it so while backlog mode lasts.
+    armed: bool,
     metrics: Metrics,
     /// Metrics only: `MQTT_NAVIGATOR_AUTOSELECT=<topic>` (ignored without
     /// `MQTT_NAVIGATOR_METRICS`). When this topic arrives, the app selects it and applies Show
@@ -1144,6 +1170,8 @@ impl Navigator {
             incoming,
             held: None,
             last_alloc: None,
+            last_frame: None,
+            armed: false,
             metrics: Metrics::from_env(),
             autoselect: std::env::var("MQTT_NAVIGATOR_AUTOSELECT")
                 .ok()
@@ -1437,13 +1465,8 @@ impl Navigator {
     ) {
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok((held, work, backlog, since)) = this.update(cx, |v, _| {
-                    (
-                        v.held.is_some(),
-                        v.store.has_work(),
-                        v.backlog.on(),
-                        v.last_alloc.map(|t| t.elapsed()),
-                    )
+                let Ok((held, work, backlog)) = this.update(cx, |v, _| {
+                    (v.held.is_some(), v.store.has_work(), v.backlog.on())
                 }) else {
                     break;
                 };
@@ -1458,6 +1481,11 @@ impl Navigator {
                         break;
                     }
                 }
+                // The time is read after the wait for a message, so the first message after a
+                // quiet time does not wait.
+                let Ok(since) = this.update(cx, |v, _| v.last_alloc.map(|t| t.elapsed())) else {
+                    break;
+                };
                 let wait = if backlog {
                     Some(COALESCE)
                 } else {
@@ -1467,7 +1495,7 @@ impl Navigator {
                     cx.background_executor().timer(wait).await;
                 }
                 if this
-                    .update(cx, |v, cx| v.allocate(COALESCE, false, cx))
+                    .update(cx, |v, cx| v.allocate(Caller::Loop, cx))
                     .is_err()
                 {
                     break;
@@ -1478,12 +1506,15 @@ impl Navigator {
     }
 
     /// The one place that runs a merge allocation: the merge, the redraw and the metrics line.
-    /// It does nothing if the last allocation started less than `gap` ago, so a late callback or
-    /// timer cannot add a second allocation to the same frame. `paced` is true for a frame
-    /// callback.
-    fn allocate(&mut self, gap: Duration, paced: bool, cx: &mut Context<Self>) {
+    /// `may_allocate` keeps one frame budget for the loop and the frame callbacks, so a late
+    /// callback or timer does nothing.
+    fn allocate(&mut self, caller: Caller, cx: &mut Context<Self>) {
         let now = Instant::now();
-        if self.last_alloc.is_some_and(|t| now - t < gap) {
+        let ok = may_allocate(caller, now, self.last_alloc, self.last_frame);
+        if caller == Caller::Frame {
+            self.last_frame = Some(now);
+        }
+        if !ok {
             return;
         }
         // The loop holds the queue only while it waits for a message, and then nothing is due.
@@ -1493,11 +1524,30 @@ impl Navigator {
         };
         self.last_alloc = Some(now);
         let first = self.held.take();
-        if let Some(line) = self.merge(first, &mut rx, paced) {
+        if let Some(line) = self.merge(first, &mut rx, caller == Caller::Frame) {
             cx.background_executor().spawn(write_metrics(line)).detach();
         }
         cx.notify();
         self.schedule_rate_zero(cx);
+    }
+
+    /// Registers the frame callback while backlog mode lasts. The callback allocates, and then it
+    /// registers the next one, also when it skipped. So the pacing follows the display.
+    fn arm_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.armed || !self.backlog.on() {
+            return;
+        }
+        self.armed = true;
+        let this = cx.weak_entity();
+        // GPUI runs the callbacks of a frame before it decides to draw. The merge in the
+        // callback marks the view dirty, so the same frame draws its result.
+        window.on_next_frame(move |window, cx| {
+            let _ = this.update(cx, |v, cx| {
+                v.armed = false;
+                v.allocate(Caller::Frame, cx);
+                v.arm_frame(window, cx);
+            });
+        });
     }
 
     /// A design height in pixels now. The rows are `ui(..)` high, so this equals their height.
@@ -3546,15 +3596,7 @@ fn status_items(f: &StatusFacts) -> StatusItems {
 impl Render for Navigator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.metrics.frame_start(window);
-        if self.backlog.on() {
-            // GPUI runs the callbacks of a frame before it decides to draw. The merge in the
-            // callback marks the view dirty, so the same frame draws its result. A callback that
-            // comes late or twice finds the frame budget used and does nothing.
-            let this = cx.weak_entity();
-            window.on_next_frame(move |_, cx| {
-                let _ = this.update(cx, |v, cx| v.allocate(FRAME_GAP, true, cx));
-            });
-        }
+        self.arm_frame(window, cx);
         self.rem = f32::from(window.rem_size());
         self.sync_subs();
         // A notify during the draw does not schedule a frame, so it goes out after the draw.
@@ -3961,14 +4003,15 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
-        COALESCE, ConnState, ConnectionDetails, DetailsCache, GenGate, Protocol, Status,
-        StatusFacts, StatusItems, SubState, Subs, coalesce_wait, connection_live, scroll_top_of,
-        send_error_text, status_items, top_row, ui, validate_filter,
+        COALESCE, Caller, ConnState, ConnectionDetails, DetailsCache, GenGate, Protocol, Status,
+        StatusFacts, StatusItems, SubState, Subs, coalesce_wait, connection_live, may_allocate,
+        scroll_top_of, send_error_text, status_items, top_row, ui, validate_filter,
     };
     use gpui_kit::{px, rems};
     use navigator_core::Qos;
     use navigator_core::net::SendError;
     use std::time::Duration;
+    use std::time::Instant;
 
     #[test]
     fn the_composer_follows_the_connection_while_connected_and_the_profile_otherwise() {
@@ -4791,5 +4834,25 @@ mod tests {
             coalesce_wait(Duration::from_millis(30)),
             Some(COALESCE - Duration::from_millis(30))
         );
+    }
+
+    /// A 20 Hz display (a frame each 50 ms): the callback allocates at 0, the fallback at 36, and
+    /// the callback at 50 must not allocate, because the fallback used this interval.
+    #[test]
+    fn two_allocations_never_share_a_display_interval() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let ms = |n| Some(at(n));
+        // The first callback, and the fallback 36 ms after the allocation.
+        assert!(may_allocate(Caller::Frame, at(0), None, None));
+        assert!(!may_allocate(Caller::Loop, at(20), ms(0), ms(0)));
+        assert!(may_allocate(Caller::Loop, at(36), ms(0), ms(0)));
+        // The next callback finds the fallback allocation since the last callback: skip.
+        assert!(!may_allocate(Caller::Frame, at(50), ms(36), ms(0)));
+        // The one after it allocates again.
+        assert!(may_allocate(Caller::Frame, at(100), ms(36), ms(50)));
+        // At 144 Hz every callback allocates, and the loop never does.
+        assert!(may_allocate(Caller::Frame, at(7), ms(0), ms(0)));
+        assert!(!may_allocate(Caller::Loop, at(7), ms(0), ms(0)));
     }
 }
