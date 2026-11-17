@@ -204,24 +204,10 @@ enum RowData {
     RemovedMarker,
 }
 
-/// Most merge work on the UI thread in one frame.
-const FRAME_BUDGET: Duration = Duration::from_millis(4);
-/// Part of each frame that `TopicStore::work` keeps while it has work. A flood cannot take it.
-const WORK_RESERVE: Duration = Duration::from_millis(1);
-/// `TopicStore::work` stops this long before the end of the frame. One round takes up to 0.4 ms
-/// (measured), and a round that starts before the deadline can end after it.
-const WORK_MARGIN: Duration = Duration::from_micros(750);
+use crate::ingest;
+
 /// Least time between two frames, so that many messages make one render.
 const COALESCE: Duration = Duration::from_millis(33);
-
-/// Merge time of one frame. While the store has work, the merge leaves `WORK_RESERVE` of it.
-fn merge_budget(has_work: bool) -> Duration {
-    if has_work {
-        FRAME_BUDGET - WORK_RESERVE
-    } else {
-        FRAME_BUDGET
-    }
-}
 
 /// How long the next frame waits, `since_last` after the start of the last one. `None`: no wait.
 /// The first message after a quiet time gets a frame at once, and a flood gets one frame in each
@@ -1546,15 +1532,14 @@ impl Navigator {
         let _ = self.kick.try_send(());
     }
 
-    /// One frame: merges the messages and then runs store work, all inside `FRAME_BUDGET`.
+    /// One frame: merges the messages and then runs store work, inside the plan of `ingest::plan`.
     fn merge(
         &mut self,
         first: Option<navigator_core::Incoming>,
         rx: &mut tokio::sync::mpsc::Receiver<navigator_core::Incoming>,
     ) -> Option<String> {
         let start = Instant::now();
-        let work = self.store.has_work();
-        let deadline = start + merge_budget(work);
+        let plan = ingest::plan(self.store.has_work());
         self.capture_anchor();
         let mut n = 0u64;
         let mut metrics_line = None;
@@ -1565,12 +1550,17 @@ impl Navigator {
                 .unwrap_or_default();
             self.counts.age_max = self.counts.age_max.max(age);
         }
-        while let Some(msg) = next.take() {
+        // Filter rebuilds and cap trims keep a part of the allocation. `work` always does one
+        // round, also when the merge used its time, so a flood cannot starve it.
+        ingest::run(&mut self.store, start, plan, |store| {
+            let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) else {
+                return false;
+            };
             self.net.release(&msg);
             self.counts.dequeued += 1;
-            if self.accept(msg.generation) {
+            if self.gate.accept(msg.generation) {
                 let pick = self.autoselect.as_deref() == Some(&*msg.topic);
-                if let Insert::Stored(id) = self.store.insert(msg) {
+                if let Insert::Stored(id) = store.insert(msg) {
                     self.counts.admitted += 1;
                     if pick {
                         self.sel_topic = Some(id);
@@ -1585,15 +1575,8 @@ impl Navigator {
             } else {
                 self.counts.stale += 1;
             }
-            if Instant::now() < deadline {
-                next = rx.try_recv().ok();
-            }
-        }
-        // Filter rebuilds and cap trims keep a part of the frame. `work` always does one round,
-        // also when the merge used its time, so a flood cannot starve it.
-        if self.store.has_work() {
-            self.store.work(start + FRAME_BUDGET - WORK_MARGIN);
-        }
+            true
+        });
         self.restore_anchor();
         // `work` can remove the selected topic (an idle leaf, near the caps).
         if self
@@ -3880,10 +3863,9 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
-        COALESCE, ConnState, ConnectionDetails, DetailsCache, FRAME_BUDGET, GenGate, Protocol,
-        Status, StatusFacts, StatusItems, SubState, Subs, WORK_RESERVE, coalesce_wait,
-        connection_live, merge_budget, scroll_top_of, send_error_text, status_items, top_row, ui,
-        validate_filter,
+        COALESCE, ConnState, ConnectionDetails, DetailsCache, GenGate, Protocol, Status,
+        StatusFacts, StatusItems, SubState, Subs, coalesce_wait, connection_live, scroll_top_of,
+        send_error_text, status_items, top_row, ui, validate_filter,
     };
     use gpui_kit::{px, rems};
     use navigator_core::Qos;
@@ -4700,13 +4682,6 @@ mod tests {
         s.begin_remove("a/#");
         s.connection_reset();
         assert!(s.rows.is_empty() && s.index.is_empty() && s.take_dirty());
-    }
-
-    #[test]
-    fn the_merge_leaves_the_work_reserve_only_when_there_is_work() {
-        assert_eq!(merge_budget(false), FRAME_BUDGET);
-        assert_eq!(merge_budget(true) + WORK_RESERVE, FRAME_BUDGET);
-        assert!(merge_budget(true) >= Duration::from_millis(3));
     }
 
     #[test]

@@ -72,6 +72,10 @@ const PAUSED_LIST_FACTOR: usize = 10;
 /// Items one step of `work` handles before it looks at the clock. `work` always does one step.
 const WORK_CHUNK: usize = 256;
 
+/// Units one snapshot step handles. A unit walks the tree and copies a row, so a round of
+/// `WORK_CHUNK` took up to 0.73 ms (release, 100k nodes). This is a quarter of that.
+const SNAP_CHUNK: usize = 64;
+
 /// Most rows an insert removes because the list is above its cap (after a pause).
 const MAX_TRIM_PER_INSERT: usize = 8;
 
@@ -1654,7 +1658,7 @@ impl TopicStore {
     /// (paused), the list filter rebuild and the removal of rows above the cap (after a pause).
     /// Returns true while work remains.
     ///
-    /// One round is one step of at most 256 items of the first task that has work. A step takes
+    /// One round is one step of the first task that has work (at most 256 items, 64 for the snapshot). A step takes
     /// some microseconds and never depends on the size of the store. The call does rounds until
     /// `deadline`. If `deadline` has passed already, it does exactly one round, so that repeated
     /// calls always make progress. The UI should not call it after its frame budget is used.
@@ -1667,7 +1671,7 @@ impl TopicStore {
             } else if self.tf.active && self.tree_cursor < self.nodes.len() {
                 self.tree_step(WORK_CHUNK);
             } else if self.snap_job.is_some() {
-                self.snap_step(WORK_CHUNK);
+                self.snap_step(SNAP_CHUNK);
             } else if self.scanning {
                 self.list_step(WORK_CHUNK);
             } else {
@@ -4618,14 +4622,14 @@ mod tests {
         while s.work(Instant::now()) {
             calls += 1;
             let n = s.snap_rows.len();
-            assert!(n - seen <= WORK_CHUNK, "a slice handles at most one chunk");
+            assert!(n - seen <= SNAP_CHUNK, "a slice handles at most one chunk");
             seen = n;
             if calls % 10 == 0 {
                 // Nodes that arrive during the job are not in the snapshot.
                 s.insert(msg(&format!("late/{calls}"), b"x"));
             }
         }
-        assert!(calls >= SNAPSHOT_MAX_ROWS / WORK_CHUNK, "{calls} slices");
+        assert!(calls >= SNAPSHOT_MAX_ROWS / SNAP_CHUNK, "{calls} slices");
         assert_eq!(s.rows().len(), SNAPSHOT_MAX_ROWS, "the cap stays");
         let rows = s.rows().to_vec();
         assert!(rows.iter().all(|id| !s.path(*id).starts_with("late")));
@@ -4815,6 +4819,70 @@ mod tests {
              worst {worst3:?}, total {total3:?}, rows() {rows_time:?} ({rows} rows); site3 rows() \
              {rows3_time:?}; pause {pause_time:?} (10k rows), {pause_max_time:?} (cap)"
         );
+    }
+
+    /// The time of single `work` rounds (one chunk each). There is no timing assert:
+    /// run `cargo test --release -- --nocapture round_costs` to see the numbers.
+    #[test]
+    fn round_costs() {
+        let rounds = |s: &mut TopicStore, what: &str| {
+            let (mut n, mut worst, mut sum) = (0u32, Duration::ZERO, Duration::ZERO);
+            loop {
+                let t = Instant::now();
+                let more = s.work(Instant::now());
+                let d = t.elapsed();
+                worst = worst.max(d);
+                sum += d;
+                n += 1;
+                if !more {
+                    break;
+                }
+            }
+            println!(
+                "round {what}: {n} rounds, worst {worst:?}, mean {:?}",
+                sum / n
+            );
+        };
+        let mut s = TopicStore::new(many_nodes());
+        for i in 0..100_000u32 {
+            let topic = format!("site{}/line{}/dev{i}", i % 10, (i / 10) % 100);
+            stored(s.insert(msg(&topic, format!("{{\"v\":{i}}}").as_bytes())));
+        }
+        s.set_list_filter(ListFilter {
+            text: "dev9999".into(),
+            ..ListFilter::default()
+        });
+        rounds(&mut s, "list filter");
+        s.set_tree_filter(TreeFilter {
+            text: "line42/dev4".into(),
+            ..TreeFilter::default()
+        });
+        rounds(&mut s, "tree filter");
+        s.set_tree_filter(TreeFilter {
+            show_only: Some("+/#".into()),
+            ..TreeFilter::default()
+        });
+        rounds(&mut s, "tree filter all visible");
+        s.set_paused(true);
+        rounds(&mut s, "snapshot");
+        s.set_paused(false);
+        rounds(&mut s, "trim");
+        // Eviction at the budget with 1 KB payloads.
+        let mut e = TopicStore::new(Limits {
+            budget: 32 * 1024 * 1024,
+            ..big()
+        });
+        let payload = vec![b'x'; 1000];
+        let mut worst = Duration::ZERO;
+        for i in 0..200_000u32 {
+            e.insert(msg(&format!("e/{}", i % 5000), &payload));
+            if e.mem_pending() {
+                let t = Instant::now();
+                e.work(Instant::now());
+                worst = worst.max(t.elapsed());
+            }
+        }
+        println!("round eviction: worst {worst:?}");
     }
 
     #[test]

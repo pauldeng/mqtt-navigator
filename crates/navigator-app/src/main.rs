@@ -10,6 +10,7 @@ mod connections;
 #[cfg(target_os = "linux")]
 mod desktop_entry;
 mod diagnostics;
+mod ingest;
 mod inspector;
 mod logging;
 mod messages;
