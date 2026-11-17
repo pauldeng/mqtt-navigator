@@ -100,6 +100,15 @@ pub async fn next_first(
     }
 }
 
+/// The next message of an allocation: the held one first, then the queue. A held message is
+/// older than every queued one.
+pub fn next_message(
+    held: &mut Option<Incoming>,
+    rx: &mut tokio::sync::mpsc::Receiver<Incoming>,
+) -> Option<Incoming> {
+    held.take().or_else(|| rx.try_recv().ok())
+}
+
 /// Where the time of one allocation went.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Timing {
@@ -219,6 +228,30 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// The held message is older than the queue. An allocation that took the queue first would
+    /// store the newer value first, and the older one would replace it.
+    #[test]
+    fn an_allocation_takes_the_held_message_before_the_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.try_send(msg("a".into(), Bytes::from_static(b"new")))
+            .expect("room");
+        let mut held = Some(msg("a".into(), Bytes::from_static(b"old")));
+        let mut s = TopicStore::new(Limits::default());
+        let mut order = Vec::new();
+        run(&mut s, Instant::now(), plan(false, false, false), |_| {
+            let Some(m) = next_message(&mut held, &mut rx) else {
+                return false;
+            };
+            order.push(m.payload.clone());
+            true
+        });
+        assert_eq!(
+            order,
+            [Bytes::from_static(b"old"), Bytes::from_static(b"new")]
+        );
+        assert!(held.is_none());
     }
 
     /// An idle loop parks on the queue: it has no timer, and only a message or a kick wakes it.
