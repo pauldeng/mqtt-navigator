@@ -1567,18 +1567,21 @@ impl Navigator {
         let mut n = 0u64;
         let mut metrics_line = None;
         let mut next = first;
-        if let Some(m) = &next {
-            let age = SystemTime::now()
-                .duration_since(m.received_at)
-                .unwrap_or_default();
-            self.counts.age_max = self.counts.age_max.max(age);
-        }
+        let mut aged = false;
         // Filter rebuilds and cap trims keep a part of the allocation. `work` always does one
         // round, also when the merge used its time, so a flood cannot starve it.
         let timing = ingest::run(&mut self.store, start, plan, |store| {
             let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) else {
                 return false;
             };
+            if !aged {
+                // The first message of an allocation is the oldest one in it.
+                aged = true;
+                let age = SystemTime::now()
+                    .duration_since(msg.received_at)
+                    .unwrap_or_default();
+                self.counts.age_max = self.counts.age_max.max(age);
+            }
             self.net.release(&msg);
             self.counts.dequeued += 1;
             if self.gate.accept(msg.generation) {
