@@ -192,7 +192,7 @@ At 60 Hz the candidate admits all of 50k msg/s with no drop, and 67k of 75k. At 
 
 ## 8. Idle wake-ups
 
-`idle.sh`: 3 floods of 20k msg/s for 8 s, 8 s to drain, then 10 s of idle. Voluntary context switches of the main thread: baseline 626, candidate 626. All threads: 666 and 646 (repeated for `HEAD`). The metrics log has no line while idle. The candidate adds no wake-up. The count of about 60 per second is in both builds. It is not zero. Its source is not in this change (I did not look for it). The owner may want to check it (a frame timer of gpui, the cursor or the window system).
+`idle.sh`: 3 floods of 20k msg/s for 8 s, 8 s to drain, then 10 s of idle. Voluntary context switches of the main thread: baseline 626, candidate 626. All threads: 666 and 666 (`HEAD`, repeated after the last scheduling fix: 627 and 666). The metrics log has no line while idle. The candidate adds no wake-up. The count of about 60 per second is in both builds. It is not zero. Its source is not in this change (I did not look for it). The owner may want to check it (a frame timer of gpui, the cursor or the window system).
 
 ## 9. Gate
 
@@ -200,7 +200,7 @@ At 60 Hz the candidate admits all of 50k msg/s with no drop, and 67k of 75k. At 
 |---|---|
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass |
-| `cargo test --workspace` | pass (app 135, core 171, broker-free tests) |
+| `cargo test --workspace` | pass (app 136, core 171, broker-free tests) |
 | `net_mosquitto`, `broker_matrix`, `net_system_ca` (Mosquitto, `broker-tests`) | pass (22, 27, 1 tests) |
 | `load_ci` (release, warm-up 15 s, 60 s) | pass: 10002 msg/s, 751000 sent, 0 missing, 0 duplicate, 0 drops, merge slices p99 1.56 ms, max 1.81 ms. The test drives `navigator-core` and the store, not the UI loop. |
 
