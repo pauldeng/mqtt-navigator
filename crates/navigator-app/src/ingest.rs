@@ -298,7 +298,8 @@ mod tests {
         } else {
             Duration::from_micros(750)
         };
-        let (mut i, mut worst) = (0u32, Duration::ZERO);
+        let mut i = 0u32;
+        let mut over = Vec::new();
         let mut plans = [
             plan(false, false, false),
             plan(true, false, false),
@@ -307,7 +308,7 @@ mod tests {
         ]
         .into_iter()
         .cycle();
-        for round in 0..400 {
+        for _ in 0..400 {
             let p = plans.next().expect("cycle");
             let start = Instant::now();
             run(&mut s, start, p, |st| {
@@ -318,14 +319,18 @@ mod tests {
                 ));
                 true
             });
-            let took = start.elapsed();
-            worst = worst.max(took.saturating_sub(p.work));
-            assert!(
-                took <= p.work + margin,
-                "round {round}: {took:?} for a plan of {p:?}"
-            );
+            over.push(start.elapsed().saturating_sub(p.work));
         }
-        println!("allocation overrun past the work deadline: worst {worst:?}");
+        over.sort();
+        let (p95, worst) = (over[over.len() * 95 / 100], over[over.len() - 1]);
+        println!("allocation overrun past the work deadline: p95 {p95:?}, worst {worst:?}");
+        // The OS can stop the test thread (the tests run in parallel), so only the 95th
+        // percentile has the tight bound. The worst case gets a loose one.
+        assert!(p95 <= margin, "p95 {p95:?}");
+        assert!(
+            worst <= margin + Duration::from_millis(5),
+            "worst {worst:?}"
+        );
         assert!(i > 0);
     }
 }

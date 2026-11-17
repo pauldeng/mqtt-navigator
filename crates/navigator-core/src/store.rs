@@ -70,11 +70,13 @@ const SNAPSHOT_PREVIEW_BYTES: usize = 64;
 const PAUSED_LIST_FACTOR: usize = 10;
 
 /// Items one step of `work` handles before it looks at the clock. `work` always does one step.
-const WORK_CHUNK: usize = 256;
+/// Eviction in a full store touches cold memory: a step of 256 items took up to 2.2 ms in a
+/// load run (Xvfb, 50k msg/s), and that broke the 4 ms frame budget. 32 items take about 0.3 ms.
+const WORK_CHUNK: usize = 32;
 
-/// Units one snapshot step handles. A unit walks the tree and copies a row, so a round of
-/// `WORK_CHUNK` took up to 0.73 ms (release, 100k nodes). This is a quarter of that.
-const SNAP_CHUNK: usize = 64;
+/// Units one snapshot step handles. A unit walks the tree and copies a row. A round of 256
+/// units took up to 0.73 ms with a warm cache.
+const SNAP_CHUNK: usize = 16;
 
 /// Most rows an insert removes because the list is above its cap (after a pause).
 const MAX_TRIM_PER_INSERT: usize = 8;
@@ -1658,7 +1660,7 @@ impl TopicStore {
     /// (paused), the list filter rebuild and the removal of rows above the cap (after a pause).
     /// Returns true while work remains.
     ///
-    /// One round is one step of the first task that has work (at most 256 items, 64 for the snapshot). A step takes
+    /// One round is one step of the first task that has work (at most 32 items, 16 for the snapshot). A step takes
     /// some microseconds and never depends on the size of the store. The call does rounds until
     /// `deadline`. If `deadline` has passed already, it does exactly one round, so that repeated
     /// calls always make progress. The UI should not call it after its frame budget is used.
@@ -4818,6 +4820,32 @@ mod tests {
              list 3 filters: {n2} slices, worst {worst2:?}, total {total2:?}; tree: {n3} slices, \
              worst {worst3:?}, total {total3:?}, rows() {rows_time:?} ({rows} rows); site3 rows() \
              {rows3_time:?}; pause {pause_time:?} (10k rows), {pause_max_time:?} (cap)"
+        );
+    }
+
+    /// One `work` round removes at most `WORK_CHUNK` items. Eviction in a full store is slow (cold
+    /// memory), so a long round would break the frame budget.
+    #[test]
+    fn one_eviction_round_is_one_small_chunk() {
+        let mut s = TopicStore::new(Limits {
+            budget: 4 * 1024 * 1024,
+            ..big()
+        });
+        let payload = vec![b'x'; 1000];
+        let mut i = 0;
+        while !s.mem_pending() {
+            s.insert(msg(&format!("c/{}", i % 100), &payload));
+            i += 1;
+        }
+        let before = s.hist_order.len();
+        assert!(
+            s.work(Instant::now()),
+            "eviction is not done after one round"
+        );
+        let gone = before - s.hist_order.len();
+        assert!(
+            gone > 0 && gone <= WORK_CHUNK,
+            "{gone} entries in one round"
         );
     }
 
