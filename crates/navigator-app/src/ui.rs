@@ -922,7 +922,10 @@ pub struct Navigator {
     rate: Rate,
     counts: IngestCounts,
     backlog: ingest::Backlog,
-    /// Wakes the frame loop. `render` sends it from a next-frame callback in backlog mode.
+    /// The net queue. The frame loop and the next-frame callback of `render` share it. The
+    /// callback runs the paced merge, so the draw of the same frame shows its result.
+    incoming: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<navigator_core::Incoming>>>,
+    /// Tells the frame loop that the callback merged. `render` sends it in backlog mode.
     tick: tokio::sync::mpsc::Sender<()>,
     metrics: Metrics,
     /// Metrics only: `MQTT_NAVIGATOR_AUTOSELECT=<topic>` (ignored without
@@ -1040,7 +1043,8 @@ impl Navigator {
 
         let (kick, kick_rx) = tokio::sync::mpsc::channel(1);
         let (tick_tx, tick_rx) = tokio::sync::mpsc::channel(1);
-        Self::spawn_ingest(incoming, kick_rx, tick_rx, cx);
+        let incoming = Arc::new(tokio::sync::Mutex::new(incoming));
+        Self::spawn_ingest(incoming.clone(), kick_rx, tick_rx, cx);
         Self::spawn_events(events, drained, cx);
         Self::spawn_status(status_rx, cx);
         // The time zone file is read off the UI thread.
@@ -1132,6 +1136,7 @@ impl Navigator {
             rate: Rate::default(),
             counts: IngestCounts::default(),
             backlog: ingest::Backlog::default(),
+            incoming,
             tick: tick_tx,
             metrics: Metrics::from_env(),
             autoselect: std::env::var("MQTT_NAVIGATOR_AUTOSELECT")
@@ -1416,12 +1421,12 @@ impl Navigator {
 
     /// The frame loop. It is the only scheduler of UI-thread store work. Each frame has one
     /// deadline, shared by the merge and `TopicStore::work`. Outside backlog mode, one more frame
-    /// follows after `COALESCE` while work remains. In backlog mode (a deep net queue) the loop
-    /// runs one allocation in each display frame: `render` asks for a frame callback, and the
-    /// callback wakes the loop. With no work, the loop waits for a message or a kick and has
-    /// no timer.
+    /// follows after `COALESCE` while work remains. In backlog mode (a deep net queue) one
+    /// allocation runs in each display frame. `render` asks for a frame callback, and the callback
+    /// runs the merge before the draw of that frame. The loop only waits for its tick. With no
+    /// work, the loop waits for a message or a kick and has no timer.
     fn spawn_ingest(
-        mut rx: tokio::sync::mpsc::Receiver<navigator_core::Incoming>,
+        incoming: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<navigator_core::Incoming>>>,
         mut kick: tokio::sync::mpsc::Receiver<()>,
         mut tick: tokio::sync::mpsc::Receiver<()>,
         cx: &mut Context<Self>,
@@ -1431,44 +1436,62 @@ impl Navigator {
             let mut backlog = false;
             let mut last_frame: Option<Instant> = None;
             loop {
-                let Some(first) = ingest::next_first(&mut rx, &mut kick, pending).await else {
-                    break;
+                // In backlog mode the queue is deep, so the merge needs no first message.
+                let first = if backlog {
+                    None
+                } else {
+                    let mut rx = incoming.lock().await;
+                    let Some(first) = ingest::next_first(&mut rx, &mut kick, pending).await else {
+                        break;
+                    };
+                    first
                 };
-                // The wait comes before the frame, so an idle loop has no timer.
-                let mut paced = false;
                 if backlog {
-                    // The timer is a fallback for a display that is slower than 1/COALESCE
-                    // (or a hidden window). It runs only while the backlog lasts.
+                    // The callback of a frame merges. The timer is a fallback for a display that
+                    // is slower than 1/COALESCE (or a hidden window). It runs only while the
+                    // backlog lasts.
                     tokio::select! {
-                        _ = tick.recv() => paced = true,
+                        _ = tick.recv() => {
+                            let Ok((more, on)) =
+                                this.update(cx, |v, _| (v.store.has_work(), v.backlog.on()))
+                            else {
+                                break;
+                            };
+                            (pending, backlog) = (more, on);
+                            continue;
+                        }
                         () = cx.background_executor().timer(COALESCE) => {}
                     }
                 } else if let Some(wait) = last_frame.and_then(|t| coalesce_wait(t.elapsed())) {
                     cx.background_executor().timer(wait).await;
                 }
                 last_frame = Some(Instant::now());
-                let frame = this.update(cx, |v, cx| {
-                    let line = v.merge(first, &mut rx, paced);
-                    cx.notify();
-                    v.schedule_rate_zero(cx);
-                    (line, v.store.has_work(), v.backlog.on())
-                });
-                match frame {
+                let mut rx = incoming.lock().await;
+                match this.update(cx, |v, cx| v.frame(first, &mut rx, false, cx)) {
                     Err(_) => break,
-                    Ok((line, more, on)) => {
-                        pending = more;
-                        backlog = on;
-                        // A tick that came before this point is old. `render` registers the
-                        // next one after this update.
-                        while tick.try_recv().is_ok() {}
-                        if let Some(line) = line {
-                            cx.background_executor().spawn(write_metrics(line)).detach();
-                        }
-                    }
+                    Ok((more, on)) => (pending, backlog) = (more, on),
                 }
             }
         })
         .detach();
+    }
+
+    /// One frame: the merge, the redraw and the metrics line. Returns whether store work remains
+    /// and whether backlog mode is on.
+    fn frame(
+        &mut self,
+        first: Option<navigator_core::Incoming>,
+        rx: &mut tokio::sync::mpsc::Receiver<navigator_core::Incoming>,
+        paced: bool,
+        cx: &mut Context<Self>,
+    ) -> (bool, bool) {
+        let line = self.merge(first, rx, paced);
+        cx.notify();
+        self.schedule_rate_zero(cx);
+        if let Some(line) = line {
+            cx.background_executor().spawn(write_metrics(line)).detach();
+        }
+        (self.store.has_work(), self.backlog.on())
     }
 
     /// A design height in pixels now. The rows are `ui(..)` high, so this equals their height.
@@ -3518,9 +3541,18 @@ impl Render for Navigator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.metrics.frame_start(window);
         if self.backlog.on() {
-            // One merge allocation for each display frame: the loop waits for this callback.
-            let tick = self.tick.clone();
-            window.on_next_frame(move |_, _| {
+            // GPUI runs the callbacks of a frame before it decides to draw. The merge in the
+            // callback marks the view dirty, so the same frame draws its result.
+            let (this, incoming, tick) =
+                (cx.weak_entity(), self.incoming.clone(), self.tick.clone());
+            window.on_next_frame(move |_, cx| {
+                // A locked queue means that the loop is waiting for a message: no backlog.
+                if let Ok(mut rx) = incoming.try_lock() {
+                    let _ = this.update(cx, |v, cx| {
+                        let first = rx.try_recv().ok();
+                        v.frame(first, &mut rx, true, cx)
+                    });
+                }
                 let _ = tick.try_send(());
             });
         }
