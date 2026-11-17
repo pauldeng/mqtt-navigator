@@ -36,13 +36,13 @@ The plan is [2026-11-17-threads-review.md](2026-11-17-threads-review.md). The Co
 | Allocation in backlog, store above its budget | ingest 1.5 ms, maintenance until 3.25 ms |
 | Allocation outside backlog | ingest until 3.25 ms (3.0 ms while the store has work), maintenance until 3.25 ms. The 33 ms coalescing stays. |
 | Pacing in backlog | `render` registers `window.on_next_frame`. GPUI runs these callbacks before it decides to draw (`gpui-pre` `window.rs`, the frame request handler). The callback calls `allocate`, which merges and marks the view dirty, so the same frame draws the result. |
-| Fallback | A 33 ms timer in the loop. It starts only while backlog lasts. It covers a hidden window or a slow display. Its allocation follows the rule in `may_allocate`, and it uses the plan of normal mode. |
+| Fallback | A 33 ms timer in the loop. It starts only while backlog lasts. It covers a hidden window or a display below 10 Hz. It allocates only if no frame callback came for 100 ms (`may_allocate`), and it uses the plan of normal mode. |
 | Idle | The loop parks on the net queue and the kick channel (`ingest::next_first`). It has no timer. |
 | Work round | 32 items (16 for the snapshot, 16 for node eviction). |
 
 Pause is the same as before. The store still freezes the views, counts the paused messages and shows the removed-row markers. The new code does not touch these paths.
 
-`allocate` applies `may_allocate`: a frame callback allocates only if no allocation started since the previous callback, and the loop (the fallback) only 33 ms after the last allocation. So there is at most one allocation in a display interval, and a fallback adds one only when frames stall. A late or duplicate callback does nothing. A callback registers the next one while backlog mode lasts, also when it skipped. The loop and `allocate` share the net queue through one lock. `allocate` skips if the loop holds the lock (the loop holds it only while it waits for a message, and then nothing is due).
+`allocate` applies `may_allocate`. A frame callback allocates only if no allocation started since the previous callback. In normal mode the loop allocates 33 ms after the last allocation. In backlog mode the loop is only a fallback for stalled frames: it allocates only 33 ms after the last allocation **and** if no callback came for 100 ms (a hidden or minimized window). So while frames come at 10 Hz or more, backlog mode has at most one allocation in each display interval. The rule does not limit these cases: the first allocations after backlog starts (before the first callback), and the start of a stall (up to 100 ms with no callback, with fallback allocations every 33 ms). A late or duplicate callback does nothing. A callback registers the next one while backlog mode lasts, also when it skipped. The loop and `allocate` share the net queue through one lock. `allocate` skips if the loop holds the lock (the loop holds it only while it waits for a message, and then nothing is due).
 
 ## 4. Tests
 
@@ -190,9 +190,11 @@ The diagnostic build (built on `3e0abfd`, so it does not show `HEAD`; not repeat
 
 At 60 Hz the candidate admits all of 50k msg/s with no drop, and 67k of 75k. At 120 Hz it admits all of 75k. The 1 KB case at 75k admits 27k at 60 Hz. The publishers delivered only 27,170 msg/s in that run (the flood limit), so this is the publisher limit and not a store limit.
 
+Check after the stall rule for the fallback (the last commit): one timestamped run of 75k with 100 B under Xvfb gave 36.4k admitted of 75.0k offered, 21.9 allocations/s and a maximum of 4.35 ms. These match the two runs above (36.8k and 37.6k, 22/s). At 22 frames/s the fallback never allocated before the change either, so I did not repeat the other cases.
+
 ## 8. Idle wake-ups
 
-`idle.sh`: 3 floods of 20k msg/s for 8 s, 8 s to drain, then 10 s of idle. Voluntary context switches of the main thread: baseline 626, candidate 626. All threads: 666 and 666 (`HEAD`, repeated after the last scheduling fix: 627 and 666). The metrics log has no line while idle. The candidate adds no wake-up. The count of about 60 per second is in both builds. It is not zero. Its source is not in this change (I did not look for it). The owner may want to check it (a frame timer of gpui, the cursor or the window system).
+`idle.sh`: 3 floods of 20k msg/s for 8 s, 8 s to drain, then 10 s of idle. Voluntary context switches of the main thread: baseline 626, candidate 626. All threads: 666 and 666 (`HEAD`; after the stall rule for the fallback: 626 and 666). The metrics log has no line while idle. The candidate adds no wake-up. The count of about 60 per second is in both builds. It is not zero. Its source is not in this change (I did not look for it). The owner may want to check it (a frame timer of gpui, the cursor or the window system).
 
 ## 9. Gate
 

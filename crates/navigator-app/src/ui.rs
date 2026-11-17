@@ -212,25 +212,33 @@ const COALESCE: Duration = Duration::from_millis(33);
 /// Who asks for an allocation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Caller {
-    /// The frame loop: a normal frame, or the fallback of backlog mode.
+    /// The frame loop in normal mode.
     Loop,
+    /// The frame loop in backlog mode: the fallback for stalled frames.
+    Fallback,
     /// The next-frame callback of `render` (backlog mode).
     Frame,
 }
 
+/// No frame callback for this long means that frames have stalled (a hidden window).
+const FRAME_STALL: Duration = Duration::from_millis(100);
+
 /// The one rule for the frame budget. A frame callback allocates only if no allocation started
-/// since the previous callback, so there is at most one allocation in a display interval. The
-/// loop allocates only `COALESCE` after the last allocation, so it adds one only when frames stall.
-/// `last_frame` is the time of the previous callback.
+/// since the previous callback. The loop in normal mode allocates `COALESCE` after the last
+/// allocation. The fallback in backlog mode does the same, and only if the last callback is older
+/// than `FRAME_STALL`. So while frames come, backlog mode has at most one allocation in each
+/// display interval. `last_frame` is the time of the previous callback.
 fn may_allocate(
     caller: Caller,
     now: Instant,
     last_alloc: Option<Instant>,
     last_frame: Option<Instant>,
 ) -> bool {
+    let coalesced = last_alloc.is_none_or(|a| now - a >= COALESCE);
     match caller {
         Caller::Frame => last_frame.is_none_or(|f| last_alloc.is_none_or(|a| a <= f)),
-        Caller::Loop => last_alloc.is_none_or(|a| now - a >= COALESCE),
+        Caller::Loop => coalesced,
+        Caller::Fallback => coalesced && last_frame.is_none_or(|f| now - f >= FRAME_STALL),
     }
 }
 
@@ -1495,7 +1503,16 @@ impl Navigator {
                     cx.background_executor().timer(wait).await;
                 }
                 if this
-                    .update(cx, |v, cx| v.allocate(Caller::Loop, cx))
+                    .update(cx, |v, cx| {
+                        v.allocate(
+                            if backlog {
+                                Caller::Fallback
+                            } else {
+                                Caller::Loop
+                            },
+                            cx,
+                        )
+                    })
                     .is_err()
                 {
                     break;
@@ -4847,10 +4864,19 @@ mod tests {
         assert!(may_allocate(Caller::Frame, at(0), None, None));
         assert!(!may_allocate(Caller::Loop, at(20), ms(0), ms(0)));
         assert!(may_allocate(Caller::Loop, at(36), ms(0), ms(0)));
-        // The next callback finds the fallback allocation since the last callback: skip.
-        assert!(!may_allocate(Caller::Frame, at(50), ms(36), ms(0)));
-        // The one after it allocates again.
-        assert!(may_allocate(Caller::Frame, at(100), ms(36), ms(50)));
+        // In backlog mode the fallback waits for stalled frames: at 20 Hz it never allocates.
+        assert!(!may_allocate(Caller::Fallback, at(36), ms(0), ms(0)));
+        assert!(!may_allocate(Caller::Fallback, at(72), ms(0), ms(50)));
+        assert!(!may_allocate(Caller::Fallback, at(145), ms(100), ms(100)));
+        // The callbacks allocate in every interval.
+        assert!(may_allocate(Caller::Frame, at(50), ms(0), ms(0)));
+        assert!(may_allocate(Caller::Frame, at(100), ms(50), ms(50)));
+        // A stall of 100 ms lets the fallback allocate, and then a late callback skips.
+        assert!(may_allocate(Caller::Fallback, at(133), ms(0), ms(0)));
+        assert!(!may_allocate(Caller::Frame, at(140), ms(133), ms(0)));
+        assert!(may_allocate(Caller::Frame, at(190), ms(133), ms(140)));
+        // The first fallback of a hidden window (no callback yet) allocates.
+        assert!(may_allocate(Caller::Fallback, at(33), ms(0), None));
         // At 144 Hz every callback allocates, and the loop never does.
         assert!(may_allocate(Caller::Frame, at(7), ms(0), ms(0)));
         assert!(!may_allocate(Caller::Loop, at(7), ms(0), ms(0)));
