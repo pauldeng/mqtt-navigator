@@ -5,10 +5,10 @@ The plan is [2026-11-17-threads-review.md](2026-11-17-threads-review.md). The Co
 
 ## 1. Result in short
 
-- Backlog mode runs one merge allocation for each display frame. Under Xvfb the display makes 22 frames/s, so this is 22 allocations/s, and the admitted rate is limited by that. At 50k with 100 B the candidate admits 27k and 37k, and the baseline 30k and 32k: **no clear change**. At 75k with 100 B the candidate admits 36k and 37k, and the baseline 14k and 20k (+116 %). With a text filter (+12 %) and with the expanded tree (+9 %) at 50k it is a little higher. There is no change at 10k and 25k.
+- Backlog mode runs one merge allocation for each display frame. Under Xvfb the display makes 22 frames/s, so this is 22 allocations/s, and the admitted rate is limited by that. At 50k with 100 B the candidate admits 38k and 38k, and the baseline 30k and 32k (+24 %). At 75k with 100 B the candidate admits 37k and 38k, and the baseline 14k and 20k (+121 %). With a text filter at 50k it is +9 %. With the expanded tree it is lower (34k and 21k against 32k and 35k, -19 %): one run was store-limited and I did not find the cause. There is no change at 10k and 25k.
 - An earlier version of this report showed a candidate that admitted all of 50k. That build let the 33 ms fallback timer and the frame callbacks both start allocations in one display interval, so it used more than the frame budget. The current build has one function for all allocations and one budget (section 3). It does not do this. The table below is for this build.
 - **The flood tool does not deliver 1 KB at 50k or 75k msg/s here.** With 1 KB it publishes about 30k msg/s in total. The rest are failed publishes. An earlier version of this report counted them as offered load. Section 7 gives the real offered rate of each run. The 1 KB cases at "50k" and "75k" are 27k to 30k msg/s cases. The candidate admits 24k to 25k of it, and the baseline 21k to 24k.
-- **Not met: "no merge allocation above 4 ms".** The candidate still logs allocations of 4.0 to 6.0 ms in the load runs. I measured the thread CPU time of only 20 of them (section 6). Each of those 20 had 1.5 to 3.1 ms of CPU time, and the rest was run queue wait. I did not measure the other allocations above 4 ms (137 in the first matrix, not counted again in the new one). So the claim that the OS causes all of them is **not shown**. The release unit test allows the worst allocation to end 5.75 ms after its 3.25 ms deadline (about 9 ms, section 4). It passes, but it does not prove 4 ms.
+- **Not met: "no merge allocation above 4 ms".** The candidate still logs allocations of 4.0 to 5.3 ms in the 100 B load runs. The 1 KB runs reach 6.0 ms, and one run (`own-50k-1k-r2`, build `5b3fe57`) logged **8.82 ms** (8.79 ms of ingest). I did not measure the cause of that one. I measured the thread CPU time of only 20 of them (section 6). Each of those 20 had 1.5 to 3.1 ms of CPU time, and the rest was run queue wait. I did not measure the other allocations above 4 ms (137 in the first matrix, not counted again in the new one). So the claim that the OS causes all of them is **not shown**. The release unit test allows the worst allocation to end 5.75 ms after its 3.25 ms deadline (about 9 ms, section 4). It passes, but it does not prove 4 ms.
 - **Limit of the Xvfb test.** llvmpipe draws a frame every 45 ms (22 frames/s). It is **not a measurement on a real GPU**. On a real display (60 Hz or more) the same code does 60 or more allocations/s, and the gain should be larger. I did not measure this for the current build.
 - **Cost of the change.** In overload (50k and 75k with 100 B) the net queue stays full (50k messages). The oldest message in it waits 1.4 to 2.0 s. The old build dropped the excess in the store instead, and its queue age was 0.2 to 0.4 s. The number of drops is lower, but the data on the screen is older during an overload.
 - Idle: no new wake-up. The main thread has the same 626 voluntary context switches in 10 s of idle in both builds (section 8, repeated for `HEAD`). This count is not zero in either build. It comes from the existing code.
@@ -23,7 +23,8 @@ The plan is [2026-11-17-threads-review.md](2026-11-17-threads-review.md). The Co
 | `3e0abfd` fix(store) | A work round is 32 items (was 256). Section 5 explains why. The backlog plan runs only when a frame callback paces the allocation. |
 | fix(metrics) | The queue age is measured at the first message that the allocation pulls. It was measured only for the message that the loop pulled before. |
 | fix(ui) | The frame callback runs the paced merge. Before, it only woke the loop. GPUI decided to draw before the loop ran, so one tick merged and the next drew: one allocation for two frames. |
-| fix(ui) | One function (`Navigator::allocate`) runs every allocation, for the loop and for the callbacks. A message that wakes the loop goes into `Navigator::held`, and every allocation takes it before the queue. This fixes a reorder: the loop held message A while a late callback merged the newer B, and then A replaced B. The function also refuses to start within a gap of the last allocation, so the loop and the callbacks share one frame budget. The tick channel and the copied loop state are gone. Test: `an_allocation_takes_the_held_message_before_the_queue`. |
+| fix(ui) | The frame budget rule (`may_allocate`): a frame callback allocates only if no allocation started since the previous callback, and the loop only 33 ms after the last allocation. So there is at most one allocation in a display interval, plus a fallback when frames stall. The callback registers the next one also when it skips (`arm_frame`), so pacing follows the display. The loop reads the time since the last allocation after it has a message. Test: `two_allocations_never_share_a_display_interval`. |
+| fix(ui) | One function (`Navigator::allocate`) runs every allocation, for the loop and for the callbacks. A message that wakes the loop goes into `Navigator::held`, and every allocation takes it before the queue. This fixes a reorder: the loop held message A while a late callback merged the newer B, and then A replaced B. The tick channel and the copied loop state are gone. (The first version of its budget rule was an 8 ms gap. It could still let two allocations into one interval, see the next row.) Test: `an_allocation_takes_the_held_message_before_the_queue`. |
 
 ## 3. Parameters
 
@@ -35,13 +36,13 @@ The plan is [2026-11-17-threads-review.md](2026-11-17-threads-review.md). The Co
 | Allocation in backlog, store above its budget | ingest 1.5 ms, maintenance until 3.25 ms |
 | Allocation outside backlog | ingest until 3.25 ms (3.0 ms while the store has work), maintenance until 3.25 ms. The 33 ms coalescing stays. |
 | Pacing in backlog | `render` registers `window.on_next_frame`. GPUI runs these callbacks before it decides to draw (`gpui-pre` `window.rs`, the frame request handler). The callback calls `allocate`, which merges and marks the view dirty, so the same frame draws the result. |
-| Fallback | A 33 ms timer in the loop. It starts only while backlog lasts. It covers a hidden window or a slow display. Its allocation counts against the same gap as the callbacks, and it uses the plan of normal mode. |
+| Fallback | A 33 ms timer in the loop. It starts only while backlog lasts. It covers a hidden window or a slow display. Its allocation follows the rule in `may_allocate`, and it uses the plan of normal mode. |
 | Idle | The loop parks on the net queue and the kick channel (`ingest::next_first`). It has no timer. |
 | Work round | 32 items (16 for the snapshot, 16 for node eviction). |
 
 Pause is the same as before. The store still freezes the views, counts the paused messages and shows the removed-row markers. The new code does not touch these paths.
 
-`allocate` does nothing if the last allocation started less than a gap ago: 8 ms for a callback, 33 ms for the loop. A callback that comes late or twice is harmless, and the loop and the callbacks never exceed one allocation in a gap. The loop and `allocate` share the net queue through one lock. `allocate` skips if the loop holds the lock (the loop holds it only while it waits for a message, and then nothing is due).
+`allocate` applies `may_allocate`: a frame callback allocates only if no allocation started since the previous callback, and the loop (the fallback) only 33 ms after the last allocation. So there is at most one allocation in a display interval, and a fallback adds one only when frames stall. A late or duplicate callback does nothing. A callback registers the next one while backlog mode lasts, also when it skipped. The loop and `allocate` share the net queue through one lock. `allocate` skips if the loop holds the lock (the loop holds it only while it waits for a message, and then nothing is due).
 
 ## 4. Tests
 
@@ -82,23 +83,25 @@ The `merge` columns are per allocation. The p95 column shows the median and the 
 
 ### Admitted rate (messages the store stored, per second, mean over the window)
 
-"Offered" is the rate of successful publishes over the same window, summed over the flood processes (`analyze.py` reads the flood logs). Failed publishes do not count. A run is valid when the offered rate is within 1 % of the stated rate. All runs in the first matrix with 1 KB at 50k and 75k were not valid, except `base-50k-1k-r1` (49980 offered, admitted 16372) and `base-75k-1k-r1` (71357 offered, admitted 7478). I repeated the baseline for these cases, and the table shows the real offered rate (30k) instead.
+"Offered" is the rate of successful publishes. A failed publish does not count. A run is valid when the offered rate is within 1 % of the stated rate.
+
+**How the rates are measured.** The four `HEAD` cases (50k and 75k with 100 B, 50k with a text filter, 50k with the tree) were run again with timestamps on every log line (`run2.sh`, `analyze2.py`). The offered rate and the admitted rate are counter deltas over the same wall-clock window of 30.02 s (the window of the CPU measurement). The counters are interpolated between the one-second log lines. The window of the queue, age and merge columns is the log lines in that interval. All other rows (the baseline, the 25k and 10k rows, the 1 KB rows) come from earlier runs without timestamps. Their rates pair flood line k with app line i0+k, so the two windows differ by up to about 0.6 s. For the 100 B and 25k rows the flood delivered the stated rate in every run, so this does not change the offered rate by more than 0.1 %. The 1 KB offered rates are less exact. The 1 KB candidate rows are from `5b3fe57`, the build before the last scheduling fix. I did not re-run them. Baseline 1 KB: the offered rate was 30k in the repeated runs.
 
 | Scenario | offered/s (mean) | baseline (run 1, run 2) | candidate (run 1, run 2) | change of mean |
 |---|---|---|---|---|
 | 10k-100 | 10000 | 9999, 9999 | 9999, 10000 | +0 % |
 | 25k-100 | 24998 | 24995, 25000 | 25000, 24997 | +0 % |
-| 50k-100 | 49996 | 29523, 31652 | 27280, 37089 | +5 % |
-| 75k-100 | 74998 | 13529, 20148 | 35982, 36743 | +116 % |
+| 50k-100 | 49997 | 29523, 31652 | 38193, 37621 | +24 % |
+| 75k-100 | 74994 | 13529, 20148 | 37610, 36844 | +121 % |
 | 25k-1k | 24998 | 25006, 25005 | 25002, 24993 | -0 % |
 | 50k-1k | 29497 | 23463, 23919 | 25207, 25365 | +7 % |
 | 75k-1k | 30129 | 21203, 23489 | 24359, 24352 | +9 % |
 | 25k-100-filter | 24998 | 24996, 25000 | 24999, 24996 | -0 % |
-| 50k-100-filter | 49997 | 30974, 33020 | 36078, 35746 | +12 % |
+| 50k-100-filter | 49995 | 30974, 33020 | 33023, 36928 | +9 % |
 | 25k-100-tree | 25012 | 25040, 24998 | 25003, 25004 | -0 % |
-| 50k-100-tree | 50002 | 32214, 34965 | 36185, 36790 | +9 % |
+| 50k-100-tree | 50001 | 32214, 34965 | 34101, 20513 | -19 % |
 
-The flood tool cannot sustain more than about 30k msg/s with 1 KB here, so the 1 KB cases at 50k and 75k are 27k to 30k msg/s cases. The offered rate is the successful publishes in the window that matches the app log window by line number (`analyze.py`). The candidate loses part of it at the net queue, because it does 22 allocations/s. The baseline loses more of it in the store.
+The flood tool cannot sustain more than about 30k msg/s with 1 KB here, so the 1 KB cases at 50k and 75k are 27k to 30k msg/s cases. The offered rate is the successful publishes in the window of the run (see the note on the rates above). The candidate loses part of it at the net queue, because it does 22 allocations/s. The baseline loses more of it in the store.
 
 ### Full table (all runs)
 
@@ -116,45 +119,45 @@ Drops are per window. The cause columns are separate: "net drops" is a full net 
 | 25k-100 | cand 1862482 | 2 | 25001 | 24997 | 0 | 0 | 71 | 57 | 3.26/3.29 | 3.39 | 0 | 11.9 |
 | 50k-100 | base | 1 | 49994 | 29523 | 0 | 627748 | 8102 | 217 | 3.40/3.58 | 5.20 | 3 | 14.6 |
 | 50k-100 | base | 2 | 49997 | 31652 | 0 | 565818 | 5539 | 195 | 3.41/3.56 | 5.12 | 3 | 14.4 |
-| 50k-100 | cand HEAD | 1 | 49991 | 27280 | 697157 | 0 | 49377 | 1999 | 3.30/3.35 | 3.45 | 0 | 14.8 |
-| 50k-100 | cand HEAD | 2 | 50003 | 37089 | 397262 | 0 | 48896 | 1438 | 3.29/3.33 | 3.91 | 0 | 14.3 |
+| 50k-100 | cand HEAD | 1 | 49999 | 38193 | 354092 | 0 | 48719 | 1386 | 3.29/3.37 | 4.46 | 1 | 14.4 |
+| 50k-100 | cand HEAD | 2 | 49997 | 37621 | 371426 | 0 | 48907 | 1432 | 3.28/3.34 | 3.8 | 0 | 14.5 |
 | 75k-100 | base | 1 | 74989 | 13529 | 0 | 1873308 | 24389 | 404 | 3.45/3.60 | 4.53 | 6 | 14.2 |
 | 75k-100 | base | 2 | 74996 | 20148 | 0 | 1684177 | 13643 | 283 | 3.44/3.62 | 4.22 | 3 | 13.6 |
-| 75k-100 | cand HEAD | 1 | 75008 | 35982 | 1197488 | 0 | 49514 | 1534 | 3.29/3.35 | 4.95 | 4 | 14.2 |
-| 75k-100 | cand HEAD | 2 | 74999 | 36743 | 1175226 | 0 | 48789 | 1542 | 3.29/3.39 | 4.83 | 1 | 14.4 |
+| 75k-100 | cand HEAD | 1 | 75004 | 37610 | 1122695 | 0 | 48819 | 1484 | 3.29/3.34 | 4.2 | 1 | 14.4 |
+| 75k-100 | cand HEAD | 2 | 74986 | 36844 | 1145286 | 0 | 49019 | 1531 | 3.29/3.38 | 3.81 | 0 | 14.3 |
 | 25k-1k | base | 1 | 24999 | 25006 | 0 | 0 | 1220 | 99 | 3.40/3.79 | 4.28 | 4 | 13.9 |
 | 25k-1k | base | 2 | 25000 | 25005 | 0 | 0 | 106 | 95 | 3.40/3.63 | 4.89 | 4 | 13.2 |
 | 25k-1k | cand 1862482 | 1 | 24999 | 25002 | 0 | 0 | 374 | 69 | 3.29/3.38 | 4.20 | 1 | 12.8 |
 | 25k-1k | cand 1862482 | 2 | 24996 | 24993 | 0 | 0 | 90 | 74 | 3.29/3.36 | 5.76 | 1 | 12.9 |
 | 50k-1k | base | 1 | 30281 | 23463 | 0 | 211900 | 3393 | 147 | 3.53/3.87 | 5.03 | 7 | 14.7 |
 | 50k-1k | base | 2 | 30167 | 23919 | 0 | 190646 | 3958 | 213 | 3.52/4.18 | 5.00 | 12 | 14.5 |
-| 50k-1k | cand HEAD | 1 | 27082 | 25207 | 59542 | 0 | 26998 | 1189 | 3.31/3.39 | 3.54 | 0 | 14.5 |
-| 50k-1k | cand HEAD | 2 | 30457 | 25365 | 158117 | 0 | 27066 | 1207 | 3.31/3.48 | 8.82 | 3 | 14.8 |
+| 50k-1k | cand 5b3fe57 | 1 | 27082 | 25207 | 59542 | 0 | 26998 | 1189 | 3.31/3.39 | 3.54 | 0 | 14.5 |
+| 50k-1k | cand 5b3fe57 | 2 | 30457 | 25365 | 158117 | 0 | 27066 | 1207 | 3.31/3.48 | 8.82 | 3 | 14.8 |
 | 75k-1k | base | 1 | 30276 | 21203 | 0 | 278218 | 2495 | 191 | 3.58/3.85 | 5.25 | 10 | 14.5 |
 | 75k-1k | base | 2 | 30075 | 23489 | 0 | 203234 | 2650 | 156 | 3.50/4.00 | 6.00 | 8 | 14.5 |
-| 75k-1k | cand HEAD | 1 | 30093 | 24359 | 176615 | 0 | 27115 | 1240 | 3.31/3.37 | 4.05 | 1 | 14.8 |
-| 75k-1k | cand HEAD | 2 | 30072 | 24352 | 175635 | 0 | 27242 | 1242 | 3.31/3.39 | 5.30 | 3 | 14.9 |
+| 75k-1k | cand 5b3fe57 | 1 | 30093 | 24359 | 176615 | 0 | 27115 | 1240 | 3.31/3.37 | 4.05 | 1 | 14.8 |
+| 75k-1k | cand 5b3fe57 | 2 | 30072 | 24352 | 175635 | 0 | 27242 | 1242 | 3.31/3.39 | 5.30 | 3 | 14.9 |
 | 25k-100-filter | base | 1 | 24994 | 24996 | 0 | 0 | 1198 | 96 | 3.32/3.43 | 4.45 | 1 | 11.7 |
 | 25k-100-filter | base | 2 | 25000 | 25000 | 0 | 0 | 1152 | 100 | 3.31/3.39 | 4.00 | 0 | 11.6 |
 | 25k-100-filter | cand 3e0abfd | 1 | 24997 | 24999 | 0 | 0 | 73 | 62 | 3.26/3.41 | 4.25 | 1 | 12.1 |
 | 25k-100-filter | cand 3e0abfd | 2 | 25002 | 24996 | 0 | 0 | 65 | 52 | 3.26/3.30 | 4.44 | 1 | 11.6 |
 | 50k-100-filter | base | 1 | 49996 | 30974 | 0 | 583123 | 7109 | 219 | 3.40/3.53 | 4.08 | 2 | 14.0 |
 | 50k-100-filter | base | 2 | 49995 | 33020 | 0 | 524095 | 5209 | 194 | 3.38/3.56 | 4.40 | 6 | 14.0 |
-| 50k-100-filter | cand HEAD | 1 | 49996 | 36078 | 427496 | 0 | 48906 | 1489 | 3.27/3.32 | 3.45 | 0 | 14.2 |
-| 50k-100-filter | cand HEAD | 2 | 50001 | 35746 | 437362 | 0 | 49282 | 1518 | 3.27/3.33 | 3.81 | 0 | 14.3 |
+| 50k-100-filter | cand HEAD | 1 | 49995 | 33023 | 0 | 509472 | 3881 | 125 | 3.30/3.46 | 5.1 | 4 | 14.5 |
+| 50k-100-filter | cand HEAD | 2 | 49995 | 36928 | 392712 | 0 | 48760 | 1457 | 3.29/3.48 | 4.35 | 1 | 14.4 |
 | 25k-100-tree | base | 1 | 25043 | 25040 | 0 | 0 | 1208 | 103 | 3.32/3.50 | 4.77 | 2 | 13.3 |
 | 25k-100-tree | base | 2 | 24999 | 24998 | 0 | 0 | 1276 | 97 | 3.31/3.36 | 3.53 | 0 | 12.0 |
 | 25k-100-tree | cand 3e0abfd | 1 | 25000 | 25003 | 0 | 0 | 72 | 56 | 3.27/3.35 | 3.63 | 0 | 14.6 |
 | 25k-100-tree | cand 3e0abfd | 2 | 25006 | 25004 | 0 | 0 | 76 | 53 | 3.26/3.32 | 4.47 | 1 | 12.2 |
 | 50k-100-tree | base | 1 | 50004 | 32214 | 0 | 545967 | 7142 | 187 | 3.39/3.60 | 4.50 | 2 | 14.7 |
 | 50k-100-tree | base | 2 | 50000 | 34965 | 0 | 462535 | 4929 | 180 | 3.40/3.53 | 4.50 | 1 | 14.4 |
-| 50k-100-tree | cand HEAD | 1 | 50003 | 36185 | 425411 | 0 | 48952 | 1569 | 3.29/3.35 | 4.51 | 2 | 14.9 |
-| 50k-100-tree | cand HEAD | 2 | 50001 | 36790 | 404450 | 0 | 48698 | 1474 | 3.28/3.45 | 4.18 | 1 | 14.9 |
+| 50k-100-tree | cand HEAD | 1 | 49998 | 34101 | 0 | 476936 | 1036 | 102 | 3.30/3.38 | 3.91 | 0 | 15.0 |
+| 50k-100-tree | cand HEAD | 2 | 50002 | 20513 | 0 | 906593 | 14731 | 517 | 3.31/3.38 | 4.82 | 3 | 15.7 |
 
 What the table shows about the cause of the drops:
 
 - The baseline loses messages in the store (admission above budget plus 25 %). It does that because eviction does not keep up. The queue stays short and young (0.1 to 0.4 s).
-- The candidate (`HEAD`) had no store memory drop in any run. It loses messages at the net queue when the offered rate is above its allocation rate, and then the queue is full (1.2 to 2.0 s old). Eviction keeps the store near its budget. (The earlier candidate `1862482` had 16,618 and 5,487 store admission drops in two 1 KB runs. Those rows are replaced.)
+- The candidate loses messages at the net queue when the offered rate is above its allocation rate, and then the queue is full (1.4 to 1.5 s old). In three of the four runs with a text filter or the tree it lost messages in the store instead (admission above budget plus 25 %: 477k to 907k), with a short queue. The baseline does the same in all runs. Eviction keeps the store near its budget. One run (`50k-100-tree`, run 2) admitted only 20.5k msg/s. I did not look for its cause. (The earlier candidate `1862482` had 16,618 and 5,487 store admission drops in two 1 KB runs. Those rows are replaced.)
 - `merges/s` is 22 in every `HEAD` run, equal to the frame rate. Every one of them is a paced allocation (`backlog_merges` grows by about 22 each second).
 
 ### Effect of the frame-callback fix (Xvfb, 100 B, list view)
@@ -165,10 +168,10 @@ What the table shows about the cause of the drops:
 |---|---|---|---|---|---|
 | 50k | before (`3e0abfd`) | 13.7 | 22 | 22 | 34.5k to 38.9k |
 | 50k | `1862482` | 9.4 | 27 to 30 | 22 | 46k to 53k |
-| 50k | `HEAD` | 22 | 22 | 22 | 27k and 37k (two runs) |
+| 50k | `HEAD` | 22 | 22 | 22 | 38k and 38k (two runs) |
 | 75k | before (`3e0abfd`) | 11.4 | 22 | 22 | 33k to 36k |
 | 75k | `1862482` | 21.9 | 30 to 36 | 21 to 23 | 48k to 61k |
-| 75k | `HEAD` | 22 | 22 | 22 | 36k and 37k (two runs) |
+| 75k | `HEAD` | 22 | 22 | 22 | 37k and 37k (two runs) |
 
 Before the fix, the paced allocations were about half of the frames (11 to 14 of 22). With `HEAD` all 22 allocations in each second are paced, and there are no more than one in each frame. The `3e0abfd` and `1862482` rows are single 20 s runs. The `HEAD` rows are from the two-run matrix. The higher rates of `1862482` came from the extra allocations, not from a gain that holds the budget. The frame rate under llvmpipe is the limit of the draw (45 ms), so a real display should show a larger gain.
 
@@ -207,8 +210,8 @@ I did not run `broker_compat` and `net_keepalive_tasks` (not in the requested se
 
 | Criterion | Result |
 |---|---|
-| Admitted throughput clearly higher at 50k and 75k | Under Xvfb (22 frames/s): 75k with 100 B yes (+116 %). 50k with 100 B no clear change (+5 %, the two runs differ by 10k). With a text filter +12 %, with the tree +9 %. With 1 KB (offered 27k to 30k) +7 % and +9 %. Not measured at 60 Hz or more for `HEAD`. |
-| No merge allocation above 4 ms | **Not met** in the load runs (max 4.0 to 6.0 ms). Only 20 allocations have a CPU time measurement (at most 3.13 ms, section 6). The others are not measured. Met in the unit test (p95 bound 0.75 ms past the deadline; the worst-case bound is 5.75 ms past it, about 9 ms in total, so it is not a 4 ms test) and at 10k and 25k except single noise seconds (the baseline has them too). |
+| Admitted throughput clearly higher at 50k and 75k | Under Xvfb (22 frames/s): 75k with 100 B yes (+121 %). 50k with 100 B yes (+24 %: 38.2k and 37.6k against 29.5k and 31.7k). With a text filter +9 % (33.0k and 36.9k), with the tree **-19 %** (34.1k and 20.5k; the second run is an outlier with a store-limited rate, cause not measured). With 1 KB (offered 27k to 30k, build `5b3fe57`) +7 % and +9 %. Not measured at 60 Hz or more. |
+| No merge allocation above 4 ms | **Not met** in the load runs (max 4.0 to 5.3 ms with 100 B, up to 6.0 ms with 1 KB, and 8.82 ms once, cause not measured). Only 20 allocations have a CPU time measurement (at most 3.13 ms, section 6). The others are not measured. Met in the unit test (p95 bound 0.75 ms past the deadline; the worst-case bound is 5.75 ms past it, about 9 ms in total, so it is not a 4 ms test) and at 10k and 25k except single noise seconds (the baseline has them too). |
 | No regression at 10k and 25k | Met. Admitted rate equal, queue age lower (52 to 77 ms against 94 to 103 ms), main CPU equal. |
 | No idle wake-ups | No new wake-up (section 8). |
 
