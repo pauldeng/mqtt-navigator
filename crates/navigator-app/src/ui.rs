@@ -921,6 +921,9 @@ pub struct Navigator {
     last_result: Option<(u64, String)>,
     rate: Rate,
     counts: IngestCounts,
+    backlog: ingest::Backlog,
+    /// Wakes the frame loop. `render` sends it from a next-frame callback in backlog mode.
+    tick: tokio::sync::mpsc::Sender<()>,
     metrics: Metrics,
     /// Metrics only: `MQTT_NAVIGATOR_AUTOSELECT=<topic>` (ignored without
     /// `MQTT_NAVIGATOR_METRICS`). When this topic arrives, the app selects it and applies Show
@@ -940,6 +943,8 @@ struct IngestCounts {
     stale: u64,
     /// Messages that the store accepted (a row in the list and a node value).
     admitted: u64,
+    /// Merge allocations that ran with the backlog plan (paced by a frame).
+    paced: u64,
     /// Longest wait of the first message of a merge in the net queue, since the last log line.
     age_max: Duration,
 }
@@ -1034,7 +1039,8 @@ impl Navigator {
         );
 
         let (kick, kick_rx) = tokio::sync::mpsc::channel(1);
-        Self::spawn_ingest(incoming, kick_rx, cx);
+        let (tick_tx, tick_rx) = tokio::sync::mpsc::channel(1);
+        Self::spawn_ingest(incoming, kick_rx, tick_rx, cx);
         Self::spawn_events(events, drained, cx);
         Self::spawn_status(status_rx, cx);
         // The time zone file is read off the UI thread.
@@ -1125,6 +1131,8 @@ impl Navigator {
             last_result: None,
             rate: Rate::default(),
             counts: IngestCounts::default(),
+            backlog: ingest::Backlog::default(),
+            tick: tick_tx,
             metrics: Metrics::from_env(),
             autoselect: std::env::var("MQTT_NAVIGATOR_AUTOSELECT")
                 .ok()
@@ -1407,49 +1415,52 @@ impl Navigator {
     }
 
     /// The frame loop. It is the only scheduler of UI-thread store work. Each frame has one
-    /// deadline, shared by the merge and `TopicStore::work`. While work remains, one more frame
-    /// follows after `COALESCE`. With no work, the loop waits for a message or a kick and has
+    /// deadline, shared by the merge and `TopicStore::work`. Outside backlog mode, one more frame
+    /// follows after `COALESCE` while work remains. In backlog mode (a deep net queue) the loop
+    /// runs one allocation in each display frame: `render` asks for a frame callback, and the
+    /// callback wakes the loop. With no work, the loop waits for a message or a kick and has
     /// no timer.
     fn spawn_ingest(
         mut rx: tokio::sync::mpsc::Receiver<navigator_core::Incoming>,
         mut kick: tokio::sync::mpsc::Receiver<()>,
+        mut tick: tokio::sync::mpsc::Receiver<()>,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
             let mut pending = false;
+            let mut backlog = false;
             let mut last_frame: Option<Instant> = None;
             loop {
-                let first = if pending {
-                    rx.try_recv().ok()
-                } else {
-                    tokio::select! {
-                        m = rx.recv() => match m {
-                            Some(m) => Some(m),
-                            None => break,
-                        },
-                        k = kick.recv() => {
-                            if k.is_none() {
-                                break;
-                            }
-                            None
-                        }
-                    }
+                let Some(first) = ingest::next_first(&mut rx, &mut kick, pending).await else {
+                    break;
                 };
                 // The wait comes before the frame, so an idle loop has no timer.
-                if let Some(wait) = last_frame.and_then(|t| coalesce_wait(t.elapsed())) {
+                let mut paced = false;
+                if backlog {
+                    // The timer is a fallback for a display that is slower than 1/COALESCE
+                    // (or a hidden window). It runs only while the backlog lasts.
+                    tokio::select! {
+                        _ = tick.recv() => paced = true,
+                        () = cx.background_executor().timer(COALESCE) => {}
+                    }
+                } else if let Some(wait) = last_frame.and_then(|t| coalesce_wait(t.elapsed())) {
                     cx.background_executor().timer(wait).await;
                 }
                 last_frame = Some(Instant::now());
                 let frame = this.update(cx, |v, cx| {
-                    let line = v.merge(first, &mut rx);
+                    let line = v.merge(first, &mut rx, paced);
                     cx.notify();
                     v.schedule_rate_zero(cx);
-                    (line, v.store.has_work())
+                    (line, v.store.has_work(), v.backlog.on())
                 });
                 match frame {
                     Err(_) => break,
-                    Ok((line, more)) => {
+                    Ok((line, more, on)) => {
                         pending = more;
+                        backlog = on;
+                        // A tick that came before this point is old. `render` registers the
+                        // next one after this update.
+                        while tick.try_recv().is_ok() {}
                         if let Some(line) = line {
                             cx.background_executor().spawn(write_metrics(line)).detach();
                         }
@@ -1537,10 +1548,22 @@ impl Navigator {
         &mut self,
         first: Option<navigator_core::Incoming>,
         rx: &mut tokio::sync::mpsc::Receiver<navigator_core::Incoming>,
+        paced: bool,
     ) -> Option<String> {
         let start = Instant::now();
-        let plan = ingest::plan(self.store.has_work());
+        let backlog = self
+            .backlog
+            .update(self.net.queued_msgs(), self.net.queued_bytes());
+        // A display that draws fewer frames than 1/COALESCE gets the allocation of normal mode
+        // from the fallback timer: the backlog split would give it less than before.
+        let plan = ingest::plan(
+            self.store.has_work(),
+            backlog && paced,
+            self.store.over_budget(),
+        );
+        self.counts.paced += u64::from(backlog && paced);
         self.capture_anchor();
+        let anchor_in = start.elapsed();
         let mut n = 0u64;
         let mut metrics_line = None;
         let mut next = first;
@@ -1552,7 +1575,7 @@ impl Navigator {
         }
         // Filter rebuilds and cap trims keep a part of the allocation. `work` always does one
         // round, also when the merge used its time, so a flood cannot starve it.
-        ingest::run(&mut self.store, start, plan, |store| {
+        let timing = ingest::run(&mut self.store, start, plan, |store| {
             let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) else {
                 return false;
             };
@@ -1577,7 +1600,11 @@ impl Navigator {
             }
             true
         });
+        let restore_start = Instant::now();
         self.restore_anchor();
+        let anchor_out = restore_start.elapsed();
+        self.backlog
+            .update(self.net.queued_msgs(), self.net.queued_bytes());
         // `work` can remove the selected topic (an idle leaf, near the caps).
         if self
             .sel_topic
@@ -1589,7 +1616,8 @@ impl Navigator {
             }
         }
         let now = Instant::now();
-        self.metrics.merge(now - start);
+        self.metrics
+            .merge(now - start, || (plan, timing, anchor_in, anchor_out));
         if self.metrics.due(now) {
             let s = self.store.stats();
             let net_drops = self
@@ -3486,6 +3514,13 @@ fn status_items(f: &StatusFacts) -> StatusItems {
 impl Render for Navigator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.metrics.frame_start(window);
+        if self.backlog.on() {
+            // One merge allocation for each display frame: the loop waits for this callback.
+            let tick = self.tick.clone();
+            window.on_next_frame(move |_, _| {
+                let _ = tick.try_send(());
+            });
+        }
         self.rem = f32::from(window.rem_size());
         self.sync_subs();
         // A notify during the draw does not schedule a frame, so it goes out after the draw.
@@ -3722,6 +3757,8 @@ struct Metrics {
     first_frame_logged: bool,
     /// Counters at the last log line, for the rates.
     prev: IngestCounts,
+    /// Lines about allocations above the frame budget, written with the next log line.
+    slow: Vec<String>,
 }
 
 /// The net queue as the merge sees it.
@@ -3741,12 +3778,35 @@ impl Metrics {
             last: Instant::now(),
             first_frame_logged: false,
             prev: IngestCounts::default(),
+            slow: Vec::new(),
         }
     }
 
-    fn merge(&mut self, d: Duration) {
+    /// Records the time of one allocation. `parts` tells where an allocation above the frame
+    /// budget spent its time (the log shows one line for it).
+    fn merge(
+        &mut self,
+        d: Duration,
+        parts: impl FnOnce() -> (ingest::Plan, ingest::Timing, Duration, Duration),
+    ) {
         if self.on {
             self.merge_ms.push(d.as_secs_f32() * 1000.);
+            if d > Duration::from_millis(4) {
+                let (p, t, a_in, a_out) = parts();
+                let ms = |d: Duration| d.as_secs_f32() * 1000.;
+                self.slow.push(format!(
+                    "metrics slow_merge total={:.2}ms plan_ingest={:.2}ms plan_work={:.2}ms \
+                     anchor_in={:.2}ms ingest={:.2}ms messages={} work={:.2}ms anchor_out={:.2}ms",
+                    ms(d),
+                    ms(p.ingest),
+                    ms(p.work),
+                    ms(a_in),
+                    ms(t.ingest),
+                    t.messages,
+                    ms(t.work),
+                    ms(a_out),
+                ));
+            }
         }
     }
 
@@ -3822,7 +3882,7 @@ impl Metrics {
             "metrics rate={rate}/s drops={drops} topics={} store={}MiB \
              dequeued={} admitted={} stale={} net_drops={} mem_drops={} topic_drops={} \
              list_drops={} dequeue_rate={dq_rate}/s admit_rate={adm_rate}/s \
-             queue={} queue_kib={} queue_age_max={:.1}ms \
+             backlog_merges={} queue={} queue_kib={} queue_age_max={:.1}ms \
              merges={merges} merge_p95={mp:.2}ms merge_max={mm:.2}ms frame_p95={fp:.2}ms frame_max={fm:.2}ms frames={}",
             s.topics,
             s.used_bytes / (1024 * 1024),
@@ -3833,6 +3893,7 @@ impl Metrics {
             s.drops,
             s.topic_drops,
             s.list_drops,
+            c.paced,
             q.msgs,
             q.bytes / 1024,
             c.age_max.as_secs_f32() * 1000.,
@@ -3841,7 +3902,10 @@ impl Metrics {
         self.merge_ms.clear();
         self.frame_ms.borrow_mut().clear();
         self.last = now;
-        line
+        // The caller adds the RSS to the last line, so the slow lines go first.
+        let mut out = std::mem::take(&mut self.slow);
+        out.push(line);
+        out.join("\n")
     }
 }
 
