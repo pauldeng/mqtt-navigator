@@ -187,3 +187,20 @@ No change. The address stays at the bottom left.
 
 1. **A choice while disconnected: select only, or select and connect?** Recommendation: select only. You see the name and the address, then you select **Connect**. While connected, the current question "Disconnect from … and connect to …?" stays in both cases.
 2. **State B: a "Choose a connection ▾" menu button, or a second list of saved connections in the centre?** Recommendation: the menu button. It has the same rows as the title bar menu, and B is rare.
+
+## 8. Verification (2026-11-18)
+
+Screenshots: `/tmp/claude-1000/-home-pdeng-Workspace-mqtt-navigator/48e74d3d-e99e-4cde-8366-7382a812f445/scratchpad/conn/`. Xvfb :77, a temporary config folder, no real keyring, Mosquitto on 18830. The window was 960 × 600, and one shot is 1600 × 1000.
+
+- A, no connection: `A.png`. B, none active: `B.png`, `B-menu.png` (menu open). C, disconnected: `C.png`, `L-1600.png` (1600 × 1000). D, failed, with a long name and a long address: `D-long.png`. E, connecting: `E.png`. Banner, failed with messages: `banner.png`, `banner-closed.png`.
+- Title bar menu open: `menu.png`. IPv6 host `[fd00::1]:1883`: `k-open.png`. "Command line" connection and its menu: `N-menu.png`. Sheet titles: `sheet.png` ("Edit lab"), `sheet-new.png` ("New connection").
+- Keyboard: `kt-all.png` (first Tab reaches the menu button), `k-all2.png` (Enter opens, arrows move, Enter chooses, the focus goes to **Connect**), `Q2-cancelled.png` (a cancelled "Disconnect from…?" question returns the focus to the menu button), `menu-esc.png` and `N-esc.png` (Esc closes the menu).
+- Save of a new connection while failed: `save-new.png`. The new connection is active, the old messages are gone and the focus is on **Connect**.
+- Unit tests: the menu button text, the Save rule for every state (with a pending keyring read or an outstanding Connect), and the IPv6 address text.
+
+Not checked:
+
+- State F (Disconnecting). It lasts less than a frame against a local broker, so no screenshot caught it. The code path is in `render_empty`.
+- The button below 900 px. The window minimum is 960 px.
+- A unit test of "the old messages do not stay". The rule is the use of `switch_to`, which calls `clear_data`. The screenshot `save-new.png` shows it.
+- 150 % zoom. This is a check for the owner.

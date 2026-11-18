@@ -2286,13 +2286,11 @@ impl Navigator {
                             Button::new("connect")
                                 .small()
                                 .primary()
-                                .label(
-                                    if self.status.state == ConnState::Disconnecting {
-                                        "Disconnecting…"
-                                    } else {
-                                        label
-                                    },
-                                )
+                                .label(if self.status.state == ConnState::Disconnecting {
+                                    "Disconnecting…"
+                                } else {
+                                    label
+                                })
                                 .tooltip(self.primary_tooltip(label))
                                 .track_focus(&self.connect_focus)
                                 .disabled(self.status.state == ConnState::Disconnecting)

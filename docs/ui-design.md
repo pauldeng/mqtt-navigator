@@ -52,12 +52,13 @@ In a wide window (1 100 px or more), the details pane opens on the right when yo
 The window has one place for each job. A control shows when it can act. Rare actions are in a `⋯` menu and in the command palette.
 
 - **Title bar:**
-  - The profile `Select`. Its last item, "Manage connections…", opens the connection sheet (section 3.1).
+  - The connection menu: a button with the state dot, the name and the host and port. It truncates the address first, then the name. Below 900 px it shows the dot and the name only. A click opens a menu with the saved connections (checked = active; a "Command line" connection shows first), then "Edit "name"…", "New connection… (Ctrl/Cmd+N)" and "Manage connections…" (the sheet, section 3.1). For a "Command line" connection, the menu shows "Command line: not saved" in place of Edit. With no active connection, the button says "Choose a connection". With no connection at all, it says "Add a connection" and opens the sheet.
   - The connection state, as a dot **and** text: "Connecting…", "Connected", "Reconnecting (3)…", "Disconnected: The broker rejected the connection: this client is not authorized.".
-  - The one primary action. It is "Connect" when disconnected, "Cancel" while connecting, and "Disconnect" when connected.
+  - The one primary action. It is "Connect" when disconnected, "Cancel" while connecting, and "Disconnect" when connected. Its tooltip names the target. During Disconnecting it says "Disconnecting…" and is off. With no active connection, it does not show.
   - A settings menu (gear icon, tooltip "Settings"). It holds: Commands… (`Ctrl/Cmd+K`), the submenus Appearance, Theme, Row height and Memory budget, Reset the layout, and a renderer line (GPU or software, and the API). The renderer line is not an action. The checked items are in the submenus. The top level has no checked item and does not scroll, so it fits a small window. (A scrollable gpui-kit menu scrolls to its first checked item one frame after it opens. In a small window that looked like a flicker.)
   - The filter is in the centre header. The command palette has no button of its own.
-  - If you select a different profile while connected, the app asks "Disconnect from prod and connect to test? Messages from prod are removed.". It does not change the active broker silently.
+  - If you choose a different profile while disconnected or failed, the app only selects it. You then select **Connect**. If you choose a different profile while connected, connecting or reconnecting, the app asks "Disconnect from prod and connect to test? Messages from prod are removed.". It does not change the active broker silently.
+  - **A new connection that you save** becomes active when the state is Disconnected or Failed, no keyring read is pending and no Connect is outstanding. Else it is only saved.
   - **Data belongs to one profile.** Switching to another profile clears the received messages, the selection, the composer and History. A disconnect or a reconnect with the **same** profile keeps them, and the list shows a marker row "Reconnected 12:05:10".
 - **Left pane, Subscribe (major feature 1):**
   - One input: type a topic filter and press Enter. A small QoS select (`Q0 ▾`) is the suffix of the input. QoS 0 is the default. The filter is added with the shown QoS.
@@ -139,6 +140,7 @@ The window has one place for each job. A control shows when it can act. Rare act
 - **TLS** (TLS and WSS only): verify the server certificate (on), CA file, and a collapsed "Client certificate" section (certificate, key, key passphrase).
 - **Advanced** (collapsed): client ID (generated; edit it here), WebSocket path, clean start (MQTT 3.1.1: clean session), session expiry (MQTT 5), keepalive, Will message (will delay: MQTT 5).
 - The saved connections are `ListItem` rows. The row of the draft is selected. "New connection" is the last row.
+- The sheet title names the action: "New connection" or "Edit lab". It follows the draft.
 - Buttons: **Save and connect** (primary), **Save**, **Cancel**. A button that opens a dialog ends with "…" (for example "Delete connection…"). A dialog has **Cancel** and a verb ("Discard changes", "Switch connection"). Validation runs when you press a button. A validation error in a collapsed section opens that section first, then moves the focus to the field.
 - There is no separate "Test connection" button. "Save and connect" is the test, a connection failure shows in the title bar, and a validation error shows in the sheet.
 
@@ -180,7 +182,7 @@ This table lists what the app uses now.
 | UI part | gpui-kit component |
 |---|---|
 | Window and overlays | `gpui_kit::open_window` with `TitleBar::window_options()`. `Root` hosts dialogs, sheets, toasts, menus. |
-| Title bar | `TitleBar` with `Select` (profiles), `Button` (settings menu, connect) |
+| Title bar | `TitleBar` with `Button` + `dropdown_menu` and `dropdown_caret` (connection menu; rows are `PopupMenuItem::element` with `checked`), `Button` (settings menu, connect) |
 | Settings menu | `Button::dropdown_menu` with a `PopupMenu`: Commands…, submenus (`PopupMenu::submenu`) Appearance, Theme, Row height and Memory budget with checked items, Reset the layout, the renderer label |
 | Three panes | `h_resizable` with `resizable_panel().size(saved).size_range(..)`. The side panels are `.fixed()`. We save the widths in `on_resize`. |
 | Subscriptions list | `ListItem` rows (selected state = "Show only") in a `uniform_list`; a colour dot (`div` with a theme `chart_1`…`chart_5` colour); `Tag` (QoS 1); ghost `Button` with `dropdown_menu` and a `PopupMenu` (row actions); `Input` with `InputEvent::PressEnter` and a QoS `Select` as suffix; `Popover` with `Switch` and `ToggleGroup` for the options (MQTT 5) |
@@ -248,12 +250,16 @@ Every view designs these states: empty, loading, error with a recovery action, d
 
 | Where | Empty-state text | Action |
 |---|---|---|
-| No profiles | "Add a broker to start" | "New connection…" (primary), "Connect to localhost:1883 (not encrypted)" |
+| No connection exists | "Add a broker to start" | "New connection…" (primary), "Connect to localhost:1883 (not encrypted)" |
+| Connections exist, none active | "Choose a connection" and "Your connections are in this menu." | "Choose a connection ▾" (a menu button with the rows of the title bar menu), "New connection…" |
 | Connected, no subscriptions | "Subscribe to a topic filter to see messages." | Focus the subscribe input |
-| Connecting | "Connecting to mqtts://broker:8883…" | "Cancel" |
+| Connecting, reconnecting | "Connecting to mqtts://broker:8883…" | "Cancel" |
 | Broker rejected `#` | "The broker does not allow #. Subscribe to a narrower filter." | Focus the subscribe input |
 | Subscribed, no messages yet | "No messages yet" and "Messages show here when the broker sends them." | — |
-| Not connected | "Not connected" and "Connect to a broker to see messages." | "Connect" |
+| Active, disconnected | The connection card: the name, then "mqtt://host:port · MQTT 3.1.1 · Not encrypted" | "Connect" (primary), "Edit connection…" |
+| Failed | The card, then the reason | "Try again" (primary), "Edit connection…" |
+| Disconnecting | "Disconnecting from lab…" | — |
+| Failed, messages on screen | A banner above the list: "lab: reason" | "Try again", "Edit connection…", close (×). A new connect shows it again. |
 | Filters have no match | "No messages match the filters" (Tree: "No topics match the filters") | "Clear filters" |
 | No selection | "Select a topic with a message." | — |
 

@@ -462,7 +462,9 @@ impl Navigator {
                 // A cancelled question returns the focus to the menu button.
                 .on_close(move |_, window, cx| {
                     if !close_flag.get() {
-                        on_close.update(cx, |v, cx| v.menu_focus.focus(window, cx)).ok();
+                        on_close
+                            .update(cx, |v, cx| v.menu_focus.focus(window, cx))
+                            .ok();
                     }
                 })
         });

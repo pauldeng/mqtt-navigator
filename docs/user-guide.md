@@ -53,8 +53,8 @@ If you start the app again, it adds the entry again. On X11 the window icon come
 
 ## First run
 
-1. Start the app. It opens with the message "Add a broker to start" The screen also has **Connect to localhost:1883 (not encrypted)** for a broker on your own computer.
-2. Select **New connection…** (`Ctrl/Cmd+N`). Fill in the host. Select **Save and connect**.
+1. Start the app. It opens with the message "Add a broker to start". The screen also has **Connect to localhost:1883 (not encrypted)** for a broker on your own computer.
+2. Select **New connection…** (`Ctrl/Cmd+N`). Fill in the host. Select **Save and connect**. If you select **Save**, the connection becomes the active one and the screen shows its name and address. Then select **Connect**.
 3. A new connection subscribes to `#`. Messages appear at once.
 4. Select a row. In a wide window, the details pane opens and shows the payload.
 
@@ -62,7 +62,11 @@ To test without a broker of your own, use a public test broker. Use TLS, and do 
 
 ## Connections
 
-Open the sheet with **Manage connections…** in the profile menu of the title bar. The sheet lists the saved connections. **New connection** is the last row.
+The connection menu is the button at the left of the title bar. It shows the active connection: its name and its address. Select it to see all connections. A check mark shows the active one. The menu also has **Edit "name"…**, **New connection…** and **Manage connections…**. **Manage connections…** opens the sheet. The sheet lists the saved connections. **New connection** is the last row. The sheet title says "New connection" or "Edit name".
+
+When no connection is active, the button says **Choose a connection**. When no connection exists, it says **Add a connection**.
+
+The main screen also shows the active connection when it is not connected. It has the name, the address, **Connect** and **Edit connection…**. If a connection fails, the screen shows the reason and **Try again**. If messages are on screen, a banner above the list shows the same. A connection that you start with command line options is not saved. The menu shows "Command line: not saved" for it.
 
 ### Basic fields
 
@@ -142,7 +146,7 @@ QoS 1 does not guarantee that the app shows each message. If the app queue or th
 - **Import…** reads such a file. The app never overwrites a connection. It adds a suffix such as " (2)" to a name that exists.
 - **Delete connection…** also removes the saved password.
 - If you save a connection that is active, the status bar shows "Reconnect to apply your changes." Select **Reconnect**.
-- If you select another connection while connected, the app asks first. Messages of the old connection are removed.
+- If you choose another connection while you are not connected, the app only selects it. Select **Connect** to connect. If you choose another connection while connected, the app asks first. Messages of the old connection are removed.
 - The app reconnects by itself after a lost connection ("Reconnecting (3)…"). The wait grows: the base doubles from 1 s to 30 s, and the real wait is 0.8 s to 36 s. It also retries when the broker is not reachable or answers with one of these reasons: the server is not available, the server is busy, a quota is exceeded, or the connection rate is exceeded. It does not retry for a wrong user name or password, a client that is not authorized, a ban, a host name that is not found, or a certificate error.
 
 ## Subscribe

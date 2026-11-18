@@ -364,7 +364,14 @@ impl ConnectionSheet {
             "New connection".into()
         } else {
             let p = &self.origin;
-            format!("Edit {}", if p.name.trim().is_empty() { &p.host } else { &p.name })
+            format!(
+                "Edit {}",
+                if p.name.trim().is_empty() {
+                    &p.host
+                } else {
+                    &p.name
+                }
+            )
         }
     }
 
