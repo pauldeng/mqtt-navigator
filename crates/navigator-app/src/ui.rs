@@ -5,6 +5,7 @@ mod commands;
 mod compose;
 mod details;
 mod profiles;
+use profiles::{choose_text, display_name, host_port};
 mod update;
 
 use std::cell::OnceCell;
@@ -47,7 +48,7 @@ use navigator_core::store::{
 use navigator_core::text::display_safe;
 use uuid::Uuid;
 
-use crate::connections::{Choice, ConnectionSheet, ProfileItem, SheetEvent};
+use crate::connections::{ConnectionSheet, SheetEvent};
 use crate::messages::{
     colour_slot, details_lines, format_time, granted_text, group_digits, options_text, row_result,
     status_failed, status_from_result, status_text,
@@ -880,7 +881,12 @@ pub struct Navigator {
     connect_owners: Vec<(u64, Uuid)>,
     /// The MQTT version of the latest Connect.
     conn_protocol: Protocol,
-    profile_select: Entity<SelectState<Vec<ProfileItem>>>,
+    /// The primary button of the title bar. A choice or a save moves the focus here.
+    connect_focus: FocusHandle,
+    /// The connection menu button. A cancelled switch question returns the focus here.
+    menu_focus: FocusHandle,
+    /// The user closed the failure banner. A new connect shows it again.
+    banner_closed: bool,
     sheet: Option<WeakEntity<ConnectionSheet>>,
     /// The window system can resize a new window soon after the first frame. A resize before
     /// this time is not the user's. `None`: no frame yet.
@@ -1067,25 +1073,6 @@ impl Navigator {
             }
         });
         let bounds = cx.observe_window_bounds(window, |v, window, cx| v.on_resize(window, cx));
-        let profile_select =
-            cx.new(|cx| SelectState::new(Vec::<ProfileItem>::new(), None, window, cx));
-        let select_events = cx.subscribe_in(
-            &profile_select,
-            window,
-            |v, _, ev: &SelectEvent<Vec<ProfileItem>>, window, cx| {
-                let SelectEvent::Confirm(choice) = ev;
-                match choice {
-                    Some(Choice::Profile(id)) => v.request_switch(*id, false, window, cx),
-                    Some(Choice::Manage) => {
-                        // The select shows the active profile again, not "Manage connections…".
-                        v.sync_select(window, cx);
-                        v.open_sheet(None, false, window, cx);
-                    }
-                    None => {}
-                }
-            },
-        );
-
         let (kick, kick_rx) = tokio::sync::mpsc::channel(1);
         let incoming = Arc::new(tokio::sync::Mutex::new(incoming));
         Self::spawn_ingest(incoming.clone(), kick_rx, cx);
@@ -1124,7 +1111,9 @@ impl Navigator {
             reconnect_pending: false,
             connect_owners: Vec::new(),
             conn_protocol: Protocol::V311,
-            profile_select,
+            connect_focus: cx.focus_handle(),
+            menu_focus: cx.focus_handle(),
+            banner_closed: false,
             sheet: None,
             resize_settled_at: None,
             user_resized: false,
@@ -1194,7 +1183,6 @@ impl Navigator {
             _subscriptions: vec![
                 appearance,
                 bounds,
-                select_events,
                 sub_events,
                 filter_events,
                 // On quit, the settings writer saves a pending change at once.
@@ -1228,7 +1216,6 @@ impl Navigator {
                 }),
             ],
         };
-        this.sync_select(window, cx);
         // The command line gives a session profile: connect at once, as before.
         if this.profile.is_some()
             && let Err(why) = this.send_connect()
@@ -2231,7 +2218,7 @@ impl Navigator {
             navigator_core::net::Transport::Wss => "wss",
             navigator_core::net::Transport::Ws => "ws",
         };
-        format!("{scheme}://{}:{}", p.host, p.port)
+        format!("{scheme}://{}", host_port(p))
     }
 
     fn render_title(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2245,6 +2232,8 @@ impl Navigator {
             ConnState::Failed(_) => theme.danger,
             ConnState::Disconnected => theme.muted_foreground,
         };
+        let menu_button = self.render_menu_button(dot, cx);
+        let theme = cx.theme();
         let reason = match &self.status.state {
             ConnState::Reconnecting { reason, .. } => Some(reason.clone()),
             _ => None,
@@ -2260,19 +2249,21 @@ impl Navigator {
                 .w_full()
                 .pr_2()
                 .gap_3()
-                .child(
-                    div().w(ui(180.)).child(
-                        Select::new(&self.profile_select)
-                            .small()
-                            .placeholder("No connections")
-                            .menu_width(ui(260.)),
-                    ),
-                )
+                .child(menu_button)
                 .child(
                     h_flex()
                         .gap_1()
-                        .child(div().size_2().rounded_full().bg(dot))
-                        .child(div().text_sm().child(self.state_text()))
+                        .min_w_0()
+                        .child(div().size_2().flex_none().rounded_full().bg(dot))
+                        .child(
+                            div()
+                                .text_sm()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(self.state_text()),
+                        )
                         .when_some(reason, |d, why| {
                             d.child(
                                 div()
@@ -2289,17 +2280,92 @@ impl Navigator {
                 .child(div().flex_1())
                 .children(self.render_update_badge(cx))
                 .child(self.render_settings_menu(cx))
-                .child(
-                    Button::new("connect")
-                        .small()
-                        .primary()
-                        .label(label)
-                        .disabled(
-                            self.status.state == ConnState::Disconnecting || self.profile.is_none(),
-                        )
-                        .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx))),
-                ),
+                .when(self.profile.is_some(), |d| {
+                    d.child(
+                        div().flex_none().child(
+                            Button::new("connect")
+                                .small()
+                                .primary()
+                                .label(
+                                    if self.status.state == ConnState::Disconnecting {
+                                        "Disconnecting…"
+                                    } else {
+                                        label
+                                    },
+                                )
+                                .tooltip(self.primary_tooltip(label))
+                                .track_focus(&self.connect_focus)
+                                .disabled(self.status.state == ConnState::Disconnecting)
+                                .on_click(
+                                    cx.listener(|v, _, window, cx| v.toggle_connection(window, cx)),
+                                ),
+                        ),
+                    )
+                }),
         )
+    }
+
+    /// "Connect to lab (mqtt://localhost:18830)".
+    fn primary_tooltip(&self, label: &str) -> String {
+        let name = self.profile.as_ref().map(display_name).unwrap_or_default();
+        match label {
+            "Connect" => format!("Connect to {name} ({})", self.url()),
+            "Cancel" => format!("Cancel the connection to {name}"),
+            _ => format!("Disconnect from {name}"),
+        }
+    }
+
+    /// The connection menu button of the title bar. With no connection at all, it opens the
+    /// sheet. Below 900 px, it shows the name only.
+    fn render_menu_button(&self, dot: Hsla, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.all_profiles().count();
+        let Some(p) = &self.profile else {
+            let button = Button::new("connection-menu")
+                .small()
+                .track_focus(&self.menu_focus)
+                .label(choose_text(count));
+            return if count == 0 {
+                button
+                    .on_click(cx.listener(|v, _, window, cx| v.open_sheet(None, true, window, cx)))
+                    .into_any_element()
+            } else {
+                button
+                    .dropdown_caret(true)
+                    .dropdown_menu(self.connection_menu(cx))
+                    .into_any_element()
+            };
+        };
+        let (name, addr) = (display_name(p), host_port(p));
+        let narrow = self.last_size.0 < 900.;
+        Button::new("connection-menu")
+            .small()
+            .max_w(ui(320.))
+            .track_focus(&self.menu_focus)
+            .tooltip(format!("{name} ({})", self.url()))
+            .dropdown_caret(true)
+            .child(div().size_2().flex_none().rounded_full().bg(dot))
+            .child(
+                div()
+                    .max_w(ui(160.))
+                    .flex_none()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(name),
+            )
+            .when(!narrow, |b| {
+                b.child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("· {addr}")),
+                )
+            })
+            .dropdown_menu(self.connection_menu(cx))
+            .into_any_element()
     }
 
     /// The settings menu of the title bar (the gear): Commands…, the submenus Appearance, Theme,

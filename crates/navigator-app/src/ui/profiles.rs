@@ -7,6 +7,8 @@ use navigator_core::net::Transport;
 use navigator_core::profile::{dedupe_names, export_profiles, import_profiles};
 use navigator_core::settings::Load;
 
+use gpui_kit::component::menu::PopupMenu;
+
 use super::*;
 use crate::secrets::{self, Edit, Stored};
 
@@ -47,6 +49,31 @@ pub(super) fn display_name(p: &Profile) -> String {
     } else {
         p.name.clone()
     }
+}
+
+/// "host:port". An IPv6 host shows in brackets.
+pub(super) fn host_port(p: &Profile) -> String {
+    if p.host.contains(':') && !p.host.starts_with('[') {
+        format!("[{}]:{}", p.host, p.port)
+    } else {
+        format!("{}:{}", p.host, p.port)
+    }
+}
+
+/// The text of the connection menu button when no connection is active. `connections` counts
+/// the saved ones and the "Command line" one.
+pub(super) fn choose_text(connections: usize) -> &'static str {
+    if connections == 0 {
+        "Add a connection"
+    } else {
+        "Choose a connection"
+    }
+}
+
+/// A Save of a new connection makes it active only when nothing is live or on its way: the
+/// state is Disconnected or Failed, no keyring read is pending and no Connect is outstanding.
+pub(super) fn save_selects(is_new: bool, state: &ConnState, connecting: bool) -> bool {
+    is_new && !connecting && matches!(state, ConnState::Disconnected | ConnState::Failed(_))
 }
 
 impl Navigator {
@@ -134,7 +161,6 @@ impl Navigator {
                 }
             }
         }
-        self.sync_select(window, cx);
         // One check at start, never on a timer. A metrics run makes no network traffic.
         if ui.check_updates && std::env::var_os("MQTT_NAVIGATOR_METRICS").is_none() {
             self.check_updates(false, window, cx);
@@ -214,7 +240,7 @@ impl Navigator {
     // -----------------------------------------------------------------------------------------
 
     /// The session profile (command line) first, then the saved profiles.
-    fn all_profiles(&self) -> impl Iterator<Item = &Profile> {
+    pub(super) fn all_profiles(&self) -> impl Iterator<Item = &Profile> {
         self.session.iter().chain(self.settings.profiles.iter())
     }
 
@@ -222,27 +248,80 @@ impl Navigator {
         self.all_profiles().find(|p| p.id == id)
     }
 
-    /// Makes the select show the profile list and the active profile.
-    pub(super) fn sync_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut items: Vec<ProfileItem> = self
+    /// The rows of the connection menus: the title bar menu and the menu button of the empty
+    /// state "Choose a connection". One function builds both.
+    pub(super) fn connection_menu(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let rows: Vec<(Uuid, SharedString, SharedString)> = self
             .all_profiles()
-            .map(|p| ProfileItem {
-                choice: Choice::Profile(p.id),
-                title: display_name(p).into(),
-            })
+            .map(|p| (p.id, display_name(p).into(), host_port(p).into()))
             .collect();
-        items.push(ProfileItem {
-            choice: Choice::Manage,
-            title: "Manage connections…".into(),
-        });
-        let active = self.profile.as_ref().map(|p| Choice::Profile(p.id));
-        self.profile_select.update(cx, |select, cx| {
-            select.set_items(items, window, cx);
-            match active {
-                Some(choice) => select.set_selected_value(&choice, window, cx),
-                None => select.set_selected_index(None, window, cx),
+        let active = self.profile.as_ref().map(|p| p.id);
+        let command_line = self.session.as_ref().map(|s| s.id) == active;
+        let edit_name = self.profile.as_ref().map(display_name);
+        let weak = cx.entity().downgrade();
+        move |menu, window, _| {
+            let rem = window.rem_size();
+            let mut menu = menu
+                .scrollable(true)
+                .min_w(ui(300.).to_pixels(rem))
+                .max_h(ui(320.).to_pixels(rem));
+            for (id, name, addr) in rows.iter().cloned() {
+                let w = weak.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, cx| {
+                        h_flex()
+                            .w_full()
+                            .gap_4()
+                            .justify_between()
+                            .child(name.clone())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(addr.clone()),
+                            )
+                    })
+                    .checked(active == Some(id))
+                    .on_click(move |_, window, cx| {
+                        w.update(cx, |v, cx| v.request_switch(id, false, window, cx))
+                            .ok();
+                    }),
+                );
             }
-        });
+            if !rows.is_empty() {
+                menu = menu.separator();
+            }
+            if let (Some(name), Some(id)) = (&edit_name, active) {
+                let w = weak.clone();
+                menu = menu.item(if command_line {
+                    PopupMenuItem::new("Command line: not saved").disabled(true)
+                } else {
+                    PopupMenuItem::new(format!("Edit \"{name}\"…")).on_click(
+                        move |_, window, cx| {
+                            w.update(cx, |v, cx| v.open_sheet(Some(id), false, window, cx))
+                                .ok();
+                        },
+                    )
+                });
+            }
+            let (w1, w2) = (weak.clone(), weak.clone());
+            menu.item(
+                PopupMenuItem::new(format!("New connection… ({}+N)", crate::palette::MOD))
+                    .on_click(move |_, window, cx| {
+                        w1.update(cx, |v, cx| v.open_sheet(None, true, window, cx))
+                            .ok();
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Manage connections…").on_click(move |_, window, cx| {
+                    w2.update(cx, |v, cx| v.open_sheet(None, false, window, cx))
+                        .ok();
+                }),
+            )
+        }
     }
 
     /// Makes `profile` the active one and shows its subscriptions. It starts no connection.
@@ -354,8 +433,10 @@ impl Navigator {
         }
         let from = self.profile.as_ref().map(display_name).unwrap_or_default();
         let weak = cx.entity().downgrade();
+        let accepted = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (on_ok, on_close) = (weak.clone(), weak.clone());
+            let (ok_flag, close_flag) = (accepted.clone(), accepted.clone());
             alert
                 .title(if same {
                     format!("Reconnect to {target}?")
@@ -371,14 +452,17 @@ impl Navigator {
                 })
                 .cancel_text("Cancel")
                 .on_ok(move |_, window, cx| {
+                    ok_flag.set(true);
                     on_ok
                         .update(cx, |v, cx| v.switch_to(id, true, window, cx))
                         .ok();
                     true
                 })
-                // Whatever the user chose, the select shows the active profile again.
+                // A cancelled question returns the focus to the menu button.
                 .on_close(move |_, window, cx| {
-                    on_close.update(cx, |v, cx| v.sync_select(window, cx)).ok();
+                    if !close_flag.get() {
+                        on_close.update(cx, |v, cx| v.menu_focus.focus(window, cx)).ok();
+                    }
                 })
         });
     }
@@ -404,10 +488,10 @@ impl Navigator {
             self.settings.last_profile_id = Some(id);
             self.persist();
         }
-        self.sync_select(window, cx);
         if connect {
             self.connect(window, cx);
         }
+        self.connect_focus.focus(window, cx);
         cx.notify();
     }
 
@@ -569,7 +653,6 @@ impl Navigator {
     /// The saved profiles changed: show them in the select and in the open sheet.
     fn profiles_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.persist();
-        self.sync_select(window, cx);
         let profiles = self.settings.profiles.clone();
         if let Some(sheet) = self.sheet.as_ref().and_then(WeakEntity::upgrade) {
             sheet.update(cx, |s, cx| s.set_profiles(profiles, window, cx));
@@ -588,6 +671,11 @@ impl Navigator {
     ) {
         let id = profile.id;
         let mut profile = profile;
+        let select = save_selects(
+            !self.settings.profiles.iter().any(|p| p.id == id),
+            &self.status.state,
+            self.connecting(),
+        );
         match self.settings.profiles.iter_mut().find(|p| p.id == id) {
             Some(slot) => {
                 // The sheet does not edit the subscriptions. Keep the ones that the user
@@ -643,6 +731,9 @@ impl Navigator {
         window.close_sheet(cx);
         if connect {
             self.request_switch(id, true, window, cx);
+        } else if select {
+            // The same path as a choice in the menu: the old data does not stay.
+            self.switch_to(id, false, window, cx);
         }
     }
 
@@ -858,7 +949,8 @@ impl Navigator {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_size, count_text, same_connection};
+    use super::{choose_text, clamp_size, count_text, host_port, same_connection, save_selects};
+    use crate::ui::ConnState;
     use navigator_core::net::Transport;
     use navigator_core::profile::Profile;
 
@@ -888,5 +980,48 @@ mod tests {
     fn counts_read_well() {
         assert_eq!(count_text(1, "Imported"), "Imported 1 connection.");
         assert_eq!(count_text(3, "Imported"), "Imported 3 connections.");
+    }
+
+    #[test]
+    fn menu_button_text_follows_the_connection_count() {
+        // Nothing saved and no "Command line" connection.
+        assert_eq!(choose_text(0), "Add a connection");
+        // Saved connections, or only the "Command line" one.
+        assert_eq!(choose_text(1), "Choose a connection");
+        assert_eq!(choose_text(3), "Choose a connection");
+    }
+
+    #[test]
+    fn ipv6_host_shows_in_brackets() {
+        let mut p = Profile::new();
+        p.host = "fd00::1".into();
+        p.port = 1883;
+        assert_eq!(host_port(&p), "[fd00::1]:1883");
+        p.host = "localhost".into();
+        assert_eq!(host_port(&p), "localhost:1883");
+    }
+
+    #[test]
+    fn save_selects_a_new_connection_only_when_idle() {
+        let idle = [ConnState::Disconnected, ConnState::Failed("x".into())];
+        for s in &idle {
+            assert!(save_selects(true, s, false));
+            // A pending keyring read or an outstanding Connect.
+            assert!(!save_selects(true, s, true));
+            // An edit of a saved connection.
+            assert!(!save_selects(false, s, false));
+        }
+        let busy = [
+            ConnState::Connected,
+            ConnState::Connecting,
+            ConnState::Reconnecting {
+                attempt: 1,
+                reason: "x".into(),
+            },
+            ConnState::Disconnecting,
+        ];
+        for s in &busy {
+            assert!(!save_selects(true, s, false));
+        }
     }
 }

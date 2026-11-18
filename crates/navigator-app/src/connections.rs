@@ -26,32 +26,6 @@ use uuid::Uuid;
 
 use crate::secrets::Edit;
 
-/// What the title bar select offers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Choice {
-    Profile(Uuid),
-    /// The last item: "Manage connections…".
-    Manage,
-}
-
-#[derive(Clone)]
-pub struct ProfileItem {
-    pub choice: Choice,
-    pub title: SharedString,
-}
-
-impl SearchableListItem for ProfileItem {
-    type Value = Choice;
-
-    fn title(&self) -> SharedString {
-        self.title.clone()
-    }
-
-    fn value(&self) -> &Choice {
-        &self.choice
-    }
-}
-
 #[derive(Clone)]
 struct ProtocolItem(Protocol);
 
