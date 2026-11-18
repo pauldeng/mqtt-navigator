@@ -148,7 +148,7 @@ Each empty state names the broker and gives the next action. One primary button 
 - The menu button is in the Tab order. `Enter` or `Space` opens the menu. The arrow keys move. `Enter` chooses. `Esc` closes the menu and returns the focus to the button.
 - After a choice, the focus moves to the primary button (**Connect**).
 - After **Save** in the sheet, the focus moves to the primary button.
-- If you cancel the "Disconnect from …?" question, the focus returns to the menu button.
+- When the "Disconnect from …?" question closes (Switch connection or Cancel), the focus is on the menu button. gpui-kit gives the focus back to the element that had it when the question opened, after its close animation, so the app moves the focus to the menu button before it asks.
 - The card buttons in C and D are normal buttons in the Tab order.
 - `Ctrl/Cmd+N` (new connection) stays.
 

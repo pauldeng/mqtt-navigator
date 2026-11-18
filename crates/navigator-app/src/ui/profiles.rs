@@ -434,10 +434,11 @@ impl Navigator {
         }
         let from = self.profile.as_ref().map(display_name).unwrap_or_default();
         let weak = cx.entity().downgrade();
-        let accepted = std::rc::Rc::new(std::cell::Cell::new(false));
+        // The dialog gives the focus back to the element that had it when it opened, after its
+        // close animation. So the focus goes to the menu button first, for Switch and Cancel.
+        self.menu_focus.focus(window, cx);
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let (on_ok, on_close) = (weak.clone(), weak.clone());
-            let (ok_flag, close_flag) = (accepted.clone(), accepted.clone());
+            let weak = weak.clone();
             alert
                 .title(if same {
                     format!("Reconnect to {target}?")
@@ -453,19 +454,9 @@ impl Navigator {
                 })
                 .cancel_text("Cancel")
                 .on_ok(move |_, window, cx| {
-                    ok_flag.set(true);
-                    on_ok
-                        .update(cx, |v, cx| v.switch_to(id, true, window, cx))
+                    weak.update(cx, |v, cx| v.switch_to(id, true, window, cx))
                         .ok();
                     true
-                })
-                // A cancelled question returns the focus to the menu button.
-                .on_close(move |_, window, cx| {
-                    if !close_flag.get() {
-                        on_close
-                            .update(cx, |v, cx| v.menu_focus.focus(window, cx))
-                            .ok();
-                    }
                 })
         });
     }
