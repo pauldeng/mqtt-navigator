@@ -2302,8 +2302,10 @@ impl Navigator {
         )
     }
 
-    /// The settings menu of the title bar (the gear): Commands…, Appearance, Theme, Row height,
-    /// Memory budget, Reset the layout and the renderer. The checked items show the current choice.
+    /// The settings menu of the title bar (the gear): Commands…, the submenus Appearance, Theme,
+    /// Row height and Memory budget, Reset the layout, and the renderer. The checked items of a
+    /// submenu show the current choice. The top level has no checked item and is short, so it
+    /// fits a small window and does not scroll (a scrollable menu jumps to its checked item).
     fn render_settings_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.settings.ui.theme_mode;
         let current = crate::themes::preset_by_id(&self.settings.ui.theme_preset);
@@ -2315,62 +2317,78 @@ impl Navigator {
             .ghost()
             .icon(IconName::Settings)
             .tooltip("Settings")
-            .dropdown_menu(move |menu, window, _| {
+            .dropdown_menu(move |menu, window, cx| {
                 let w = weak.clone();
-                let mut menu = menu.scrollable(true).item(
+                let menu = menu.item(
                     PopupMenuItem::new(format!("Commands… ({}+K)", crate::palette::MOD)).on_click(
                         move |_, window, cx| {
                             w.update(cx, |v, cx| v.open_palette(window, cx)).ok();
                         },
                     ),
                 );
-                menu = menu.separator().label("Appearance");
-                for (label, m) in [
-                    ("System", ThemeMode::System),
-                    ("Light", ThemeMode::Light),
-                    ("Dark", ThemeMode::Dark),
-                ] {
-                    let weak = weak.clone();
-                    menu = menu.item(PopupMenuItem::new(label).checked(mode == m).on_click(
-                        move |_, window, cx| {
-                            weak.update(cx, |v, cx| v.set_appearance(m, window, cx))
-                                .ok();
-                        },
-                    ));
-                }
-                menu = menu.separator().label("Theme");
-                for p in crate::themes::PRESETS {
-                    let weak = weak.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(p.label)
-                            .checked(p.id == current.id)
-                            .on_click(move |_, window, cx| {
-                                weak.update(cx, |v, cx| v.set_preset(p.id, window, cx)).ok();
-                            }),
-                    );
-                }
-                menu = menu.separator().label("Row height");
-                for (label, two) in [("1 line", false), ("2 lines", true)] {
-                    let weak = weak.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label)
-                            .checked(two_lines == two)
-                            .on_click(move |_, _, cx| {
-                                weak.update(cx, |v, cx| v.set_row_height(two, cx)).ok();
-                            }),
-                    );
-                }
-                menu = menu.separator().label("Memory budget");
-                for mib in crate::palette::MEMORY_OPTIONS_MIB {
-                    let weak = weak.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(crate::palette::memory_text(mib))
-                            .checked(mib == memory)
-                            .on_click(move |_, _, cx| {
-                                weak.update(cx, |v, cx| v.set_memory_limit(mib, cx)).ok();
-                            }),
-                    );
-                }
+                let w = weak.clone();
+                let menu =
+                    menu.separator()
+                        .submenu("Appearance", window, cx, move |mut menu, _, _| {
+                            for (label, m) in [
+                                ("System", ThemeMode::System),
+                                ("Light", ThemeMode::Light),
+                                ("Dark", ThemeMode::Dark),
+                            ] {
+                                let w = w.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label).checked(mode == m).on_click(
+                                        move |_, window, cx| {
+                                            w.update(cx, |v, cx| v.set_appearance(m, window, cx))
+                                                .ok();
+                                        },
+                                    ),
+                                );
+                            }
+                            menu
+                        });
+                let w = weak.clone();
+                let menu = menu.submenu("Theme", window, cx, move |mut menu, _, _| {
+                    for p in crate::themes::PRESETS {
+                        let w = w.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(p.label)
+                                .checked(p.id == current.id)
+                                .on_click(move |_, window, cx| {
+                                    w.update(cx, |v, cx| v.set_preset(p.id, window, cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                });
+                let w = weak.clone();
+                let menu = menu.submenu("Row height", window, cx, move |mut menu, _, _| {
+                    for (label, two) in [("1 line", false), ("2 lines", true)] {
+                        let w = w.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(label)
+                                .checked(two_lines == two)
+                                .on_click(move |_, _, cx| {
+                                    w.update(cx, |v, cx| v.set_row_height(two, cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                });
+                let w = weak.clone();
+                let menu = menu.submenu("Memory budget", window, cx, move |mut menu, _, _| {
+                    for mib in crate::palette::MEMORY_OPTIONS_MIB {
+                        let w = w.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(crate::palette::memory_text(mib))
+                                .checked(mib == memory)
+                                .on_click(move |_, _, cx| {
+                                    w.update(cx, |v, cx| v.set_memory_limit(mib, cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                });
                 let w = weak.clone();
                 menu.separator()
                     .item(

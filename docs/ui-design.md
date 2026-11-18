@@ -55,7 +55,7 @@ The window has one place for each job. A control shows when it can act. Rare act
   - The profile `Select`. Its last item, "Manage connections…", opens the connection sheet (section 3.1).
   - The connection state, as a dot **and** text: "Connecting…", "Connected", "Reconnecting (3)…", "Disconnected: The broker rejected the connection: this client is not authorized.".
   - The one primary action. It is "Connect" when disconnected, "Cancel" while connecting, and "Disconnect" when connected.
-  - A settings menu (gear icon, tooltip "Settings"). It holds: Commands… (`Ctrl/Cmd+K`), Appearance, Theme, Row height, Memory budget, Reset the layout and a renderer line (GPU or software, and the API). The renderer line is not an action.
+  - A settings menu (gear icon, tooltip "Settings"). It holds: Commands… (`Ctrl/Cmd+K`), the submenus Appearance, Theme, Row height and Memory budget, Reset the layout, and a renderer line (GPU or software, and the API). The renderer line is not an action. The checked items are in the submenus. The top level has no checked item and does not scroll, so it fits a small window. (A scrollable gpui-kit menu scrolls to its first checked item one frame after it opens. In a small window that looked like a flicker.)
   - The filter is in the centre header. The command palette has no button of its own.
   - If you select a different profile while connected, the app asks "Disconnect from prod and connect to test? Messages from prod are removed.". It does not change the active broker silently.
   - **Data belongs to one profile.** Switching to another profile clears the received messages, the selection, the composer and History. A disconnect or a reconnect with the **same** profile keeps them, and the list shows a marker row "Reconnected 12:05:10".
@@ -181,7 +181,7 @@ This table lists what the app uses now.
 |---|---|
 | Window and overlays | `gpui_kit::open_window` with `TitleBar::window_options()`. `Root` hosts dialogs, sheets, toasts, menus. |
 | Title bar | `TitleBar` with `Select` (profiles), `Button` (settings menu, connect) |
-| Settings menu | `Button::dropdown_menu` with a `PopupMenu`: Commands…, sections "Appearance" and "Theme" (checked items), Row height, Memory budget, Reset the layout, the renderer label |
+| Settings menu | `Button::dropdown_menu` with a `PopupMenu`: Commands…, submenus (`PopupMenu::submenu`) Appearance, Theme, Row height and Memory budget with checked items, Reset the layout, the renderer label |
 | Three panes | `h_resizable` with `resizable_panel().size(saved).size_range(..)`. The side panels are `.fixed()`. We save the widths in `on_resize`. |
 | Subscriptions list | `ListItem` rows (selected state = "Show only") in a `uniform_list`; a colour dot (`div` with a theme `chart_1`…`chart_5` colour); `Tag` (QoS 1); ghost `Button` with `dropdown_menu` and a `PopupMenu` (row actions); `Input` with `InputEvent::PressEnter` and a QoS `Select` as suffix; `Popover` with `Switch` and `ToggleGroup` for the options (MQTT 5) |
 | Messages / Tree switch | `TabBar::segmented()` |
@@ -225,7 +225,7 @@ Not used yet: `Spinner`, `Button::loading`, `Popover` with `TextView` (update no
   | macOS Classic | macOS Classic Light | macOS Classic Dark |
   | Tokyo Night | Default Light | Tokyo Night |
 
-- Setting "Appearance": **System** (default), Light, Dark. The settings menu of the title bar has two sections, "Appearance" and "Theme". The command palette has "Appearance: …" and "Theme: …" entries. The app saves `ui.theme_mode` and `ui.theme_preset`. An unknown preset id means "default".
+- Setting "Appearance": **System** (default), Light, Dark. The settings menu of the title bar has two submenus, "Appearance" and "Theme". The command palette has "Appearance: …" and "Theme: …" entries. The app saves `ui.theme_mode` and `ui.theme_preset`. An unknown preset id means "default".
 - The app applies the saved preset before the first window opens, so the first frame has the right colours. After each change it sets the font size, the font families and the caret blink again, because a theme change resets them.
 - System mode follows the OS. Use `cx.observe_window_appearance` and `Theme::sync_system_appearance`. This is an event; there is no polling.
 - Status colours use the semantic tokens `success`, `warning`, `danger`, `info`. Each status also has an icon or text.
