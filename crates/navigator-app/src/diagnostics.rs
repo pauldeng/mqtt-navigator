@@ -43,7 +43,7 @@ impl Info {
         format!(
             "MQTT Navigator {}\n\
              System: {} {}\n\
-             Graphics: {}\n\
+             Graphics: {} ({GRAPHICS_API})\n\
              Connection: {}\n\
              Topics: {}\n\
              Messages: {}\n\
@@ -100,10 +100,28 @@ pub fn gpu_text(specs: Option<(&str, &str, &str, bool)>) -> String {
     }
 }
 
+/// The drawing API of this build. gpui uses one API on each OS.
+pub const GRAPHICS_API: &str = if cfg!(windows) {
+    "DirectX 11"
+} else if cfg!(target_os = "macos") {
+    "Metal"
+} else {
+    "Vulkan or OpenGL"
+};
+
+/// The renderer line of the settings menu: GPU or software, and the API. "Copy diagnostics"
+/// names the adapter. `None`: the platform does not tell (macOS always draws on the GPU).
+pub fn renderer_text(software: Option<bool>) -> String {
+    match software {
+        Some(true) => format!("software, {GRAPHICS_API}"),
+        _ => format!("GPU, {GRAPHICS_API}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
-    use super::{Info, gpu_text};
+    use super::{GRAPHICS_API, Info, gpu_text, renderer_text};
     use navigator_core::Incoming;
     use navigator_core::net::{ConnState, Profile};
     use navigator_core::store::{Limits, TopicStore};
@@ -156,5 +174,15 @@ mod tests {
         assert!(text.contains("Test GPU") && text.contains("Connection: Failed"));
         assert!(text.contains("2 messages (network)"));
         assert_eq!(gpu_text(None), "Unavailable");
+    }
+
+    #[test]
+    fn the_renderer_line_names_software_drawing() {
+        assert_eq!(
+            renderer_text(Some(true)),
+            format!("software, {GRAPHICS_API}")
+        );
+        assert_eq!(renderer_text(Some(false)), format!("GPU, {GRAPHICS_API}"));
+        assert_eq!(renderer_text(None), format!("GPU, {GRAPHICS_API}"));
     }
 }

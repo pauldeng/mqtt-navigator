@@ -2297,7 +2297,7 @@ impl Navigator {
     }
 
     /// The settings menu of the title bar (the gear): Commands…, Appearance, Theme, Row height,
-    /// Memory budget and Reset the layout. The checked items show the current choice.
+    /// Memory budget, Reset the layout and the renderer. The checked items show the current choice.
     fn render_settings_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.settings.ui.theme_mode;
         let current = crate::themes::preset_by_id(&self.settings.ui.theme_preset);
@@ -2308,7 +2308,7 @@ impl Navigator {
             .ghost()
             .icon(IconName::Settings)
             .tooltip("Settings")
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu(move |menu, window, _| {
                 let w = weak.clone();
                 let mut menu = menu.scrollable(true).item(
                     PopupMenuItem::new(format!("Commands… ({}+K)", crate::palette::MOD)).on_click(
@@ -2372,6 +2372,13 @@ impl Navigator {
                                 .ok();
                         }),
                     )
+                    .separator()
+                    .label(format!(
+                        "Renderer: {}",
+                        crate::diagnostics::renderer_text(
+                            window.gpu_specs().map(|g| g.is_software_emulated)
+                        )
+                    ))
             })
     }
 
