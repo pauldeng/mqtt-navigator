@@ -7,7 +7,9 @@ mod details;
 mod profiles;
 mod update;
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -901,9 +903,9 @@ pub struct Navigator {
     /// Keep the newest row at the top of the Messages view.
     follow: Follow,
     two_lines: bool,
-    /// The renderer line of the settings menu. It is read once: on Windows `gpu_specs` loads
-    /// driver libraries.
-    renderer: SharedString,
+    /// The renderer line of the settings menu. The first menu open reads it, not the start: on
+    /// Windows `gpu_specs` loads driver libraries on the UI thread.
+    renderer: Rc<OnceCell<SharedString>>,
     /// The update badge, and the check that runs.
     update: update::UpdateUi,
     direction: DirectionFilter,
@@ -1141,10 +1143,7 @@ impl Navigator {
             sel_topic: None,
             follow: Follow::default(),
             two_lines: true,
-            renderer: crate::diagnostics::renderer_text(
-                window.gpu_specs().map(|g| g.is_software_emulated),
-            )
-            .into(),
+            renderer: Rc::default(),
             update: update::UpdateUi::default(),
             direction: DirectionFilter::All,
             show_only: None,
@@ -2316,7 +2315,7 @@ impl Navigator {
             .ghost()
             .icon(IconName::Settings)
             .tooltip("Settings")
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu(move |menu, window, _| {
                 let w = weak.clone();
                 let mut menu = menu.scrollable(true).item(
                     PopupMenuItem::new(format!("Commands… ({}+K)", crate::palette::MOD)).on_click(
@@ -2381,7 +2380,15 @@ impl Navigator {
                         }),
                     )
                     .separator()
-                    .label(format!("Renderer: {renderer}"))
+                    .label(format!(
+                        "Renderer: {}",
+                        renderer.get_or_init(|| {
+                            crate::diagnostics::renderer_text(
+                                window.gpu_specs().map(|g| g.is_software_emulated),
+                            )
+                            .into()
+                        })
+                    ))
             })
     }
 
