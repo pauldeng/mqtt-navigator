@@ -1,6 +1,6 @@
 # Connection UX: proposal (2026-11-18)
 
-Status: proposal for owner review. Nothing is built. Codex reviewed rounds 1 and 2. This text includes their corrections.
+Status: approved by the owner on 2026-11-18, with the two recommendations of section 7 (select only; a "Choose a connection ▾" button in state B). Codex reviewed rounds 1 and 2. This text includes their corrections.
 
 ## 1. Problem
 
