@@ -743,8 +743,13 @@ impl Navigator {
         }
         self.profiles_changed(window, cx);
         window.close_sheet(cx);
-        // The sheet gives the focus back after it closes, so move it one step later.
-        cx.defer_in(window, |v, window, cx| v.focus_primary(window, cx));
+        // The sheet gives the focus back after it closes, so move it one step later. A switch
+        // question (Save and connect while connected) keeps the focus.
+        cx.defer_in(window, |v, window, cx| {
+            if !window.has_active_dialog(cx) {
+                v.focus_primary(window, cx);
+            }
+        });
         if connect {
             self.request_switch(id, true, window, cx);
         } else if select {
