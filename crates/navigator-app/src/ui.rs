@@ -901,6 +901,9 @@ pub struct Navigator {
     /// Keep the newest row at the top of the Messages view.
     follow: Follow,
     two_lines: bool,
+    /// The renderer line of the settings menu. It is read once: on Windows `gpu_specs` loads
+    /// driver libraries.
+    renderer: SharedString,
     /// The update badge, and the check that runs.
     update: update::UpdateUi,
     direction: DirectionFilter,
@@ -1138,6 +1141,10 @@ impl Navigator {
             sel_topic: None,
             follow: Follow::default(),
             two_lines: true,
+            renderer: crate::diagnostics::renderer_text(
+                window.gpu_specs().map(|g| g.is_software_emulated),
+            )
+            .into(),
             update: update::UpdateUi::default(),
             direction: DirectionFilter::All,
             show_only: None,
@@ -2302,13 +2309,14 @@ impl Navigator {
         let mode = self.settings.ui.theme_mode;
         let current = crate::themes::preset_by_id(&self.settings.ui.theme_preset);
         let (two_lines, memory) = (self.two_lines, self.memory_mib());
+        let renderer = self.renderer.clone();
         let weak = cx.entity().downgrade();
         Button::new("settings")
             .small()
             .ghost()
             .icon(IconName::Settings)
             .tooltip("Settings")
-            .dropdown_menu(move |menu, window, _| {
+            .dropdown_menu(move |menu, _, _| {
                 let w = weak.clone();
                 let mut menu = menu.scrollable(true).item(
                     PopupMenuItem::new(format!("Commands… ({}+K)", crate::palette::MOD)).on_click(
@@ -2373,12 +2381,7 @@ impl Navigator {
                         }),
                     )
                     .separator()
-                    .label(format!(
-                        "Renderer: {}",
-                        crate::diagnostics::renderer_text(
-                            window.gpu_specs().map(|g| g.is_software_emulated)
-                        )
-                    ))
+                    .label(format!("Renderer: {renderer}"))
             })
     }
 
