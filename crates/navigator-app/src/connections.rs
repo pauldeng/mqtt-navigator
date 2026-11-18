@@ -33,15 +33,18 @@ impl SearchableListItem for ProtocolItem {
     type Value = Protocol;
 
     fn title(&self) -> SharedString {
-        match self.0 {
-            Protocol::V311 => "MQTT 3.1.1",
-            Protocol::V5 => "MQTT 5",
-        }
-        .into()
+        protocol_text(self.0).into()
     }
 
     fn value(&self) -> &Protocol {
         &self.0
+    }
+}
+
+pub(crate) fn protocol_text(p: Protocol) -> &'static str {
+    match p {
+        Protocol::V311 => "MQTT 3.1.1",
+        Protocol::V5 => "MQTT 5",
     }
 }
 
@@ -337,8 +340,9 @@ impl ConnectionSheet {
                 name.update(cx, |i, cx| i.focus(window, cx));
             }
             let on_close = entity.clone();
+            let title = entity.read(cx).title();
             sheet
-                .title("Connections")
+                .title(title)
                 .size(crate::ui::ui(540.))
                 // A click outside must not drop the draft. Escape and the close button can
                 // still close the sheet: `dismissed` brings it back if the draft has changes.
@@ -352,6 +356,16 @@ impl ConnectionSheet {
                 .footer(Self::footer(&entity))
                 .child(entity.clone())
         });
+    }
+
+    /// "New connection", or "Edit lab". It follows the draft.
+    fn title(&self) -> String {
+        if self.is_new {
+            "New connection".into()
+        } else {
+            let p = &self.origin;
+            format!("Edit {}", if p.name.trim().is_empty() { &p.host } else { &p.name })
+        }
     }
 
     fn footer(entity: &Entity<Self>) -> impl IntoElement + use<> {

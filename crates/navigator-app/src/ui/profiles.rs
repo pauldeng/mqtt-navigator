@@ -384,6 +384,7 @@ impl Navigator {
     /// has come yet) and removes the messages, the selection, the composer and the subscription
     /// results.
     fn clear_data(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.banner_closed = false;
         self.cancel_connection();
         // Dropping a full store (up to 128 MiB) takes long. A background thread does it.
         let old = self.store.take();
@@ -512,6 +513,7 @@ impl Navigator {
         let Some(id) = self.profile.as_ref().map(|p| p.id) else {
             return;
         };
+        self.banner_closed = false;
         // Edits made while the old connection was live apply now.
         if let Some(saved) = self.find_profile(id).cloned() {
             self.profile = Some(saved);
@@ -904,15 +906,27 @@ impl Navigator {
     /// "No profiles" state (docs/ui-design.md, section 7). "New connection…" is the one primary
     /// action. The localhost shortcut is a plain button next to it.
     pub(super) fn render_no_profile(&self, cx: &mut Context<Self>) -> AnyElement {
-        if !self.settings.profiles.is_empty() {
+        let count = self.all_profiles().count();
+        if count > 0 {
             return empty_state(
-                "No connection selected",
-                "Choose a connection to see messages.",
-                [Button::new("manage-empty")
-                    .small()
-                    .label("Manage connections…")
-                    .on_click(cx.listener(|v, _, window, cx| v.open_sheet(None, false, window, cx)))
-                    .into_any_element()],
+                "Choose a connection",
+                "Your connections are in this menu.",
+                [
+                    Button::new("choose-empty")
+                        .small()
+                        .primary()
+                        .label(choose_text(count))
+                        .dropdown_caret(true)
+                        .dropdown_menu(self.connection_menu(cx))
+                        .into_any_element(),
+                    Button::new("new-empty")
+                        .small()
+                        .label("New connection…")
+                        .on_click(
+                            cx.listener(|v, _, window, cx| v.open_sheet(None, true, window, cx)),
+                        )
+                        .into_any_element(),
+                ],
             );
         }
         empty_state(

@@ -48,7 +48,7 @@ use navigator_core::store::{
 use navigator_core::text::display_safe;
 use uuid::Uuid;
 
-use crate::connections::{ConnectionSheet, SheetEvent};
+use crate::connections::{ConnectionSheet, SheetEvent, protocol_text};
 use crate::messages::{
     colour_slot, details_lines, format_time, granted_text, group_digits, options_text, row_result,
     status_failed, status_from_result, status_text,
@@ -3135,33 +3135,78 @@ impl Navigator {
                 [],
             );
         }
+        let Some(p) = &self.profile else {
+            return div().into_any_element();
+        };
+        let name = display_name(p);
         let connecting = self.connecting()
             || matches!(
                 self.status.state,
                 ConnState::Connecting | ConnState::Reconnecting { .. }
             );
-        let (title, what, action) = if connecting {
-            (
-                format!("Connecting to {}…", self.url()),
+        if connecting {
+            return empty_state(
+                &format!("Connecting to {}…", self.url()),
                 "Messages show here when the connection is up.",
-                "Cancel",
-            )
-        } else {
-            (
-                "Not connected".to_string(),
-                "Connect to a broker to see messages.",
-                "Connect",
-            )
+                [Button::new("connect-empty")
+                    .small()
+                    .label("Cancel")
+                    .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx)))
+                    .into_any_element()],
+            );
+        }
+        if self.status.state == ConnState::Disconnecting {
+            return empty_state(
+                &format!("Disconnecting from {name}…"),
+                "Messages show here when the connection is up.",
+                [],
+            );
+        }
+        // C and D: the connection card. A failure adds its reason.
+        let facts = format!(
+            "{} · {} · {}",
+            self.url(),
+            protocol_text(p.protocol),
+            if p.transport.is_encrypted() {
+                "Encrypted"
+            } else {
+                "Not encrypted"
+            }
+        );
+        let (what, action) = match &self.status.state {
+            ConnState::Failed(why) => (format!("{facts}\n{why}"), "Try again"),
+            _ => (facts, "Connect"),
         };
         empty_state(
-            &title,
-            what,
-            [Button::new("connect-empty")
-                .small()
-                .label(action)
-                .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx)))
-                .into_any_element()],
+            &name,
+            &what,
+            [
+                Button::new("connect-empty")
+                    .small()
+                    .primary()
+                    .label(action)
+                    .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx)))
+                    .into_any_element(),
+                self.edit_action("edit-empty", cx),
+            ],
         )
+    }
+
+    /// "Edit connection…", or a note for the "Command line" connection (it is not saved, so the
+    /// sheet cannot edit it).
+    fn edit_action(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        if self.session.as_ref().map(|s| s.id) == self.profile.as_ref().map(|p| p.id) {
+            return div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Command line: not saved")
+                .into_any_element();
+        }
+        Button::new(id)
+            .small()
+            .label("Edit connection…")
+            .on_click(cx.listener(|v, _, window, cx| v.open_sheet(None, false, window, cx)))
+            .into_any_element()
     }
 
     /// The centre pane: header, filter chips and the active view. The composer is added by the
@@ -3170,6 +3215,10 @@ impl Navigator {
         let body = match self.view {
             View::Messages => self.render_messages(cx),
             View::Tree => self.render_tree(cx),
+        };
+        let has_rows = match self.view {
+            View::Messages => self.store.list_len() > 0,
+            View::Tree => !self.store.rows().is_empty(),
         };
         let jump = self.view == View::Messages
             && self.store.list_len() > 0
@@ -3217,7 +3266,65 @@ impl Navigator {
                         ),
                 )
             })
+            .children(self.failure_banner(has_rows, cx))
             .child(body)
+    }
+
+    /// A failed connection with messages on screen: the empty state does not show, so a banner
+    /// above the list gives the reason and the next steps.
+    fn failure_banner(&self, has_rows: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ConnState::Failed(why) = &self.status.state else {
+            return None;
+        };
+        if self.banner_closed || !has_rows {
+            return None;
+        }
+        let name = self.profile.as_ref().map(display_name).unwrap_or_default();
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .flex_none()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .small()
+                        .text_color(theme.danger),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(format!("{name}: {why}")),
+                )
+                .child(
+                    Button::new("retry-banner")
+                        .small()
+                        .primary()
+                        .label("Try again")
+                        .on_click(cx.listener(|v, _, window, cx| v.toggle_connection(window, cx))),
+                )
+                .child(self.edit_action("edit-banner", cx))
+                .child(
+                    Button::new("close-banner")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Close)
+                        .tooltip("Close")
+                        .on_click(cx.listener(|v, _, _, cx| {
+                            v.banner_closed = true;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_messages(&mut self, cx: &mut Context<Self>) -> AnyElement {
