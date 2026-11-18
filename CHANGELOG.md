@@ -4,6 +4,34 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-19
+
+### Added
+
+- A connection menu in the title bar replaces the connection list. The menu button shows the active connection with its host and port, for example `lab-broker · localhost:18830`. The menu lists every connection with its address. A check shows the active one. The menu also has **Edit "name"…**, **New connection… (Ctrl/Cmd+N)** and **Manage connections…**.
+- When a connection is active and disconnected or failed, and the message list is empty with no filter, the centre shows a card: the name, the URL, the protocol and the encryption, with **Connect** and **Edit connection…**. A failed connection also shows the reason and **Try again**.
+- A failure banner above the message list when a connection fails while messages are on screen. It has **Try again**, **Edit connection…** and **×**.
+- The tooltip of the **Connect** button names the connection and its URL.
+
+### Changed
+
+- With no active connection, the title bar button says "Add a connection" (none exists) or "Choose a connection". The **Connect** button does not show then. Before, the list said "No connections" even when connections were saved.
+- When connections exist but none is active, the centre shows **Choose a connection ▾** (the same rows as the title bar menu) and **New connection…**.
+- **Save** of a new connection makes it active when the state is Disconnected or Failed and no connect is pending. The app clears the data of the old connection. Before, the app saved the new connection but did not select it.
+- The connection sheet title is "New connection" or "Edit name". Before, it was "Connections" for both.
+- While the app disconnects, the button says "Disconnecting…" and the centre shows "Disconnecting from name…". Before, the centre showed a **Connect** button that did nothing.
+- The settings menu puts Appearance, Theme, Row height and Memory budget in submenus. The top level is short.
+- An IPv6 host shows in brackets, for example `[fd00::1]:1883`.
+- Keyboard focus: after you choose a connection or select **Save**, the focus goes to the primary button. When the "Disconnect from … and connect to …?" question closes, the focus is on the connection menu button.
+
+### Fixed
+
+- In a small window, the settings menu jumped by two rows one frame after it opened (seen on Windows). The top level now has no checked item and does not scroll, so **Commands…** stays the first line.
+
+### Known limitations
+
+- You cannot edit the "Command line" connection (from command line arguments). The menu and the card show "Command line: not saved".
+
 ## [0.2.1] - 2026-11-18
 
 ### Added
@@ -157,7 +185,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.0...v0.1.1

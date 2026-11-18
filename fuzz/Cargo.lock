@@ -731,7 +731,7 @@ checksum = "bc0287524726960e07b119cebd01678f852f147742ae0d925e6a520dca956126"
 
 [[package]]
 name = "navigator-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "ntex",
