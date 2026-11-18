@@ -2344,8 +2344,8 @@ impl Navigator {
             .child(div().size_2().flex_none().rounded_full().bg(dot))
             .child(
                 div()
-                    .max_w(ui(160.))
-                    .flex_none()
+                    .max_w(ui(240.))
+                    .flex_shrink_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
@@ -3274,7 +3274,7 @@ impl Navigator {
         let ConnState::Failed(why) = &self.status.state else {
             return None;
         };
-        if self.banner_closed || !has_rows {
+        if self.banner_closed || !has_rows || self.connecting() {
             return None;
         }
         let name = self.profile.as_ref().map(display_name).unwrap_or_default();

@@ -498,6 +498,16 @@ impl Navigator {
         cx.notify();
     }
 
+    /// The focus goes to the primary button. It goes to the menu button when the primary
+    /// button is hidden or off.
+    fn focus_primary(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.profile.is_some() && self.status.state != ConnState::Disconnecting {
+            self.connect_focus.focus(window, cx);
+        } else {
+            self.menu_focus.focus(window, cx);
+        }
+    }
+
     /// The active profile was deleted.
     fn deselect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_data(window, cx);
@@ -733,6 +743,8 @@ impl Navigator {
         }
         self.profiles_changed(window, cx);
         window.close_sheet(cx);
+        // The sheet gives the focus back after it closes, so move it one step later.
+        cx.defer_in(window, |v, window, cx| v.focus_primary(window, cx));
         if connect {
             self.request_switch(id, true, window, cx);
         } else if select {
