@@ -37,8 +37,33 @@ async fn black_hole() -> (tokio::net::TcpListener, Vec<tokio::net::TcpStream>) {
     (listener, fill)
 }
 
+/// Counts the descriptors that are not a path: sockets, pipes, eventfd and epoll. A dial leaks one
+/// of these. Files do not count: the system CA load opens certificate files in the background,
+/// also after a cancelled TLS dial, and the read of `/proc/self/fd` is itself a file.
 fn fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").expect("fd list").count()
+    fd_list()
+        .iter()
+        .filter(|e| !e.split_once('=').is_some_and(|(_, t)| t.starts_with('/')))
+        .count()
+}
+
+/// The targets of the open descriptors, for the failure message.
+fn fd_list() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir("/proc/self/fd")
+        .expect("fd list")
+        .filter_map(|e| e.ok())
+        // A descriptor that closed after the directory read has no target: skip it.
+        .filter_map(|e| {
+            let t = std::fs::read_link(e.path()).ok()?;
+            Some(format!(
+                "{}={}",
+                e.file_name().to_string_lossy(),
+                t.display()
+            ))
+        })
+        .collect();
+    v.sort();
+    v
 }
 
 async fn wait(net: &mut Net, f: impl Fn(&ConnState) -> bool) {
@@ -76,6 +101,7 @@ async fn a_cancelled_black_hole_dial_leaves_no_file_descriptor() {
         Transport::Wss,
     ] {
         let mut warm = 0;
+        let mut warm_list = Vec::new();
         for round in 0..3 {
             let mut c = ConnectConfig::from(Profile {
                 host: "127.0.0.1".into(),
@@ -100,9 +126,15 @@ async fn a_cancelled_black_hole_dial_leaves_no_file_descriptor() {
                 // Let the descriptors settle: two equal counts in a row.
                 let mut last = usize::MAX;
                 warm = poll_fds(|n| std::mem::replace(&mut last, n) == n).await;
+                warm_list = fd_list();
             } else {
                 let after = poll_fds(|n| n == warm).await;
-                assert_eq!(after, warm, "{transport:?}: a file descriptor leaked");
+                assert_eq!(
+                    after,
+                    warm,
+                    "{transport:?} round {round}: a file descriptor leaked.\nwarm: {warm_list:?}\nnow:  {:?}",
+                    fd_list()
+                );
             }
         }
     }
