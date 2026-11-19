@@ -2367,7 +2367,7 @@ impl Navigator {
     }
 
     /// The settings menu of the title bar (the gear): Commands…, the submenus Appearance, Theme,
-    /// Row height and Memory budget, Reset the layout, and the renderer. The checked items of a
+    /// Row height and Memory budget, Reset the layout, the renderer and the version. The checked items of a
     /// submenu show the current choice. The top level has no checked item and is short, so it
     /// fits a small window and does not scroll (a scrollable menu jumps to its checked item).
     fn render_settings_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2471,6 +2471,7 @@ impl Navigator {
                             .into()
                         })
                     ))
+                    .label(concat!("Version: ", env!("CARGO_PKG_VERSION")))
             })
     }
 
