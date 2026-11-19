@@ -7,7 +7,7 @@ Status: accepted (2026-11-10). The MQTT row and the MQTT consequences are supers
 | Area | Choice |
 |---|---|
 | Language | Rust (edition 2024, latest stable toolchain, not pinned) |
-| UI | `gpui-kit` 0.9.1, default features (`component`, `assets`). `tree-sitter` (JSON) is a possible later addition, decided in P5 by an ADR. |
+| UI | `gpui-kit` 0.10.0, default features (`component`, `assets`). `tree-sitter` (JSON) is a possible later addition, decided in P5 by an ADR. |
 | MQTT | `ntex-mqtt` 10.0.0 (was `ms-mqtt-client` 0.1.0 until v0.1.1; see ADR 0006) |
 | Async runtime | tokio, on one dedicated `current_thread` runtime thread |
 | TLS | OpenSSL (through `ntex-tls`). The app enables `openssl/vendored`, so no system OpenSSL is necessary. |

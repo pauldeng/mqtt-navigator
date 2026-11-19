@@ -16,7 +16,7 @@ anyhow = "1.0.104"
 bytes = "1.12.2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }  # local UTC offset, read once in the background
 dirs = "7.0.0"
-gpui-kit = "0.9.1"
+gpui-kit = "0.10.0"
 keyring-core = "1.0.1"
 navigator-core = { path = "../navigator-core" }
 navigator-update = { path = "../navigator-update" }
