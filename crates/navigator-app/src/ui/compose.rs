@@ -874,6 +874,7 @@ impl Navigator {
             .child(more)
             .child(
                 Button::new("send")
+                    .debug_selector(|| "send".into())
                     .small()
                     .primary()
                     .label(format!("Send ({}+Enter)", crate::palette::MOD))
