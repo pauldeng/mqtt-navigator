@@ -4,13 +4,19 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-19
+
 ### Added
 
-- The settings menu shows the app version on its last line, for example "Version: 0.2.2".
+- The settings menu shows the app version on its last line, for example "Version: 0.2.3".
 
 ### Fixed
 
 - The update check could show "The update signature is not valid." for a few minutes after a new release. GitHub sent the manifest and its signature from two different releases. The app now resolves the address of the latest release once and reads both files from it.
+
+### Known limitations
+
+- Versions 0.2.2 and earlier keep the old check. For a few minutes after a new release, their update check can fail with this text. A later check works.
 
 ## [0.2.2] - 2026-11-19
 
@@ -193,7 +199,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/pauldeng/mqtt-navigator/compare/v0.1.1...v0.2.0
