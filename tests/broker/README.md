@@ -8,6 +8,12 @@ These files start real brokers in Docker: Mosquitto 2.x, EMQX and HiveMQ CE. The
 tests/broker/up.sh && cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks --test net_system_ca && tests/broker/down.sh
 ```
 
+The GUI test (`crates/navigator-app/src/ui/gui_round_trip.rs`) needs only Mosquitto on port 18830. It clicks Connect, subscribes to `hello/world`, publishes a random text with the composer and waits for the Received row:
+
+```bash
+tests/broker/up.sh mosquitto && cargo test -p navigator-app --features broker-tests gui_round_trip && tests/broker/down.sh
+```
+
 `up.sh` takes service names (`mosquitto`, `emqx`, `hivemq`). With no name, it starts all three. `mosquitto` starts two Mosquitto services: the main one and `mosquitto-limits`.
 
 The soak test runs 1 h by default (`SOAK_SECS`, `SOAK_RATE`). It restarts the broker 6 times:

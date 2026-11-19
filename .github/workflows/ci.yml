@@ -86,6 +86,7 @@ jobs:
       - run: tests/broker/up.sh
       # Each test has its own topics and client IDs, and a RwLock keeps the restart tests apart.
       - run: cargo test -p navigator-core --features broker-tests --test net_mosquitto --test broker_matrix --test broker_compat --test net_keepalive_tasks --test net_system_ca
+      - run: cargo test -p navigator-app --features broker-tests gui_round_trip
       - name: Load test (10 000 msg/s)
         env:
           LOAD_WARMUP_SECS: 15

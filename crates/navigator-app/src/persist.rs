@@ -15,6 +15,10 @@ pub const QUIET: Duration = Duration::from_millis(500);
 
 /// `<config dir>/mqtt-navigator/settings.json`. `None` if the system has no config folder.
 pub fn settings_path() -> Option<PathBuf> {
+    // A test must never write the settings file of the user.
+    if cfg!(test) {
+        return None;
+    }
     dirs::config_dir().map(|d| d.join("mqtt-navigator").join("settings.json"))
 }
 

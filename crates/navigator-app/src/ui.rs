@@ -4223,6 +4223,9 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
     tokio::sync::mpsc::channel(1).1
 }
 
+#[cfg(all(test, feature = "broker-tests"))]
+mod gui_round_trip;
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
