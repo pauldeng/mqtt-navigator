@@ -241,8 +241,21 @@ fn resolve(policy: &Policy, url: &str) -> Result<String> {
         .get("location")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    policy.check_url(to)?;
-    Ok(to.into())
+    // A root-relative address ("/owner/repo/...") keeps the scheme and host of the request.
+    let to = match to.strip_prefix('/') {
+        Some(path) if !path.starts_with('/') => format!("{}/{path}", origin(url)),
+        _ => to.to_string(),
+    };
+    policy.check_url(&to)?;
+    Ok(to)
+}
+
+/// "https://host:port" of an absolute URL.
+fn origin(url: &str) -> &str {
+    let after_scheme = url.find("://").map_or(0, |i| i + 3);
+    url[after_scheme..]
+        .find('/')
+        .map_or(url, |i| &url[..after_scheme + i])
 }
 
 /// Fetches and verifies the manifest. `Ok(None)`: no newer version, or this version was rolled

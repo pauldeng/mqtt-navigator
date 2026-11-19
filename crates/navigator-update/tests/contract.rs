@@ -404,6 +404,14 @@ fn the_manifest_and_its_signature_come_from_the_resolved_release() {
             route(k.sign(new.as_bytes())),
         );
         r.insert("/out/latest.json".to_string(), go("/elsewhere/latest.json"));
+        // A root-relative Location keeps the host of the request.
+        r.insert(
+            "/rel/latest.json".to_string(),
+            common::Route {
+                redirect: Some("/dl/v2/latest.json".into()),
+                ..route("")
+            },
+        );
         r
     });
     let dir = tempfile::tempdir().expect("dir");
@@ -413,6 +421,8 @@ fn the_manifest_and_its_signature_come_from_the_resolved_release() {
     let r = check("/latest/latest.json").expect("ok").expect("newer");
     assert_eq!(r.version.to_string(), "2.0.0");
     assert!(matches!(check("/out/latest.json"), Err(Error::BadUrl(_))));
+    let r = check("/rel/latest.json").expect("ok").expect("newer");
+    assert_eq!(r.version.to_string(), "2.0.0");
 }
 
 #[test]
