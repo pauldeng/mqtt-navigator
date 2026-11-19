@@ -69,6 +69,7 @@ tests/broker/down.sh
 
 ### Process
 
+- `main` is protected. Make every change on a branch and merge it with a pull request. Do not push to `main`.
 - Each phase ends with a report in `docs/plans/phase-N-verification.md` and a read-only Codex review.
 - Report only checks that you actually ran.
 
