@@ -113,5 +113,10 @@ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
+[features]
+# Tests against the Docker brokers in tests/broker (see tests/broker/README.md).
+broker-tests = ["gpui-kit/test-support"]
+
 [dev-dependencies]
 tempfile = "3.27.0"
+uuid = { version = "1.29.3", features = ["v4"] }
