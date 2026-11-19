@@ -22,7 +22,7 @@ pub fn download(policy: &Policy, release: &Release, install: &Install, dir: &Pat
     fs::create_dir_all(&staging)?;
     let part = staging.join("download.part");
 
-    let body = agent(policy)
+    let body = agent(policy, 10)
         .get(&want.url)
         .call()
         .map_err(http_err)?

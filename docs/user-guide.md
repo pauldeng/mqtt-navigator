@@ -319,7 +319,7 @@ The theme files keep the licences of their projects. See [THIRD-PARTY-NOTICES.md
 
 - The app checks for a new version once at start. It has no timer. Use **Check for updates…** in the command palette to check at any time.
 - To turn off the check at start, use "Turn off the update check at start" in the command palette.
-- The check reads `latest.json` from the latest published GitHub release. The file has a minisign signature, and the app verifies it. The app also checks the SHA-256 hash and the size of the download. It rejects an older or equal version.
+- The check resolves the address of the latest published GitHub release once. Then it reads `latest.json` from that release. The file has a minisign signature, and the app verifies it. The app also checks the SHA-256 hash and the size of the download. It rejects an older or equal version.
 - When an update is ready, the title bar shows "Update 0.2.0 ready". Select it, then **Restart to update** (or **Later**). The app never restarts by itself.
 - The app keeps one previous copy. If the new version never opens a window, the next start restores the old one.
 - **Windows (installer), AppImage, macOS app:** the app updates itself.

@@ -4,6 +4,10 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- The update check could show "The update signature is not valid." for a few minutes after a new release. GitHub sent the manifest and its signature from two different releases. The app now resolves the address of the latest release once and reads both files from it.
+
 ## [0.2.2] - 2026-11-19
 
 ### Added

@@ -195,7 +195,7 @@ pub fn is_release_page(url: &str) -> bool {
     })
 }
 
-pub(crate) fn agent(policy: &Policy) -> ureq::Agent {
+pub(crate) fn agent(policy: &Policy, redirects: u32) -> ureq::Agent {
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -203,6 +203,7 @@ pub(crate) fn agent(policy: &Policy) -> ureq::Agent {
     ureq::Agent::config_builder()
         .tls_config(tls)
         .https_only(!policy.allow_http)
+        .max_redirects(redirects)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_global(Some(Duration::from_secs(15 * 60)))
         .build()
@@ -225,6 +226,25 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
         .map_err(http_err)
 }
 
+/// Follows the first redirect of `url` by hand and returns its address, checked by the policy.
+/// `latest/download/...` points to a new release a few minutes after a publish. When the app
+/// asks for the manifest and the signature one after the other, each request can get another
+/// release. The signature address comes from this address, never from the unverified manifest.
+fn resolve(policy: &Policy, url: &str) -> Result<String> {
+    // 0 redirects: ureq returns the 3xx response and does not follow it.
+    let res = agent(policy, 0).get(url).call().map_err(http_err)?;
+    if !res.status().is_redirection() {
+        return Ok(url.into());
+    }
+    let to = res
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    policy.check_url(to)?;
+    Ok(to.into())
+}
+
 /// Fetches and verifies the manifest. `Ok(None)`: no newer version, or this version was rolled
 /// back before.
 pub fn check(
@@ -236,9 +256,10 @@ pub fn check(
     if !policy.scheme_ok(manifest_url) {
         return Err(Error::BadUrl(manifest_url.chars().take(80).collect()));
     }
-    let agent = agent(policy);
-    let manifest = fetch(&agent, manifest_url)?;
-    let minisig = fetch(&agent, &format!("{manifest_url}.minisig"))?;
+    let base = resolve(policy, manifest_url)?;
+    let agent = agent(policy, 10);
+    let manifest = fetch(&agent, &base)?;
+    let minisig = fetch(&agent, &format!("{base}.minisig"))?;
     match verify(&manifest, &minisig, pubkey, policy) {
         Ok(r) if swap::read_failed(dir).is_some_and(|f| f == r.version.to_string()) => Ok(None),
         Ok(r) => Ok(Some(r)),

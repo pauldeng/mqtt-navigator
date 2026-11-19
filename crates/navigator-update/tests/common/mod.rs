@@ -57,12 +57,15 @@ pub fn manifest_with(version: &str, target: &str, url: &str, sha: &str, size: u6
 pub struct Route {
     pub body: Vec<u8>,
     pub cut: Option<usize>,
+    /// Answer 302 to this address instead of the body.
+    pub redirect: Option<String>,
 }
 
 pub fn route(body: impl Into<Vec<u8>>) -> Route {
     Route {
         body: body.into(),
         cut: None,
+        redirect: None,
     }
 }
 
@@ -92,6 +95,13 @@ pub fn serve(routes: impl FnOnce(&str) -> HashMap<String, Route>) -> String {
                 );
                 continue;
             };
+            if let Some(to) = &r.redirect {
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                continue;
+            }
             let _ = write!(
                 s,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
