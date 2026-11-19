@@ -110,6 +110,10 @@ impl Navigator {
     /// The first frame is here: tell the next start that this version runs. The next start
     /// rolls back a new version that never writes this marker.
     pub(super) fn mark_healthy(&self, cx: &mut Context<Self>) {
+        // A test must never write into the update folder of an installed app.
+        if cfg!(test) {
+            return;
+        }
         cx.background_executor()
             .spawn(async {
                 let Some(dir) = swap::update_dir() else {
