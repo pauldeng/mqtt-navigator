@@ -180,7 +180,11 @@ fn fixture(version: &str, advertised: &[u8], served: Vec<u8>, cut: Option<usize>
         routes.insert("/latest.json.minisig".to_string(), route(sig));
         routes.insert(
             "/dl/payload".to_string(),
-            common::Route { body: served, cut },
+            common::Route {
+                body: served,
+                cut,
+                redirect: None,
+            },
         );
         routes
     });
@@ -372,6 +376,43 @@ fn a_manifest_with_a_bad_signature_from_the_server_is_an_error() {
         &f.update_dir(),
     );
     assert!(matches!(r, Err(Error::BadSignature)));
+}
+
+/// GitHub can answer the manifest from the old release and the signature from the new one.
+/// The check must resolve the redirect once and read both files from the resolved address.
+#[test]
+fn the_manifest_and_its_signature_come_from_the_resolved_release() {
+    let k = keys();
+    let old = manifest("0.5.0", TARGET, GOOD_URL, b"payload");
+    let mut new = String::new();
+    let base = serve(|base| {
+        new = manifest("2.0.0", TARGET, &format!("{base}/dl/v2/app"), b"payload");
+        let mut r = HashMap::new();
+        let go = |to: &str| common::Route {
+            redirect: Some(format!("{base}{to}")),
+            ..route("")
+        };
+        r.insert("/latest/latest.json".to_string(), go("/dl/v2/latest.json"));
+        // A second request to "latest" would get the old pair.
+        r.insert(
+            "/latest/latest.json.minisig".to_string(),
+            route(k.sign(old.as_bytes())),
+        );
+        r.insert("/dl/v2/latest.json".to_string(), route(new.clone()));
+        r.insert(
+            "/dl/v2/latest.json.minisig".to_string(),
+            route(k.sign(new.as_bytes())),
+        );
+        r.insert("/out/latest.json".to_string(), go("/elsewhere/latest.json"));
+        r
+    });
+    let dir = tempfile::tempdir().expect("dir");
+    let p = Policy::for_test("1.0.0", TARGET, &format!("{base}/dl/"));
+    let check =
+        |path: &str| navigator_update::check(&p, &k.pubkey, &format!("{base}{path}"), dir.path());
+    let r = check("/latest/latest.json").expect("ok").expect("newer");
+    assert_eq!(r.version.to_string(), "2.0.0");
+    assert!(matches!(check("/out/latest.json"), Err(Error::BadUrl(_))));
 }
 
 #[test]

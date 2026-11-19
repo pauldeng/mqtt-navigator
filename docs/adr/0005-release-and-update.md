@@ -30,6 +30,7 @@ Our own updater in the app, built on `ureq` (native-tls), `minisign-verify` and 
 
 - `latest.json`: `version`, and for each Rust target triple: `url`, `sha256`, `size`.
 - CI signs the exact bytes of `latest.json` with minisign: `latest.json.minisig` lies beside it. The secret key and its password are GitHub secrets; the public key is in the repository and in the app.
+- The address `releases/latest/download/latest.json` redirects to the newest release. Right after a publish, two requests can reach two releases. The app therefore asks once, does not follow the redirect, and reads the `Location` address. That address must pass the same rules as an artifact address. The app reads `latest.json` and `latest.json.minisig` from it. The app never takes the signature address from the unverified manifest.
 - The app rejects a bad signature, a hash or size mismatch, an unknown target, and any version not newer than the running one.
 - `SHA256SUMS` is for people; the app trusts only the signed manifest.
 
