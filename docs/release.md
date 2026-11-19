@@ -2,9 +2,11 @@
 
 ## Cut a release
 
-1. Set `version` in the workspace `Cargo.toml`. Run `cargo check` to update `Cargo.lock`.
-2. Commit and merge to `main`. CI must pass.
-3. Tag the commit: `git tag v0.2.0 && git push origin v0.2.0`. The tag must equal `v` plus the crate version. The workflow stops when they differ.
+`main` is protected. Every change, the release commit too, goes through a pull request. Nobody can push to `main` directly, admins included.
+
+1. On the branch of the pull request, set `version` in the workspace `Cargo.toml`. Run `cargo check` to update `Cargo.lock`. Move the `[Unreleased]` entries of `CHANGELOG.md` under the new version.
+2. Merge the pull request to `main`. CI must pass.
+3. Tag the merge result on `main`: `git switch main && git pull && git tag -a vX.Y.Z -m "MQTT Navigator X.Y.Z" && git push origin vX.Y.Z`. The tag must equal `v` plus the crate version. The workflow stops when they differ.
 4. Wait for the `Release` workflow. It makes a **draft** release with GitHub generated notes (`--generate-notes`) and attaches all files.
 5. Open the draft. Paste the section of this version from `CHANGELOG.md` into the notes. Press **Publish release**.
 
