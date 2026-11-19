@@ -14,6 +14,10 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 - The update check could show "The update signature is not valid." for a few minutes after a new release. GitHub sent the manifest and its signature from two different releases. The app now resolves the address of the latest release once and reads both files from it.
 
+### Changed
+
+- Dependency updates, including gpui-kit 0.10.0 and ntex-mqtt 10.0.2. ntex-mqtt has no exact pin now.
+
 ### Known limitations
 
 - Versions 0.2.2 and earlier keep the old check. For a few minutes after a new release, their update check can fail with this text. A later check works.

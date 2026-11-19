@@ -8,12 +8,12 @@ The owner requires MQTT 3.1.1 (2026-11-14). `ms-mqtt-client` 0.1.0 supports MQTT
 
 ## Decision
 
-Use `ntex-mqtt` 10.0.0. It has a v3 (MQTT 3.1.1) client and a v5 client. MIT OR Apache-2.0.
+Use `ntex-mqtt` 10. It has a v3 (MQTT 3.1.1) client and a v5 client. MIT OR Apache-2.0.
 
 - **D1. Keep the boundary.** Only `navigator-core/src/net.rs` and its submodules, the test helpers and `examples/flood.rs` use ntex. The public API of `navigator_core::net` changes only where the plan allows it (the `protocol` field in the profile, subscription options, the `ConnectionDetails` event and request IDs).
 - **D2. Keep OpenSSL.** `tls.rs` keeps the material, the verify callback and the diagnostics. It returns an `openssl::ssl::SslConnector`. `net.rs` wraps it with `ntex-tls`.
 - **D3. Our supervisor owns reconnect.** One connector call and one client for each attempt. Backoff, retry rules, cancel, generations and the set of wanted subscriptions stay as they were. A session persists when `session_expiry_secs > 0` (MQTT 5) or when Clean Session is off (MQTT 3.1.1).
-- **D4. Exact pin.** `ntex-mqtt = "=10.0.0"`. The other ntex crates (`ntex-tls` with `openssl`, `ntex-net` with `tokio`, `ntex` for WebSocket only) go through `Cargo.lock`. Dependabot groups them. Each major version goes in its own commit.
+- **D4. No exact pin.** `ntex-mqtt = "10.0.2"` (a caret requirement; the owner decided on 2026-11-19 that it needs no pin). The other ntex crates (`ntex-tls` with `openssl`, `ntex-net` with `tokio`, `ntex` for WebSocket only) go through `Cargo.lock`. Dependabot groups them. Each major version goes in its own commit.
 - **D5. Remove the vendor copy last.** `vendor/ms-mqtt-client` and the `[patch]` are gone after the last user was ported.
 - **D6. One internal interface, two adapters.** A private `Wire` enum (`V3`, `V5`) has the same operations. Each adapter uses `start_with_control`, because the default control service drops the stop reason. The supervisor, the queues and the timers do not know the version.
 - **D7. MQTT 3.1.1 is the default** for a new profile and for the command line. Existing profiles keep MQTT 5.
