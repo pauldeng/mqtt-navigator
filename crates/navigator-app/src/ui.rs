@@ -1907,6 +1907,10 @@ impl Navigator {
             }
         }
         if !self.accept(g) {
+            // A late send result changed its row and maybe the result line: draw again.
+            if matches!(ev, Event::Published { .. }) {
+                cx.notify();
+            }
             return;
         }
         match ev {
