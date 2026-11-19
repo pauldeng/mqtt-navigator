@@ -25,10 +25,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "std"] }
 uuid = { version = "1.29.3", default-features = false }
 
-# Test-only: the engine crates that gpui-kit uses, with their test support (feature broker-tests).
-gpui-pre = { version = "=0.3.12", optional = true, features = ["test-support"] }
-gpui-pre-platform = { version = "=0.3.12", optional = true, features = ["test-support"] }
-
 [lints]
 workspace = true
 
@@ -119,10 +115,13 @@ zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rus
 
 [features]
 # Tests against the Docker brokers in tests/broker (see tests/broker/README.md).
-# The test support of gpui-pre directly: "gpui-kit/test-support" names optional gpui-fast crates,
-# and Cargo then locks their exact wgpu pin for the whole build.
-broker-tests = ["dep:gpui-pre", "dep:gpui-pre-platform"]
+# Turns on the GUI tests against the broker (crates/navigator-app/src/ui/gui_round_trip.rs).
+broker-tests = []
 
 [dev-dependencies]
+# The engine crates that gpui-kit uses, with their test support. Not gpui-kit/test-support: it names
+# optional gpui-fast crates, and Cargo then locks their exact wgpu pin for the whole build.
+gpui-pre = { version = "=0.3.12", features = ["test-support"] }
+gpui-pre-platform = { version = "=0.3.12", features = ["test-support"] }
 tempfile = "3.27.0"
 uuid = { version = "1.29.3", features = ["v4"] }
