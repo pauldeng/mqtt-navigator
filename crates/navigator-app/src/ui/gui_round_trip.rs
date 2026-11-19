@@ -4,8 +4,7 @@
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::InputState;
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AppContext, Entity, TestAppContext, WindowHandle, base::Root, px, size};
+use gpui_kit::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
 use navigator_core::net::{Profile, Transport};
 use navigator_core::settings::{Load, Settings};
 use navigator_core::store::{Direction, RowView};
@@ -35,19 +34,15 @@ fn rows(v: &Navigator) -> Vec<(Direction, String, String)> {
 /// Runs the test executor and the real net thread until `done`. The test clock is not real time,
 /// so each turn moves it on and then sleeps a little.
 fn wait(
-    cx: &mut TestAppContext,
-    win: WindowHandle<Root>,
+    cx: &mut VisualTestContext,
     what: &str,
-    mut done: impl FnMut(&mut TestAppContext) -> bool,
+    mut done: impl FnMut(&mut VisualTestContext) -> bool,
 ) {
     cx.executor().allow_parking();
     let end = Instant::now() + Duration::from_secs(10);
     loop {
         cx.executor().advance_clock(Duration::from_millis(50));
         cx.run_until_parked();
-        // Draw the frame, as the window does.
-        cx.update_window(win.into(), |_, window, cx| window.render_frame(cx))
-            .expect("window");
         if done(cx) {
             return;
         }
@@ -59,36 +54,37 @@ fn wait(
     }
 }
 
+/// A real mouse click in the middle of the element that has this debug selector.
+fn click(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("no element with the debug selector {selector:?}"));
+    cx.simulate_click(bounds.center(), Modifiers::none());
+}
+
 /// Opens the composer with Ctrl+Shift+N, fills it and clicks Send. The shortcut focuses the
 /// topic while it is empty, and the payload after that: then Shift+Tab goes back to the topic.
-fn publish(cx: &mut TestAppContext, win: WindowHandle<Root>, topic: &str, text: &str, first: bool) {
-    cx.update_window(win.into(), |_, window, cx| {
-        window.press("ctrl-shift-n", cx);
-        if !first {
-            window.press("shift-tab", cx);
-        }
-        window.press("ctrl-a", cx);
-        window.input(topic, cx);
-        // Tab moves the focus from the topic to the payload.
-        window.press("tab", cx);
-        window.press("ctrl-a", cx);
-        window.input(text, cx);
-        window.click("send", cx);
-    })
-    .expect("window");
+fn publish(cx: &mut VisualTestContext, topic: &str, text: &str, first: bool) {
+    cx.simulate_keystrokes("ctrl-shift-n");
+    if !first {
+        cx.simulate_keystrokes("shift-tab");
+    }
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input(topic);
+    // Tab moves the focus from the topic to the payload.
+    cx.simulate_keystrokes("tab ctrl-a");
+    cx.simulate_input(text);
+    click(cx, "send");
 }
 
 /// Types a filter in the input of the left pane, presses Enter and waits for the SUBACK.
-fn subscribe(cx: &mut TestAppContext, win: WindowHandle<Root>, nav: &Entity<Navigator>, f: &str) {
-    let input: Entity<InputState> = cx.read_entity(nav, |v, _| v.sub_input.clone());
-    cx.update_window(win.into(), |_, w, cx| {
-        input.update(cx, |i, cx| i.focus(w, cx));
-        w.input(f, cx);
-        w.press("enter", cx);
-    })
-    .expect("window");
-    wait(cx, win, &format!("SUBACK for {f}"), |cx| {
-        cx.read_entity(nav, |v, _| {
+fn subscribe(cx: &mut VisualTestContext, nav: &Entity<Navigator>, f: &str) {
+    let input: Entity<InputState> = nav.read_with(cx, |v, _| v.sub_input.clone());
+    cx.update(|w, cx| input.update(cx, |i, cx| i.focus(w, cx)));
+    cx.simulate_input(f);
+    cx.simulate_keystrokes("enter");
+    wait(cx, &format!("SUBACK for {f}"), |cx| {
+        nav.read_with(cx, |v, _| {
             v.subs
                 .rows
                 .iter()
@@ -98,8 +94,10 @@ fn subscribe(cx: &mut TestAppContext, win: WindowHandle<Root>, nav: &Entity<Navi
 }
 
 /// Opens the window with a saved profile for the test Mosquitto, and clicks Connect.
-fn start(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Navigator>) {
+fn start(cx: &mut TestAppContext) -> (VisualTestContext, Entity<Navigator>) {
     // An in-memory keyring: the test never reads the keyring of the user.
+    // The net thread wakes tasks of the UI at any time. The test must not stop it.
+    cx.executor().allow_parking();
     keyring_core::set_default_store(keyring_core::mock::Store::new().expect("mock keyring"));
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -137,38 +135,37 @@ fn start(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Navigator>) {
             |window, cx| cx.new(|cx| Navigator::new(None, load, window, cx)),
         )
         .expect("open the window");
-        (win.downcast::<Root>().expect("root"), nav)
+        (win, nav)
     });
-    cx.update_window(win.into(), |_, w, cx| {
-        w.render_frame(cx);
-        w.click("connect", cx);
-    })
-    .expect("window");
-    wait(cx, win, "connection", |cx| {
-        cx.read_entity(&nav, |v, _| v.status.state == ConnState::Connected)
+    let mut cx = VisualTestContext::from_window(win, cx);
+    cx.run_until_parked();
+    click(&mut cx, "connect");
+    wait(&mut cx, "connection", |cx| {
+        nav.read_with(cx, |v, _| v.status.state == ConnState::Connected)
     });
-    (win, nav)
+    (cx, nav)
 }
 
 #[gpui_kit::test]
 fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestAppContext) {
-    let (win, nav) = start(cx);
+    let (mut cx, nav) = start(cx);
+    let cx = &mut cx;
 
     // Control: a message to hello/world before any subscription. It must never come back.
     let control = format!("control-{}", Uuid::new_v4());
-    publish(cx, win, "hello/world", &control, true);
+    publish(cx, "hello/world", &control, true);
 
-    subscribe(cx, win, &nav, "hello/world");
+    subscribe(cx, &nav, "hello/world");
     let text = format!("hello-{}", Uuid::new_v4());
-    publish(cx, win, "hello/world", &text, false);
+    publish(cx, "hello/world", &text, false);
 
     // The broker sends it back: a Received row. Our own Sent row is there too.
-    wait(cx, win, &format!("Received row {text:?}"), |cx| {
-        cx.read_entity(&nav, |v, _| {
+    wait(cx, &format!("Received row {text:?}"), |cx| {
+        nav.read_with(cx, |v, _| {
             rows(v).contains(&(Direction::Received, "hello/world".into(), text.clone()))
         })
     });
-    let all = cx.read_entity(&nav, |v, _| rows(v));
+    let all = nav.read_with(cx, |v, _| rows(v));
     assert!(
         all.contains(&(Direction::Sent, "hello/world".into(), text.clone())),
         "no Sent row in {all:?}"
@@ -185,8 +182,8 @@ fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestApp
 }
 
 /// The Received rows: topic and payload.
-fn received(cx: &mut TestAppContext, nav: &Entity<Navigator>) -> Vec<(String, String)> {
-    cx.read_entity(nav, |v, _| {
+fn received(cx: &mut VisualTestContext, nav: &Entity<Navigator>) -> Vec<(String, String)> {
+    nav.read_with(cx, |v, _| {
         rows(v)
             .into_iter()
             .filter(|r| r.0 == Direction::Received)
@@ -195,13 +192,19 @@ fn received(cx: &mut TestAppContext, nav: &Entity<Navigator>) -> Vec<(String, St
     })
 }
 
+/// The debug selector of a subscription row (the test needs a `&'static str`).
+fn sub_row(filter: &str) -> &'static str {
+    Box::leak(format!("sub-{filter}").into_boxed_str())
+}
+
 #[gpui_kit::test]
 fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut TestAppContext) {
-    let (win, nav) = start(cx);
+    let (mut cx, nav) = start(cx);
+    let cx = &mut cx;
     let p = format!("wild-{}", Uuid::new_v4());
     let (plus, hash) = (format!("{p}/+/temp"), format!("{p}/#"));
-    subscribe(cx, win, &nav, &plus);
-    subscribe(cx, win, &nav, &hash);
+    subscribe(cx, &nav, &plus);
+    subscribe(cx, &nav, &hash);
 
     // `+` is one level: `a/temp` has two levels between P and temp, so only `#` takes it.
     let sent: Vec<(String, String)> = ["room1/temp", "room1/hum", "room1/a/temp"]
@@ -209,13 +212,11 @@ fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut 
         .map(|t| (format!("{p}/{t}"), format!("v-{}", Uuid::new_v4())))
         .collect();
     for (i, (topic, text)) in sent.iter().enumerate() {
-        publish(cx, win, topic, text, i == 0);
+        publish(cx, topic, text, i == 0);
     }
     // Mosquitto sends one copy for each matching subscription (the filters overlap on
     // `room1/temp`), and the app shows each copy: 2 + 1 + 1 Received rows.
-    wait(cx, win, "4 Received rows", |cx| {
-        received(cx, &nav).len() >= 4
-    });
+    wait(cx, "4 Received rows", |cx| received(cx, &nav).len() >= 4);
     let count =
         |got: &[(String, String)], m: &(String, String)| got.iter().filter(|r| *r == m).count();
     let got = received(cx, &nav);
@@ -231,7 +232,7 @@ fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut 
     );
 
     // The row of `room1/temp` has the colour of the first matching subscription: `+/temp`, row 0.
-    let colours: Vec<Option<usize>> = cx.update_entity(&nav, |v, _| {
+    let colours: Vec<Option<usize>> = nav.update(cx, |v, _| {
         sent.iter()
             .map(|(t, _)| v.store.colour_of_topic(t))
             .collect()
@@ -239,18 +240,10 @@ fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut 
     assert_eq!(colours, [Some(0), Some(1), Some(1)]);
 
     // Click the row of a subscription: Show only. Then the rows follow the filter.
-    cx.update_window(win.into(), |_, w, cx| {
-        w.click(gpui_kit::SharedString::from(plus.clone()), cx)
-    })
-    .expect("window");
-    wait(cx, win, "Show only +/temp", |cx| {
-        received(cx, &nav).len() == 2
-    });
+    click(cx, sub_row(&plus));
+    wait(cx, "Show only +/temp", |cx| received(cx, &nav).len() == 2);
     let got = received(cx, &nav);
     assert!(got.iter().all(|r| *r == sent[0]), "{got:?}");
-    cx.update_window(win.into(), |_, w, cx| {
-        w.click(gpui_kit::SharedString::from(hash.clone()), cx)
-    })
-    .expect("window");
-    wait(cx, win, "Show only #", |cx| received(cx, &nav).len() == 4);
+    click(cx, sub_row(&hash));
+    wait(cx, "Show only #", |cx| received(cx, &nav).len() == 4);
 }

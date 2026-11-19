@@ -2288,6 +2288,7 @@ impl Navigator {
                     d.child(
                         div().flex_none().child(
                             Button::new("connect")
+                                .debug_selector(|| "connect".into())
                                 .small()
                                 .primary()
                                 .label(if self.status.state == ConnState::Disconnecting {
@@ -2537,6 +2538,7 @@ impl Navigator {
         // Click the row to show only its messages. Click again to show all. The state of the
         // row (selected) is the fill of the row.
         ListItem::new(row_id)
+            .debug_selector(|| format!("sub-{}", s.filter))
             .w_full()
             .h(ui(SUB_ROW_H))
             .flex_none()
