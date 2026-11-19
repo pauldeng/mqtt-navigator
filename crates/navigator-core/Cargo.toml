@@ -11,15 +11,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-bytes = "1.12.1"
-# The MQTT client (D4 of the ntex plan). Exact pin: the maintainer breaks the API in each major.
-ntex = { version = "4.8.0", default-features = false, features = ["tokio", "ws"] }
-ntex-bytes = "1.15.2"
+bytes = "1.12.2"
+# The MQTT client (D4 of the ntex plan). The maintainer breaks the API in each major: run the broker tests on each update.
+ntex = { version = "4.9.2", default-features = false, features = ["tokio", "ws"] }
+ntex-bytes = "1.15.4"
 ntex-error = "3.1.0"
-ntex-io = "4.7.2"
-ntex-mqtt = "=10.0.0"
-ntex-net = { version = "4.12.0", features = ["tokio"] }
-ntex-service = "5.7.2"
+ntex-io = "4.8.0"
+ntex-mqtt = "10.0.2"
+ntex-net = { version = "4.12.3", features = ["tokio"] }
+ntex-service = "5.8.0"
 ntex-tls = { version = "4.8.0", features = ["openssl"] }
 ntex-util = "4.11.0"
 openssl = { version = "0.10.82", features = ["vendored"] }
@@ -34,7 +34,7 @@ tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros", "net"]
 tracing = "0.1.44"
 # Unicode general categories for the MQTT string rules (the old client used it; it is in Cargo.lock).
 unicode-properties = "0.1.5"
-uuid = { version = "1.29.2", features = ["v4", "serde"] }
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
 
 [features]
 # Tests against the Docker brokers in tests/broker (see tests/broker/README.md).
