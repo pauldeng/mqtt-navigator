@@ -113,12 +113,15 @@ fn start(cx: &mut TestAppContext) -> (VisualTestContext, Entity<Navigator>) {
         subscriptions: Vec::new(),
         ..Profile::default()
     };
+    let mut settings = Settings {
+        last_profile_id: Some(profile.id),
+        profiles: vec![profile],
+        ..Settings::default()
+    };
+    // No update check: it is a real network request.
+    settings.ui.check_updates = false;
     let load = Load {
-        settings: Settings {
-            last_profile_id: Some(profile.id),
-            profiles: vec![profile],
-            ..Settings::default()
-        },
+        settings,
         notice: None,
         read_only: false,
     };
