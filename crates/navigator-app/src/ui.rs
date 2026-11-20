@@ -1997,10 +1997,10 @@ impl Navigator {
         cx.notify();
     }
 
-    /// Selects a topic of the tree. `generation` is the data generation when the row was
-    /// rendered. A click on a row of an older generation does nothing, because its `NodeId` may
-    /// now name another topic.
-    fn select(&mut self, id: NodeId, generation: u64, cx: &mut Context<Self>) {
+    /// Selects a topic of the tree, and with `toggle` (a double click) expands or collapses it.
+    /// `generation` is the data generation when the row was rendered. A click on a row of an
+    /// older generation does nothing, because its `NodeId` may now name another topic.
+    fn select(&mut self, id: NodeId, generation: u64, toggle: bool, cx: &mut Context<Self>) {
         if generation != self.gate.generation() {
             return;
         }
@@ -2012,8 +2012,12 @@ impl Navigator {
         self.sel_msg = None;
         self.detail_of = DetailOf::Topic;
         self.insp.hist_pick = None;
-        self.reveal_details();
-        if has_children {
+        // A topic with subtopics takes a double click. Details that open on the first click
+        // change the layout, and the second press lands on another element.
+        if !has_children {
+            self.reveal_details();
+        }
+        if toggle && has_children {
             self.store.set_expanded(id, !expanded);
             // A paused tree takes a new snapshot: wake the frame loop for the work.
             self.kick_work();
@@ -2060,11 +2064,17 @@ impl Navigator {
         }
     }
 
-    /// Enter in the list. A narrow window opens the details sheet for the selected row. A wide
-    /// window shows the pane already.
+    /// Enter in the list: shows the details of the selected row. A narrow window opens the
+    /// sheet, a wide window the pane (a click on a topic with subtopics does not open it).
     fn enter_on_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.narrow && self.detail_of != DetailOf::Nothing {
+        if self.detail_of == DetailOf::Nothing {
+            return;
+        }
+        if self.narrow {
             self.open_details_sheet(window, cx);
+        } else {
+            self.details_open = true;
+            cx.notify();
         }
     }
 
@@ -2253,7 +2263,7 @@ impl Navigator {
                 .w_full()
                 .pr_2()
                 .gap_3()
-                .child(menu_button)
+                .child(caption_control(menu_button))
                 .child(
                     h_flex()
                         .gap_1()
@@ -2282,28 +2292,26 @@ impl Navigator {
                         }),
                 )
                 .child(div().flex_1())
-                .children(self.render_update_badge(cx))
-                .child(self.render_settings_menu(cx))
+                .children(self.render_update_badge(cx).map(caption_control))
+                .child(caption_control(self.render_settings_menu(cx)))
                 .when(self.profile.is_some(), |d| {
-                    d.child(
-                        div().flex_none().child(
-                            Button::new("connect")
-                                .debug_selector(|| "connect".into())
-                                .small()
-                                .primary()
-                                .label(if self.status.state == ConnState::Disconnecting {
-                                    "Disconnecting…"
-                                } else {
-                                    label
-                                })
-                                .tooltip(self.primary_tooltip(label))
-                                .track_focus(&self.connect_focus)
-                                .disabled(self.status.state == ConnState::Disconnecting)
-                                .on_click(
-                                    cx.listener(|v, _, window, cx| v.toggle_connection(window, cx)),
-                                ),
-                        ),
-                    )
+                    d.child(caption_control(
+                        Button::new("connect")
+                            .debug_selector(|| "connect".into())
+                            .small()
+                            .primary()
+                            .label(if self.status.state == ConnState::Disconnecting {
+                                "Disconnecting…"
+                            } else {
+                                label
+                            })
+                            .tooltip(self.primary_tooltip(label))
+                            .track_focus(&self.connect_focus)
+                            .disabled(self.status.state == ConnState::Disconnecting)
+                            .on_click(
+                                cx.listener(|v, _, window, cx| v.toggle_connection(window, cx)),
+                            ),
+                    ))
                 }),
         )
     }
@@ -2341,6 +2349,7 @@ impl Navigator {
         let (name, addr) = (display_name(p), host_port(p));
         let narrow = self.last_size.0 < 900.;
         Button::new("connection-menu")
+            .debug_selector(|| "connection-menu".into())
             .small()
             .max_w(ui(320.))
             .track_focus(&self.menu_focus)
@@ -2382,6 +2391,7 @@ impl Navigator {
         let renderer = self.renderer.clone();
         let weak = cx.entity().downgrade();
         Button::new("settings")
+            .debug_selector(|| "settings".into())
             .small()
             .ghost()
             .icon(IconName::Settings)
@@ -3578,8 +3588,10 @@ impl Navigator {
                             (None, None) => SharedString::default(),
                         };
                         let selected = v.sel_topic == Some(id);
+                        let parent = n.has_children;
                         h_flex()
                             .id(("row", node_key(id)))
+                            .debug_selector(move || format!("tree-{}", node_key(id)))
                             .h(ui(TREE_ROW_H))
                             .px_2()
                             .gap_2()
@@ -3624,10 +3636,11 @@ impl Navigator {
                                     .font_family(theme.mono_font_family.clone())
                                     .child(n.subtree_msgs.to_string()),
                             )
-                            .on_click(cx.listener(move |v, _, window, cx| {
+                            .on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
                                 v.list_focus.focus(window, cx);
-                                v.select(id, generation, cx);
-                                v.insp.want_sheet = v.narrow;
+                                v.select(id, generation, ev.click_count() == 2, cx);
+                                // As in `select`: a topic with subtopics opens no sheet.
+                                v.insp.want_sheet = v.narrow && !parent;
                             }))
                             .into_any_element()
                     })
@@ -4229,7 +4242,19 @@ fn tokio_channel_placeholder<T>() -> tokio::sync::mpsc::Receiver<T> {
     tokio::sync::mpsc::channel(1).1
 }
 
-#[cfg(all(test, feature = "broker-tests"))]
+/// A control of the title bar. On Windows the bar is the caption of the window: a press that no
+/// element stops starts the system move loop, and the loop takes the release, so a click never
+/// comes. The control stops the press. The free bar still moves the window.
+fn caption_control(el: impl IntoElement) -> Div {
+    div()
+        .flex_none()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(el)
+}
+
+// The tests find elements by `debug_selector`, which gpui has in debug builds only.
+#[cfg(all(test, debug_assertions))]
+#[cfg_attr(not(feature = "broker-tests"), allow(dead_code))]
 mod gui_round_trip;
 
 #[cfg(test)]
