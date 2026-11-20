@@ -274,16 +274,16 @@ The composer is closed by default. The bottom of the centre pane then shows one 
 4. Set QoS 0 or 1, and **Retain** if you need it.
 5. Press **Send** or `Ctrl/Cmd+Enter`.
 
-The composer stays open after Send. To close it, use **Close** in its **⋯** menu, or press `Esc`. The focus moves to the message list. The draft stays. When you open the composer again, the draft is there. Closing does not put the draft in History.
+The composer stays open after Send. To close it, select **✕** at the end of the topic row, or press `Esc`. The focus moves to the message list. The draft stays. When you open the composer again, the draft is there. Closing does not put the draft in History.
 
 The result shows as one line below the payload and, if it is not routine, in the list row. It is short: "Sending…", "Sent" (QoS 0), "Acknowledged" (QoS 1), or "Rejected: <ReasonName>", for example "Rejected: NotAuthorized". If the broker sent a reason string, the text is "Rejected: <ReasonName>: <reason string>". The app shows no hex code. A message can also end with "No acknowledgement after 10 s." or "Not sent: the connection closed." The app checks the message before it sends it. An error then shows under the composer, for example "Connect to a broker first." When you are not connected, Send is off. The 10 s timeout also ends the session (see [Troubleshooting](#other-connection-problems)).
 
 - **Text or Hex:** the switch is always visible. A Hex payload sends exact bytes. Write the bytes as hex digits. Spaces are ignored.
-- The **⋯** menu of the composer has: **Format**, **History…**, **Properties** (MQTT 5) and **Close**.
-- **Format** pretty-prints JSON. It works up to 1 MiB.
+- The **⋯** menu of the composer has: **Beautify JSON**, **Minify JSON**, **History…** and **Properties** (MQTT 5).
+- **Beautify JSON** indents the JSON payload. **Minify JSON** removes all spaces and line breaks outside strings. Both keep the key order. They work up to 1 MiB, in Text mode only.
 - **Properties** (MQTT 5): a **Properties (N)** tag shows next to the topic when a property is present. Select it to open the section. The section shows only the properties that are present. Use **Add property** to add: **Payload format: UTF-8**, content type, response topic, correlation data (hex), message expiry or user property. **Send empty** keeps an empty property in the message. A property that you add stays visible while it is empty.
 - **History** menu: **Drafts** (the last 5 drafts that you replaced) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. A draft leaves **Drafts** when you choose it. The app does not save History to disk. It clears History when you change the connection.
-- The composer saves the old content as a draft before something replaces it. These actions replace it: a choice in History, Edit and publish, Reply, Publish to this topic, Format and the Text/Hex switch. The app saves the old content only if it is unsent, it is not empty (a topic alone is empty) and it is at most 1 MiB. A larger draft is dropped, and the app says "The old draft is larger than 1 MiB. It is not kept."
+- The composer saves the old content as a draft before something replaces it. These actions replace it: a choice in History, Edit and publish, Reply, Publish to this topic, Beautify JSON, Minify JSON and the Text/Hex switch. The app saves the old content only if it is unsent, it is not empty (a topic alone is empty) and it is at most 1 MiB. A larger draft is dropped, and the app says "The old draft is larger than 1 MiB. It is not kept."
 - Drafts and Sent share a budget of 1 MiB. The app removes the oldest entries first.
 - The command palette entry **Send** opens the composer first when it is closed. It does not send a draft that you cannot see.
 

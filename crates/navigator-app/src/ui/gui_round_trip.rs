@@ -220,6 +220,14 @@ fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestApp
         "the control came back without a subscription: {all:?}"
     );
 
+    // The ✕ of the composer closes it.
+    click(cx, "composer-close");
+    cx.run_until_parked();
+    assert!(
+        !nav.read_with(cx, |v, _| v.comp.vis.open),
+        "the composer is still open"
+    );
+
     // The same button disconnects.
     click(cx, "connect");
     wait(cx, "disconnect", |cx| {

@@ -97,7 +97,7 @@ The window has one place for each job. A control shows when it can act. Rare act
   - Closing keeps the editors and the draft. Opening restores them. Closing does not move the draft into History.
   - Edit and publish, Reply, Publish to this topic and a History recall open the composer too. The palette entry "Send" opens a closed composer first. It does not send a draft that you cannot see.
   - The open composer has the topic, the payload, and one row: payload mode `Text | Hex` (always visible, because it changes the bytes that are sent), QoS `0 | 1`, Retain, a `⋯` menu and **Send** (`Ctrl/Cmd+Enter`).
-  - The `⋯` menu holds: Format, History…, Properties (MQTT 5) and Close. A menu item that is a state uses a checked item.
+  - The `⋯` menu holds: Beautify JSON, Minify JSON, History… and Properties (MQTT 5). A visible ✕ button at the end of the topic row closes the composer (also `Esc`). A menu item that is a state uses a checked item.
   - **One close operation** serves the Close item, `Esc` and the palette. It moves the focus to the message list, so the focus never stays on a removed control.
   - The composer stays open after Send. The last result shows as one line under the payload ("Acknowledged", "Rejected: …").
   - A "Properties (N)" tag shows next to the topic when any property is present. The count includes present-but-empty properties ("Send empty"). A click on the tag opens the section.
@@ -107,7 +107,7 @@ The window has one place for each job. A control shows when it can act. Rare act
   - **Every** replacement of the composer content first saves the current draft to Drafts, if it has content and was not sent. This includes History recall, Edit and publish, Reply, and Publish to this topic.
   - The topic and the property texts are single-line inputs. A text with a line break shows escaped (`\n`) with the note "This topic has line breaks; they are kept.". The composer keeps the exact text until you edit that field.
   - Content type, correlation data and each user property have **Send empty**: a property that is present but empty stays present in Edit and publish and in the sent message.
-  - **Format** works up to 1 MiB of payload and 2 MiB of result, and it saves the old draft first. The Text/Hex switch saves the old draft, too.
+  - **Beautify JSON** and **Minify JSON** work up to 1 MiB of payload and 2 MiB of result, and it saves the old draft first. The Text/Hex switch saves the old draft, too.
   - While disconnected, Send is disabled and the composer shows "Connect to a broker first."
 - **Right pane, details of the selected message or topic:**
   - **Wide window (1 100 px or more):** the pane opens when you select a message or a topic, with the mouse or the keyboard. Its close button closes it. It stays closed until the next selection, or until you open it from the command palette ("Details: Open").

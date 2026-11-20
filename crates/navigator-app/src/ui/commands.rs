@@ -62,7 +62,7 @@ impl Navigator {
             Cmd::Send if !self.comp.vis.open => self.open_composer(window, cx),
             Cmd::Send => self.send(window, cx),
             Cmd::PayloadMode(mode) => self.set_payload_mode(mode, window, cx),
-            Cmd::FormatJson => self.format_json(window, cx),
+            Cmd::FormatJson(pretty) => self.format_json(pretty, window, cx),
             Cmd::NewMessage => self.open_composer(window, cx),
             Cmd::ComposerProperties => self.open_properties(window, cx),
             Cmd::ComposerHistory => self.open_history(window, cx),
