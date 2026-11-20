@@ -51,7 +51,8 @@ pub enum Cmd {
     FocusPublishTopic,
     Send,
     PayloadMode(PayloadMode),
-    FormatJson,
+    /// Beautify (`true`) or Minify (`false`) the JSON payload.
+    FormatJson(bool),
     NewMessage,
     ComposerProperties,
     ComposerHistory,
@@ -528,10 +529,17 @@ pub static COMMANDS: &[Entry] = &[
         |f| f.payload_mode == PayloadMode::Text,
     ),
     e(
-        "format-json",
-        "Format the payload as JSON",
+        "beautify-json",
+        "Beautify the JSON payload",
         None,
-        Cmd::FormatJson,
+        Cmd::FormatJson(true),
+        |f| f.payload_mode == PayloadMode::Text,
+    ),
+    e(
+        "minify-json",
+        "Minify the JSON payload",
+        None,
+        Cmd::FormatJson(false),
         |f| f.payload_mode == PayloadMode::Text,
     ),
     e(
@@ -878,7 +886,8 @@ mod tests {
         ] {
             assert!(v.contains(&id), "{id}");
         }
-        assert!(!v.contains(&"format-json"), "Format is off in Hex mode");
+        assert!(!v.contains(&"beautify-json"), "Beautify is off in Hex mode");
+        assert!(!v.contains(&"minify-json"), "Minify is off in Hex mode");
         // Direction filters belong to the Messages view.
         assert!(!v.contains(&"direction-sent"));
         assert!(

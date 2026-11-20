@@ -8,7 +8,7 @@ use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
-use navigator_core::decode::{self, Decoder};
+use navigator_core::decode;
 use navigator_core::publish::{validate_outgoing, validate_v3_size};
 
 use super::*;
@@ -108,6 +108,8 @@ impl Composer {
         let payload = cx.new(|cx| {
             EditorState::new(window, cx)
                 .line_number(false)
+                // No fold column: the payload text starts at the same edge as the topic.
+                .folding(false)
                 .searchable(false)
                 .soft_wrap(true)
                 .placeholder("Payload")
@@ -563,9 +565,14 @@ impl Navigator {
         });
     }
 
-    /// Formats the payload as JSON. The work runs in the background. A result for text that the
-    /// user has changed since is dropped.
-    pub(super) fn format_json(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Beautify (`pretty`) or Minify the JSON payload. The work runs in the background. A result
+    /// for text that the user has changed since is dropped.
+    pub(super) fn format_json(
+        &mut self,
+        pretty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.comp.mode != PayloadMode::Text {
             return;
         }
@@ -586,7 +593,7 @@ impl Navigator {
                 .background_executor()
                 .spawn(async move {
                     let bytes = text.into_bytes();
-                    decode::render(Decoder::Json, &bytes, bytes.len(), &AtomicBool::new(false))
+                    decode::json(&bytes, pretty, &AtomicBool::new(false))
                 })
                 .await;
             this.update_in(cx, |v, window, cx| {
@@ -746,7 +753,7 @@ impl Navigator {
         let hex = self.comp.mode == PayloadMode::Hex;
         let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();
-        // The `⋯` menu: Format, History…, Properties (MQTT 5) and Close.
+        // The `⋯` menu: Beautify JSON, Minify JSON, History… and Properties (MQTT 5).
         let more = Button::new("composer-more")
             .small()
             .ghost()
@@ -762,7 +769,11 @@ impl Navigator {
                     })
                 };
                 let mut menu = menu
-                    .item(item("Format", |v, w, cx| v.format_json(w, cx)).disabled(hex))
+                    .item(
+                        item("Beautify JSON", |v, w, cx| v.format_json(true, w, cx)).disabled(hex),
+                    )
+                    .item(item("Minify JSON", |v, w, cx| v.format_json(false, w, cx)).disabled(hex))
+                    .separator()
                     .item(item("History…", |v, w, cx| v.open_history(w, cx)));
                 if v5 {
                     menu = menu.item(
@@ -773,8 +784,7 @@ impl Navigator {
                         .checked(props_open),
                     );
                 }
-                menu.separator()
-                    .item(item("Close", |v, w, cx| v.close_composer(w, cx)))
+                menu
             });
 
         let topic_note = self.comp.topic.note("topic", cx);
@@ -797,7 +807,18 @@ impl Navigator {
                             cx.notify();
                         })),
                 )
-            });
+            })
+            .child(
+                Button::new("composer-close")
+                    .debug_selector(|| "composer-close".into())
+                    .small()
+                    .ghost()
+                    .icon(IconName::Close)
+                    // Tab goes from the topic to the payload. The keyboard closes with Esc.
+                    .tab_stop(false)
+                    .tooltip("Close (Esc). The draft stays.")
+                    .on_click(cx.listener(|v, _, window, cx| v.close_composer(window, cx))),
+            );
 
         // The last result, or the error, as one line under the payload.
         let line = if let Some(e) = self.comp.error.clone() {

@@ -155,7 +155,7 @@ pub fn render(decoder: Decoder, payload: &[u8], limit: usize, cancel: &AtomicBoo
         Decoder::Json if cut => Rendered::err(format!(
             "The payload is larger than {limit} bytes. Show all to format it as JSON."
         )),
-        Decoder::Json => json(head, cancel),
+        Decoder::Json => json(head, true, cancel),
         Decoder::Hex => hex(head, cut, cancel),
         Decoder::Base64 => base64(head, cut, cancel),
         Decoder::Number(kind, endian) => number(kind, endian, head, cut, cancel),
@@ -211,7 +211,9 @@ impl io::Write for Capped<'_> {
     }
 }
 
-fn json(head: &[u8], cancel: &AtomicBool) -> Rendered {
+/// The payload as JSON text: `pretty` (beautify, two-space indent) or compact (minify). The key
+/// order stays. The composer uses it for Beautify and Minify.
+pub fn json(head: &[u8], pretty: bool, cancel: &AtomicBool) -> Rendered {
     // serde_json stops at nesting depth 128, so a hostile payload cannot overflow the stack.
     let value: serde_json::Value = match serde_json::from_slice(head) {
         Ok(v) => v,
@@ -229,7 +231,11 @@ fn json(head: &[u8], cancel: &AtomicBool) -> Rendered {
         cancel,
         over: false,
     };
-    let result = serde_json::to_writer_pretty(&mut out, &value);
+    let result = if pretty {
+        serde_json::to_writer_pretty(&mut out, &value)
+    } else {
+        serde_json::to_writer(&mut out, &value)
+    };
     let mut text = String::from_utf8_lossy(&out.buf).into_owned();
     if out.over {
         // Cut at a line end, so the last line is whole.
@@ -554,6 +560,14 @@ mod tests {
         let b: serde_json::Value = serde_json::from_str(&text).expect("pretty");
         assert_eq!(a, b);
         assert_eq!(ok(Decoder::Json, b"42"), "42");
+        // Minify: no spaces or line breaks outside strings, the same order.
+        let min = json(
+            br#"{ "z" : 1,
+            "a": [ "x y", 2 ] }"#,
+            false,
+            &NO,
+        );
+        assert_eq!(min.text, r#"{"z":1,"a":["x y",2]}"#);
         assert!(
             run(Decoder::Json, b"{")
                 .error

@@ -4,9 +4,15 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+### Changed
+
+- The composer has a visible ✕ button to close it, at the end of the topic row. `Esc` also closes it.
+- The composer menu has **Beautify JSON** and **Minify JSON**. They replace **Format**.
+
 ### Fixed
 
 - On Windows, console windows flashed open and closed when the app unpacked a downloaded update. The archive tool now runs without a window.
+- The payload text of the composer had a left indent. It now starts at the same edge as the topic.
 
 ## [0.2.4] - 2026-11-20
 
