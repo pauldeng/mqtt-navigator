@@ -94,23 +94,32 @@ fn unzip(zip: &Path, out: &Path, links: bool) -> bool {
         return false;
     }
     let mut cmd = if cfg!(target_os = "macos") {
-        let mut c = std::process::Command::new("ditto");
+        let mut c = tool("ditto");
         c.args(["-x", "-k"]).arg(zip).arg(out);
         c
     } else {
-        let mut c = std::process::Command::new("tar");
+        let mut c = tool("tar");
         c.arg("-xf").arg(zip).arg("-C").arg(out);
         c
     };
     cmd.status().is_ok_and(|s| s.success())
 }
 
+/// A command for an archive tool. On Windows it gets no console window: the app has no console,
+/// so Windows would show a new console window for each run of `tar`.
+fn tool(program: &str) -> std::process::Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut c = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
 fn tar_list(flag: &str, zip: &Path) -> Option<Vec<String>> {
-    let out = std::process::Command::new("tar")
-        .arg(flag)
-        .arg(zip)
-        .output()
-        .ok()?;
+    let out = tool("tar").arg(flag).arg(zip).output().ok()?;
     let text = String::from_utf8(out.stdout).ok()?;
     out.status
         .success()
