@@ -40,7 +40,7 @@ The workflow uses `GITHUB_TOKEN` for everything else. Never put a key in the rep
 
 The public key (`assets/update/minisign.pub`) is compiled into the app. An old app trusts only the old key. An old app also checks only the manifest, so the bridge release must carry a manifest that the **old** key signs.
 
-Known gap: the release workflow cannot make the bridge release. `scripts/sign-manifest.sh` signs with the secret key from the environment, then verifies the signature with the public key in the repository. The bridge release must embed the **new** public key, so the check fails for a signature from the old key. The script and the workflow have no switch for another verification key. This needs a code change. Do not use this procedure until the owner has decided how to change the script ([open question 8](open-questions.md#open)).
+Known gap: the release workflow cannot make the bridge release. `scripts/sign-manifest.sh` signs with the secret key from the environment, then verifies the signature with the public key in the repository. The bridge release must embed the **new** public key, so the check fails for a signature from the old key. The script and the workflow have no switch for another verification key. This needs a code change. Do not use this procedure until the owner has decided how to change the script ([open question 7](open-questions.md#open)).
 
 Plan, once the script supports it:
 

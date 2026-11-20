@@ -24,6 +24,15 @@ tests/broker/down.sh
 
 `LOAD_WARMUP_SECS` (default 60) and `LOAD_SECS` (default 300) set the load test time. `up.sh mosquitto` starts only the two Mosquitto services.
 
+Fuzz and soak tests run on a local machine only, not in CI. Run them before a release that changes parsing, the network or the store.
+
+```bash
+# Fuzz (nightly Rust and cargo-fuzz). A crash input goes to fuzz/artifacts.
+cd fuzz && for t in decode_render:60 parse_hex:20 topic_matches:20 profile_import:60; do cargo +nightly fuzz run "${t%%:*}" -- -max_total_time="${t##*:}" || break; done
+# Soak: 1 h at 500 msg/s with 6 broker restarts (SOAK_SECS, SOAK_RATE).
+tests/broker/up.sh mosquitto && cargo test --release -p navigator-core --features broker-tests --test soak -- --ignored --nocapture; tests/broker/down.sh
+```
+
 ## System packages
 
 - Linux (Ubuntu 24.04): `sudo apt install gcc g++ clang pkg-config libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1 perl make`

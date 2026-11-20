@@ -1,6 +1,6 @@
 # ADR 0004: Release profile and size gate
 
-Status: accepted (2026-11-11). Advice: Codex (gpt-6.1-sol), decision D7 of P5. The measurements are for 0.1.x (`ms-mqtt-client`). The 0.2.0 binary is 2.2% larger ([ADR 0006](0006-ntex-mqtt.md)).
+Status: accepted (2026-11-11). The size gate is removed (2026-11-20, owner decision); the release profile stays. Advice: Codex (gpt-6.1-sol), decision D7 of P5. The measurements are for 0.1.x (`ms-mqtt-client`). The 0.2.0 binary is 2.2% larger ([ADR 0006](0006-ntex-mqtt.md)).
 
 ## Measurements (Linux x64, stripped, panic = unwind, split debug info)
 
@@ -16,8 +16,7 @@ Load: 10k msg/s, 10k topics, 100 B payloads, 40 s; warm-cache first frame of 3 r
 ## Decision
 
 - Use `opt-level = "s"` and `lto = "fat"` with `codegen-units = 1`. It is the smallest build, and it passes the budgets (frame p95 < 16 ms, merge ≤ 4 ms, no drops, first frame ≈ 200 ms warm).
-- The CI `size` job fails when the Linux x64 binary is larger than 37 317 165 B (measured + 10%).
-- Windows and macOS get their own gates after their first CI builds.
+- ~~The CI `size` job fails when the Linux x64 binary is larger than 37 317 165 B (measured + 10%).~~ Removed on 2026-11-20: the owner sets no size limit. CI has no size job.
 
 ## Consequences
 
