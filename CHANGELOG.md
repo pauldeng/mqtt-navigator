@@ -4,9 +4,11 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-20
+
 ### Changed
 
-- The tree is the default view. A click on a topic selects it. A double click expands or collapses a topic that has subtopics. A click on such a topic does not open the details: press Enter or click Details.
+- The tree is the default view of a new install. An install that saved a view keeps it. A click on a topic selects it. A double click expands or collapses a topic that has subtopics. A click on such a topic does not open the details: press Enter or click Details.
 
 ### Fixed
 
@@ -211,7 +213,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.0...v0.2.1
