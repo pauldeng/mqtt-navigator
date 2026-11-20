@@ -8,6 +8,8 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 - The composer has a visible ✕ button to close it, at the end of the topic row. `Esc` also closes it.
 - The composer menu has **Beautify JSON** and **Minify JSON**. They replace **Format**.
+- The composer has a **JSON** payload mode next to Text and Hex. Valid JSON gets syntax colours. Invalid JSON shows a warning, and you can still publish it.
+- The composer button is **Publish** (was Send).
 
 ### Fixed
 

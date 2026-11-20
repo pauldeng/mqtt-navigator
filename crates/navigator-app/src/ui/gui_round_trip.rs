@@ -196,6 +196,12 @@ fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestApp
     publish(cx, "hello/world", &control, true);
 
     subscribe(cx, &nav, "hello/world");
+    // JSON mode: the text is not JSON, so the composer warns, and Publish still sends it.
+    let mode = cx
+        .debug_bounds("payload-mode")
+        .expect("payload mode switch");
+    let json_tab = gpui_kit::point(mode.origin.x + mode.size.width * 5. / 6., mode.center().y);
+    cx.simulate_click(json_tab, gpui_kit::Modifiers::none());
     let text = format!("h-{}", rid());
     publish(cx, "hello/world", &text, false);
 
@@ -205,6 +211,11 @@ fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestApp
             rows(v).contains(&(Direction::Received, "hello/world".into(), text.clone()))
         })
     });
+    assert!(nav.read_with(cx, |v, _| v.comp.mode == crate::composer::PayloadMode::Json));
+    assert!(
+        cx.debug_bounds("json-warning").is_some(),
+        "the warning is not drawn"
+    );
     let all = nav.read_with(cx, |v, _| rows(v));
     assert!(
         all.contains(&(Direction::Sent, "hello/world".into(), text.clone())),

@@ -30,6 +30,16 @@ pub enum PayloadMode {
     #[default]
     Text,
     Hex,
+    /// Text that the composer checks as JSON and highlights. It is sent as is, also when it is
+    /// not valid JSON.
+    Json,
+}
+
+impl PayloadMode {
+    /// Text and JSON both hold the payload text itself. Hex holds hex digits.
+    pub fn is_text(self) -> bool {
+        self != PayloadMode::Hex
+    }
 }
 
 /// Everything the user can set in the composer.
@@ -37,7 +47,7 @@ pub enum PayloadMode {
 pub struct Draft {
     pub topic: String,
     pub mode: PayloadMode,
-    /// The text of the payload editor: the payload itself (Text) or its hex digits (Hex).
+    /// The text of the payload editor: the payload itself (Text, JSON) or its hex digits (Hex).
     pub payload: String,
     pub qos: Qos,
     pub retain: bool,
@@ -83,10 +93,11 @@ impl Draft {
             + 64
     }
 
-    /// The payload bytes. Text sends the characters as UTF-8. Hex sends the bytes of the digits.
+    /// The payload bytes. Text and JSON send the characters as UTF-8. Hex sends the bytes of the
+    /// digits.
     pub fn payload_bytes(&self) -> Result<Vec<u8>, String> {
         match self.mode {
-            PayloadMode::Text => Ok(self.payload.clone().into_bytes()),
+            PayloadMode::Text | PayloadMode::Json => Ok(self.payload.clone().into_bytes()),
             PayloadMode::Hex => parse_hex(&self.payload).map_err(|e| format!("Payload: {e}")),
         }
     }
@@ -94,12 +105,14 @@ impl Draft {
     /// Changes the payload mode and converts the payload exactly. `Err` is the text for the
     /// user, and the draft does not change.
     pub fn switch_mode(&mut self, to: PayloadMode) -> Result<(), String> {
-        if self.mode == to {
+        // Text and JSON hold the same text: only the mode changes.
+        if self.mode == to || (self.mode.is_text() && to.is_text()) {
+            self.mode = to;
             return Ok(());
         }
         match to {
             PayloadMode::Hex => self.payload = to_hex(self.payload.as_bytes()),
-            PayloadMode::Text => {
+            PayloadMode::Text | PayloadMode::Json => {
                 let bytes = parse_hex(&self.payload).map_err(|e| format!("Payload: {e}"))?;
                 self.payload = String::from_utf8(bytes)
                     .map_err(|_| "These bytes are not valid text. Keep Hex mode.".to_string())?;
@@ -205,7 +218,7 @@ impl Draft {
     /// One line for the History menu.
     fn label(&self) -> String {
         let payload = match self.mode {
-            PayloadMode::Text => decode::preview(self.payload.as_bytes(), 40),
+            PayloadMode::Text | PayloadMode::Json => decode::preview(self.payload.as_bytes(), 40),
             PayloadMode::Hex => decode::preview(self.payload.as_bytes(), 24),
         };
         format!("{}  {}", display_safe(&self.topic), payload)

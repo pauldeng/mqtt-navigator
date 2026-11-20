@@ -8,7 +8,7 @@ This page is the design reference for the user interface. Read [ARCHITECTURE.md]
 - Keep the UI simple and professional, in a dense developer-tool style.
 - Use **gpui-kit components only**. Do not use a webview or web UI. Do not depend on `gpui-webview` or `gpui-shell`.
 - Use only theme tokens from `cx.theme()`. Do not put raw colour values in components.
-- Each area has one primary action: Connect or Disconnect in the title bar, Send in the composer, Save and connect in the connection sheet. The subscribe input has no button: Enter adds the filter.
+- Each area has one primary action: Connect or Disconnect in the title bar, Publish in the composer, Save and connect in the connection sheet. The subscribe input has no button: Enter adds the filter.
 - A choice shows its selected state (a toggle group, a toggle, a selected list row). Do not swap primary and ghost buttons to show a choice.
 - Follow the [gpui-kit design guides](https://gpui-kit.com/docs/design-guides.md) for sizes, copy and states.
 - All actions work from the keyboard. The one exception is pane resizing, which uses the mouse ("Reset the layout" is in the command palette).
@@ -95,20 +95,20 @@ The window has one place for each job. A control shows when it can act. Rare act
 - **Bottom of the centre pane, Publish (major feature 2):**
   - The composer is **closed** by default. Then the bottom of the centre pane shows one text button, **New message** (`Ctrl/Cmd+Shift+N`). This is the only New message button.
   - Closing keeps the editors and the draft. Opening restores them. Closing does not move the draft into History.
-  - Edit and publish, Reply, Publish to this topic and a History recall open the composer too. The palette entry "Send" opens a closed composer first. It does not send a draft that you cannot see.
-  - The open composer has the topic, the payload, and one row: payload mode `Text | Hex` (always visible, because it changes the bytes that are sent), QoS `0 | 1`, Retain, a `⋯` menu and **Send** (`Ctrl/Cmd+Enter`).
+  - Edit and publish, Reply, Publish to this topic and a History recall open the composer too. The palette entry "Publish" opens a closed composer first. It does not send a draft that you cannot see.
+  - The open composer has the topic, the payload, and one row: payload mode `Text | Hex | JSON` (always visible, because it changes the bytes that are sent), QoS `0 | 1`, Retain, a `⋯` menu and **Publish** (`Ctrl/Cmd+Enter`). JSON sends the text as is. It checks the text in the background: valid JSON gets tree-sitter highlighting ([ADR 0007](adr/0007-json-highlighting.md)), invalid JSON a warning line in the warning colour. The warning does not block Publish.
   - The `⋯` menu holds: Beautify JSON, Minify JSON, History… and Properties (MQTT 5). A visible ✕ button at the end of the topic row closes the composer (also `Esc`). A menu item that is a state uses a checked item.
   - **One close operation** serves the Close item, `Esc` and the palette. It moves the focus to the message list, so the focus never stays on a removed control.
-  - The composer stays open after Send. The last result shows as one line under the payload ("Acknowledged", "Rejected: …").
+  - The composer stays open after Publish. The last result shows as one line under the payload ("Acknowledged", "Rejected: …").
   - A "Properties (N)" tag shows next to the topic when any property is present. The count includes present-but-empty properties ("Send empty"). A click on the tag opens the section.
   - **Properties** (MQTT 5) shows only the fields that are present, and an "Add property ▾" menu for the others: payload format (UTF-8), content type, response topic, correlation data, message expiry and user property. A field that you add stays visible while it is empty, because "present" is a state separate from the text. A History recall or a Reply opens Properties when it fills a field.
-  - Payload mode is **Text** or **Hex**. A Hex payload is sent as raw bytes.
+  - Payload mode is **Text**, **Hex** or **JSON**. A Hex payload is sent as raw bytes. JSON sends the text as is, with a validity check and highlighting. Beautify and Minify work in Text and JSON mode.
   - The **History** menu has two groups: **Drafts** (the last 5 replaced drafts) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. Nothing is saved to disk.
   - **Every** replacement of the composer content first saves the current draft to Drafts, if it has content and was not sent. This includes History recall, Edit and publish, Reply, and Publish to this topic.
   - The topic and the property texts are single-line inputs. A text with a line break shows escaped (`\n`) with the note "This topic has line breaks; they are kept.". The composer keeps the exact text until you edit that field.
   - Content type, correlation data and each user property have **Send empty**: a property that is present but empty stays present in Edit and publish and in the sent message.
   - **Beautify JSON** and **Minify JSON** work up to 1 MiB of payload and 2 MiB of result, and it saves the old draft first. The Text/Hex switch saves the old draft, too.
-  - While disconnected, Send is disabled and the composer shows "Connect to a broker first."
+  - While disconnected, Publish is disabled and the composer shows "Connect to a broker first."
 - **Right pane, details of the selected message or topic:**
   - **Wide window (1 100 px or more):** the pane opens when you select a message or a topic, with the mouse or the keyboard. Its close button closes it. It stays closed until the next selection, or until you open it from the command palette ("Details: Open").
   - **Narrow window:** a click opens the details as a right-side sheet. Keyboard selection keeps the focus in the list, and `Enter` opens the sheet for the selected row. Closing the sheet returns the focus to the list.
@@ -290,7 +290,7 @@ Other rules:
 | `Esc` (elsewhere) | Close the top layer (menu, popover, dialog, sheet), else the composer or the details pane |
 | `Ctrl/Cmd+Shift+N` | New message (opens the composer) |
 | `Ctrl/Cmd+1` / `Ctrl/Cmd+2` | Messages view / Tree view |
-| `Ctrl/Cmd+Enter` (in the composer) | Send |
+| `Ctrl/Cmd+Enter` (in the composer) | Publish |
 | `Ctrl/Cmd+N` | New connection |
 | `Ctrl/Cmd+,` | Settings (planned; not built in v1) |
 | `F6` / `Shift+F6` | Next / previous pane (planned; not built in v1) |

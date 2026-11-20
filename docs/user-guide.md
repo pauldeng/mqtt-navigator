@@ -272,20 +272,21 @@ The composer is closed by default. The bottom of the centre pane then shows one 
 2. Type the topic.
 3. Type the payload.
 4. Set QoS 0 or 1, and **Retain** if you need it.
-5. Press **Send** or `Ctrl/Cmd+Enter`.
+5. Press **Publish** or `Ctrl/Cmd+Enter`.
 
-The composer stays open after Send. To close it, select **✕** at the end of the topic row, or press `Esc`. The focus moves to the message list. The draft stays. When you open the composer again, the draft is there. Closing does not put the draft in History.
+The composer stays open after Publish. To close it, select **✕** at the end of the topic row, or press `Esc`. The focus moves to the message list. The draft stays. When you open the composer again, the draft is there. Closing does not put the draft in History.
 
-The result shows as one line below the payload and, if it is not routine, in the list row. It is short: "Sending…", "Sent" (QoS 0), "Acknowledged" (QoS 1), or "Rejected: <ReasonName>", for example "Rejected: NotAuthorized". If the broker sent a reason string, the text is "Rejected: <ReasonName>: <reason string>". The app shows no hex code. A message can also end with "No acknowledgement after 10 s." or "Not sent: the connection closed." The app checks the message before it sends it. An error then shows under the composer, for example "Connect to a broker first." When you are not connected, Send is off. The 10 s timeout also ends the session (see [Troubleshooting](#other-connection-problems)).
+The result shows as one line below the payload and, if it is not routine, in the list row. It is short: "Sending…", "Sent" (QoS 0), "Acknowledged" (QoS 1), or "Rejected: <ReasonName>", for example "Rejected: NotAuthorized". If the broker sent a reason string, the text is "Rejected: <ReasonName>: <reason string>". The app shows no hex code. A message can also end with "No acknowledgement after 10 s." or "Not sent: the connection closed." The app checks the message before it sends it. An error then shows under the composer, for example "Connect to a broker first." When you are not connected, Publish is off. The 10 s timeout also ends the session (see [Troubleshooting](#other-connection-problems)).
 
-- **Text or Hex:** the switch is always visible. A Hex payload sends exact bytes. Write the bytes as hex digits. Spaces are ignored.
+- **Text, Hex or JSON:** the switch is always visible. A Hex payload sends exact bytes. Write the bytes as hex digits. Spaces are ignored.
+- **JSON** sends the same bytes as Text. The composer checks the payload: valid JSON gets syntax colours. Invalid JSON shows a warning under the payload, for example "The payload is not valid JSON: … Publish still sends it as is." You can still publish it. Text and JSON keep the same text when you switch between them.
 - The **⋯** menu of the composer has: **Beautify JSON**, **Minify JSON**, **History…** and **Properties** (MQTT 5).
-- **Beautify JSON** indents the JSON payload. **Minify JSON** removes all spaces and line breaks outside strings. Both keep the key order. They work up to 1 MiB, in Text mode only.
+- **Beautify JSON** indents the JSON payload. **Minify JSON** removes all spaces and line breaks outside strings. Both keep the key order. They work up to 1 MiB, in Text and JSON mode.
 - **Properties** (MQTT 5): a **Properties (N)** tag shows next to the topic when a property is present. Select it to open the section. The section shows only the properties that are present. Use **Add property** to add: **Payload format: UTF-8**, content type, response topic, correlation data (hex), message expiry or user property. **Send empty** keeps an empty property in the message. A property that you add stays visible while it is empty.
 - **History** menu: **Drafts** (the last 5 drafts that you replaced) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. A draft leaves **Drafts** when you choose it. The app does not save History to disk. It clears History when you change the connection.
 - The composer saves the old content as a draft before something replaces it. These actions replace it: a choice in History, Edit and publish, Reply, Publish to this topic, Beautify JSON, Minify JSON and the Text/Hex switch. The app saves the old content only if it is unsent, it is not empty (a topic alone is empty) and it is at most 1 MiB. A larger draft is dropped, and the app says "The old draft is larger than 1 MiB. It is not kept."
 - Drafts and Sent share a budget of 1 MiB. The app removes the oldest entries first.
-- The command palette entry **Send** opens the composer first when it is closed. It does not send a draft that you cannot see.
+- The command palette entry **Publish** opens the composer first when it is closed. It does not send a draft that you cannot see.
 
 **Publish to this topic**, **Edit and publish** and **Reply** open the composer and fill it. They never send. **Clear retained…** is different: after you confirm, it publishes an empty retained message at QoS 1.
 
@@ -352,7 +353,7 @@ Version 0.1.x does not load a schema 2 settings file. It leaves the file unchang
 | `Esc` | Close the top layer (menu, popover, dialog, sheet). In the filter: clear it. Else close the area that has the focus: the composer (the draft stays) or the details pane. The focus moves to the list. |
 | `Ctrl+Shift+N` | New message (opens the composer) |
 | `Ctrl+1` / `Ctrl+2` | Messages view / Tree view |
-| `Ctrl+Enter` | Send (in the composer) |
+| `Ctrl+Enter` | Publish (in the composer) |
 | `Ctrl+N` | New connection |
 | `Ctrl+Q` | Quit |
 | `Tab` / `Shift+Tab` | Next / previous control. In the composer, it moves focus and does not type a tab. |
