@@ -14,13 +14,13 @@ Status: `done`, `dropped` (with a reason), `better` (we do more than the referen
 | TLS | separate toggle, off by default; verify **off** by default | TLS **on** by default (port 8883); verify **on** by default; "Not encrypted" warning for TCP/WS; plain-language TLS errors; mTLS | P2 | better |
 | Secrets | OS secure storage, session fallback | System keyring, session fallback with a notice. Not run on a real keyring yet. | P4 | done |
 | Subscriptions | list of filter + QoS in the profile; default `#` and `$SYS/#` | Live panel: add and remove while connected; granted QoS and SUBACK failure reason; Retry and Remove | P2 | better |
-| Message list view | none | Newest-first list (default view), switchable with the tree; sent messages included; All / Received / Sent filter | P3 | better |
+| Message list view | none | Newest-first list, switchable with the tree; sent messages included; All / Received / Sent filter | P3 | better |
 | Subscription colours and click-to-filter | none | Automatic colour for each subscription; a click filters the views (Show only) | P3 | better |
 | Edit and publish, Reply | none | Copy a message into the composer; reply through the MQTT 5 Response Topic | P5 | better |
 | Session | clean start, session expiry, keepalive | Same, plus removal of subscriptions on a persistent session | P2, P4 | done |
 | Will message | — | Optional Will, under Advanced in the connection sheet | P4 | better |
 | Reconnect | — | Automatic reconnect with backoff (base 1 s to 30 s, real wait 0.8 s to 36 s) and resubscribe | P2 | better |
-| Topic tree | counts, activity blink, staged rendering | Virtual list (own flat rows, ADR 0003), a payload preview, a count of the topics below each row and message counts; no activity dot and no retained marker in the tree (the Messages list has the retained mark) | P1, P3 | partial |
+| Topic tree | counts, activity blink, staged rendering | Default view. Virtual list (own flat rows, ADR 0003), first level only at the start, a double click expands, a payload preview, a count of the topics below each row and message counts; no activity dot and no retained marker in the tree (the Messages list has the retained mark) | P1, P3 | partial |
 | Topic filter | substring | Substring, debounced, keeps ancestors; also searches the first 1 KiB of the payload in the Messages view | P3 | better |
 | Sort | a-z, messages, topics | Tree a–z only. The message list is always chronological. | P3 | dropped (simpler) |
 | Pause | stop merge, buffer up to 100 MB | Pause with the store budget, drops shown | P3 | done |

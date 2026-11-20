@@ -10,7 +10,14 @@ use navigator_core::settings::{Load, Settings};
 use navigator_core::store::{Direction, RowView};
 use uuid::Uuid;
 
+#[cfg(feature = "broker-tests")]
+use super::View;
 use super::{ConnState, Navigator, SubState};
+
+/// A short random id. The GUI types each character, so a full UUID costs time.
+fn rid() -> String {
+    Uuid::new_v4().simple().to_string()[..8].to_owned()
+}
 
 /// Every row of the message list: direction, topic and payload text.
 fn rows(v: &Navigator) -> Vec<(Direction, String, String)> {
@@ -62,6 +69,29 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     cx.simulate_click(bounds.center(), Modifiers::none());
 }
 
+/// A real double click: the second press has a click count of 2.
+fn double_click(cx: &mut VisualTestContext, selector: &'static str) {
+    use gpui_kit::{MouseButton, MouseDownEvent, MouseUpEvent};
+    let at = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("no element with the debug selector {selector:?}"))
+        .center();
+    for n in 1..=2 {
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            click_count: n,
+            ..Default::default()
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: at,
+            click_count: n,
+            ..Default::default()
+        });
+    }
+}
+
 /// Opens the composer with Ctrl+Shift+N, fills it and clicks Send. The shortcut focuses the
 /// topic while it is empty, and the payload after that: then Shift+Tab goes back to the topic.
 fn publish(cx: &mut VisualTestContext, topic: &str, text: &str, first: bool) {
@@ -95,6 +125,16 @@ fn subscribe(cx: &mut VisualTestContext, nav: &Entity<Navigator>, f: &str) {
 
 /// Opens the window with a saved profile for the test Mosquitto, and clicks Connect.
 fn start(cx: &mut TestAppContext) -> (VisualTestContext, Entity<Navigator>) {
+    let (mut cx, nav) = open(cx);
+    click(&mut cx, "connect");
+    wait(&mut cx, "connection", |cx| {
+        nav.read_with(cx, |v, _| v.status.state == ConnState::Connected)
+    });
+    (cx, nav)
+}
+
+/// Opens the window with a saved profile for the test Mosquitto. It does not connect.
+fn open(cx: &mut TestAppContext) -> (VisualTestContext, Entity<Navigator>) {
     // An in-memory keyring: the test never reads the keyring of the user.
     // The net thread wakes tasks of the UI at any time. The test must not stop it.
     cx.executor().allow_parking();
@@ -140,26 +180,23 @@ fn start(cx: &mut TestAppContext) -> (VisualTestContext, Entity<Navigator>) {
         .expect("open the window");
         (win, nav)
     });
-    let mut cx = VisualTestContext::from_window(win, cx);
+    let cx = VisualTestContext::from_window(win, cx);
     cx.run_until_parked();
-    click(&mut cx, "connect");
-    wait(&mut cx, "connection", |cx| {
-        nav.read_with(cx, |v, _| v.status.state == ConnState::Connected)
-    });
     (cx, nav)
 }
 
+#[cfg(feature = "broker-tests")]
 #[gpui_kit::test]
 fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestAppContext) {
     let (mut cx, nav) = start(cx);
     let cx = &mut cx;
 
     // Control: a message to hello/world before any subscription. It must never come back.
-    let control = format!("control-{}", Uuid::new_v4());
+    let control = format!("c-{}", rid());
     publish(cx, "hello/world", &control, true);
 
     subscribe(cx, &nav, "hello/world");
-    let text = format!("hello-{}", Uuid::new_v4());
+    let text = format!("h-{}", rid());
     publish(cx, "hello/world", &text, false);
 
     // The broker sends it back: a Received row. Our own Sent row is there too.
@@ -182,6 +219,12 @@ fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestApp
             .any(|(d, _, p)| *d == Direction::Received && *p == control),
         "the control came back without a subscription: {all:?}"
     );
+
+    // The same button disconnects.
+    click(cx, "connect");
+    wait(cx, "disconnect", |cx| {
+        nav.read_with(cx, |v, _| v.status.state == ConnState::Disconnected)
+    });
 }
 
 /// The Received rows: topic and payload.
@@ -200,11 +243,12 @@ fn sub_row(filter: &str) -> &'static str {
     Box::leak(format!("sub-{filter}").into_boxed_str())
 }
 
+#[cfg(feature = "broker-tests")]
 #[gpui_kit::test]
 fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut TestAppContext) {
     let (mut cx, nav) = start(cx);
     let cx = &mut cx;
-    let p = format!("wild-{}", Uuid::new_v4());
+    let p = format!("w{}", rid());
     let (plus, hash) = (format!("{p}/+/temp"), format!("{p}/#"));
     subscribe(cx, &nav, &plus);
     subscribe(cx, &nav, &hash);
@@ -212,7 +256,7 @@ fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut 
     // `+` is one level: `a/temp` has two levels between P and temp, so only `#` takes it.
     let sent: Vec<(String, String)> = ["room1/temp", "room1/hum", "room1/a/temp"]
         .into_iter()
-        .map(|t| (format!("{p}/{t}"), format!("v-{}", Uuid::new_v4())))
+        .map(|t| (format!("{p}/{t}"), format!("v{}", rid())))
         .collect();
     for (i, (topic, text)) in sent.iter().enumerate() {
         publish(cx, topic, text, i == 0);
@@ -234,6 +278,42 @@ fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut 
         "{got:?}"
     );
 
+    // The tree is the first view. It shows the first level only: a click selects, and a double
+    // click opens one level.
+    let shown = |cx: &mut VisualTestContext| -> Vec<String> {
+        nav.update(cx, |v, _| {
+            let ids = v.store.rows().to_vec();
+            ids.into_iter()
+                .filter_map(|id| v.store.get(id))
+                .map(|n| n.topic.to_owned())
+                .filter(|t| t.starts_with(&p))
+                .collect()
+        })
+    };
+    assert!(nav.read_with(cx, |v, _| v.view == View::Tree));
+    wait(cx, "the tree row", |cx| {
+        shown(cx) == std::slice::from_ref(&p)
+    });
+    let row = nav.update(cx, |v, _| {
+        let ids = v.store.rows().to_vec();
+        let id = ids
+            .into_iter()
+            .find(|id| v.store.get(*id).is_some_and(|n| n.topic == p))
+            .expect("tree row");
+        &*Box::leak(format!("tree-{}", super::node_key(id)).into_boxed_str())
+    });
+    click(cx, row);
+    cx.run_until_parked();
+    assert_eq!(
+        shown(cx),
+        std::slice::from_ref(&p),
+        "a single click opened the node"
+    );
+    double_click(cx, row);
+    wait(cx, "the second level", |cx| {
+        shown(cx) == [p.clone(), format!("{p}/room1")]
+    });
+
     // The row of `room1/temp` has the colour of the first matching subscription: `+/temp`, row 0.
     let colours: Vec<Option<usize>> = nav.update(cx, |v, _| {
         sent.iter()
@@ -249,4 +329,59 @@ fn wildcard_subscriptions_match_by_level_and_show_only_follows_the_row(cx: &mut 
     assert!(got.iter().all(|r| *r == sent[0]), "{got:?}");
     click(cx, sub_row(&hash));
     wait(cx, "Show only #", |cx| received(cx, &nav).len() == 4);
+}
+
+/// On Windows the title bar is the caption of the window. A press that no element stops goes to
+/// the system move loop, and the loop takes the release: the click never comes. So each control
+/// of the bar must stop the press, and the free bar must not (it moves the window).
+#[gpui_kit::test]
+fn title_bar_controls_take_the_press_and_the_free_bar_does_not(cx: &mut TestAppContext) {
+    use gpui_kit::{
+        MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
+    };
+    let (mut cx, _nav) = open(cx);
+    let cx = &mut cx;
+    let press = |cx: &mut VisualTestContext, at| {
+        cx.update(|w, cx| {
+            w.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: at,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            let r = w.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: at,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            w.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: at,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            r.propagate
+        })
+    };
+    for id in ["connection-menu", "settings", "connect"] {
+        let at = cx
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("no {id}"))
+            .center();
+        assert!(!press(cx, at), "{id}: the press goes on to the window move");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+    }
+    assert!(
+        press(cx, point(px(700.), px(16.))),
+        "the free bar must move the window"
+    );
 }

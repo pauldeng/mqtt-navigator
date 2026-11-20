@@ -219,7 +219,10 @@ The centre pane has two views. Switch with **Messages | Tree**, `Ctrl/Cmd+1` or 
 ### Tree
 
 - The tree is sorted a–z. Each row shows the topic name, "N topics" when topics with messages are below it (not on a leaf), a preview of the latest payload and the number of messages of the topic and all its subtopics. The tree has no activity dot and no retained marker. The Messages list shows the retained mark (R).
-- Click a row. Then use Up and Down to move. Use Left and Right to collapse and expand a topic that has subtopics.
+- The tree is the first view. It shows the first topic level. All topics below are collapsed.
+- Click a row to select it. A click on a topic without subtopics also opens its details.
+- Double-click a topic that has subtopics to expand or collapse it. To see its details, press Enter or click **Details**.
+- Use Up and Down to move. Use Left and Right to collapse and expand.
 
 ### Filters
 
