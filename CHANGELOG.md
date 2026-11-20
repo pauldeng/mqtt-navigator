@@ -4,6 +4,8 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-20
+
 ### Changed
 
 - The composer has a visible ✕ button to close it, at the end of the topic row. `Esc` also closes it.
@@ -225,7 +227,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.1...v0.2.2

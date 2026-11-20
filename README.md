@@ -2,7 +2,7 @@
 
 MQTT Navigator is a fast native desktop app to inspect MQTT traffic. It shows a live topic tree, message values and history. It supports MQTT 3.1.1 and MQTT 5. It publishes messages with MQTT 5 properties. It runs on Windows 10 or later, Ubuntu 24.04 and macOS 15 or later.
 
-> Status: version 0.2.4 is released (MQTT 3.1.1 and MQTT 5). See [the changelog](CHANGELOG.md) and [the plan](docs/plans/2026-11-10-plan.md).
+> Status: version 0.2.5 is released (MQTT 3.1.1 and MQTT 5). See [the changelog](CHANGELOG.md) and [the plan](docs/plans/2026-11-10-plan.md).
 
 ## Features
 
