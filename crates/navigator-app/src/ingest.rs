@@ -355,15 +355,20 @@ mod tests {
             over.push(start.elapsed().saturating_sub(p.work));
         }
         over.sort();
-        let (p95, worst) = (over[over.len() * 95 / 100], over[over.len() - 1]);
-        println!("allocation overrun past the work deadline: p95 {p95:?}, worst {worst:?}");
-        // The OS can stop the test thread (the tests run in parallel), so only the 95th
-        // percentile has the tight bound. The worst case gets a loose one.
-        assert!(p95 <= margin, "p95 {p95:?}");
-        assert!(
-            worst <= margin + Duration::from_millis(5),
-            "worst {worst:?}"
+        let (p95, p99, worst) = (
+            over[over.len() * 95 / 100],
+            over[over.len() * 99 / 100],
+            over[over.len() - 1],
         );
+        println!(
+            "allocation overrun past the work deadline: p95 {p95:?}, p99 {p99:?}, worst {worst:?}"
+        );
+        // The OS can stop the test thread (parallel tests, a shared CI VM: one stop of 21 ms was
+        // seen on macOS), so the worst case has no bound. The 95th percentile has the tight
+        // bound and the 99th a loose one. A plan that ignores its deadline fails a quarter of
+        // the samples, so both still catch it.
+        assert!(p95 <= margin, "p95 {p95:?}");
+        assert!(p99 <= margin + Duration::from_millis(5), "p99 {p99:?}");
         assert!(i > 0);
     }
 }
