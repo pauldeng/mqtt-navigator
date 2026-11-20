@@ -4,6 +4,10 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows, console windows flashed open and closed when the app unpacked a downloaded update. The archive tool now runs without a window.
+
 ## [0.2.4] - 2026-11-20
 
 ### Changed
