@@ -92,6 +92,11 @@ pub(super) struct Composer {
     /// Why the last Send or conversion did not work. It shows under the composer.
     error: Option<String>,
     format_task: Option<Task<()>>,
+    /// JSON mode: why the payload is not valid JSON. A warning only: Publish still works.
+    json_warning: Option<String>,
+    /// JSON mode: the payload is valid and has JSON highlighting.
+    json_lang: bool,
+    json_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -130,9 +135,10 @@ impl Composer {
             })
         })
         .collect();
-        subs.push(cx.subscribe(&payload, |v, _, ev: &InputEvent, _| {
+        subs.push(cx.subscribe(&payload, |v, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 v.comp.model.edited();
+                v.check_json(cx);
             }
         }));
         Self {
@@ -155,6 +161,9 @@ impl Composer {
             model: ComposerModel::default(),
             error: None,
             format_task: None,
+            json_warning: None,
+            json_lang: false,
+            json_task: None,
             _subs: subs,
         }
     }
@@ -164,6 +173,13 @@ impl Composer {
         self.model.clear();
         self.error = None;
         self.format_task = None;
+        self.json_warning = None;
+        self.json_task = None;
+        if self.json_lang {
+            self.json_lang = false;
+            self.payload
+                .update(cx, |e, cx| e.set_highlighter("text", cx));
+        }
         self.mode = PayloadMode::Text;
         self.qos = Qos::AtMostOnce;
         self.retain = false;
@@ -287,10 +303,54 @@ impl Navigator {
         self.comp.vis.props |= property_count(d) > 0;
     }
 
+    /// JSON mode: checks the payload in the background. Valid JSON gets highlighting. Invalid
+    /// JSON gets a warning, and Publish still sends it. A result for text that changed since is
+    /// dropped. Other modes: no warning and no highlighting.
+    fn check_json(&mut self, cx: &mut Context<Self>) {
+        if self.comp.mode != PayloadMode::Json {
+            self.comp.json_task = None;
+            self.comp.json_warning = None;
+            self.set_json_lang(false, cx);
+            return;
+        }
+        let snapshot = self.comp.payload.read(cx).value().to_string();
+        let text = snapshot.clone();
+        self.comp.json_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { decode::json_valid(text.as_bytes()) })
+                .await;
+            this.update(cx, |v, cx| {
+                if v.comp.mode != PayloadMode::Json
+                    || v.comp.payload.read(cx).value() != snapshot.as_str()
+                {
+                    return;
+                }
+                v.comp.json_warning = result.as_ref().err().cloned();
+                v.set_json_lang(result.is_ok(), cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Changes the highlighting only when it changes, so typing keeps a stable editor.
+    fn set_json_lang(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.comp.json_lang != on {
+            self.comp.json_lang = on;
+            let lang = if on { "json" } else { "text" };
+            self.comp
+                .payload
+                .update(cx, |e, cx| e.set_highlighter(lang, cx));
+        }
+    }
+
     fn set_payload_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check_json(cx);
         let hint = match self.comp.mode {
             PayloadMode::Text => "Payload",
             PayloadMode::Hex => "Payload as hex bytes, for example 01 ff 7a",
+            PayloadMode::Json => "Payload as JSON",
         };
         self.comp
             .payload
@@ -361,10 +421,10 @@ impl Navigator {
                             cx,
                         );
                     }
+                    self.comp
+                        .payload
+                        .update(cx, |e, cx| e.set_value(d.payload, window, cx));
                 }
-                self.comp
-                    .payload
-                    .update(cx, |e, cx| e.set_value(d.payload, window, cx));
                 self.comp.mode = to;
                 self.comp.error = None;
                 self.set_payload_hint(window, cx);
@@ -573,7 +633,7 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.comp.mode != PayloadMode::Text {
+        if !self.comp.mode.is_text() {
             return;
         }
         let size = self.comp.payload.read(cx).text().len();
@@ -623,6 +683,8 @@ impl Navigator {
                             .payload
                             .update(cx, |e, cx| e.set_value(out.text, window, cx));
                         v.comp.error = None;
+                        // `set_value` sends no Change event: check the new text here.
+                        v.check_json(cx);
                     }
                 }
                 cx.notify();
@@ -820,9 +882,15 @@ impl Navigator {
                     .on_click(cx.listener(|v, _, window, cx| v.close_composer(window, cx))),
             );
 
-        // The last result, or the error, as one line under the payload.
+        // The last result, the error or the JSON warning, as one line under the payload.
         let line = if let Some(e) = self.comp.error.clone() {
             div().text_xs().text_color(theme.danger).child(e)
+        } else if let Some(w) = self.comp.json_warning.clone() {
+            div()
+                .debug_selector(|| "json-warning".into())
+                .text_xs()
+                .text_color(theme.warning)
+                .child(format!("{w} Publish still sends it as is."))
         } else {
             div().text_xs().text_color(muted).child(if connected {
                 result
@@ -831,7 +899,11 @@ impl Navigator {
             })
         };
 
-        let mode_ix = usize::from(hex);
+        let mode_ix = match self.comp.mode {
+            PayloadMode::Text => 0,
+            PayloadMode::Hex => 1,
+            PayloadMode::Json => 2,
+        };
         // A toggle group with a selected state. A click on the selected one keeps it.
         let qos = ToggleGroup::new("qos")
             .segmented()
@@ -863,22 +935,26 @@ impl Navigator {
             .gap_2()
             .items_center()
             .child(
-                div().w(ui(110.)).child(
-                    TabBar::new("payload-mode")
-                        .segmented()
-                        .small()
-                        .selected_index(mode_ix)
-                        .on_click(cx.listener(|v, ix: &usize, window, cx| {
-                            let to = if *ix == 0 {
-                                PayloadMode::Text
-                            } else {
-                                PayloadMode::Hex
-                            };
-                            v.set_payload_mode(to, window, cx);
-                        }))
-                        .child("Text")
-                        .child("Hex"),
-                ),
+                div()
+                    .debug_selector(|| "payload-mode".into())
+                    .w(ui(165.))
+                    .child(
+                        TabBar::new("payload-mode")
+                            .segmented()
+                            .small()
+                            .selected_index(mode_ix)
+                            .on_click(cx.listener(|v, ix: &usize, window, cx| {
+                                let to = match ix {
+                                    0 => PayloadMode::Text,
+                                    1 => PayloadMode::Hex,
+                                    _ => PayloadMode::Json,
+                                };
+                                v.set_payload_mode(to, window, cx);
+                            }))
+                            .child("Text")
+                            .child("Hex")
+                            .child("JSON"),
+                    ),
             )
             .child(qos)
             .child(
@@ -898,7 +974,7 @@ impl Navigator {
                     .debug_selector(|| "send".into())
                     .small()
                     .primary()
-                    .label(format!("Send ({}+Enter)", crate::palette::MOD))
+                    .label(format!("Publish ({}+Enter)", crate::palette::MOD))
                     .disabled(!connected)
                     .on_click(cx.listener(|v, _, window, cx| v.send(window, cx))),
             );

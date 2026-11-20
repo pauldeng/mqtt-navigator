@@ -511,7 +511,7 @@ pub static COMMANDS: &[Entry] = &[
         Cmd::FocusPublishTopic,
         always,
     ),
-    e("send", "Send", Some("Mod+Enter"), Cmd::Send, |f| {
+    e("send", "Publish", Some("Mod+Enter"), Cmd::Send, |f| {
         f.connected
     }),
     e(
@@ -519,28 +519,35 @@ pub static COMMANDS: &[Entry] = &[
         "Payload mode: Text",
         None,
         Cmd::PayloadMode(PayloadMode::Text),
-        |f| f.payload_mode == PayloadMode::Hex,
+        |f| f.payload_mode != PayloadMode::Text,
     ),
     e(
         "payload-hex",
         "Payload mode: Hex",
         None,
         Cmd::PayloadMode(PayloadMode::Hex),
-        |f| f.payload_mode == PayloadMode::Text,
+        |f| f.payload_mode != PayloadMode::Hex,
+    ),
+    e(
+        "payload-json",
+        "Payload mode: JSON",
+        None,
+        Cmd::PayloadMode(PayloadMode::Json),
+        |f| f.payload_mode != PayloadMode::Json,
     ),
     e(
         "beautify-json",
         "Beautify the JSON payload",
         None,
         Cmd::FormatJson(true),
-        |f| f.payload_mode == PayloadMode::Text,
+        |f| f.payload_mode.is_text(),
     ),
     e(
         "minify-json",
         "Minify the JSON payload",
         None,
         Cmd::FormatJson(false),
-        |f| f.payload_mode == PayloadMode::Text,
+        |f| f.payload_mode.is_text(),
     ),
     e(
         "new-message",

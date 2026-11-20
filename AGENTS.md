@@ -69,7 +69,7 @@ Fuzz and soak tests run on a local machine only, not in CI. Run them before a re
 
 ### gpui-kit
 
-- Depend only on `gpui-kit`, with its default features. The only extra feature that may be added is `tree-sitter` (JSON highlighting), and only after P5 measures its size cost and an ADR accepts it. Import with `use gpui_kit::*;`.
+- Depend only on `gpui-kit`, with its default features and `tree-sitter` (JSON highlighting in the composer, [ADR 0007](docs/adr/0007-json-highlighting.md)). Add no other feature. Import with `use gpui_kit::*;`.
 - Build the UI from gpui-kit components. Do not use a webview or web UI (`gpui-webview`, `gpui-shell`). Follow [docs/ui-design.md](docs/ui-design.md).
 - Use only theme tokens (`cx.theme()`). Do not put raw colour values in components.
 - Do not invent APIs. Read the pinned source or <https://gpui-kit.com/component/{name}.md>.

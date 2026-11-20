@@ -211,6 +211,15 @@ impl io::Write for Capped<'_> {
     }
 }
 
+/// `Ok` when `text` is one valid JSON value. `Err` has the reason for the user. It builds no
+/// value, so it is cheap. It skips nested values without recursion, so it has no depth limit:
+/// deep JSON is valid here, and [`json`] (Beautify, Minify) still refuses more than 127 levels.
+pub fn json_valid(text: &[u8]) -> Result<(), String> {
+    serde_json::from_slice::<serde::de::IgnoredAny>(text)
+        .map(|_| ())
+        .map_err(|e| format!("The payload is not valid JSON: {e}."))
+}
+
 /// The payload as JSON text: `pretty` (beautify, two-space indent) or compact (minify). The key
 /// order stays. The composer uses it for Beautify and Minify.
 pub fn json(head: &[u8], pretty: bool, cancel: &AtomicBool) -> Rendered {
@@ -560,6 +569,8 @@ mod tests {
         let b: serde_json::Value = serde_json::from_str(&text).expect("pretty");
         assert_eq!(a, b);
         assert_eq!(ok(Decoder::Json, b"42"), "42");
+        assert!(json_valid(br#"{"a": [1, "x"]}"#).is_ok());
+        assert!(json_valid(b"").is_err() && json_valid(b"{\"a\":}").is_err());
         // Minify: no spaces or line breaks outside strings, the same order.
         let min = json(
             br#"{ "z" : 1,
