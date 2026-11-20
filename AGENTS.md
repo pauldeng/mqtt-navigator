@@ -27,10 +27,10 @@ tests/broker/down.sh
 Fuzz and soak tests run on a local machine only, not in CI. Run them before a release that changes parsing, the network or the store.
 
 ```bash
-# Fuzz (nightly Rust and cargo-fuzz). A crash input goes to fuzz/artifacts.
-cd fuzz && for t in decode_render:60 parse_hex:20 topic_matches:20 profile_import:60; do cargo +nightly fuzz run "${t%%:*}" -- -max_total_time="${t##*:}" || break; done
-# Soak: 1 h at 500 msg/s with 6 broker restarts (SOAK_SECS, SOAK_RATE).
-tests/broker/up.sh mosquitto && cargo test --release -p navigator-core --features broker-tests --test soak -- --ignored --nocapture; tests/broker/down.sh
+# Fuzz (nightly Rust and cargo-fuzz). A crash stops the loop with an error. The input goes to fuzz/artifacts.
+(cd fuzz && for t in decode_render:60 parse_hex:20 topic_matches:20 profile_import:60; do cargo +nightly fuzz run "${t%%:*}" -- -max_total_time="${t##*:}" || exit 1; done)
+# Soak: 1 h at 500 msg/s with 6 broker restarts (SOAK_SECS, SOAK_RATE). The broker stops also after a failure, and the status of the test stays.
+(tests/broker/up.sh mosquitto && cargo test --release -p navigator-core --features broker-tests --test soak -- --ignored --nocapture; s=$?; tests/broker/down.sh; exit $s)
 ```
 
 ## System packages
