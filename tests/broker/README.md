@@ -16,7 +16,7 @@ tests/broker/up.sh mosquitto && cargo test -p navigator-app --features broker-te
 
 `up.sh` takes service names (`mosquitto`, `emqx`, `hivemq`). With no name, it starts all three. `mosquitto` starts two Mosquitto services: the main one and `mosquitto-limits`.
 
-The soak test runs 1 h by default (`SOAK_SECS`, `SOAK_RATE`). It restarts the broker 6 times:
+The soak test runs on a local machine only, not in CI. It runs 1 h by default (`SOAK_SECS`, `SOAK_RATE`). It restarts the broker 6 times:
 
 ```bash
 tests/broker/up.sh mosquitto && SOAK_SECS=600 cargo test --release -p navigator-core --features broker-tests --test soak -- --ignored --nocapture && tests/broker/down.sh
