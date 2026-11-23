@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr;
 
+use gpui_kit::component::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::form::{Field, field, v_form};
@@ -1478,6 +1479,7 @@ impl Render for ConnectionSheet {
                     .id("sheet-form")
                     .size_full()
                     .overflow_y_scroll()
+                    .lock_scroll_axis()
                     .track_scroll(&self.scroll)
                     .child(form),
             )
