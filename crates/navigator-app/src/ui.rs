@@ -4088,7 +4088,11 @@ impl Render for Navigator {
                         ),
                 ),
             )
-            .child(self.render_status(cx))
+            .child(
+                div()
+                    .debug_selector(|| "status-bar".into())
+                    .child(self.render_status(cx)),
+            )
     }
 }
 

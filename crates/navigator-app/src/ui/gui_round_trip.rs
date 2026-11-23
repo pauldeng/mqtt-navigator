@@ -1173,12 +1173,15 @@ fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAp
             .expect("the Publish button is drawn");
         let composer = cx.debug_bounds("composer").expect("the composer is drawn");
         let window = cx.update(|w, _| w.viewport_size());
-        // The composer takes at most 80% of the window (55% at the default zoom). The status bar
-        // (about 28 px) is below it.
-        let most = if rem == 16. { 0.55 } else { 0.8 };
+        let status = cx
+            .debug_bounds("status-bar")
+            .expect("the status bar is drawn");
+        // The composer takes 55% of the window at the default zoom, and at 150% zoom the floor
+        // (375 px). The status bar is below it.
+        let most = if rem == 16. { 0.55 } else { 0.625 };
         assert!(
             composer.size.height <= window.height * most + px(1.)
-                && composer.bottom() < window.height - px(20.)
+                && composer.bottom() <= status.top()
                 && send.bottom() <= composer.bottom(),
             "the composer is too tall at {rem} px: {composer:?}, Publish {send:?}, window {window:?}"
         );
