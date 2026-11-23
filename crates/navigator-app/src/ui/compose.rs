@@ -28,7 +28,18 @@ const PAYLOAD_HEIGHT: f32 = 84.;
 /// ("Send empty" and Remove), and the most height of the rows before they scroll.
 const LABEL_WIDTH: f32 = 160.;
 const END_WIDTH: f32 = 150.;
-const PROPS_MAX_HEIGHT: f32 = 168.;
+/// A centre pane narrower than this stacks the label above the field: the label column, the end
+/// column and two inputs of a user property need about this much width.
+const STACK_BELOW: f32 = 560.;
+/// The composer takes at most this part of the window height. The message list keeps the rest, and
+/// the properties scroll inside the composer.
+const MAX_HEIGHT_PART: f32 = 0.55;
+
+/// Whether a property row puts its label above the field, for a centre pane of width `centre`.
+/// Before the first layout, the width is unknown (`None`): the row stays in one line.
+fn props_stacked(centre: Option<Pixels>, rem: Pixels) -> bool {
+    centre.is_some_and(|w| w < ui(STACK_BELOW).to_pixels(rem))
+}
 
 /// Format refuses a payload above this size, and a result above [`FORMAT_MAX_OUT`]: setting a
 /// large text into the editor runs on the UI thread (see docs/ui-design.md, 3.3).
@@ -899,6 +910,10 @@ impl Navigator {
         let hex = self.comp.mode == PayloadMode::Hex;
         let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();
+        let stacked = props_stacked(
+            self.panes.read(cx).sizes().get(1).copied(),
+            window.rem_size(),
+        );
         // The `⋯` menu: Beautify JSON, Minify JSON, History… and Properties (MQTT 5).
         let more = Button::new("composer-more")
             .small()
@@ -1066,33 +1081,41 @@ impl Navigator {
                     .on_click(cx.listener(|v, _, window, cx| v.send(window, cx))),
             );
 
+        // The composer has a most height. The properties are the only part that shrinks: they scroll
+        // and the other rows (topic, payload, the action row) stay in view.
         v_flex()
             .key_context("Composer")
+            .debug_selector(|| "composer".into())
+            .max_h(window.viewport_size().height * MAX_HEIGHT_PART)
             .on_action(cx.listener(|v, _: &CloseComposer, window, cx| v.close_composer(window, cx)))
             .border_t_1()
             .border_color(theme.border)
             .p_2()
             .gap_2()
-            .child(header)
+            .child(header.flex_none())
             .when_some(topic_note, |d, n| {
-                d.child(div().text_xs().text_color(muted).child(n))
+                d.child(div().flex_none().text_xs().text_color(muted).child(n))
             })
             .child(
-                Editor::new(&self.comp.payload)
-                    .h(ui(PAYLOAD_HEIGHT))
-                    .bordered(true)
-                    .small(),
+                div().flex_none().child(
+                    Editor::new(&self.comp.payload)
+                        .h(ui(PAYLOAD_HEIGHT))
+                        .bordered(true)
+                        .small(),
+                ),
             )
-            .child(line)
-            .when(v5 && props_open, |d| d.child(self.render_props(cx)))
-            .child(controls)
+            .child(line.flex_none())
+            .when(v5 && props_open, |d| {
+                d.child(self.render_props(stacked, cx))
+            })
+            .child(controls.flex_none())
             .into_any_element()
     }
 
     /// The "Properties" section: only the fields that are present, and an "Add property" menu
     /// for the others. "Send empty" keeps a property that is present but empty. A line break or
     /// a hidden character in a text is kept (see [`LineKeep`]).
-    fn render_props(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_props(&self, stacked: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let shown = self.comp.shown;
         let empty_switch =
@@ -1156,6 +1179,7 @@ impl Navigator {
                         .size_full(),
                 )
                 .child(prop_row(
+                    stacked,
                     "User property",
                     muted,
                     names,
@@ -1187,9 +1211,9 @@ impl Navigator {
         let section =
             v_flex()
                 .gap_1()
-                .pr_2()
                 .when(shown.payload_format, |d| {
                     d.child(prop_row(
+                        stacked,
                         "Payload format",
                         muted,
                         div().text_sm().child("UTF-8"),
@@ -1200,6 +1224,7 @@ impl Navigator {
                 })
                 .when(shown.content_type, |d| {
                     d.child(prop_row(
+                        stacked,
                         "Content type",
                         muted,
                         Input::new(&self.comp.content_type.input)
@@ -1219,6 +1244,7 @@ impl Navigator {
                 })
                 .when(shown.response_topic, |d| {
                     d.child(prop_row(
+                        stacked,
                         "Response topic",
                         muted,
                         Input::new(&self.comp.response_topic.input)
@@ -1231,6 +1257,7 @@ impl Navigator {
                 })
                 .when(shown.correlation, |d| {
                     d.child(prop_row(
+                        stacked,
                         "Correlation data (hex)",
                         muted,
                         Input::new(&self.comp.correlation)
@@ -1250,6 +1277,7 @@ impl Navigator {
                 })
                 .when(shown.expiry, |d| {
                     d.child(prop_row(
+                        stacked,
                         "Message expiry (seconds)",
                         muted,
                         Input::new(&self.comp.expiry)
@@ -1260,11 +1288,10 @@ impl Navigator {
                         None,
                     ))
                 });
-        // The Name and Value captions are outside the scroll area, so they stay in view.
-        let captions = has_rows.then(|| {
+        // The Name and Value captions (a stacked row has the hints in the inputs).
+        let captions = (has_rows && !stacked).then(|| {
             h_flex()
                 .gap_2()
-                .pr_2()
                 .text_xs()
                 .text_color(muted)
                 .child(div().w(ui(LABEL_WIDTH)).min_w_0())
@@ -1277,37 +1304,38 @@ impl Navigator {
                 )
                 .child(div().w(ui(END_WIDTH)).min_w_0())
         });
-        // The user property rows scroll when there are many. The captions, the other properties,
-        // the Add button and the action row stay in view.
+        // The properties scroll as one block, down to nothing when the composer is at its most
+        // height. The Add button and the action row stay in view.
         v_flex()
             .gap_1()
-            .child(section)
-            .children(captions)
-            .when(has_rows, |d| {
-                d.child(
-                    div()
-                        .relative()
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .pr_2()
-                                .children(rows)
-                                .id("props-rows")
-                                .max_h(ui(PROPS_MAX_HEIGHT))
-                                .overflow_y_scroll()
-                                .lock_scroll_axis()
-                                .track_scroll(&self.comp.props_scroll),
-                        )
-                        .vertical_scrollbar(&self.comp.props_scroll),
-                )
-            })
-            .child(h_flex().child(add))
+            .min_h_0()
+            .child(
+                v_flex()
+                    .relative()
+                    .min_h_0()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .pr_2()
+                            .min_h_0()
+                            .child(section)
+                            .children(captions)
+                            .children(rows)
+                            .id("props-rows")
+                            .overflow_y_scroll()
+                            .lock_scroll_axis()
+                            .track_scroll(&self.comp.props_scroll),
+                    )
+                    .vertical_scrollbar(&self.comp.props_scroll),
+            )
+            .child(h_flex().flex_none().child(add))
     }
 }
 
 /// One row of the Properties section: a label column, the field, and a column at the end for
 /// "Send empty" and Remove. A note (a line break or a hidden character) shows under the field.
 fn prop_row(
+    stacked: bool,
     label: &'static str,
     muted: Hsla,
     field: impl IntoElement,
@@ -1315,34 +1343,49 @@ fn prop_row(
     remove: Button,
     note: Option<String>,
 ) -> impl IntoElement {
-    v_flex()
-        .child(
-            h_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .w(ui(LABEL_WIDTH))
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(label),
-                )
-                .child(div().flex_1().min_w_0().child(field))
+    let end = h_flex().gap_1().justify_end().children(empty).child(remove);
+    let label = div().min_w_0().text_xs().text_color(muted).child(label);
+    // A narrow pane: the label and the end column share the first line, the field has the second.
+    let (head, indent) = if stacked {
+        (
+            v_flex()
+                .gap_1()
                 .child(
                     h_flex()
-                        .w(ui(END_WIDTH))
-                        .min_w_0()
-                        .gap_1()
-                        .justify_end()
-                        .children(empty)
-                        .child(remove),
-                ),
+                        .gap_2()
+                        .justify_between()
+                        .child(label.flex_1())
+                        .child(end.flex_none()),
+                )
+                .child(div().min_w_0().child(field)),
+            0.,
         )
-        .children(note.map(|n| {
-            div()
-                .pl(ui(LABEL_WIDTH + 8.))
-                .text_xs()
-                .text_color(muted)
-                .child(n)
-        }))
+    } else {
+        (
+            v_flex().child(
+                h_flex()
+                    .gap_2()
+                    .child(label.w(ui(LABEL_WIDTH)))
+                    .child(div().flex_1().min_w_0().child(field))
+                    .child(end.w(ui(END_WIDTH)).min_w_0()),
+            ),
+            LABEL_WIDTH + 8.,
+        )
+    };
+    head.children(note.map(|n| div().pl(ui(indent)).text_xs().text_color(muted).child(n)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STACK_BELOW, props_stacked, ui};
+    use gpui_kit::px;
+
+    #[core::prelude::v1::test]
+    fn rows_stack_in_a_narrow_pane_only() {
+        let rem = px(16.);
+        // The least centre width (360) stacks. A wide centre and an unknown width do not.
+        assert!(props_stacked(Some(ui(360.).to_pixels(rem)), rem));
+        assert!(!props_stacked(Some(ui(STACK_BELOW).to_pixels(rem)), rem));
+        assert!(!props_stacked(None, rem));
+    }
 }
