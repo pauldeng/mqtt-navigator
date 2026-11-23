@@ -1590,7 +1590,7 @@ impl Navigator {
     /// Follow and a pause need no anchor. A scroll that is not yet drawn has no valid offset.
     fn capture_anchor(&mut self) {
         self.anchor = None;
-        self.leave_follow_if_dragged();
+        self.list_scrolled();
         if self.follow.on || self.store.is_paused() {
             return;
         }
@@ -1832,22 +1832,25 @@ impl Navigator {
         }
     }
 
-    /// A scrollbar drag moves the list with no wheel event. If the list left its top while Follow
-    /// is on, Follow goes off. A scroll that is not yet drawn has no valid offset.
-    fn leave_follow_if_dragged(&mut self) {
+    /// The list moved (a wheel event, or a scrollbar drag that sends none). A scroll that leaves
+    /// the top turns Follow off. Only "Jump to newest" turns it on. Returns true when Follow
+    /// went off. A scroll that is not yet drawn has no valid offset.
+    fn list_scrolled(&mut self) -> bool {
         if !self.follow.on || self.view != View::Messages || self.store.is_paused() {
-            return;
+            return false;
         }
         let y = {
             let state = self.list_scroll.0.borrow();
             if state.deferred_scroll_to_item.is_some() {
-                return;
+                return false;
             }
             f32::from(state.base_handle.offset().y)
         };
-        if left_the_top(y) {
+        let left = left_the_top(y);
+        if left {
             self.leave_follow();
         }
+        left
     }
 
     /// "Jump to newest": scroll to the top, keep the selection, turn Follow on.
@@ -3314,12 +3317,8 @@ impl Navigator {
             // A scroll that leaves the top turns Follow off. The list handles the wheel event
             // first, so the offset is the new one here.
             .on_scroll(cx.listener(|v, _, _, cx| {
-                if v.view == View::Messages && v.follow.on {
-                    let y = f32::from(v.list_scroll.0.borrow().base_handle.offset().y);
-                    if left_the_top(y) {
-                        v.leave_follow();
-                        cx.notify();
-                    }
+                if v.list_scrolled() {
+                    cx.notify();
                 }
             }))
             // The button has its own strip: it never covers a row.
@@ -3409,7 +3408,7 @@ impl Navigator {
         if count == 0 {
             return self.render_empty(cx);
         }
-        self.leave_follow_if_dragged();
+        self.list_scrolled();
         if self.follow.on && !self.store.is_paused() {
             self.list_scroll
                 .scroll_to_item_strict(0, ScrollStrategy::Top);
