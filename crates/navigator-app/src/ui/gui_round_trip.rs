@@ -927,3 +927,49 @@ fn escape_in_a_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// A full composer (all the standard properties and many user properties) keeps its action row
+/// above the status bar in a small window. The properties scroll inside the composer.
+#[gpui_kit::test]
+fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
+    cx.simulate_resize(size(px(960.), px(600.)));
+    cx.simulate_keystrokes("secondary-shift-n");
+    for kind in [
+        PropKind::PayloadFormat,
+        PropKind::ContentType,
+        PropKind::ResponseTopic,
+        PropKind::Correlation,
+        PropKind::Expiry,
+    ]
+    .into_iter()
+    .chain([PropKind::User; 20])
+    {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(kind, w, cx)));
+        cx.run_until_parked();
+    }
+    for _ in 0..3 {
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+    }
+    let send = cx
+        .debug_bounds("send")
+        .expect("the Publish button is drawn");
+    let composer = cx.debug_bounds("composer").expect("the composer is drawn");
+    let window = cx.update(|w, _| w.viewport_size());
+    // The composer takes at most 55% of the window. The status bar (about 28 px) is below it.
+    assert!(
+        composer.size.height <= window.height * 0.55 + px(1.)
+            && composer.bottom() < window.height - px(20.)
+            && send.bottom() <= composer.bottom(),
+        "the composer is too tall: {composer:?}, Publish {send:?}, window {window:?}"
+    );
+}
