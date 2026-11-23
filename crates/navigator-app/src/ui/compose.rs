@@ -162,8 +162,11 @@ pub(super) struct Composer {
     /// The `⋯` button and the "Add property" button. Escape in their menus returns the focus here.
     more_focus: FocusHandle,
     add_focus: FocusHandle,
-    /// Frames to draw after a change of the stacking, before the focused row is revealed.
+    /// Wait two frames after the composer size, the stacking or the height of the Properties
+    /// area changes. Then show the row with the focus.
     settle: Rc<Cell<u8>>,
+    /// The height of the Properties area at the last layout.
+    view_height: Rc<Cell<Pixels>>,
     /// The scroll position of the Properties area (the standard fields and the user rows).
     props_scroll: ScrollHandle,
     pub(super) mode: PayloadMode,
@@ -275,6 +278,7 @@ impl Composer {
             more_focus: cx.focus_handle().tab_stop(true),
             add_focus: cx.focus_handle().tab_stop(true),
             settle: Rc::default(),
+            view_height: Rc::default(),
             props_scroll: ScrollHandle::new(),
             mode: PayloadMode::Text,
             qos: Qos::AtMostOnce,
@@ -1098,6 +1102,10 @@ impl Navigator {
             self.comp.size.clone(),
             self.comp.settle.clone(),
         );
+        let (scroll, view_height) = (
+            self.comp.props_scroll.clone(),
+            self.comp.view_height.clone(),
+        );
         let stacked = props_stacked(size.get().map(|s| s.width), rem);
         // The composer measures itself. A change of the stacking draws the window again, and two
         // frames later (the rows have their new height) the row with the focus, if any, is shown.
@@ -1111,7 +1119,11 @@ impl Navigator {
                     (o.width - b.size.width).abs() > px(0.5)
                         || (o.height - b.size.height).abs() > px(0.5)
                 });
-                if was != props_stacked(Some(b.size.width), rem) || moved {
+                // A result line can take room from the Properties area: its height changes.
+                let view = scroll.bounds().size.height;
+                let resized = (view_height.get() - view).abs() > px(0.5);
+                view_height.set(view);
+                if was != props_stacked(Some(b.size.width), rem) || moved || resized {
                     settle.set(2);
                 }
                 let left = settle.get();
@@ -1404,7 +1416,12 @@ impl Navigator {
                 &r.spot,
                 prop_row(
                     stacked,
-                    "User property",
+                    // A stacked row has no Name and Value captions above it: the label says it.
+                    if stacked {
+                        "User property (name, value)"
+                    } else {
+                        "User property"
+                    },
                     muted,
                     names,
                     Some(r.spot.switch_div(switch)),
