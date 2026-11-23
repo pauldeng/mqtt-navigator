@@ -789,22 +789,28 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
             );
         }
     }
-    // A move from "Send empty" to Remove stays inside the row: it reveals the row too.
+    // A move from Value to "Send empty", and from there to Remove, stays inside the row. The row
+    // is scrolled away before each step.
     cx.simulate_resize(size(px(1400.), px(900.)));
     draw(cx);
     let last = nav.read_with(cx, |v, _| v.last_user_value());
     cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
-    cx.simulate_keystrokes("tab");
-    nav.update(cx, |v, _| v.scroll_props_to_top());
-    draw(cx);
-    cx.simulate_keystrokes("tab");
-    draw(cx);
+    for step in ["Send empty", "Remove"] {
+        nav.update(cx, |v, _| v.scroll_props_to_top());
+        draw(cx);
+        assert!(!nav.read_with(cx, |v, _| v.last_user_row_in_view()));
+        cx.simulate_keystrokes("tab");
+        draw(cx);
+        assert!(
+            nav.read_with(cx, |v, _| v.last_user_row_in_view()),
+            "the row is not in view after Tab to {step}"
+        );
+    }
     let remove = nav.read_with(cx, |v, _| v.last_user_remove_focus());
     assert!(
         cx.update(|w, _| remove.is_focused(w)),
         "Remove has no focus"
     );
-    assert!(nav.read_with(cx, |v, _| v.last_user_row_in_view()));
     // A new standard field is at the top of the area: the area scrolls there. Payload format has
     // no input to focus.
     for kind in [PropKind::ContentType, PropKind::PayloadFormat] {
@@ -982,6 +988,38 @@ fn escape_in_a_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
     }
 }
 
+/// The same for the menus of the composer: "Composer actions" and "Add property".
+#[gpui_kit::test]
+fn escape_in_a_composer_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
+    cx.simulate_keystrokes("secondary-shift-n");
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+    cx.run_until_parked();
+    cx.update(|w, _| w.refresh());
+    cx.run_until_parked();
+    let handles = nav.read_with(cx, |v, _| v.menu_buttons_focus());
+    for (button, handle) in ["composer-more", "add-prop"].into_iter().zip(handles) {
+        // The focus is in the payload, not on the button.
+        cx.simulate_keystrokes("secondary-a");
+        click(cx, button);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|w, _| handle.is_focused(w)),
+            "Escape did not return the focus to {button}"
+        );
+    }
+}
+
 /// The composer measures its own width and stacks the property rows below the limit: a user row
 /// has two lines in a narrow window. A window resize changes the stacking.
 #[gpui_kit::test]
@@ -1029,6 +1067,18 @@ fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppCont
     assert!(
         in_view,
         "the row with the focus is not in view after the resize"
+    );
+    // A lower window gives the properties less height. The row with the focus stays in view.
+    cx.simulate_resize(size(px(1400.), px(900.)));
+    draw(cx);
+    nav.update(cx, |v, _| v.scroll_props_to_top());
+    let (_, _, in_view) = draw(cx);
+    assert!(!in_view, "the row is scrolled away");
+    cx.simulate_resize(size(px(1400.), px(600.)));
+    let (_, _, in_view) = draw(cx);
+    assert!(
+        in_view,
+        "the row with the focus is not in view in a low window"
     );
     cx.simulate_resize(size(px(1400.), px(900.)));
     let (stacked, again, in_view) = draw(cx);

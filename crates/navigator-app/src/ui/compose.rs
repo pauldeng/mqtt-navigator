@@ -156,8 +156,12 @@ pub(super) struct Composer {
     next_row: u64,
     /// The rows of the standard properties, in the order of [`PropKind`] (without `User`).
     std_spots: [Spot; 5],
-    /// The width of the composer at the last layout. It sets the stacking of the property rows.
-    width: Rc<Cell<Option<Pixels>>>,
+    /// The size of the composer at the last layout. Its width sets the stacking of the property
+    /// rows. A change of the size shows the row with the focus again.
+    size: Rc<Cell<Option<Size<Pixels>>>>,
+    /// The `⋯` button and the "Add property" button. Escape in their menus returns the focus here.
+    more_focus: FocusHandle,
+    add_focus: FocusHandle,
     /// Frames to draw after a change of the stacking, before the focused row is revealed.
     settle: Rc<Cell<u8>>,
     /// The scroll position of the Properties area (the standard fields and the user rows).
@@ -267,7 +271,9 @@ impl Composer {
             rows: Vec::new(),
             next_row: 1,
             std_spots,
-            width: Rc::default(),
+            size: Rc::default(),
+            more_focus: cx.focus_handle().tab_stop(true),
+            add_focus: cx.focus_handle().tab_stop(true),
             settle: Rc::default(),
             props_scroll: ScrollHandle::new(),
             mode: PayloadMode::Text,
@@ -425,8 +431,9 @@ impl Navigator {
     }
 
     /// Scrolls the Properties area the least that shows `b`. Tab can focus a row that the area
-    /// hides. The callers take the place of the row: after a scroll it is old until the next frame,
-    /// and a second reveal (the row and its input both report the focus) would scroll again.
+    /// hides. Each caller reads and clears the saved bounds of the row. After a scroll the bounds
+    /// are old until the next frame, so a second reveal in the same frame (the row and its input
+    /// both report the focus) must not scroll again.
     fn reveal(&mut self, b: Option<Bounds<Pixels>>, cx: &mut Context<Self>) {
         let Some(b) = b else {
             return;
@@ -519,10 +526,16 @@ impl Navigator {
         b.top() >= view.top() && b.bottom() <= view.bottom()
     }
 
+    /// For the window tests: the focus handles of the `⋯` button and of "Add property".
+    #[cfg(test)]
+    pub(super) fn menu_buttons_focus(&self) -> [FocusHandle; 2] {
+        [self.comp.more_focus.clone(), self.comp.add_focus.clone()]
+    }
+
     /// For the window tests: whether the property rows are stacked now.
     #[cfg(test)]
     pub(super) fn rows_stacked(&self, rem: Pixels) -> bool {
-        props_stacked(self.comp.width.get(), rem)
+        props_stacked(self.comp.size.get().map(|s| s.width), rem)
     }
 
     /// Writes a draft into the composer fields. It does not touch History.
@@ -1080,20 +1093,25 @@ impl Navigator {
         let hex = self.comp.mode == PayloadMode::Hex;
         let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();
-        let (rem, width, settle) = (
+        let (rem, size, settle) = (
             window.rem_size(),
-            self.comp.width.clone(),
+            self.comp.size.clone(),
             self.comp.settle.clone(),
         );
-        let stacked = props_stacked(width.get(), rem);
+        let stacked = props_stacked(size.get().map(|s| s.width), rem);
         // The composer measures itself. A change of the stacking draws the window again, and two
         // frames later (the rows have their new height) the row with the focus, if any, is shown.
         let this = cx.entity().downgrade();
         let measure = canvas(
             move |b, window, cx| {
-                let was = props_stacked(width.get(), rem);
-                width.set(Some(b.size.width));
-                if was != props_stacked(Some(b.size.width), rem) {
+                let old = size.get();
+                size.set(Some(b.size));
+                let was = props_stacked(old.map(|s| s.width), rem);
+                let moved = old.is_some_and(|o| {
+                    (o.width - b.size.width).abs() > px(0.5)
+                        || (o.height - b.size.height).abs() > px(0.5)
+                });
+                if was != props_stacked(Some(b.size.width), rem) || moved {
                     settle.set(2);
                 }
                 let left = settle.get();
@@ -1116,13 +1134,17 @@ impl Navigator {
         .absolute()
         .size_full();
         // The `⋯` menu: Beautify JSON, Minify JSON, History… and Properties (MQTT 5).
+        let more_focus = self.comp.more_focus.clone();
         let more = Button::new("composer-more")
+            .debug_selector(|| "composer-more".into())
+            .track_focus(&self.comp.more_focus)
             .small()
             .ghost()
             .icon(IconName::Ellipsis)
             .tab_stop(true)
             .tooltip("Composer actions")
             .dropdown_menu(move |menu, _, _| {
+                let menu = menu.action_context(more_focus.clone());
                 let item = |label: &'static str,
                             run: fn(&mut Navigator, &mut Window, &mut Context<Navigator>)| {
                     let weak = weak.clone();
@@ -1395,13 +1417,17 @@ impl Navigator {
         let has_rows = !rows.is_empty();
         let addable = shown.addable();
         let weak = cx.entity().downgrade();
+        let add_focus = self.comp.add_focus.clone();
         let add = Button::new("add-prop")
+            .debug_selector(|| "add-prop".into())
+            .track_focus(&self.comp.add_focus)
             .xsmall()
             .ghost()
             .icon(IconName::Plus)
             .label("Add property")
             .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
+                let menu = menu.action_context(add_focus.clone());
                 addable.iter().fold(menu, |menu, kind| {
                     let (weak, kind) = (weak.clone(), *kind);
                     menu.item(
