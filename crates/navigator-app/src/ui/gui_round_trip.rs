@@ -718,6 +718,55 @@ fn focus_in_a_hidden_user_property_row_scrolls_to_it(cx: &mut TestAppContext) {
     );
 }
 
+/// Any control of a user property row scrolls the row into view when it takes the focus, not only
+/// the inputs: Shift+Tab from "Add property" reaches the Remove button of the last row. A hidden
+/// Remove button must not keep the focus (Enter would delete a row out of view).
+#[gpui_kit::test]
+fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
+    // Focus-in events run only in an active window.
+    cx.update(|w, _| w.activate_window());
+    cx.simulate_keystrokes("secondary-shift-n");
+    for _ in 0..12 {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.run_until_parked();
+    }
+    let draw = |cx: &mut VisualTestContext| {
+        for _ in 0..3 {
+            cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
+    };
+    draw(cx);
+    // From the last Value: the switch, Remove, then "Add property" (outside the rows).
+    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
+    cx.simulate_keystrokes("tab tab tab");
+    let row = nav.read_with(cx, |v, _| v.last_user_row_focus());
+    assert!(
+        !cx.update(|w, cx| row.contains_focused(w, cx)),
+        "Add property must have the focus"
+    );
+    nav.update(cx, |v, _| v.scroll_props_to_top());
+    draw(cx);
+    assert_eq!(nav.read_with(cx, |v, _| v.props_offset()), px(0.));
+    cx.simulate_keystrokes("shift-tab");
+    draw(cx);
+    assert!(cx.update(|w, cx| row.contains_focused(w, cx)));
+    assert!(
+        nav.read_with(cx, |v, _| v.props_offset()) < px(0.),
+        "the area did not show the row of the focused Remove button"
+    );
+}
+
 /// A wrong field below the visible part of the sheet scrolls into view when Enter focuses it.
 #[gpui_kit::test]
 fn a_wrong_field_below_the_fold_scrolls_into_view(cx: &mut TestAppContext) {
