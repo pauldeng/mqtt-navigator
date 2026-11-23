@@ -531,11 +531,9 @@ impl Navigator {
         if let Some(input) = focus {
             input.update(cx, |i, cx| i.focus(window, cx));
         }
-        // The new field must be in view: a user property is the last row, the others are first.
+        // The new field must be in view: only the user rows scroll.
         if kind == PropKind::User {
             self.comp.props_scroll.scroll_to_bottom();
-        } else {
-            self.comp.props_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.comp.vis.props = true;
         self.comp.model.edited();
