@@ -175,6 +175,11 @@ fn disclosure_icon(open: bool) -> IconName {
     }
 }
 
+/// The name that a screen reader says for a disclosure button: the chevron has no text.
+fn disclosure_name(label: &str, open: bool) -> String {
+    format!("{label}, {}", if open { "open" } else { "closed" })
+}
+
 fn err(field: &'static str, message: &str) -> FieldError {
     FieldError {
         field,
@@ -1041,13 +1046,14 @@ impl ConnectionSheet {
     /// Scrolls the form to the wrong field that `focus_field` named. The field must have been
     /// drawn once (a closed section opens first), so it waits one frame, and then it uses the
     /// place that the field reported. Without a place it does nothing.
-    fn scroll_to_reveal(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn scroll_to_reveal(&mut self, window: &Window) {
         let Some((field, drawn)) = self.reveal.take() else {
             return;
         };
         if !drawn {
             self.reveal = Some((field, true));
-            cx.notify();
+            // The frame that draws the field comes first, then this view renders again.
+            window.request_animation_frame();
             return;
         }
         let Some(top) = self.tops.get(field).and_then(|t| t.take()) else {
@@ -1137,7 +1143,7 @@ impl ConnectionSheet {
 
 impl Render for ConnectionSheet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.scroll_to_reveal(window, cx);
+        self.scroll_to_reveal(window);
         let (warning, muted) = {
             let t = cx.theme();
             (t.warning, t.muted_foreground)
@@ -1384,6 +1390,10 @@ impl Render for ConnectionSheet {
                                     .ghost()
                                     .icon(disclosure_icon(cert_open))
                                     .label("Client certificate")
+                                    .accessibility_label(disclosure_name(
+                                        "Client certificate",
+                                        cert_open,
+                                    ))
                                     .on_click(cx.listener(|s, _, _, cx| {
                                         s.client_cert_open = !s.client_cert_open;
                                         cx.notify();
@@ -1404,6 +1414,7 @@ impl Render for ConnectionSheet {
                         .ghost()
                         .icon(disclosure_icon(self.advanced))
                         .label("Advanced")
+                        .accessibility_label(disclosure_name("Advanced", self.advanced))
                         .on_click(cx.listener(|s, _, _, cx| {
                             s.advanced = !s.advanced;
                             cx.notify();
