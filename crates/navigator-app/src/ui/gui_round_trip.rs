@@ -407,6 +407,29 @@ fn title_bar_controls_take_the_press_and_the_free_bar_does_not(cx: &mut TestAppC
     );
 }
 
+/// Tab from the topic filter input of the left pane reaches the list, also before a row is
+/// selected.
+#[gpui_kit::test]
+fn tab_reaches_the_message_list(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let input: Entity<InputState> = nav.read_with(&cx, |v, _| v.sub_input.clone());
+    cx.update(|w, cx| input.update(cx, |i, cx| i.focus(w, cx)));
+    let focused = |cx: &mut VisualTestContext| {
+        let list = nav.read_with(cx, |v, _| v.list_focus.clone());
+        cx.update(|w, _| list.is_focused(w))
+    };
+    assert!(!focused(&mut cx));
+    // Some controls (the QoS list and the buttons of the header) come before the list in the Tab
+    // order, so the test presses Tab until the list has the focus. No row is selected.
+    for _ in 0..6 {
+        if focused(&mut cx) {
+            break;
+        }
+        cx.simulate_keystrokes("tab");
+    }
+    assert!(focused(&mut cx), "Tab did not reach the list");
+}
+
 /// The palette list is a snapshot. A "Disconnect" chosen after the connection dropped must not
 /// start a connection: the action is checked again when it runs.
 #[cfg(feature = "broker-tests")]

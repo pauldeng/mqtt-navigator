@@ -1144,7 +1144,8 @@ impl Navigator {
             anchor: None,
             utc_offset: 0,
             root_focus,
-            list_focus: cx.focus_handle(),
+            // A Tab stop: the keyboard reaches the rows with Tab.
+            list_focus: cx.focus_handle().tab_stop(true),
             gate: GenGate::default(),
             insp: details::Inspector::new(window, cx),
             details_open: false,
@@ -3239,6 +3240,7 @@ impl Navigator {
             View::Messages => self.store.list_len() > 0,
             View::Tree => !self.store.rows().is_empty(),
         };
+        let ring = cx.theme().ring;
         let jump = self.view == View::Messages
             && self.store.list_len() > 0
             && self.follow.jump_visible(self.store.is_paused());
@@ -3247,6 +3249,11 @@ impl Navigator {
             .min_h_0()
             .track_focus(&self.list_focus)
             .key_context(LIST_CONTEXT)
+            // Keyboard focus shows also before a row is selected. The border is always there,
+            // so that the focus does not move the rows.
+            .border_2()
+            .border_color(cx.theme().transparent)
+            .focus_visible(|s| s.border_color(ring))
             .on_action(cx.listener(|v, _: &SelectPrev, _, cx| v.step_selection(-1, cx)))
             .on_action(cx.listener(|v, _: &SelectNext, _, cx| v.step_selection(1, cx)))
             .on_action(cx.listener(|v, _: &ExpandNode, _, cx| v.expand_selected(true, cx)))
@@ -3358,8 +3365,9 @@ impl Navigator {
         uniform_list(
             "messages",
             count,
-            cx.processor(|v, range: std::ops::Range<usize>, _window, cx| {
+            cx.processor(|v, range: std::ops::Range<usize>, window, cx| {
                 let theme = cx.theme().clone();
+                let focused = v.list_focus.contains_focused(window, cx);
                 let mut rows = Vec::with_capacity(range.len());
                 for i in range {
                     rows.push(match v.store.list_row(i) {
@@ -3402,7 +3410,7 @@ impl Navigator {
                     }
                 }
                 rows.into_iter()
-                    .map(|row| v.message_row(row, &theme, cx))
+                    .map(|row| v.message_row(row, &theme, focused, cx))
                     .collect()
             }),
         )
@@ -3412,7 +3420,13 @@ impl Navigator {
     }
 
     /// One row of the message list. Its height is fixed, so that the list can be virtual.
-    fn message_row(&self, row: RowData, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn message_row(
+        &self,
+        row: RowData,
+        theme: &Theme,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let height = ui(if self.two_lines { ROW_H2 } else { ROW_H1 });
         let mono = theme.mono_font_family.clone();
         let muted = theme.muted_foreground;
@@ -3428,6 +3442,9 @@ impl Navigator {
                 colour,
             } => {
                 let selected = self.sel_msg.as_ref().is_some_and(|s| s.id == id);
+                let look = row_look(theme, selected, focused);
+                // Muted text stays readable on the strong selected colour.
+                let muted = look.muted.unwrap_or(muted);
                 // The subscription colour is a thin edge, and only with more than one
                 // subscription.
                 let edge = (self.subs.rows.len() > 1)
@@ -3516,8 +3533,9 @@ impl Navigator {
                             .when_some(edge, |d, c| d.bg(c)),
                     )
                     .child(content)
-                    .when(selected, |d| d.bg(theme.accent))
-                    .hover(|d| d.bg(theme.muted))
+                    .when_some(look.bg, |d, c| d.bg(c))
+                    .when_some(look.fg, |d, c| d.text_color(c))
+                    .hover(move |d| look.hover_bg.map_or(d.clone(), |c| d.bg(c)))
                     .on_click(cx.listener(move |v, _, window, cx| {
                         v.list_focus.focus(window, cx);
                         v.select_row(id, cx);
@@ -3570,8 +3588,9 @@ impl Navigator {
         uniform_list(
             "topics",
             count,
-            cx.processor(|v, range: std::ops::Range<usize>, _window, cx| {
+            cx.processor(|v, range: std::ops::Range<usize>, window, cx| {
                 let theme = cx.theme().clone();
+                let focused = v.list_focus.contains_focused(window, cx);
                 let generation = v.gate.generation();
                 let ids: Vec<NodeId> = v.store.rows()[range].to_vec();
                 ids.into_iter()
@@ -3593,15 +3612,19 @@ impl Navigator {
                         };
                         let selected = v.sel_topic == Some(id);
                         let parent = n.has_children;
+                        let look = row_look(&theme, selected, focused);
+                        let muted = look.muted.unwrap_or(theme.muted_foreground);
                         h_flex()
                             .id(("row", node_key(id)))
                             .debug_selector(move || format!("tree-{}", node_key(id)))
                             .h(ui(TREE_ROW_H))
+                            .w_full()
                             .px_2()
                             .gap_2()
                             .text_sm()
-                            .when(selected, |d| d.bg(theme.accent))
-                            .hover(|d| d.bg(theme.muted))
+                            .when_some(look.bg, |d, c| d.bg(c))
+                            .when_some(look.fg, |d, c| d.text_color(c))
+                            .hover(move |d| look.hover_bg.map_or(d.clone(), |c| d.bg(c)))
                             .child(div().w(ui(n.depth as f32 * 14.)))
                             .child(
                                 div().w(ui(14.)).flex_none().when_some(chevron, |d, icon| {
@@ -3617,7 +3640,7 @@ impl Navigator {
                                 d.child(
                                     div()
                                         .text_xs()
-                                        .text_color(theme.muted_foreground)
+                                        .text_color(muted)
                                         .child(format!("{} topics", n.subtree_topics)),
                                 )
                             })
@@ -3625,7 +3648,7 @@ impl Navigator {
                             .child(
                                 div()
                                     .font_family(theme.mono_font_family.clone())
-                                    .text_color(theme.muted_foreground)
+                                    .text_color(muted)
                                     .max_w(ui(320.))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
@@ -4261,6 +4284,51 @@ fn caption_control(el: impl IntoElement) -> Div {
 #[cfg_attr(not(feature = "broker-tests"), allow(dead_code))]
 mod gui_round_trip;
 
+/// Colours of a list row. A selected row has no hover change, as in `ListItem`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RowLook {
+    bg: Option<Hsla>,
+    fg: Option<Hsla>,
+    /// Muted text on the selected row. `None` keeps the muted colour of the theme.
+    muted: Option<Hsla>,
+    hover_bg: Option<gpui_kit::component::ThemeToken>,
+}
+
+/// A selected row has two strengths. With the list focus it is strong, without it weaker
+/// (`list_active`). As in `ListItem`, a theme with `active_highlight` keeps the text colour. Other
+/// themes use `accent` and `accent_foreground`. `accent` is the same as `list_hover` in some
+/// themes, so the strong highlight tint is the `list_active_border` colour at 0.3 alpha.
+fn row_look(theme: &Theme, selected: bool, list_focused: bool) -> RowLook {
+    match (selected, list_focused) {
+        (false, _) => RowLook {
+            bg: None,
+            fg: None,
+            muted: None,
+            hover_bg: Some(theme.tokens.list_hover),
+        },
+        (true, true) if theme.list.active_highlight => RowLook {
+            bg: Some(theme.list_active_border.alpha(0.3)),
+            fg: None,
+            // The tint lowers the contrast of the muted colour, so the muted text is the
+            // foreground colour at a lower opacity.
+            muted: Some(theme.foreground.alpha(0.7)),
+            hover_bg: None,
+        },
+        (true, true) => RowLook {
+            bg: Some(theme.accent),
+            fg: Some(theme.accent_foreground),
+            muted: Some(theme.accent_foreground.opacity(0.75)),
+            hover_bg: None,
+        },
+        (true, false) => RowLook {
+            bg: Some(theme.list_active),
+            fg: None,
+            muted: None,
+            hover_bg: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
@@ -4274,6 +4342,47 @@ mod tests {
     use navigator_core::net::SendError;
     use std::time::Duration;
     use std::time::Instant;
+
+    #[test]
+    fn a_selected_row_keeps_its_colour_under_hover_and_is_weaker_without_the_list_focus() {
+        use super::{Theme, row_look};
+        use gpui_kit::hsla;
+        let mut t = Theme::default();
+        t.accent = hsla(0.1, 1., 0.5, 1.);
+        t.accent_foreground = hsla(0.2, 1., 0.5, 1.);
+        t.list_active = hsla(0.4, 1., 0.5, 1.);
+        t.list_active_border = hsla(0.5, 1., 0.5, 1.);
+        t.list.active_highlight = false;
+        let strong = row_look(&t, true, true);
+        assert_eq!(
+            (strong.bg, strong.fg),
+            (Some(t.accent), Some(t.accent_foreground))
+        );
+        assert_eq!(strong.hover_bg, None);
+        // A theme with `active_highlight`: a tint of the border colour, the text colour stays.
+        t.list.active_highlight = true;
+        let tint = row_look(&t, true, true);
+        assert_eq!(tint.bg, Some(t.list_active_border.alpha(0.3)));
+        assert_eq!(tint.muted, Some(t.foreground.alpha(0.7)));
+        assert_eq!((tint.fg, tint.hover_bg), (None, None));
+        // A border colour with its own alpha gets the same tint alpha.
+        t.list_active_border = hsla(0.5, 1., 0.5, 0.5);
+        assert_eq!(row_look(&t, true, true).bg.map(|c| c.a), Some(0.3));
+        assert_ne!(tint.bg, Some(t.list_active));
+        t.list.active_highlight = false;
+        let weak = row_look(&t, true, false);
+        assert_eq!(weak.bg, Some(t.list_active));
+        assert_eq!(weak.hover_bg, None);
+        assert_eq!(
+            row_look(&t, false, true).hover_bg,
+            Some(t.tokens.list_hover)
+        );
+        assert_eq!(row_look(&t, false, true).bg, None);
+        assert_eq!(strong.muted, Some(t.accent_foreground.opacity(0.75)));
+        assert_eq!((weak.fg, weak.muted), (None, None));
+        // An unselected row looks the same with or without the list focus.
+        assert_eq!(row_look(&t, false, false), row_look(&t, false, true));
+    }
 
     #[test]
     fn the_composer_follows_the_connection_while_connected_and_the_profile_otherwise() {
