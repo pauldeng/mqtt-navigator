@@ -2926,7 +2926,6 @@ impl Navigator {
                     .w_full()
                     .flex_1()
                     .min_h_0()
-                    .px_2()
                     .child(
                         self.sub_list
                             .clone()
@@ -2976,6 +2975,8 @@ impl Navigator {
         )
         .track_scroll(&self.subs_scroll)
         .size_full()
+        // The inset is inside the list: the wheel region reaches the pane edge, as the bar does.
+        .px_2()
     }
 
     /// Changes when the subscription list must draw again: rows or their states, the shown
