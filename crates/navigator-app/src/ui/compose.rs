@@ -1116,7 +1116,7 @@ impl Navigator {
                     .on_click(cx.listener(|v, _, window, cx| v.close_composer(window, cx))),
             );
 
-        // The last result, the error or the JSON warning, as one line under the payload.
+        // The last result, the error or the JSON warning, under the payload (three lines at most).
         let line = if let Some(e) = self.comp.error.clone() {
             div().text_xs().text_color(theme.danger).child(e)
         } else if let Some(w) = self.comp.json_warning.clone() {
@@ -1243,7 +1243,7 @@ impl Navigator {
                 ),
             )
             // A long text (a broker reason) takes at most three lines: the action row stays in view.
-            .child(line.flex_none().line_clamp(3))
+            .child(line.flex_none().line_clamp(3).text_ellipsis())
             .when(v5 && props_open, |d| {
                 d.child(self.render_props(stacked, cx))
             })
@@ -1551,7 +1551,7 @@ mod tests {
         // 55% of a tall window. The floor of 330 design pixels at the least window height.
         assert_eq!(composer_max_height(px(900.), rem), px(495.));
         assert_eq!(composer_max_height(px(600.), rem), px(330.));
-        // At 150% zoom the floor grows with the rem, but the composer keeps 20% of the window.
+        // At 150% zoom the floor grows with the rem. The composer takes at most 80% of the window.
         assert_eq!(composer_max_height(px(600.), big), px(480.));
     }
 }
