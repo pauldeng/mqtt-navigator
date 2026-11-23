@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 
+use gpui_kit::component::InteractiveElementExt as _;
 use gpui_kit::component::button::{Toggle, ToggleGroup};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::PopupMenuItem;
@@ -321,6 +322,8 @@ impl Navigator {
 
     /// Writes a draft into the composer fields. It does not touch History.
     fn apply_draft(&mut self, d: &Draft, window: &mut Window, cx: &mut Context<Self>) {
+        // A new set of rows starts at the top.
+        self.comp.props_scroll.set_offset(point(px(0.), px(0.)));
         self.comp.topic.set(&d.topic, window, cx);
         self.comp
             .content_type
@@ -1264,6 +1267,7 @@ impl Navigator {
                                 .id("props-rows")
                                 .max_h(ui(PROPS_MAX_HEIGHT))
                                 .overflow_y_scroll()
+                                .lock_scroll_axis()
                                 .track_scroll(&self.comp.props_scroll),
                         )
                         .vertical_scrollbar(&self.comp.props_scroll),
