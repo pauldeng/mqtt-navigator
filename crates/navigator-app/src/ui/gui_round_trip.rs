@@ -856,3 +856,25 @@ fn the_connection_rows_work_with_the_keyboard(cx: &mut TestAppContext) {
     press(cx, "enter");
     assert_eq!(sheet_probe(cx, &nav).3, "New connection");
 }
+
+/// Escape in a menu returns the focus to the button that opened it, not to the window root.
+/// The next Tab then continues from the button.
+#[gpui_kit::test]
+fn escape_in_a_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    for button in ["settings", "connection-menu"] {
+        click(cx, button);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let handle = nav.read_with(cx, |v, _| match button {
+            "settings" => v.settings_focus.clone(),
+            _ => v.menu_focus.clone(),
+        });
+        assert!(
+            cx.update(|w, _| handle.is_focused(w)),
+            "Escape did not return the focus to {button}"
+        );
+    }
+}

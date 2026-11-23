@@ -925,6 +925,10 @@ pub struct Navigator {
     connect_focus: FocusHandle,
     /// The connection menu button. A cancelled switch question returns the focus here.
     menu_focus: FocusHandle,
+    /// The settings (gear) button and the "Choose a connection" button. Escape in their menus
+    /// returns the focus to the button.
+    settings_focus: FocusHandle,
+    choose_focus: FocusHandle,
     /// The user closed the failure banner. A new connect shows it again.
     banner_closed: bool,
     sheet: Option<WeakEntity<ConnectionSheet>>,
@@ -1153,6 +1157,8 @@ impl Navigator {
             conn_protocol: Protocol::V311,
             connect_focus: cx.focus_handle(),
             menu_focus: cx.focus_handle(),
+            settings_focus: cx.focus_handle(),
+            choose_focus: cx.focus_handle(),
             banner_closed: false,
             sheet: None,
             resize_settled_at: None,
@@ -2412,7 +2418,7 @@ impl Navigator {
             } else {
                 button
                     .dropdown_caret(true)
-                    .dropdown_menu(self.connection_menu(cx))
+                    .dropdown_menu(self.connection_menu(&self.menu_focus, cx))
                     .into_any_element()
             };
         };
@@ -2446,7 +2452,7 @@ impl Navigator {
                         .child(format!("· {addr}")),
                 )
             })
-            .dropdown_menu(self.connection_menu(cx))
+            .dropdown_menu(self.connection_menu(&self.menu_focus, cx))
             .into_any_element()
     }
 
@@ -2460,12 +2466,13 @@ impl Navigator {
         let (two_lines, memory) = (self.two_lines, self.memory_mib());
         let renderer = self.renderer.clone();
         let weak = cx.entity().downgrade();
-        let focus = self.root_focus.clone();
+        let focus = self.settings_focus.clone();
         Button::new("settings")
             .debug_selector(|| "settings".into())
             .small()
             .ghost()
             .icon(IconName::Settings)
+            .track_focus(&self.settings_focus)
             .tooltip("Settings")
             .dropdown_menu(move |menu, window, cx| {
                 // The action gives the menu its shortcut text (the key binding).
