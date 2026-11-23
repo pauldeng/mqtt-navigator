@@ -31,11 +31,10 @@ const END_WIDTH: f32 = 150.;
 /// A centre pane narrower than this stacks the label above the field: the label column, the end
 /// column and two inputs of a user property need about this much width.
 const STACK_BELOW: f32 = 560.;
-/// The composer takes at most this part of the window height (see [`composer_max_height`]). The
-/// message list keeps the rest, and the properties scroll inside the composer.
+/// Two limits for the maximum height of the composer (see [`composer_max_height`]): a part of the
+/// window height, and a floor in design pixels.
 const MAX_HEIGHT_PART: f32 = 0.55;
-/// The composer keeps at least this height (design pixels), also in a small window at a large zoom.
-const MIN_MAX_HEIGHT: f32 = 330.;
+const MAX_HEIGHT_FLOOR: f32 = 330.;
 
 /// Whether a property row puts its label above the field, for a composer of width `width`.
 /// Before the first layout, the width is unknown (`None`): the rows stay in one line.
@@ -43,12 +42,13 @@ fn props_stacked(width: Option<Pixels>, rem: Pixels) -> bool {
     width.is_some_and(|w| w < ui(STACK_BELOW).to_pixels(rem))
 }
 
-/// The most height of the composer, for a window of height `window`: a part of the window, but
-/// not less than the fixed rows need (the topic, the payload, the action row and some room for
-/// the properties), also at a large zoom. The message list keeps the rest.
+/// The maximum height of the composer in a window of height `window`. First take 55% of the
+/// window. If that is less than the floor of 330 design pixels, take the floor: the fixed rows
+/// (topic, payload, action row) then keep their room at a large zoom. At the end, take at most 80%
+/// of the window. The message list keeps the rest.
 fn composer_max_height(window: Pixels, rem: Pixels) -> Pixels {
     (window * MAX_HEIGHT_PART)
-        .max(ui(MIN_MAX_HEIGHT).to_pixels(rem))
+        .max(ui(MAX_HEIGHT_FLOOR).to_pixels(rem))
         .min(window * 0.8)
 }
 
@@ -454,6 +454,18 @@ impl Navigator {
     #[cfg(test)]
     pub(super) fn reveal_user_row(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.reveal_user_row_id(self.comp.rows[ix].id, cx);
+    }
+
+    /// For the window tests: the height of the last user row at the last layout.
+    #[cfg(test)]
+    pub(super) fn last_user_row_height(&self) -> Pixels {
+        let row = self.comp.rows.last().expect("a user row");
+        row.spot
+            .bounds
+            .get()
+            .expect("the row was drawn")
+            .size
+            .height
     }
 
     /// For the window tests: whether the property rows are stacked now.
@@ -1231,7 +1243,7 @@ impl Navigator {
                 ),
             )
             // A long text (a broker reason) takes at most three lines: the action row stays in view.
-            .child(line.flex_none().max_h(ui(48.)).overflow_hidden())
+            .child(line.flex_none().line_clamp(3))
             .when(v5 && props_open, |d| {
                 d.child(self.render_props(stacked, cx))
             })
