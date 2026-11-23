@@ -8,14 +8,13 @@ use std::str::FromStr;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::form::{Field, field, v_form};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::list::ListItem;
 use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::sheet::Sheet;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::TabBar;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Placement, Sizable, WindowExt, h_flex, v_flex,
+    ActiveTheme, Icon, IconName, Placement, Selectable, Sizable, WindowExt, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -98,7 +97,7 @@ pub enum SheetEvent {
 }
 
 /// Which certificate file a picker sets.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum FileKind {
     Ca,
     Cert,
@@ -114,7 +113,7 @@ enum Act {
 }
 
 /// The fields in the order that focus goes to the first wrong one.
-const FIELD_ORDER: [&str; 11] = [
+const FIELD_ORDER: [&str; 12] = [
     "name",
     "host",
     "port",
@@ -126,6 +125,7 @@ const FIELD_ORDER: [&str; 11] = [
     "session_expiry",
     "keepalive",
     "will.topic",
+    "will.delay_secs",
 ];
 const ADVANCED: [&str; 6] = [
     "client_id",
@@ -209,6 +209,8 @@ pub struct ConnectionSheet {
     will_topic: Entity<InputState>,
     will_payload: Entity<InputState>,
     will_delay: Entity<InputState>,
+    /// The "Choose…" button of the certificate. A certificate error focuses it.
+    cert_focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -246,17 +248,22 @@ impl ConnectionSheet {
         let will_topic = input(window, cx, "Empty: no will message");
         let will_payload = input(window, cx, "Payload text");
         let will_delay = input(window, cx, "0");
-        // A change of a field removes its error message.
-        let watched = [
-            ("name", &name),
-            ("host", &host),
-            ("port", &port),
-            ("client_id", &client_id),
-            ("ws_path", &ws_path),
-            ("session_expiry", &session_expiry),
-            ("keepalive", &keepalive),
-            ("will.topic", &will_topic),
-            ("will.delay_secs", &will_delay),
+        // Every single-line field. A change of a field removes its error message (`None`: the
+        // field has no error). Enter in any of them runs "Save and connect".
+        let inputs = [
+            (Some("name"), &name),
+            (Some("host"), &host),
+            (Some("port"), &port),
+            (Some("username"), &username),
+            (Some("password"), &password),
+            (Some("client_id"), &client_id),
+            (None, &key_passphrase),
+            (Some("ws_path"), &ws_path),
+            (Some("session_expiry"), &session_expiry),
+            (Some("keepalive"), &keepalive),
+            (Some("will.topic"), &will_topic),
+            (None, &will_payload),
+            (Some("will.delay_secs"), &will_delay),
         ];
         let protocol_select = cx.new(|cx| {
             let items = PROTOCOLS.map(ProtocolItem).to_vec();
@@ -272,15 +279,24 @@ impl ConnectionSheet {
                 cx.notify();
             },
         );
-        let mut subs: Vec<Subscription> = watched
+        let mut subs: Vec<Subscription> = inputs
             .into_iter()
             .map(|(field, input)| {
-                cx.subscribe(input, move |s, _, ev: &InputEvent, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        s.errors.retain(|e| e.field != field);
-                        cx.notify();
-                    }
-                })
+                cx.subscribe_in(
+                    input,
+                    window,
+                    move |s, _, ev: &InputEvent, window, cx| match ev {
+                        InputEvent::Change => {
+                            s.errors.retain(|e| Some(e.field) != field);
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        } => s.submit(true, window, cx),
+                        _ => {}
+                    },
+                )
             })
             .collect();
         subs.push(protocol_sub);
@@ -320,6 +336,7 @@ impl ConnectionSheet {
             will_topic,
             will_payload,
             will_delay,
+            cert_focus: cx.focus_handle(),
             _subs: subs,
         };
         match select.and_then(|id| this.profiles.iter().find(|p| p.id == id).cloned()) {
@@ -356,6 +373,63 @@ impl ConnectionSheet {
                 .footer(Self::footer(&entity))
                 .child(entity.clone())
         });
+    }
+
+    /// For the window tests: what the user sees. The focused field, the field errors, whether
+    /// the two collapsed sections are open, and the title.
+    #[cfg(test)]
+    pub(crate) fn probe(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> (Option<&'static str>, Vec<&'static str>, [bool; 2], String) {
+        let on = |i: &Entity<InputState>| i.read(cx).focus_handle(cx).is_focused(window);
+        let focused = [
+            ("name", &self.name),
+            ("host", &self.host),
+            ("port", &self.port),
+            ("will.delay_secs", &self.will_delay),
+        ]
+        .into_iter()
+        .find(|(_, i)| on(i))
+        .map(|(f, _)| f)
+        .or(self.cert_focus.is_focused(window).then_some("client_cert"));
+        let errors = self.errors.iter().map(|e| e.field).collect();
+        (
+            focused,
+            errors,
+            [self.advanced, self.client_cert_open],
+            self.title(),
+        )
+    }
+
+    /// For the window tests: MQTT 5 with a wrong Will delay, or a certificate without a key.
+    #[cfg(test)]
+    pub(crate) fn make_invalid(
+        &mut self,
+        will_delay: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if will_delay {
+            self.protocol = Protocol::V5;
+            Self::set_text(&self.will_topic, "a/b", window, cx);
+            Self::set_text(&self.will_delay, "abc", window, cx);
+        } else {
+            self.client_cert = Some("/c.pem".into());
+        }
+        cx.notify();
+    }
+
+    /// For the window tests: the transport, as the user picks it in the tab bar.
+    #[cfg(test)]
+    pub(crate) fn use_transport(
+        &mut self,
+        t: Transport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_transport(t, window, cx);
     }
 
     /// "New connection", or "Edit lab". It follows the draft.
@@ -638,24 +712,31 @@ impl ConnectionSheet {
     }
 
     fn focus_field(&self, field: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = field else {
+            return;
+        };
         let input = match field {
-            Some("name") => &self.name,
-            Some("host") => &self.host,
-            Some("port") => &self.port,
-            Some("username") => &self.username,
-            Some("password") => &self.password,
-            Some("ws_path") => &self.ws_path,
-            Some("client_id") => &self.client_id,
-            Some("session_expiry") => &self.session_expiry,
-            Some("keepalive") => &self.keepalive,
-            Some("will.topic") => &self.will_topic,
-            // The certificate fields have no input. Their message shows next to the buttons.
+            "name" => &self.name,
+            "host" => &self.host,
+            "port" => &self.port,
+            "username" => &self.username,
+            "password" => &self.password,
+            "ws_path" => &self.ws_path,
+            "client_id" => &self.client_id,
+            "session_expiry" => &self.session_expiry,
+            "keepalive" => &self.keepalive,
+            "will.topic" => &self.will_topic,
+            "will.delay_secs" => &self.will_delay,
+            // The certificate fields have no input: the focus goes to "Choose…".
+            "client_cert" => &self.name,
             _ => return,
         };
+        let input = (field != "client_cert").then(|| input.clone());
+        let handle = self.cert_focus.clone();
         // An input in a section that has just opened exists only after the next frame.
-        let input = input.clone();
-        cx.defer_in(window, move |_, window, cx| {
-            input.update(cx, |i, cx| i.focus(window, cx));
+        cx.defer_in(window, move |_, window, cx| match &input {
+            Some(input) => input.update(cx, |i, cx| i.focus(window, cx)),
+            None => handle.focus(window, cx),
         });
     }
 
@@ -829,6 +910,7 @@ impl ConnectionSheet {
                     Button::new(id_pick)
                         .small()
                         .label("Choose…")
+                        .when(kind == FileKind::Cert, |b| b.track_focus(&self.cert_focus))
                         .on_click(cx.listener(move |s, _, window, cx| s.pick(kind, window, cx))),
                 )
                 .when(shown.is_some(), |d| {
@@ -855,15 +937,35 @@ impl ConnectionSheet {
     /// row, too: it is selected while the draft is new.
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let row = |id: SharedString| ListItem::new(id).rounded_sm().px_2().py_0p5().text_sm();
+        // A ghost Button is a tab stop. Enter and Space press it. Up and Down move the focus.
+        let row = |id: SharedString| Button::new(id).ghost().small().w_full().justify_start();
         v_flex()
             .gap_0p5()
+            .on_key_down(|ev, window, cx| {
+                if ev.keystroke.modifiers.modified() {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "down" => window.focus_next(cx),
+                    "up" => window.focus_prev(cx),
+                    _ => {}
+                }
+            })
             .children(self.profiles.iter().map(|p| {
                 let id = p.id;
                 let active = !self.is_new && self.origin.id == id;
                 row(format!("profile:{id}").into())
                     .selected(active)
-                    .child(p.name.clone())
+                    .accessibility_label(p.name.clone())
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_left()
+                            .child(p.name.clone()),
+                    )
                     .on_click(cx.listener(move |s, _, window, cx| {
                         if s.is_new || s.origin.id != id {
                             s.guard(Act::Select(id), window, cx);
@@ -873,8 +975,10 @@ impl ConnectionSheet {
             .child(
                 row("new-profile".into())
                     .selected(self.is_new)
+                    .accessibility_label("New connection")
                     .child(
                         h_flex()
+                            .w_full()
                             .gap_1()
                             .child(Icon::new(IconName::Plus).small())
                             .child("New connection"),
@@ -1167,8 +1271,9 @@ impl Render for ConnectionSheet {
                                 d.child(div().text_xs().text_color(muted).child("In use"))
                             }),
                     )
-                    .when(cert_open, |d| d.child(client_cert))
+                    // The message is above the fields, so it stays in view when the section opens.
                     .children(self.error_text("client_cert", cx))
+                    .when(cert_open, |d| d.child(client_cert))
             })
             .child(
                 h_flex().child(
