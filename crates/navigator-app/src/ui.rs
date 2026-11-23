@@ -158,6 +158,8 @@ struct SelMsg {
     topic: Arc<str>,
     msg: Msg,
     direction: Direction,
+    /// Identity of the message (`RowView::Message::seq`). 0: a sent message.
+    seq: u64,
 }
 
 /// The top visible row of the message list while Follow is off.
@@ -183,11 +185,11 @@ fn scroll_top_of(index: usize, px: f32, row_h: f32) -> f32 {
 /// Identifies one formatted payload in the details pane.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DetailKey {
-    /// Latest value of a node: node, receive time, stored length, truncated.
-    Node(NodeId, SystemTime, usize, bool),
+    /// Latest value of a node: node, identity of the value (`NodeView::latest_seq`).
+    Node(NodeId, u64),
     Row(RowId),
-    /// A History entry of a node: node, receive time, stored length, truncated.
-    Hist(NodeId, SystemTime, usize, bool),
+    /// A History entry of a node: node, identity of the entry (`TopicStore::history_seq`).
+    Hist(NodeId, u64),
 }
 
 /// One visible row of the message list, copied out of the store for rendering.
@@ -2036,6 +2038,7 @@ impl Navigator {
             topic,
             msg,
             direction,
+            seq,
             ..
         }) = self.store.list_row(i)
         {
@@ -2045,6 +2048,7 @@ impl Navigator {
                 topic: Arc::from(topic),
                 msg: msg.clone(),
                 direction,
+                seq,
             });
             self.detail_of = DetailOf::Message;
             self.insp.hist_pick = None;

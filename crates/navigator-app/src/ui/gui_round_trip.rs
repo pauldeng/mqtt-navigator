@@ -430,3 +430,109 @@ fn a_palette_action_chosen_after_the_state_changed_does_not_run(cx: &mut TestApp
     // The palette says why nothing happened.
     assert_eq!(cx.update(|w, cx| w.notifications(cx).len()), before + 1);
 }
+
+/// Two messages of one topic can share the receive time and the size. A History row must still
+/// show its own message. It needs no broker: the test fills the store itself.
+#[gpui_kit::test]
+fn a_history_row_shows_its_own_message_when_time_and_size_are_equal(cx: &mut TestAppContext) {
+    use super::details::DetailTab;
+    use navigator_core::net::Protocol;
+    use navigator_core::store::Insert;
+    use navigator_core::{Incoming, MsgProps, Qos};
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    let seqs = nav.update(cx, |v, cx| {
+        let at = std::time::SystemTime::UNIX_EPOCH;
+        let mut id = None;
+        for text in ["aa", "bb"] {
+            let r = v.store.insert(Incoming {
+                generation: 0,
+                topic: "t".into(),
+                payload: text.into(),
+                qos: Qos::AtMostOnce,
+                retain: false,
+                props: MsgProps::default(),
+                received_at: at,
+                protocol: Protocol::V5,
+            });
+            let Insert::Stored(n) = r else {
+                panic!("not stored");
+            };
+            id = Some(n);
+        }
+        let id = id.expect("node");
+        v.select(id, v.gate.generation(), false, cx);
+        v.insp.tab = DetailTab::History;
+        // Newest first.
+        v.store.history_seq(id).map(|(q, _)| q).collect::<Vec<_>>()
+    });
+    cx.run_until_parked();
+    // What the pane renders, and what a palette action would act on.
+    let state = |cx: &mut VisualTestContext, text: &'static str| {
+        wait(cx, "the formatted payload", |cx| {
+            nav.read_with(cx, |v, _| v.insp.full == text)
+        });
+        nav.read_with(cx, |v, _| {
+            (
+                v.insp.full.clone(),
+                v.palette_target(),
+                v.shown().map(|s| s.msg.payload),
+            )
+        })
+    };
+    // The older row, then the newer one: equal time and size, so a key that ignores the
+    // identity would keep the render of the first.
+    click(cx, Box::leak(format!("hist-{}", seqs[1]).into_boxed_str()));
+    let (text_a, target_a, shown_a) = state(cx, "aa");
+    assert_eq!(&shown_a.expect("shown")[..], b"aa");
+    assert_eq!(text_a, "aa");
+    nav.update(cx, |v, cx| {
+        v.insp.tab = DetailTab::History;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    click(cx, Box::leak(format!("hist-{}", seqs[0]).into_boxed_str()));
+    let (_, target_b, shown_b) = state(cx, "bb");
+    assert_eq!(&shown_b.expect("shown")[..], b"bb");
+    assert!(
+        target_a != target_b,
+        "a palette action must not act on the other message"
+    );
+    // The equal time must not hide the way back to the latest value. The newest row is the
+    // latest message itself, so pick the older row again.
+    nav.update(cx, |v, cx| {
+        v.insp.tab = DetailTab::History;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    click(cx, Box::leak(format!("hist-{}", seqs[1]).into_boxed_str()));
+    click(cx, "show-latest");
+    let shown = nav.read_with(cx, |v, _| v.shown().expect("shown").msg.payload.clone());
+    assert_eq!(&shown[..], b"bb");
+    // The History copy of a big latest value is cut. Picking it must offer the full value.
+    let big_seq = nav.update(cx, |v, cx| {
+        let r = v.store.insert(Incoming {
+            generation: 0,
+            topic: "big".into(),
+            payload: vec![b'x'; 200 * 1024].into(),
+            qos: Qos::AtMostOnce,
+            retain: false,
+            props: MsgProps::default(),
+            received_at: std::time::SystemTime::UNIX_EPOCH,
+            protocol: Protocol::V5,
+        });
+        let Insert::Stored(id) = r else {
+            panic!("not stored");
+        };
+        v.select(id, v.gate.generation(), false, cx);
+        v.insp.tab = DetailTab::History;
+        v.store.history_seq(id).next().expect("entry").0
+    });
+    cx.run_until_parked();
+    // The row is wider than the window (a 120 character preview): click near its left edge.
+    let sel: &'static str = Box::leak(format!("hist-{big_seq}").into_boxed_str());
+    let at = cx.debug_bounds(sel).expect("History row").origin;
+    cx.simulate_click(at + gpui_kit::point(px(20.), px(10.)), Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("show-latest").is_some());
+}

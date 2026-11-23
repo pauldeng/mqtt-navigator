@@ -148,7 +148,7 @@ impl Navigator {
 
     /// What the palette actions act on: the shown message, the selected topic and the
     /// subscription in "Show only".
-    fn palette_target(&self) -> PaletteTarget {
+    pub(super) fn palette_target(&self) -> PaletteTarget {
         PaletteTarget {
             shown: self.shown().map(|s| s.key),
             topic: self.selected_topic().map(|(t, _)| t),

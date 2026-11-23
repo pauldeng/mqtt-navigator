@@ -250,6 +250,9 @@ pub enum RowView<'a> {
         direction: Direction,
         /// `Some` for a sent message.
         status: Option<&'a SendStatus>,
+        /// Identity of the message: the same number as `NodeView::latest_seq` and the entry of
+        /// `TopicStore::history_seq`. 0 for a sent message.
+        seq: u64,
     },
     /// A marker row: the session connected again.
     Reconnected { id: RowId, at: SystemTime },
@@ -281,6 +284,9 @@ pub struct NodeView<'a> {
     pub subtree_topics: u32,
     /// The latest message. It is always live.
     pub latest: Option<&'a Msg>,
+    /// Identity of the latest value. It is unique in the store and changes when the node gets a
+    /// new latest value, or when the store empties it (memory limit). 0: no message yet.
+    pub latest_seq: u64,
     /// Paused: the start (64 bytes, lossy UTF-8) of the latest payload at the time of the
     /// snapshot. `None` when the view is live, or when the node is not in the snapshot.
     pub preview: Option<&'a str>,
@@ -327,7 +333,8 @@ struct Node {
     subtree_msgs: u64,
     subtree_topics: u32,
     latest: Option<Msg>,
-    /// Key of this node in `TopicStore::order`. Valid only while `latest` has a cost above 0.
+    /// Identity of the latest value (see `NodeView::latest_seq`). It is also the key in
+    /// `TopicStore::order`, while `latest` has a cost above 0.
     seq: u64,
     /// Newest last.
     history: VecDeque<HistEntry>,
@@ -450,6 +457,8 @@ struct MsgRow {
     msg: Msg,
     direction: Direction,
     status: Option<SendStatus>,
+    /// Identity of a received message (see `RowView::Message::seq`). 0 for a sent one.
+    seq: u64,
     /// The `op_id` of a sent message.
     op: Option<u64>,
 }
@@ -464,6 +473,7 @@ impl Row {
                 msg: &m.msg,
                 direction: m.direction,
                 status: m.status.as_ref(),
+                seq: m.seq,
             },
             RowKind::Reconnected(at) => RowView::Reconnected {
                 id: self.id,
@@ -820,8 +830,8 @@ impl TopicStore {
 
     /// Removes all nodes, messages and rows. Counters reset too.
     ///
-    /// These stay: the limits, the filters, the subscriptions and the next `RowId` (an old
-    /// `RowId` never points to a new row). Pause ends.
+    /// These stay: the limits, the filters, the subscriptions, the next `RowId` and the next
+    /// message identity (an old `RowId` or identity never points to a new one). Pause ends.
     pub fn clear(&mut self) {
         drop(self.take());
     }
@@ -833,6 +843,8 @@ impl TopicStore {
     pub fn take(&mut self) -> TopicStore {
         let mut fresh = Self::new(self.limits);
         fresh.next_row = self.next_row;
+        // An old seq (identity of a message) never points to a new message.
+        fresh.seq = self.seq;
         fresh.scan_below = self.next_row;
         fresh.filter_gen = self.filter_gen + 1;
         fresh.lf = std::mem::take(&mut self.lf);
@@ -1039,16 +1051,17 @@ impl TopicStore {
         }
         node.latest = Some(latest);
         let node_topic = Arc::clone(&node.topic);
+        // Every message gets a new seq, also a value with no cost: the seq is its identity. The
+        // latest value and the history entry of one message share it.
+        self.seq += 1;
+        node.seq = self.seq;
         if latest_cost > 0 {
-            self.seq += 1;
-            node.seq = self.seq;
             self.order.insert(self.seq, id);
             self.latest_bytes += latest_cost;
         }
         self.messages += 1;
 
         // Store the history entry. The ring has a cap. The oldest entry of a full ring goes.
-        self.seq += 1;
         node.history.push_back(HistEntry {
             seq: self.seq,
             charge: hist_cost,
@@ -1089,6 +1102,7 @@ impl TopicStore {
                 msg: row_msg,
                 direction: Direction::Received,
                 status: None,
+                seq: self.seq,
                 op: None,
             }),
             row_cost,
@@ -1152,6 +1166,7 @@ impl TopicStore {
                 },
                 direction: Direction::Sent,
                 status: Some(SendStatus::Sending),
+                seq: 0,
                 op: Some(op_id),
             }),
             cost,
@@ -1444,6 +1459,7 @@ impl TopicStore {
             subtree_msgs: snap.map_or(n.subtree_msgs, |s| s.subtree_msgs),
             subtree_topics: snap.map_or(n.subtree_topics, |s| s.subtree_topics),
             latest: n.latest.as_ref(),
+            latest_seq: n.seq,
             preview: snap.map(|s| &*s.preview),
         })
     }
@@ -1492,9 +1508,15 @@ impl TopicStore {
     /// at most `history_payload_max` bytes, so it can be shorter than `NodeView::latest`.
     /// An unknown id gives an empty iterator.
     pub fn history(&self, id: NodeId) -> impl DoubleEndedIterator<Item = &Msg> + '_ {
+        self.history_seq(id).map(|(_, m)| m)
+    }
+
+    /// As [`TopicStore::history`], with the identity of each entry. The identity is unique in
+    /// the store: two messages can have the same time and size, but not the same identity.
+    pub fn history_seq(&self, id: NodeId) -> impl DoubleEndedIterator<Item = (u64, &Msg)> + '_ {
         self.live(id)
             .into_iter()
-            .flat_map(|n| n.history.iter().rev().map(|h| &h.msg))
+            .flat_map(|n| n.history.iter().rev().map(|h| (h.seq, &h.msg)))
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2093,6 +2115,8 @@ impl TopicStore {
         let Some((_, id)) = self.order.pop_first() else {
             return false;
         };
+        self.seq += 1;
+        self.nodes[id.ix()].seq = self.seq;
         if let Some(m) = self.nodes[id.ix()].latest.as_mut() {
             self.latest_bytes -= msg_cost(m);
             m.payload = Bytes::new();
@@ -3381,6 +3405,48 @@ mod tests {
     }
 
     #[test]
+    fn same_time_and_size_have_own_identity() {
+        let mut s = TopicStore::new(big());
+        let id = stored(s.insert(msg("t", b"aa")));
+        let first = s.node(id).latest_seq;
+        s.insert(msg("t", b"bb"));
+        // Same time, same size, other payload: other identity.
+        assert_ne!(s.node(id).latest_seq, first);
+        let h: Vec<_> = s
+            .history_seq(id)
+            .map(|(q, m)| (q, m.payload.clone()))
+            .collect();
+        assert_eq!(h.len(), 2);
+        assert_ne!(h[0].0, h[1].0);
+        let (q, p) = &h[1];
+        assert_eq!(&p[..], b"aa");
+        let found = s.history_seq(id).find(|(x, _)| x == q).expect("entry");
+        assert_eq!(&found.1.payload[..], b"aa");
+        // The newest entry is the latest value.
+        assert_eq!(h[0].0, s.node(id).latest_seq);
+        // The list row of a message has the same identity.
+        let mut rows: Vec<u64> = (0..s.list_len())
+            .filter_map(|i| match s.list_row(i)? {
+                RowView::Message { seq, .. } => Some(seq),
+                _ => None,
+            })
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, [h[1].0, h[0].0]);
+        // The store gives the latest value a new identity when it empties it.
+        let before = s.node(id).latest_seq;
+        assert!(s.evict_latest());
+        assert_ne!(s.node(id).latest_seq, before);
+        // The identity does not come back after a clear.
+        s.clear();
+        let id = stored(s.insert(msg("t", b"cc")));
+        assert!(
+            s.history_seq(id)
+                .all(|(x, _)| h.iter().all(|(y, _)| x != *y))
+        );
+    }
+
+    #[test]
     fn history_ring_and_truncation() {
         let mut s = TopicStore::new(Limits {
             history_len: 3,
@@ -3494,7 +3560,9 @@ mod tests {
                 direction,
                 status,
                 msg,
+                seq,
             } => {
+                assert_eq!(seq, 0, "a sent row has no identity");
                 assert_eq!((id, node, direction), (r1, Some(t), Direction::Sent));
                 assert_eq!(status, Some(&SendStatus::Sending));
                 assert_eq!(topic.as_ptr(), s.node(t).topic.as_ptr(), "topic is shared");
