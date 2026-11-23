@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "broker-tests")]
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::InputState;
 use gpui_kit::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
 use navigator_core::net::{Profile, Transport};
@@ -403,4 +405,28 @@ fn title_bar_controls_take_the_press_and_the_free_bar_does_not(cx: &mut TestAppC
         press(cx, point(px(700.), px(16.))),
         "the free bar must move the window"
     );
+}
+
+/// The palette list is a snapshot. A "Disconnect" chosen after the connection dropped must not
+/// start a connection: the action is checked again when it runs.
+#[cfg(feature = "broker-tests")]
+#[gpui_kit::test]
+fn a_palette_action_chosen_after_the_state_changed_does_not_run(cx: &mut TestAppContext) {
+    let (mut cx, nav) = start(cx);
+    let cx = &mut cx;
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Disconnect");
+    // The connection drops while the palette is open.
+    nav.update(cx, |v, _| v.net.disconnect());
+    wait(cx, "disconnect", |cx| {
+        nav.read_with(cx, |v, _| v.status.state == ConnState::Disconnected)
+    });
+    let before = cx.update(|w, cx| w.notifications(cx).len());
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(nav.read_with(cx, |v, _| {
+        v.status.state == ConnState::Disconnected && !v.connecting()
+    }));
+    // The palette says why nothing happened.
+    assert_eq!(cx.update(|w, cx| w.notifications(cx).len()), before + 1);
 }
