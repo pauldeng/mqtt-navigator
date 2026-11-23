@@ -237,6 +237,8 @@ pub struct ConnectionSheet {
     will_delay: Entity<InputState>,
     /// The "Choose…" button of the certificate. A certificate error focuses it.
     cert_focus: FocusHandle,
+    /// The hints of the password and the passphrase field now (see `refresh_secret_hints`).
+    hints: [&'static str; 2],
     /// The scroll position of the form. It has its own scroll area: see `render`.
     scroll: ScrollHandle,
     /// The top edge of each field of `FIELD_ORDER` in the window, from the last frame it was drawn.
@@ -333,18 +335,26 @@ impl ConnectionSheet {
             .collect();
         subs.push(protocol_sub);
         // New text in a secret field cancels "Remove the saved ..." (see `clear_secret_box`).
-        subs.push(cx.subscribe(&password, |s, input, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) && !input.read(cx).value().is_empty() {
-                s.clear_password = false;
-            }
-        }));
-        subs.push(
-            cx.subscribe(&key_passphrase, |s, input, ev: &InputEvent, cx| {
+        subs.push(cx.subscribe_in(
+            &password,
+            window,
+            |s, input, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::Change) && !input.read(cx).value().is_empty() {
+                    s.clear_password = false;
+                    s.refresh_secret_hints(window, cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &key_passphrase,
+            window,
+            |s, input, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::Change) && !input.read(cx).value().is_empty() {
                     s.clear_passphrase = false;
+                    s.refresh_secret_hints(window, cx);
                 }
-            }),
-        );
+            },
+        ));
         let draft = Profile::new();
         let draft_protocol = draft.protocol;
         let scroll = ScrollHandle::new();
@@ -384,6 +394,7 @@ impl ConnectionSheet {
             will_payload,
             will_delay,
             cert_focus: cx.focus_handle(),
+            hints: ["", ""],
             scroll,
             tops,
             reveal: None,
@@ -457,6 +468,12 @@ impl ConnectionSheet {
     #[cfg(test)]
     pub(crate) fn removal_boxes(&self) -> [bool; 2] {
         [self.clear_password, self.clear_passphrase]
+    }
+
+    /// For the window tests: the hint of the password field.
+    #[cfg(test)]
+    pub(crate) fn password_hint(&self) -> String {
+        self.hints[0].to_string()
     }
 
     /// For the window tests: the password field takes the focus.
@@ -595,13 +612,6 @@ impl ConnectionSheet {
             cx,
         );
         Self::set_text(&self.password, "", window, cx);
-        let hint = if is_new {
-            "Optional"
-        } else {
-            "Empty: keep the saved password"
-        };
-        self.password
-            .update(cx, |i, cx| i.set_placeholder(hint, window, cx));
         Self::set_text(&self.client_id, &p.client_id, window, cx);
         Self::set_text(&self.key_passphrase, "", window, cx);
         Self::set_text(&self.ws_path, &p.ws_path, window, cx);
@@ -642,7 +652,26 @@ impl ConnectionSheet {
         self.is_new = is_new;
         self.origin = p;
         self.baseline = self.read(cx).0;
+        self.refresh_secret_hints(window, cx);
         cx.notify();
+    }
+
+    /// The hint of an empty secret field says what Save does with the saved secret.
+    fn refresh_secret_hints(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let password = match (self.is_new, self.clear_password) {
+            (true, _) => "Optional",
+            (false, true) => "Empty: remove the saved password",
+            (false, false) => "Empty: keep the saved password",
+        };
+        let passphrase = match (self.is_new, self.clear_passphrase) {
+            (false, true) => "Empty: remove the saved passphrase",
+            _ => "Only for an encrypted key",
+        };
+        self.hints = [password, passphrase];
+        self.password
+            .update(cx, |i, cx| i.set_placeholder(password, window, cx));
+        self.key_passphrase
+            .update(cx, |i, cx| i.set_placeholder(passphrase, window, cx));
     }
 
     /// Builds a profile from the form. The errors are number fields that do not parse.
@@ -1018,11 +1047,12 @@ impl ConnectionSheet {
                 .checked(on)
                 .label(label)
                 .disabled(typed)
-                .on_change(cx.listener(move |s, on: &bool, _, cx| {
+                .on_change(cx.listener(move |s, on: &bool, window, cx| {
                     match which {
                         Secret::Password => s.clear_password = *on,
                         Secret::Passphrase => s.clear_passphrase = *on,
                     }
+                    s.refresh_secret_hints(window, cx);
                     cx.notify();
                 })),
         )

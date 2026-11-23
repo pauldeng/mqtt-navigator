@@ -1,6 +1,8 @@
 //! The publish composer at the bottom of the centre pane: fields, payload mode, properties,
 //! History, validation and Send. The model (drafts, Text/Hex conversion) is in `crate::composer`.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 
 use gpui_kit::component::button::{Toggle, ToggleGroup};
@@ -70,6 +72,8 @@ struct UserRow {
     key: Field,
     value: Field,
     keep_empty: bool,
+    /// Where the row was drawn last (window coordinates). A focus in the row scrolls to it.
+    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     _subs: Vec<Subscription>,
 }
 
@@ -256,26 +260,63 @@ impl Navigator {
             f
         };
         let (k, v) = (mk(window, cx, "Name", key), mk(window, cx, "Value", value));
+        let id = self.comp.next_row;
+        self.comp.next_row += 1;
         let subs = [&k.input, &v.input]
             .into_iter()
             .map(|i| {
-                cx.subscribe(i, |v, _, ev: &InputEvent, _| {
-                    if matches!(ev, InputEvent::Change) {
-                        v.comp.model.edited();
-                    }
+                cx.subscribe(i, move |v, _, ev: &InputEvent, cx| match ev {
+                    InputEvent::Change => v.comp.model.edited(),
+                    InputEvent::Focus => v.reveal_row(id, cx),
+                    _ => {}
                 })
             })
             .collect();
-        let id = self.comp.next_row;
-        self.comp.next_row += 1;
         UserRow {
             id,
+            bounds: Rc::default(),
             key: k,
             value: v,
             // A pair that comes from a draft or a message is sent also when it is empty.
             keep_empty: key.is_empty() && value.is_empty() && keep_empty,
             _subs: subs,
         }
+    }
+
+    /// Scrolls the user property rows the least that shows row `id`. Tab can focus a row that
+    /// the scroll area hides. A row that was never drawn has no place: the caller scrolls.
+    fn reveal_row(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(row) = self.comp.rows.iter().find(|r| r.id == id) else {
+            return;
+        };
+        let Some(b) = row.bounds.get() else {
+            return;
+        };
+        let scroll = &self.comp.props_scroll;
+        let (view, at) = (scroll.bounds(), scroll.offset());
+        let mut y = at.y;
+        if b.top() < view.top() {
+            y += view.top() - b.top();
+        } else if b.bottom() > view.bottom() {
+            y -= b.bottom() - view.bottom();
+        }
+        let y = y.clamp(-scroll.max_offset().y, px(0.));
+        if y != at.y {
+            scroll.set_offset(point(at.x, y));
+            cx.notify();
+        }
+    }
+
+    /// For the window tests: the scroll offset of the user rows, and the reveal that a focus in row `ix` runs
+    /// (the test window sends no focus events).
+    #[cfg(test)]
+    pub(super) fn props_offset(&self) -> Pixels {
+        self.comp.props_scroll.offset().y
+    }
+
+    #[cfg(test)]
+    pub(super) fn reveal_user_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.reveal_row(self.comp.rows[ix].id, cx);
     }
 
     /// Writes a draft into the composer fields. It does not touch History.
@@ -504,7 +545,7 @@ impl Navigator {
     }
 
     /// Adds a property to the section. It shows at once, also while it is empty.
-    fn add_prop(&mut self, kind: PropKind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn add_prop(&mut self, kind: PropKind, window: &mut Window, cx: &mut Context<Self>) {
         // The focus goes to the new field, so that the user can type at once.
         let focus = match kind {
             PropKind::User => {
@@ -867,9 +908,11 @@ impl Navigator {
             .gap_2()
             .items_center()
             .child(
-                div()
-                    .flex_1()
-                    .child(Input::new(&self.comp.topic.input).small()),
+                div().flex_1().child(
+                    Input::new(&self.comp.topic.input)
+                        .small()
+                        .aria_label("Topic"),
+                ),
             )
             .when(v5 && count > 0, |d| {
                 d.child(
@@ -1038,16 +1081,18 @@ impl Navigator {
             let names = h_flex()
                 .gap_2()
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&r.key.input).small()),
+                    div().flex_1().min_w_0().child(
+                        Input::new(&r.key.input)
+                            .small()
+                            .aria_label("User property name"),
+                    ),
                 )
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&r.value.input).small()),
+                    div().flex_1().min_w_0().child(
+                        Input::new(&r.value.input)
+                            .small()
+                            .aria_label("User property value"),
+                    ),
                 );
             let switch = Switch::new(("user-prop-empty", id as usize))
                 .checked(r.keep_empty)
@@ -1071,7 +1116,22 @@ impl Navigator {
                     v.comp.payload.update(cx, |e, cx| e.focus(window, cx));
                     cx.notify();
                 }));
-            prop_row("User property", muted, names, Some(switch), remove, n)
+            let place = r.bounds.clone();
+            div()
+                .relative()
+                .child(
+                    canvas(move |b, _, _| place.set(Some(b)), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                )
+                .child(prop_row(
+                    "User property",
+                    muted,
+                    names,
+                    Some(switch),
+                    remove,
+                    n,
+                ))
         });
         let rows: Vec<_> = rows.collect();
         let has_rows = !rows.is_empty();
@@ -1111,7 +1171,9 @@ impl Navigator {
                     d.child(prop_row(
                         "Content type",
                         muted,
-                        Input::new(&self.comp.content_type.input).small(),
+                        Input::new(&self.comp.content_type.input)
+                            .small()
+                            .aria_label("Content type"),
                         Some(
                             empty_switch("content-type-empty", self.comp.content_type_empty)
                                 .on_click(cx.listener(|v, on: &bool, _, cx| {
@@ -1128,7 +1190,9 @@ impl Navigator {
                     d.child(prop_row(
                         "Response topic",
                         muted,
-                        Input::new(&self.comp.response_topic.input).small(),
+                        Input::new(&self.comp.response_topic.input)
+                            .small()
+                            .aria_label("Response topic"),
                         None,
                         remove(PropKind::ResponseTopic, cx),
                         self.comp.response_topic.note("value", cx),
@@ -1138,7 +1202,9 @@ impl Navigator {
                     d.child(prop_row(
                         "Correlation data (hex)",
                         muted,
-                        Input::new(&self.comp.correlation).small(),
+                        Input::new(&self.comp.correlation)
+                            .small()
+                            .aria_label("Correlation data (hex)"),
                         Some(
                             empty_switch("correlation-empty", self.comp.correlation_empty)
                                 .on_click(cx.listener(|v, on: &bool, _, cx| {
@@ -1155,7 +1221,9 @@ impl Navigator {
                     d.child(prop_row(
                         "Message expiry (seconds)",
                         muted,
-                        Input::new(&self.comp.expiry).small(),
+                        Input::new(&self.comp.expiry)
+                            .small()
+                            .aria_label("Message expiry (seconds)"),
                         None,
                         remove(PropKind::Expiry, cx),
                         None,
