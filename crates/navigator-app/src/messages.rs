@@ -58,7 +58,7 @@ pub fn status_text(status: &SendStatus) -> String {
         SendStatus::Acknowledged => "Acknowledged".into(),
         SendStatus::Rejected(r) => format!("Rejected: {r}"),
         SendStatus::TimedOut => "No acknowledgement after 10 s.".into(),
-        SendStatus::LostOnDisconnect => "Not sent: the connection closed.".into(),
+        SendStatus::LostOnDisconnect => "No acknowledgement: the connection closed.".into(),
     }
 }
 
@@ -70,7 +70,7 @@ pub fn row_result(status: &SendStatus) -> Option<String> {
         SendStatus::Sending => Some("Sending…".into()),
         SendStatus::Rejected(r) => Some(format!("Rejected: {r}")),
         SendStatus::TimedOut => Some("Timed out".into()),
-        SendStatus::LostOnDisconnect => Some("Lost on disconnect".into()),
+        SendStatus::LostOnDisconnect => Some("Connection closed".into()),
     }
 }
 
@@ -216,7 +216,7 @@ mod tests {
         );
         assert_eq!(
             row_result(&SendStatus::LostOnDisconnect).as_deref(),
-            Some("Lost on disconnect")
+            Some("Connection closed")
         );
     }
 
@@ -231,7 +231,7 @@ mod tests {
         );
         assert_eq!(
             status_text(&status_from_result(PublishResult::LostOnDisconnect)),
-            "Not sent: the connection closed."
+            "No acknowledgement: the connection closed."
         );
     }
 
