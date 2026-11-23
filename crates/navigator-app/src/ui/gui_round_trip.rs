@@ -719,9 +719,10 @@ fn focus_in_a_hidden_user_property_row_scrolls_to_it(cx: &mut TestAppContext) {
     );
 }
 
-/// Any control of a user property row scrolls the row into view when it takes the focus, not only
-/// the inputs: Shift+Tab from "Add property" reaches the Remove button of the last row. A hidden
-/// Remove button must not keep the focus (Enter would delete a row out of view).
+/// Any control of a user property row scrolls the row into view when the focus enters the row, not
+/// only the inputs: Shift+Tab from "Add property" reaches a control of the last row (the Remove
+/// button in a wide pane). A hidden Remove button must not keep the focus (Enter would delete a
+/// row out of view).
 #[gpui_kit::test]
 fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContext) {
     use crate::composer::PropKind;
@@ -747,25 +748,39 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
         }
     };
     draw(cx);
-    // From the last Value: the switch, Remove, then "Add property" (outside the rows).
-    let last = nav.read_with(cx, |v, _| v.last_user_value());
-    cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
-    cx.simulate_keystrokes("tab tab tab");
-    let row = nav.read_with(cx, |v, _| v.last_user_row_focus());
-    assert!(
-        !cx.update(|w, cx| row.contains_focused(w, cx)),
-        "Add property must have the focus"
-    );
-    nav.update(cx, |v, _| v.scroll_props_to_top());
+    // From the last Value, Tab leaves the row (the order of the controls depends on the layout).
+    // Then Shift+Tab comes back into the row from outside. A narrow window stacks the rows.
+    for width in [1400., 700.] {
+        cx.simulate_resize(size(px(width), px(900.)));
+        draw(cx);
+        let last = nav.read_with(cx, |v, _| v.last_user_value());
+        cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
+        let row = nav.read_with(cx, |v, _| v.last_user_row_focus());
+        for _ in 0..6 {
+            if !cx.update(|w, cx| row.contains_focused(w, cx)) {
+                break;
+            }
+            cx.simulate_keystrokes("tab");
+        }
+        assert!(
+            !cx.update(|w, cx| row.contains_focused(w, cx)),
+            "Tab did not leave the last row at {width} px"
+        );
+        nav.update(cx, |v, _| v.scroll_props_to_top());
+        draw(cx);
+        assert_eq!(nav.read_with(cx, |v, _| v.props_offset()), px(0.));
+        cx.simulate_keystrokes("shift-tab");
+        draw(cx);
+        assert!(cx.update(|w, cx| row.contains_focused(w, cx)));
+        assert!(
+            nav.read_with(cx, |v, _| v.props_offset()) < px(0.),
+            "the area did not show the last row at {width} px"
+        );
+    }
+    // A new standard field is at the top of the area: the area scrolls there.
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::ContentType, w, cx)));
     draw(cx);
     assert_eq!(nav.read_with(cx, |v, _| v.props_offset()), px(0.));
-    cx.simulate_keystrokes("shift-tab");
-    draw(cx);
-    assert!(cx.update(|w, cx| row.contains_focused(w, cx)));
-    assert!(
-        nav.read_with(cx, |v, _| v.props_offset()) < px(0.),
-        "the area did not show the row of the focused Remove button"
-    );
 }
 
 /// A wrong field below the visible part of the sheet scrolls into view when Enter focuses it.
@@ -941,7 +956,6 @@ fn the_centre_width_for_the_composer_follows_the_window(cx: &mut TestAppContext)
             cx.run_until_parked();
         }
         cx.update(|w, cx| nav.read(cx).centre_width(w, cx))
-            .expect("the pane sizes are known")
     };
     let wide = centre(cx);
     cx.simulate_resize(size(px(700.), px(600.)));
