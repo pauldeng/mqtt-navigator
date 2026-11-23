@@ -682,6 +682,42 @@ fn shortcut_text_comes_from_the_key_bindings(cx: &mut TestAppContext) {
     });
 }
 
+/// Tab can focus a user property row that the scroll area hides. The area scrolls to the row.
+#[gpui_kit::test]
+fn focus_in_a_hidden_user_property_row_scrolls_to_it(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    // Properties are for MQTT 5. The saved profile of `open` may use another protocol.
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
+    cx.simulate_keystrokes("secondary-shift-n");
+    for _ in 0..12 {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.run_until_parked();
+    }
+    for _ in 0..3 {
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+    }
+    let offset = |cx: &mut VisualTestContext| nav.read_with(cx, |v, _| v.props_offset());
+    assert!(offset(cx) < px(0.), "the area must show the last row");
+    cx.update(|_, cx| nav.update(cx, |v, cx| v.reveal_user_row(0, cx)));
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update(|w, _| w.refresh());
+    }
+    assert_eq!(
+        offset(cx),
+        px(0.),
+        "the area must show the focused first row"
+    );
+}
+
 /// A wrong field below the visible part of the sheet scrolls into view when Enter focuses it.
 #[gpui_kit::test]
 fn a_wrong_field_below_the_fold_scrolls_into_view(cx: &mut TestAppContext) {
@@ -719,8 +755,11 @@ fn new_password_text_cancels_the_removal_of_the_saved_password(cx: &mut TestAppC
     cx.run_until_parked();
     let sheet = open_sheet(cx, &nav);
     let boxes = |cx: &mut VisualTestContext| cx.update(|_, cx| sheet.read(cx).removal_boxes());
+    let hint = |cx: &mut VisualTestContext| cx.update(|_, cx| sheet.read(cx).password_hint());
+    assert_eq!(hint(cx), "Empty: keep the saved password");
     click(cx, "clear-password");
     assert_eq!(boxes(cx), [true, false]);
+    assert_eq!(hint(cx), "Empty: remove the saved password");
     cx.update(|w, cx| sheet.update(cx, |s, cx| s.focus_password(w, cx)));
     cx.simulate_input("x");
     assert_eq!(

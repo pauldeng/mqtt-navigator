@@ -58,7 +58,7 @@ pub fn status_text(status: &SendStatus) -> String {
         SendStatus::Acknowledged => "Acknowledged".into(),
         SendStatus::Rejected(r) => format!("Rejected: {r}"),
         SendStatus::TimedOut => "No acknowledgement after 10 s.".into(),
-        SendStatus::LostOnDisconnect => "No acknowledgement: the connection closed.".into(),
+        SendStatus::LostOnDisconnect => "Unknown: the connection closed before the result.".into(),
     }
 }
 
@@ -231,7 +231,7 @@ mod tests {
         );
         assert_eq!(
             status_text(&status_from_result(PublishResult::LostOnDisconnect)),
-            "No acknowledgement: the connection closed."
+            "Unknown: the connection closed before the result."
         );
     }
 
