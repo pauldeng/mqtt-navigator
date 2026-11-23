@@ -99,7 +99,7 @@ fn double_click(cx: &mut VisualTestContext, selector: &'static str) {
 /// Opens the composer with Ctrl+Shift+N, fills it and clicks Send. The shortcut focuses the
 /// topic while it is empty, and the payload after that: then Shift+Tab goes back to the topic.
 fn publish(cx: &mut VisualTestContext, topic: &str, text: &str, first: bool) {
-    cx.simulate_keystrokes("ctrl-shift-n");
+    cx.simulate_keystrokes("secondary-shift-n");
     if !first {
         cx.simulate_keystrokes("shift-tab");
     }
@@ -439,7 +439,7 @@ fn tab_reaches_the_message_list(cx: &mut TestAppContext) {
 fn a_palette_action_chosen_after_the_state_changed_does_not_run(cx: &mut TestAppContext) {
     let (mut cx, nav) = start(cx);
     let cx = &mut cx;
-    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_keystrokes("secondary-k");
     cx.simulate_input("Disconnect");
     // The connection drops while the palette is open.
     nav.update(cx, |v, _| v.net.disconnect());
@@ -595,7 +595,7 @@ fn open_sheet(
 /// Opens the sheet with Ctrl+N, types a name, a host and the port of the test Mosquitto (a
 /// default port could reach a broker on the machine), and leaves the focus in the port.
 fn new_sheet(cx: &mut VisualTestContext, nav: &Entity<Navigator>) {
-    cx.simulate_keystrokes("ctrl-n");
+    cx.simulate_keystrokes("secondary-n");
     cx.run_until_parked();
     cx.simulate_input("n");
     cx.simulate_keystrokes("tab secondary-a");
@@ -806,7 +806,7 @@ fn enter_in_a_valid_form_saves_and_connects(cx: &mut TestAppContext) {
 fn the_connection_rows_work_with_the_keyboard(cx: &mut TestAppContext) {
     let (mut cx, nav) = open(cx);
     let cx = &mut cx;
-    cx.simulate_keystrokes("ctrl-n");
+    cx.simulate_keystrokes("secondary-n");
     cx.run_until_parked();
     assert_eq!(sheet_probe(cx, &nav).3, "New connection");
     // From the name field: back to the "New connection" row, then to the saved profile.

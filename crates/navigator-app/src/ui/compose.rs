@@ -1076,6 +1076,7 @@ impl Navigator {
             prop_row("User property", muted, names, Some(switch), remove, n)
         });
         let rows: Vec<_> = rows.collect();
+        let has_rows = !rows.is_empty();
         let addable = shown.addable();
         let weak = cx.entity().downgrade();
         let add = Button::new("add-prop")
@@ -1162,28 +1163,28 @@ impl Navigator {
                         None,
                     ))
                 })
-                // The Name and Value captions stay visible when the fields have text.
-                .when(!rows.is_empty(), |d| {
-                    d.child(
-                        h_flex()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(div().w(ui(LABEL_WIDTH)))
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .gap_2()
-                                    .child(div().flex_1().child("Name"))
-                                    .child(div().flex_1().child("Value")),
-                            )
-                            .child(div().w(ui(END_WIDTH))),
-                    )
-                })
                 .children(rows);
+        // The Name and Value captions are outside the scroll area, so they stay in view.
+        let captions = has_rows.then(|| {
+            h_flex()
+                .gap_2()
+                .pr_2()
+                .text_xs()
+                .text_color(muted)
+                .child(div().w(ui(LABEL_WIDTH)).min_w_0())
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .gap_2()
+                        .child(div().flex_1().child("Name"))
+                        .child(div().flex_1().child("Value")),
+                )
+                .child(div().w(ui(END_WIDTH)).min_w_0())
+        });
         // The rows scroll when there are many. The Add button and the action row stay in view.
         v_flex()
             .gap_1()
+            .children(captions)
             .child(
                 div()
                     .relative()
