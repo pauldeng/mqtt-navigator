@@ -222,7 +222,8 @@ impl Navigator {
                     (
                         e.id,
                         e.label,
-                        palette::shortcut_text(e),
+                        bound_action(e.cmd)
+                            .and_then(|(a, ctx)| shortcut_text(a.as_ref(), ctx, window)),
                         palette::is_current(e, &facts),
                         palette::disabled_reason(e, &facts),
                     )
@@ -333,4 +334,19 @@ impl Navigator {
         cx.write_to_clipboard(ClipboardItem::new_string(info.text()));
         window.push_notification(Notification::success("Diagnostics copied."), cx);
     }
+}
+
+/// The key binding that runs a palette command: its action and the key context of the binding.
+/// The palette shows the shortcut from the key map, so it cannot differ from the key.
+pub(super) fn bound_action(cmd: Cmd) -> Option<(Box<dyn Action>, Option<&'static str>)> {
+    Some(match cmd {
+        Cmd::NewConnection => (Box::new(NewConnection), Some(CONTEXT)),
+        Cmd::ViewMessages => (Box::new(ShowMessages), Some(CONTEXT)),
+        Cmd::ViewTree => (Box::new(ShowTree), Some(CONTEXT)),
+        Cmd::FocusFilter => (Box::new(FocusFilter), Some(CONTEXT)),
+        Cmd::NewMessage => (Box::new(NewMessage), Some(CONTEXT)),
+        Cmd::Send => (Box::new(SendMessage), Some("Composer")),
+        Cmd::Quit => (Box::new(crate::Quit), None),
+        _ => return None,
+    })
 }

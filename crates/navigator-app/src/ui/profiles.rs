@@ -262,9 +262,11 @@ impl Navigator {
         let command_line = self.session.as_ref().map(|s| s.id) == active;
         let edit_name = self.profile.as_ref().map(display_name);
         let weak = cx.entity().downgrade();
+        let focus = self.root_focus.clone();
         move |menu, window, _| {
             let rem = window.rem_size();
             let mut menu = menu
+                .action_context(focus.clone())
                 .scrollable(true)
                 .min_w(ui(300.).to_pixels(rem))
                 .max_h(ui(320.).to_pixels(rem));
@@ -307,20 +309,14 @@ impl Navigator {
                     )
                 });
             }
-            let (w1, w2) = (weak.clone(), weak.clone());
-            menu.item(
-                PopupMenuItem::new(format!("New connection… ({}+N)", crate::palette::MOD))
-                    .on_click(move |_, window, cx| {
-                        w1.update(cx, |v, cx| v.open_sheet(None, true, window, cx))
+            let w2 = weak.clone();
+            menu.item(PopupMenuItem::new("New connection…").action(Box::new(NewConnection)))
+                .item(
+                    PopupMenuItem::new("Manage connections…").on_click(move |_, window, cx| {
+                        w2.update(cx, |v, cx| v.open_sheet(None, false, window, cx))
                             .ok();
                     }),
-            )
-            .item(
-                PopupMenuItem::new("Manage connections…").on_click(move |_, window, cx| {
-                    w2.update(cx, |v, cx| v.open_sheet(None, false, window, cx))
-                        .ok();
-                }),
-            )
+                )
         }
     }
 

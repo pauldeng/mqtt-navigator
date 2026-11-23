@@ -19,6 +19,7 @@ use gpui_kit::component::button::{Button, ButtonVariants, DropdownButton, Toggle
 use gpui_kit::component::command::{Command as PaletteList, CommandItem, CommandState};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::menu::PopupMenuItem;
@@ -91,21 +92,48 @@ const CONTEXT: &str = "Navigator";
 const LIST_CONTEXT: &str = "NavigatorList";
 const HIST_CONTEXT: &str = "NavigatorHistory";
 
+/// A key binding. `secondary-` is the main key of the platform: Cmd on macOS, Ctrl on Windows
+/// and Linux. (`KeyBinding::new` panics on `secondary-`.)
+fn bind<A: Action>(keys: &str, action: A, context: Option<&str>, cx: &App) -> KeyBinding {
+    let context = context
+        .map(|c| KeyBindingContextPredicate::parse(c).expect("a key context"))
+        .map(Rc::new);
+    KeyBinding::load(keys, Box::new(action), context, false, None, cx).expect("a key binding")
+}
+
+/// The shortcut of an action as the key bindings of this platform give it: `Ctrl+K`, or `⌘K` on
+/// macOS. `context` is the key context of the binding (`None`: a binding without a context).
+/// It gives `None` when the action has no binding.
+pub(crate) fn shortcut_text(
+    action: &dyn Action,
+    context: Option<&str>,
+    window: &Window,
+) -> Option<String> {
+    let context = match context {
+        Some(c) => KeyContext::parse(c).ok()?,
+        None => KeyContext::default(),
+    };
+    let binding = window.highest_precedence_binding_for_action_in_context(action, context)?;
+    Some(Kbd::format(binding.keystrokes().first()?.as_keystroke()))
+}
+
 /// Registers the key bindings of this window. Call once at start.
 pub fn init(cx: &mut App) {
+    let bindings = [
+        bind("secondary-1", ShowMessages, Some(CONTEXT), cx),
+        bind("secondary-2", ShowTree, Some(CONTEXT), cx),
+        bind("secondary-f", FocusFilter, Some(CONTEXT), cx),
+        bind("secondary-k", OpenPalette, Some(CONTEXT), cx),
+        bind("secondary-n", NewConnection, Some(CONTEXT), cx),
+        bind("secondary-shift-n", NewMessage, Some(CONTEXT), cx),
+        // Publish works from any control of the composer. The payload editor takes this key for
+        // a newline, so it has its own, deeper binding below.
+        bind("secondary-enter", SendMessage, Some("Composer"), cx),
+        bind("secondary-enter", SendMessage, Some("Composer > Input"), cx),
+        bind("secondary-q", crate::Quit, None, cx),
+    ];
+    cx.bind_keys(bindings);
     cx.bind_keys([
-        KeyBinding::new("ctrl-1", ShowMessages, Some(CONTEXT)),
-        KeyBinding::new("cmd-1", ShowMessages, Some(CONTEXT)),
-        KeyBinding::new("ctrl-2", ShowTree, Some(CONTEXT)),
-        KeyBinding::new("cmd-2", ShowTree, Some(CONTEXT)),
-        KeyBinding::new("ctrl-f", FocusFilter, Some(CONTEXT)),
-        KeyBinding::new("cmd-f", FocusFilter, Some(CONTEXT)),
-        KeyBinding::new("ctrl-k", OpenPalette, Some(CONTEXT)),
-        KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
-        KeyBinding::new("ctrl-n", NewConnection, Some(CONTEXT)),
-        KeyBinding::new("cmd-n", NewConnection, Some(CONTEXT)),
-        KeyBinding::new("ctrl-shift-n", NewMessage, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-n", NewMessage, Some(CONTEXT)),
         // `Esc` closes the area that has the focus. A control that uses `Esc` (a menu, the
         // filter) handles it first and does not pass it on (design 8).
         KeyBinding::new("escape", CloseComposer, Some("Composer")),
@@ -118,10 +146,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", NoAction, Some("JumpStrip")),
         // In a narrow window, Enter opens the details sheet of the selected row.
         KeyBinding::new("enter", OpenDetails, Some(LIST_CONTEXT)),
-        // The payload editor inserts a newline for Ctrl+Enter and a tab for Tab. In the
-        // composer, these keys send and move the focus.
-        KeyBinding::new("ctrl-enter", SendMessage, Some("Composer > Input")),
-        KeyBinding::new("cmd-enter", SendMessage, Some("Composer > Input")),
+        // The payload editor inserts a tab for Tab. In the composer, Tab moves the focus.
         KeyBinding::new("tab", FocusNextField, Some("Composer > Input")),
         KeyBinding::new("shift-tab", FocusPrevField, Some("Composer > Input")),
         KeyBinding::new("up", SelectPrev, Some(LIST_CONTEXT)),
@@ -2435,6 +2460,7 @@ impl Navigator {
         let (two_lines, memory) = (self.two_lines, self.memory_mib());
         let renderer = self.renderer.clone();
         let weak = cx.entity().downgrade();
+        let focus = self.root_focus.clone();
         Button::new("settings")
             .debug_selector(|| "settings".into())
             .small()
@@ -2442,14 +2468,10 @@ impl Navigator {
             .icon(IconName::Settings)
             .tooltip("Settings")
             .dropdown_menu(move |menu, window, cx| {
-                let w = weak.clone();
-                let menu = menu.item(
-                    PopupMenuItem::new(format!("Commands… ({}+K)", crate::palette::MOD)).on_click(
-                        move |_, window, cx| {
-                            w.update(cx, |v, cx| v.open_palette(window, cx)).ok();
-                        },
-                    ),
-                );
+                // The action gives the menu its shortcut text (the key binding).
+                let menu = menu
+                    .action_context(focus.clone())
+                    .item(PopupMenuItem::new("Commands…").action(Box::new(OpenPalette)));
                 let w = weak.clone();
                 let menu =
                     menu.separator()

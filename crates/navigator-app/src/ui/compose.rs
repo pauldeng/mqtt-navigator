@@ -783,7 +783,7 @@ impl Navigator {
 
     pub(super) fn render_composer(
         &mut self,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -802,12 +802,11 @@ impl Navigator {
                         .label("New message")
                         .on_click(cx.listener(|v, _, window, cx| v.open_composer(window, cx))),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("{}+Shift+N", crate::palette::MOD)),
-                )
+                .child(div().text_xs().text_color(muted).children(shortcut_text(
+                    &NewMessage,
+                    Some(CONTEXT),
+                    window,
+                )))
                 .into_any_element();
         }
         let connected = self.connected();
@@ -981,7 +980,8 @@ impl Navigator {
                     .debug_selector(|| "send".into())
                     .small()
                     .primary()
-                    .label(format!("Publish ({}+Enter)", crate::palette::MOD))
+                    .label("Publish")
+                    .tooltip_with_action("Publish the message", &SendMessage, Some("Composer"))
                     .disabled(!connected)
                     .on_click(cx.listener(|v, _, window, cx| v.send(window, cx))),
             );
