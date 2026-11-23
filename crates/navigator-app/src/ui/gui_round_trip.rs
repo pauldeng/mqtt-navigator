@@ -103,7 +103,7 @@ fn publish(cx: &mut VisualTestContext, topic: &str, text: &str, first: bool) {
     if !first {
         cx.simulate_keystrokes("shift-tab");
     }
-    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_keystrokes("secondary-a");
     cx.simulate_input(topic);
     // Tab moves the focus from the topic to the payload.
     cx.simulate_keystrokes("tab ctrl-a");

@@ -1162,8 +1162,7 @@ impl Navigator {
                         remove(PropKind::Expiry, cx),
                         None,
                     ))
-                })
-                .children(rows);
+                });
         // The Name and Value captions are outside the scroll area, so they stay in view.
         let captions = has_rows.then(|| {
             h_flex()
@@ -1181,22 +1180,29 @@ impl Navigator {
                 )
                 .child(div().w(ui(END_WIDTH)).min_w_0())
         });
-        // The rows scroll when there are many. The Add button and the action row stay in view.
+        // The user property rows scroll when there are many. The captions, the other properties,
+        // the Add button and the action row stay in view.
         v_flex()
             .gap_1()
+            .child(section)
             .children(captions)
-            .child(
-                div()
-                    .relative()
-                    .child(
-                        section
-                            .id("props-rows")
-                            .max_h(ui(PROPS_MAX_HEIGHT))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.comp.props_scroll),
-                    )
-                    .vertical_scrollbar(&self.comp.props_scroll),
-            )
+            .when(has_rows, |d| {
+                d.child(
+                    div()
+                        .relative()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .pr_2()
+                                .children(rows)
+                                .id("props-rows")
+                                .max_h(ui(PROPS_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.comp.props_scroll),
+                        )
+                        .vertical_scrollbar(&self.comp.props_scroll),
+                )
+            })
             .child(h_flex().child(add))
     }
 }
