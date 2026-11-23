@@ -75,6 +75,8 @@ struct UserRow {
     keep_empty: bool,
     /// Where the row was drawn last (window coordinates). A focus in the row scrolls to it.
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Tracked by the row element. A focus anywhere in the row (input, switch, Remove) reveals it.
+    focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -263,19 +265,22 @@ impl Navigator {
         let (k, v) = (mk(window, cx, "Name", key), mk(window, cx, "Value", value));
         let id = self.comp.next_row;
         self.comp.next_row += 1;
-        let subs = [&k.input, &v.input]
+        let focus = cx.focus_handle();
+        let mut subs: Vec<Subscription> = [&k.input, &v.input]
             .into_iter()
             .map(|i| {
-                cx.subscribe(i, move |v, _, ev: &InputEvent, cx| match ev {
-                    InputEvent::Change => v.comp.model.edited(),
-                    InputEvent::Focus => v.reveal_row(id, cx),
-                    _ => {}
+                cx.subscribe(i, move |v, _, ev: &InputEvent, _| {
+                    if matches!(ev, InputEvent::Change) {
+                        v.comp.model.edited();
+                    }
                 })
             })
             .collect();
+        subs.push(cx.on_focus_in(&focus, window, move |v, _, cx| v.reveal_row(id, cx)));
         UserRow {
             id,
             bounds: Rc::default(),
+            focus,
             key: k,
             value: v,
             // A pair that comes from a draft or a message is sent also when it is empty.
@@ -313,6 +318,28 @@ impl Navigator {
     #[cfg(test)]
     pub(super) fn props_offset(&self) -> Pixels {
         self.comp.props_scroll.offset().y
+    }
+
+    #[cfg(test)]
+    pub(super) fn last_user_row_focus(&self) -> FocusHandle {
+        self.comp.rows.last().expect("a user row").focus.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn last_user_value(&self) -> Entity<InputState> {
+        self.comp
+            .rows
+            .last()
+            .expect("a user row")
+            .value
+            .input
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn scroll_props_to_top(&mut self) {
+        let at = self.comp.props_scroll.offset();
+        self.comp.props_scroll.set_offset(point(at.x, px(0.)));
     }
 
     #[cfg(test)]
@@ -1122,6 +1149,7 @@ impl Navigator {
             let place = r.bounds.clone();
             div()
                 .relative()
+                .track_focus(&r.focus)
                 .child(
                     canvas(move |b, _, _| place.set(Some(b)), |_, _, _, _| {})
                         .absolute()
