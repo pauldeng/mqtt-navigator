@@ -777,10 +777,20 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
             "the area did not show the last row at {width} px"
         );
     }
-    // A new standard field is at the top of the area: the area scrolls there.
-    cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::ContentType, w, cx)));
-    draw(cx);
-    assert_eq!(nav.read_with(cx, |v, _| v.props_offset()), px(0.));
+    // A new standard field is at the top of the area: the area scrolls there. Payload format has
+    // no input to focus.
+    for kind in [PropKind::ContentType, PropKind::PayloadFormat] {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        draw(cx);
+        assert!(nav.read_with(cx, |v, _| v.props_offset()) < px(0.));
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(kind, w, cx)));
+        draw(cx);
+        assert_eq!(
+            nav.read_with(cx, |v, _| v.props_offset()),
+            px(0.),
+            "{kind:?}"
+        );
+    }
 }
 
 /// A wrong field below the visible part of the sheet scrolls into view when Enter focuses it.
@@ -944,24 +954,26 @@ fn escape_in_a_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
     }
 }
 
-/// The composer stacks its property rows from the width of the centre pane. A narrow window gives a
-/// centre pane below the limit, a wide one gives more.
+/// The composer measures its own width and stacks the property rows below the limit. A window
+/// resize changes the stacking.
 #[gpui_kit::test]
-fn the_centre_width_for_the_composer_follows_the_window(cx: &mut TestAppContext) {
+fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppContext) {
     let (mut cx, nav) = open(cx);
     let cx = &mut cx;
-    let centre = |cx: &mut VisualTestContext| {
-        for _ in 0..3 {
+    cx.simulate_keystrokes("secondary-shift-n");
+    let stacked = |cx: &mut VisualTestContext| {
+        for _ in 0..4 {
             cx.update(|w, _| w.refresh());
             cx.run_until_parked();
         }
-        cx.update(|w, cx| nav.read(cx).centre_width(w, cx))
+        let rem = cx.update(|w, _| w.rem_size());
+        nav.read_with(cx, |v, _| v.rows_stacked(rem))
     };
-    let wide = centre(cx);
+    assert!(!stacked(cx), "a wide window");
     cx.simulate_resize(size(px(700.), px(600.)));
-    let narrow = centre(cx);
-    assert!(wide > px(1000.), "wide: {wide:?}");
-    assert!(narrow > px(0.) && narrow < px(560.), "narrow: {narrow:?}");
+    assert!(stacked(cx), "a narrow window");
+    cx.simulate_resize(size(px(1400.), px(600.)));
+    assert!(!stacked(cx), "a wide window again");
 }
 
 /// A full composer (all the standard properties and many user properties) keeps its action row

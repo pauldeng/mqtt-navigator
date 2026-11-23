@@ -4046,12 +4046,7 @@ impl Render for Navigator {
                             let weak = cx.entity().downgrade();
                             move |state, _, cx| {
                                 let sizes = state.read(cx).sizes().clone();
-                                // The composer reads the centre width: draw it again.
-                                weak.update(cx, |v, cx| {
-                                    v.panes_resized(&sizes);
-                                    cx.notify();
-                                })
-                                .ok();
+                                weak.update(cx, |v, _| v.panes_resized(&sizes)).ok();
                             }
                         })
                         .child(

@@ -31,15 +31,16 @@ const END_WIDTH: f32 = 150.;
 /// A centre pane narrower than this stacks the label above the field: the label column, the end
 /// column and two inputs of a user property need about this much width.
 const STACK_BELOW: f32 = 560.;
-/// The composer takes at most this part of the window height. The message list keeps the rest, and
-/// the properties scroll inside the composer.
+/// The composer takes at most this part of the window height (see [`composer_max_height`]). The
+/// message list keeps the rest, and the properties scroll inside the composer.
 const MAX_HEIGHT_PART: f32 = 0.55;
-/// The least value of that most height, in design pixels.
+/// The composer keeps at least this height (design pixels), also in a small window at a large zoom.
 const MIN_MAX_HEIGHT: f32 = 330.;
 
-/// Whether a property row puts its label above the field, for a centre pane of width `centre`.
-fn props_stacked(centre: Pixels, rem: Pixels) -> bool {
-    centre < ui(STACK_BELOW).to_pixels(rem)
+/// Whether a property row puts its label above the field, for a composer of width `width`.
+/// Before the first layout, the width is unknown (`None`): the rows stay in one line.
+fn props_stacked(width: Option<Pixels>, rem: Pixels) -> bool {
+    width.is_some_and(|w| w < ui(STACK_BELOW).to_pixels(rem))
 }
 
 /// The most height of the composer, for a window of height `window`: a part of the window, but
@@ -135,6 +136,8 @@ pub(super) struct Composer {
     next_row: u64,
     /// The rows of the standard properties, in the order of [`PropKind`] (without `User`).
     std_spots: [Spot; 5],
+    /// The width of the composer at the last layout. It sets the stacking of the property rows.
+    width: Rc<Cell<Option<Pixels>>>,
     /// The scroll position of the Properties area (the standard fields and the user rows).
     props_scroll: ScrollHandle,
     pub(super) mode: PayloadMode,
@@ -221,6 +224,19 @@ impl Composer {
                 }),
             );
         }
+        // A move inside a standard row (from Remove to the input) reveals the row too.
+        for (kind, input) in [
+            (PropKind::ContentType, &content_type),
+            (PropKind::ResponseTopic, &response_topic),
+            (PropKind::Correlation, &correlation),
+            (PropKind::Expiry, &expiry),
+        ] {
+            subs.push(cx.subscribe(input, move |v, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Focus) {
+                    v.reveal_std(kind, cx);
+                }
+            }));
+        }
         Self {
             topic: Field::new(topic),
             payload,
@@ -233,6 +249,7 @@ impl Composer {
             rows: Vec::new(),
             next_row: 1,
             std_spots,
+            width: Rc::default(),
             props_scroll: ScrollHandle::new(),
             mode: PayloadMode::Text,
             qos: Qos::AtMostOnce,
@@ -368,18 +385,19 @@ impl Navigator {
             .rows
             .iter()
             .find(|r| r.id == id)
-            .and_then(|r| r.spot.bounds.get());
+            .and_then(|r| r.spot.bounds.take());
         self.reveal(b, cx);
     }
 
     /// The same for a standard property field.
     fn reveal_std(&mut self, kind: PropKind, cx: &mut Context<Self>) {
-        let b = self.comp.std_spots[kind as usize].bounds.get();
+        let b = self.comp.std_spots[kind as usize].bounds.take();
         self.reveal(b, cx);
     }
 
     /// Scrolls the Properties area the least that shows `b`. Tab can focus a row that the area
-    /// hides.
+    /// hides. The callers take the place of the row: after a scroll it is old until the next frame,
+    /// and a second reveal (the row and its input both report the focus) would scroll again.
     fn reveal(&mut self, b: Option<Bounds<Pixels>>, cx: &mut Context<Self>) {
         let Some(b) = b else {
             return;
@@ -428,7 +446,6 @@ impl Navigator {
             .clone()
     }
 
-    #[cfg(test)]
     pub(super) fn scroll_props_to_top(&mut self) {
         let at = self.comp.props_scroll.offset();
         self.comp.props_scroll.set_offset(point(at.x, px(0.)));
@@ -439,25 +456,10 @@ impl Navigator {
         self.reveal_user_row_id(self.comp.rows[ix].id, cx);
     }
 
-    /// The width of the centre pane: the window minus the side panes. The side widths are the
-    /// ones that the layout uses (`pane_limits` clamps the saved widths to the window). The pane
-    /// group keeps its own sizes, but they can be old while a pane shows or the window changes.
-    pub(super) fn centre_width(&self, window: &Window, cx: &App) -> Pixels {
-        let limits = self.pane_limits(window);
-        let right = if !self.details_open || self.narrow {
-            px(0.)
-        } else if self.insp.expanded {
-            // Expand uses its own, wider width.
-            self.panes
-                .read(cx)
-                .sizes()
-                .get(2)
-                .copied()
-                .unwrap_or(limits.right.0)
-        } else {
-            limits.right.0
-        };
-        window.viewport_size().width - limits.left.0 - right
+    /// For the window tests: whether the property rows are stacked now.
+    #[cfg(test)]
+    pub(super) fn rows_stacked(&self, rem: Pixels) -> bool {
+        props_stacked(self.comp.width.get(), rem)
     }
 
     /// Writes a draft into the composer fields. It does not touch History.
@@ -700,6 +702,8 @@ impl Navigator {
             PropKind::PayloadFormat => {
                 self.comp.utf8 = true;
                 self.comp.shown.set(kind, true);
+                // No input takes the focus: the row is the first in the area.
+                self.scroll_props_to_top();
                 None
             }
             _ => {
@@ -1013,7 +1017,24 @@ impl Navigator {
         let hex = self.comp.mode == PayloadMode::Hex;
         let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();
-        let stacked = props_stacked(self.centre_width(window, cx), window.rem_size());
+        let (rem, width) = (window.rem_size(), self.comp.width.clone());
+        let stacked = props_stacked(width.get(), rem);
+        // The composer measures itself. A change of the stacking draws the window again.
+        let this = cx.entity().downgrade();
+        let measure = canvas(
+            move |b, window, cx| {
+                let was = props_stacked(width.get(), rem);
+                width.set(Some(b.size.width));
+                if was != props_stacked(Some(b.size.width), rem) {
+                    window.defer(cx, move |_, cx| {
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
         // The `⋯` menu: Beautify JSON, Minify JSON, History… and Properties (MQTT 5).
         let more = Button::new("composer-more")
             .small()
@@ -1184,6 +1205,7 @@ impl Navigator {
         // The composer has a most height. The properties are the only part that shrinks: they scroll
         // and the other rows (topic, payload, the action row) stay in view.
         v_flex()
+            .relative()
             .key_context("Composer")
             .debug_selector(|| "composer".into())
             .max_h(composer_max_height(
@@ -1195,6 +1217,7 @@ impl Navigator {
             .border_color(theme.border)
             .p_2()
             .gap_2()
+            .child(measure)
             .child(header.flex_none())
             .when_some(topic_note, |d, n| {
                 d.child(div().flex_none().text_xs().text_color(muted).child(n))
@@ -1207,7 +1230,8 @@ impl Navigator {
                         .small(),
                 ),
             )
-            .child(line.flex_none())
+            // A long text (a broker reason) takes at most three lines: the action row stays in view.
+            .child(line.flex_none().max_h(ui(48.)).overflow_hidden())
             .when(v5 && props_open, |d| {
                 d.child(self.render_props(stacked, cx))
             })
@@ -1502,9 +1526,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn rows_stack_in_a_narrow_pane_only() {
         let rem = px(16.);
-        // The least centre width (360) stacks. The limit and a wider centre do not.
-        assert!(props_stacked(ui(360.).to_pixels(rem), rem));
-        assert!(!props_stacked(ui(STACK_BELOW).to_pixels(rem), rem));
+        // The least centre width (360) stacks. The limit and a wider centre do not. An unknown
+        // width (before the first layout) does not.
+        assert!(props_stacked(Some(ui(360.).to_pixels(rem)), rem));
+        assert!(!props_stacked(Some(ui(STACK_BELOW).to_pixels(rem)), rem));
+        assert!(!props_stacked(None, rem));
     }
 
     #[core::prelude::v1::test]
