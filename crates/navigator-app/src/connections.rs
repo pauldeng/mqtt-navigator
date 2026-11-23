@@ -2,19 +2,24 @@
 //! presses Save. The sheet reads no file: it only keeps the paths. The core reads them at connect.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::str::FromStr;
 
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants, Toggle, ToggleGroup};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::form::{Field, field, v_form};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::sheet::Sheet;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::TabBar;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Placement, Selectable, Sizable, WindowExt, h_flex, v_flex,
+    ActiveTheme, Disableable, Icon, IconName, Placement, Selectable, Sizable, WindowExt, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -136,6 +141,13 @@ const ADVANCED: [&str; 6] = [
     "will.delay_secs",
 ];
 
+/// A saved secret that the sheet can remove.
+#[derive(Clone, Copy)]
+enum Secret {
+    Password,
+    Passphrase,
+}
+
 /// A collapsed section of the sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Section {
@@ -151,6 +163,15 @@ fn section_of(field: &str) -> Option<Section> {
         Some(Section::ClientCert)
     } else {
         None
+    }
+}
+
+/// The icon of a disclosure button: down while the section is open, right while it is closed.
+fn disclosure_icon(open: bool) -> IconName {
+    if open {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
     }
 }
 
@@ -211,6 +232,12 @@ pub struct ConnectionSheet {
     will_delay: Entity<InputState>,
     /// The "Choose…" button of the certificate. A certificate error focuses it.
     cert_focus: FocusHandle,
+    /// The scroll position of the form. It has its own scroll area: see `render`.
+    scroll: ScrollHandle,
+    /// The top edge of each field of `FIELD_ORDER` in the window, from the last frame it was drawn.
+    tops: HashMap<&'static str, Rc<Cell<Option<Pixels>>>>,
+    /// A wrong field to scroll to, and whether one frame has drawn it already.
+    reveal: Option<(&'static str, bool)>,
     _subs: Vec<Subscription>,
 }
 
@@ -300,8 +327,23 @@ impl ConnectionSheet {
             })
             .collect();
         subs.push(protocol_sub);
+        // New text in a secret field cancels "Remove the saved ..." (see `clear_secret_box`).
+        subs.push(cx.subscribe(&password, |s, input, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) && !input.read(cx).value().is_empty() {
+                s.clear_password = false;
+            }
+        }));
+        subs.push(
+            cx.subscribe(&key_passphrase, |s, input, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) && !input.read(cx).value().is_empty() {
+                    s.clear_passphrase = false;
+                }
+            }),
+        );
         let draft = Profile::new();
         let draft_protocol = draft.protocol;
+        let scroll = ScrollHandle::new();
+        let tops = FIELD_ORDER.iter().map(|f| (*f, Rc::default())).collect();
         let mut this = Self {
             profiles,
             origin: draft.clone(),
@@ -337,6 +379,9 @@ impl ConnectionSheet {
             will_payload,
             will_delay,
             cert_focus: cx.focus_handle(),
+            scroll,
+            tops,
+            reveal: None,
             _subs: subs,
         };
         match select.and_then(|id| this.profiles.iter().find(|p| p.id == id).cloned()) {
@@ -401,6 +446,18 @@ impl ConnectionSheet {
             [self.advanced, self.client_cert_open],
             self.title(),
         )
+    }
+
+    /// For the window tests: the two "Remove the saved ..." boxes.
+    #[cfg(test)]
+    pub(crate) fn removal_boxes(&self) -> [bool; 2] {
+        [self.clear_password, self.clear_passphrase]
+    }
+
+    /// For the window tests: the password field takes the focus.
+    #[cfg(test)]
+    pub(crate) fn focus_password(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.password.update(cx, |i, cx| i.focus(window, cx));
     }
 
     /// For the window tests: MQTT 5 with a wrong Will delay, or a certificate without a key.
@@ -711,7 +768,7 @@ impl ConnectionSheet {
         });
     }
 
-    fn focus_field(&self, field: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+    fn focus_field(&mut self, field: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(field) = field else {
             return;
         };
@@ -733,7 +790,12 @@ impl ConnectionSheet {
         };
         let input = (field != "client_cert").then(|| input.clone());
         let handle = self.cert_focus.clone();
-        // An input in a section that has just opened exists only after the next frame.
+        // An input in a section that has just opened exists only after the next frame. The same
+        // is true for its place: `render` scrolls to it after the frame that draws it.
+        if let Some((key, top)) = self.tops.get_key_value(field) {
+            top.take();
+            self.reveal = Some((*key, false));
+        }
         cx.defer_in(window, move |_, window, cx| match &input {
             Some(input) => input.update(cx, |i, cx| i.focus(window, cx)),
             None => handle.focus(window, cx),
@@ -868,6 +930,8 @@ impl ConnectionSheet {
     ) -> Field {
         field().label(label).child(
             v_flex()
+                .debug_selector(move || format!("field:{key}"))
+                .child(self.marker(key))
                 .gap_1()
                 .child(Input::new(input).small())
                 .children(self.error_text(key, cx)),
@@ -923,6 +987,77 @@ impl ConnectionSheet {
                     )
                 }),
         )
+    }
+
+    /// "Remove the saved password". New text in the field cancels the removal, and the box is off
+    /// while the field has text, so the two never disagree: the text always wins, and the box
+    /// shows it.
+    fn clear_secret_box(&self, which: Secret, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let (id, label, on, input) = match which {
+            Secret::Password => (
+                "clear-password",
+                "Remove the saved password",
+                self.clear_password,
+                &self.password,
+            ),
+            Secret::Passphrase => (
+                "clear-passphrase",
+                "Remove the saved passphrase",
+                self.clear_passphrase,
+                &self.key_passphrase,
+            ),
+        };
+        let typed = !input.read(cx).value().is_empty();
+        div().debug_selector(move || id.into()).child(
+            Checkbox::new(id)
+                .checked(on)
+                .label(label)
+                .disabled(typed)
+                .on_change(cx.listener(move |s, on: &bool, _, cx| {
+                    match which {
+                        Secret::Password => s.clear_password = *on,
+                        Secret::Passphrase => s.clear_passphrase = *on,
+                    }
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// An empty box at the top of a field. It records where the field is (see `reveal`).
+    fn marker(&self, field: &'static str) -> impl IntoElement + use<> {
+        let top = self.tops.get(field).cloned();
+        canvas(
+            move |bounds, _, _| {
+                if let Some(top) = &top {
+                    top.set(Some(bounds.origin.y));
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_0()
+    }
+
+    /// Scrolls the form to the wrong field that `focus_field` named. The field must have been
+    /// drawn once (a closed section opens first), so it waits one frame, and then it uses the
+    /// place that the field reported. Without a place it does nothing.
+    fn scroll_to_reveal(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some((field, drawn)) = self.reveal.take() else {
+            return;
+        };
+        if !drawn {
+            self.reveal = Some((field, true));
+            cx.notify();
+            return;
+        }
+        let Some(top) = self.tops.get(field).and_then(|t| t.take()) else {
+            return;
+        };
+        let (view, at) = (self.scroll.bounds(), self.scroll.offset());
+        // The field is a little below the top: its label is above it.
+        let y = view.origin.y - top + at.y + window.rem_size() * 2.;
+        let least = -self.scroll.max_offset().y;
+        self.scroll.set_offset(point(at.x, y.clamp(least, px(0.))));
     }
 
     fn section(title: &'static str, cx: &App) -> Div {
@@ -1001,7 +1136,8 @@ impl ConnectionSheet {
 }
 
 impl Render for ConnectionSheet {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.scroll_to_reveal(window, cx);
         let (warning, muted) = {
             let t = cx.theme();
             (t.warning, t.muted_foreground)
@@ -1058,24 +1194,12 @@ impl Render for ConnectionSheet {
             .child(
                 field().label("Password").child(
                     v_flex()
+                        .child(self.marker("password"))
                         .gap_1()
                         .child(Input::new(&self.password).small().mask_toggle())
                         .children(self.error_text("password", cx))
                         .when(!self.is_new, |d| {
-                            d.child(
-                                Button::new("clear-password")
-                                    .xsmall()
-                                    .ghost()
-                                    .label(if self.clear_password {
-                                        "The saved password is removed on save. Undo."
-                                    } else {
-                                        "Remove the saved password"
-                                    })
-                                    .on_click(cx.listener(|s, _, _, cx| {
-                                        s.clear_password = !s.clear_password;
-                                        cx.notify();
-                                    })),
-                            )
+                            d.child(self.clear_secret_box(Secret::Password, cx))
                         }),
                 ),
             );
@@ -1106,20 +1230,7 @@ impl Render for ConnectionSheet {
                         .gap_1()
                         .child(Input::new(&self.key_passphrase).small().mask_toggle())
                         .when(!self.is_new, |d| {
-                            d.child(
-                                Button::new("clear-passphrase")
-                                    .xsmall()
-                                    .ghost()
-                                    .label(if self.clear_passphrase {
-                                        "The saved passphrase is removed on save. Undo."
-                                    } else {
-                                        "Remove the saved passphrase"
-                                    })
-                                    .on_click(cx.listener(|s, _, _, cx| {
-                                        s.clear_passphrase = !s.clear_passphrase;
-                                        cx.notify();
-                                    })),
-                            )
+                            d.child(self.clear_secret_box(Secret::Passphrase, cx))
                         }),
                 ),
             );
@@ -1128,6 +1239,7 @@ impl Render for ConnectionSheet {
             .child(
                 field().label("Client ID").child(
                     v_flex()
+                        .child(self.marker("client_id"))
                         .gap_1()
                         .child(
                             h_flex()
@@ -1195,20 +1307,31 @@ impl Render for ConnectionSheet {
             )
             .child(
                 field().label("Will QoS").child(
-                    TabBar::new("will-qos")
+                    // The same control as the QoS of the composer.
+                    ToggleGroup::new("will-qos")
                         .segmented()
+                        .single()
                         .small()
-                        .selected_index(usize::from(self.will_qos == Qos::AtLeastOnce))
-                        .on_click(cx.listener(|s, ix: &usize, _, cx| {
-                            s.will_qos = if *ix == 0 {
-                                Qos::AtMostOnce
-                            } else {
-                                Qos::AtLeastOnce
-                            };
-                            cx.notify();
-                        }))
-                        .child("QoS 0")
-                        .child("QoS 1"),
+                        .child(
+                            Toggle::new("will-qos-0")
+                                .label("QoS 0")
+                                .checked(self.will_qos == Qos::AtMostOnce),
+                        )
+                        .child(
+                            Toggle::new("will-qos-1")
+                                .label("QoS 1")
+                                .checked(self.will_qos == Qos::AtLeastOnce),
+                        )
+                        .on_click(cx.listener(|s, checks: &Vec<bool>, _, cx| {
+                            if let Some(ix) = checks.iter().position(|c| *c) {
+                                s.will_qos = if ix == 0 {
+                                    Qos::AtMostOnce
+                                } else {
+                                    Qos::AtLeastOnce
+                                };
+                                cx.notify();
+                            }
+                        })),
                 ),
             )
             .child(
@@ -1231,8 +1354,9 @@ impl Render for ConnectionSheet {
                 ))
             });
 
-        v_flex()
+        let form = v_flex()
             .gap_3()
+            .px_4()
             .pb_4()
             .child(self.render_list(cx))
             .child(basic)
@@ -1251,17 +1375,15 @@ impl Render for ConnectionSheet {
                     })
                     .child(
                         h_flex()
+                            .child(self.marker("client_cert"))
                             .gap_2()
                             .items_center()
                             .child(
                                 Button::new("client-cert")
                                     .small()
                                     .ghost()
-                                    .label(if cert_open {
-                                        "Client certificate (hide)"
-                                    } else {
-                                        "Client certificate (show)"
-                                    })
+                                    .icon(disclosure_icon(cert_open))
+                                    .label("Client certificate")
                                     .on_click(cx.listener(|s, _, _, cx| {
                                         s.client_cert_open = !s.client_cert_open;
                                         cx.notify();
@@ -1280,11 +1402,8 @@ impl Render for ConnectionSheet {
                     Button::new("advanced")
                         .small()
                         .ghost()
-                        .label(if self.advanced {
-                            "Advanced (hide)"
-                        } else {
-                            "Advanced (show)"
-                        })
+                        .icon(disclosure_icon(self.advanced))
+                        .label("Advanced")
                         .on_click(cx.listener(|s, _, _, cx| {
                             s.advanced = !s.advanced;
                             cx.notify();
@@ -1303,7 +1422,25 @@ impl Render for ConnectionSheet {
                             .on_click(cx.listener(|s, _, window, cx| s.confirm_delete(window, cx))),
                     ),
                 )
-            })
+            });
+        // The sheet body grows with its content, so a scroll area inside it would grow too. An
+        // absolute box takes the size of the body instead, and the form scrolls in it. The
+        // sheet adds no padding of its own here: the form has its own, inside the scroll area.
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .child(
+                div()
+                    .id("sheet-form")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(form),
+            )
+            .vertical_scrollbar(&self.scroll)
     }
 }
 

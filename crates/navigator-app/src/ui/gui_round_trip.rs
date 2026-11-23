@@ -620,6 +620,57 @@ fn enter_in_a_field_shows_the_wrong_field_and_focuses_it(cx: &mut TestAppContext
     assert_eq!(focus, Some("will.delay_secs"));
 }
 
+/// A wrong field below the visible part of the sheet scrolls into view when Enter focuses it.
+#[gpui_kit::test]
+fn a_wrong_field_below_the_fold_scrolls_into_view(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    new_sheet(cx, &nav);
+    let sheet = open_sheet(cx, &nav);
+    cx.update(|w, cx| sheet.update(cx, |s, cx| s.make_invalid(true, w, cx)));
+    cx.simulate_keystrokes("enter");
+    // The test window draws on a refresh only: one more draw for each frame that is needed.
+    for _ in 0..2 {
+        cx.run_until_parked();
+        cx.update(|w, _| w.refresh());
+    }
+    cx.run_until_parked();
+    let field = cx
+        .debug_bounds("field:will.delay_secs")
+        .expect("the Will delay field is drawn");
+    // The title bar of the sheet is above 40 px and the footer is below `window - 60 px`.
+    let window = cx.update(|w, _| w.viewport_size());
+    assert!(
+        field.top() > px(40.) && field.bottom() < window.height - px(60.),
+        "the field is outside the visible part of the sheet: {field:?}"
+    );
+}
+
+/// New text in the password field cancels "Remove the saved password". The box is off while
+/// the field has text, so the text never wins in silence.
+#[gpui_kit::test]
+fn new_password_text_cancels_the_removal_of_the_saved_password(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    let id = nav.read_with(cx, |v, _| v.settings.profiles[0].id);
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.open_sheet(Some(id), false, w, cx)));
+    cx.run_until_parked();
+    let sheet = open_sheet(cx, &nav);
+    let boxes = |cx: &mut VisualTestContext| cx.update(|_, cx| sheet.read(cx).removal_boxes());
+    click(cx, "clear-password");
+    assert_eq!(boxes(cx), [true, false]);
+    cx.update(|w, cx| sheet.update(cx, |s, cx| s.focus_password(w, cx)));
+    cx.simulate_input("x");
+    assert_eq!(
+        boxes(cx),
+        [false, false],
+        "the new text must cancel the removal"
+    );
+    // The box is off now. A click on it does nothing.
+    click(cx, "clear-password");
+    assert_eq!(boxes(cx), [false, false]);
+}
+
 /// A certificate without a key blocks Save with TLS: the section opens and "Choose…" has the
 /// focus.
 #[gpui_kit::test]
