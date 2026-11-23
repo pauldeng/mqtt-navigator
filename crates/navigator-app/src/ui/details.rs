@@ -109,7 +109,7 @@ pub(super) struct Inspector {
     auto_all: bool,
     /// The whole rendered text. The editor shows its first `shown_len` bytes. The text grows in
     /// steps (see `crate::inspector::next_step`) up to `more_target`.
-    full: String,
+    pub(super) full: String,
     shown_len: usize,
     more_target: usize,
     /// The size of the next step.
@@ -123,10 +123,10 @@ pub(super) struct Inspector {
     pub(super) decoder_select: Entity<SelectState<Vec<DecoderItem>>>,
     kind_select: Entity<SelectState<Vec<KindItem>>>,
     /// A History row that the user chose. The Value tab shows it instead of the selection.
-    pub(super) hist_pick: Option<Msg>,
+    pub(super) hist_pick: Option<(u64, Msg)>,
     /// The History list takes the keys. `hist_cursor` is the row that Up and Down moved to.
     hist_focus: FocusHandle,
-    hist_cursor: Option<SystemTime>,
+    hist_cursor: Option<u64>,
     hist_scroll: UniformListScrollHandle,
     /// The full topic of the header, as a read-only input, so that the text can be selected.
     topic_view: Entity<InputState>,
@@ -273,8 +273,8 @@ impl Navigator {
     /// What the Value tab shows now.
     pub(super) fn shown(&self) -> Option<Shown> {
         let hist = |node: Option<NodeId>, topic: String, direction: Direction| {
-            let m = self.insp.hist_pick.clone()?;
-            let key = DetailKey::Hist(node?, m.received_at, m.payload.len(), m.truncated);
+            let (seq, m) = self.insp.hist_pick.clone()?;
+            let key = DetailKey::Hist(node?, seq);
             Some(Shown {
                 topic,
                 node,
@@ -314,7 +314,7 @@ impl Navigator {
                 Some(Shown {
                     topic,
                     node: Some(id),
-                    key: DetailKey::Node(id, m.received_at, m.payload.len(), m.truncated),
+                    key: DetailKey::Node(id, n.latest_seq),
                     msg: m,
                     direction: Direction::Received,
                     evicted: false,
@@ -1118,11 +1118,30 @@ impl Navigator {
         };
 
         // A History row that differs from the selection: say so, and offer the way back.
-        let earlier = self.insp.hist_pick.as_ref().and_then(|p| {
-            history_note(
-                p.received_at,
-                self.base_received_at(),
-                &format_time(p.received_at, self.utc_offset, false),
+        // The pick is the base itself when both have one identity.
+        // Its History copy can be shorter (the store cuts it).
+        let (base_seq, base_len) = match self.detail_of {
+            DetailOf::Topic => self
+                .sel_topic
+                .and_then(|id| self.store.get(id))
+                .map_or((0, 0), |n| {
+                    (n.latest_seq, n.latest.map_or(0, |m| m.payload.len()))
+                }),
+            DetailOf::Message => self
+                .sel_msg
+                .as_ref()
+                .map_or((0, 0), |s| (s.seq, s.msg.payload.len())),
+            DetailOf::Nothing => (0, 0),
+        };
+        let earlier = self.insp.hist_pick.as_ref().and_then(|(q, p)| {
+            let at = format_time(p.received_at, self.utc_offset, false);
+            if *q == base_seq {
+                return (p.payload.len() != base_len).then(|| format!("Shortened copy from {at}"));
+            }
+            Some(
+                history_note(p.received_at, self.base_received_at(), &at)
+                    // Same time as the base, but another message.
+                    .unwrap_or_else(|| format!("Another message from {at}")),
             )
         });
         let props_open = self.insp.props_open;
@@ -1141,6 +1160,7 @@ impl Navigator {
                         .child(div().flex_1().child(text))
                         .child(
                             Button::new("show-latest")
+                                .debug_selector(|| "show-latest".into())
                                 .xsmall()
                                 .label("Show latest")
                                 .on_click(cx.listener(|v, _, window, cx| {
@@ -1301,16 +1321,17 @@ impl Navigator {
                     count,
                     cx.processor(move |v, range: std::ops::Range<usize>, _window, cx| {
                         let theme = cx.theme().clone();
-                        let picked = v.insp.hist_pick.as_ref().map(|m| m.received_at);
+                        let picked = v.insp.hist_pick.as_ref().map(|(q, _)| *q);
                         let cursor = v.insp.hist_cursor;
                         let utc = v.utc_offset;
                         let rows: Vec<_> = v
                             .store
-                            .history(node)
+                            .history_seq(node)
                             .skip(range.start)
                             .take(range.len())
-                            .map(|m| {
+                            .map(|(seq, m)| {
                                 (
+                                    seq,
                                     m.received_at,
                                     m.original_size,
                                     m.qos.as_u8(),
@@ -1319,9 +1340,9 @@ impl Navigator {
                             })
                             .collect();
                         rows.into_iter()
-                            .map(|(at, size, qos, text)| {
+                            .map(|(seq, at, size, qos, text)| {
                                 v.history_row(
-                                    at, size, qos, text, node, picked, cursor, utc, &theme, cx,
+                                    seq, at, size, qos, text, node, picked, cursor, utc, &theme, cx,
                                 )
                             })
                             .collect()
@@ -1337,25 +1358,24 @@ impl Navigator {
     #[allow(clippy::too_many_arguments)]
     fn history_row(
         &self,
+        seq: u64,
         at: SystemTime,
         size: usize,
         qos: u8,
         text: SharedString,
         node: NodeId,
-        picked: Option<SystemTime>,
-        cursor: Option<SystemTime>,
+        picked: Option<u64>,
+        cursor: Option<u64>,
         utc: i32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let muted = theme.muted_foreground;
-        let nanos = at
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        let is_picked = picked == Some(at);
+        let is_picked = picked == Some(seq);
         let tone = move |d: Div| if is_picked { d } else { d.text_color(muted) };
         // The picked row is the selected one. The keyboard cursor is the outline.
-        ListItem::new(("hist", nanos))
+        ListItem::new(("hist", seq))
+            .debug_selector(move || format!("hist-{seq}"))
             .h(ui(HIST_ROW_H))
             .flex_none()
             .overflow_hidden()
@@ -1363,11 +1383,11 @@ impl Navigator {
             .px_2()
             .py_0p5()
             .selected(is_picked)
-            .secondary_selected(cursor == Some(at))
+            .secondary_selected(cursor == Some(seq))
             .on_click(cx.listener(move |v, _, window, cx| {
                 v.insp.hist_focus.focus(window, cx);
-                v.insp.hist_cursor = Some(at);
-                v.pick_history(node, at, window, cx)
+                v.insp.hist_cursor = Some(seq);
+                v.pick_history(node, seq, window, cx)
             }))
             .child(
                 v_flex()
@@ -1403,19 +1423,19 @@ impl Navigator {
         let Some((_, Some(node))) = self.selected_topic() else {
             return;
         };
-        let times: Vec<SystemTime> = self.store.history(node).map(|m| m.received_at).collect();
-        if times.is_empty() {
+        let seqs: Vec<u64> = self.store.history_seq(node).map(|(q, _)| q).collect();
+        if seqs.is_empty() {
             return;
         }
         let from = self
             .insp
             .hist_cursor
-            .or(self.insp.hist_pick.as_ref().map(|m| m.received_at));
-        let ix = match from.and_then(|t| times.iter().position(|x| *x == t)) {
-            Some(i) => i.saturating_add_signed(step).min(times.len() - 1),
+            .or(self.insp.hist_pick.as_ref().map(|(q, _)| *q));
+        let ix = match from.and_then(|t| seqs.iter().position(|x| *x == t)) {
+            Some(i) => i.saturating_add_signed(step).min(seqs.len() - 1),
             None => 0,
         };
-        self.insp.hist_cursor = Some(times[ix]);
+        self.insp.hist_cursor = Some(seqs[ix]);
         self.insp
             .hist_scroll
             .scroll_to_item(ix, ScrollStrategy::Nearest);
@@ -1424,8 +1444,8 @@ impl Navigator {
 
     /// Enter in History: shows the row of the cursor in the Value tab.
     fn confirm_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some((_, Some(node))), Some(at)) = (self.selected_topic(), self.insp.hist_cursor) {
-            self.pick_history(node, at, window, cx);
+        if let (Some((_, Some(node))), Some(seq)) = (self.selected_topic(), self.insp.hist_cursor) {
+            self.pick_history(node, seq, window, cx);
         }
     }
 
@@ -1433,12 +1453,12 @@ impl Navigator {
     fn pick_history(
         &mut self,
         node: NodeId,
-        at: SystemTime,
+        seq: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(m) = self.store.history(node).find(|m| m.received_at == at) {
-            self.insp.hist_pick = Some(m.clone());
+        if let Some((_, m)) = self.store.history_seq(node).find(|(q, _)| *q == seq) {
+            self.insp.hist_pick = Some((seq, m.clone()));
             self.insp.tab = DetailTab::Value;
             self.insp.value_focus.focus(window, cx);
             cx.notify();
