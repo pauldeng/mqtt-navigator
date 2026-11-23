@@ -924,7 +924,6 @@ impl Navigator {
                 [
                     Button::new("choose-empty")
                         .small()
-                        .primary()
                         .label(choose_text(count))
                         .dropdown_caret(true)
                         .dropdown_menu(self.connection_menu(cx))

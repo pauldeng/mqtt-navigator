@@ -1010,12 +1010,9 @@ impl Navigator {
         v_flex()
             .size_full()
             .when(!sheet, |d| {
-                d.key_context("DetailsPane")
-                    .on_action(
-                        cx.listener(|v, _: &CloseDetails, window, cx| v.close_details(window, cx)),
-                    )
-                    .border_l_1()
-                    .border_color(theme.border)
+                d.key_context("DetailsPane").on_action(
+                    cx.listener(|v, _: &CloseDetails, window, cx| v.close_details(window, cx)),
+                )
             })
             .p_3()
             .gap_2()
@@ -1309,6 +1306,7 @@ impl Navigator {
         // Only the visible rows are built.
         v_flex()
             .id("history")
+            .relative()
             .size_full()
             .track_focus(&self.insp.hist_focus)
             .key_context(HIST_CONTEXT)
@@ -1351,6 +1349,7 @@ impl Navigator {
                 .track_scroll(&self.insp.hist_scroll)
                 .flex_1(),
             )
+            .vertical_scrollbar(&self.insp.hist_scroll)
             .into_any_element()
     }
 
