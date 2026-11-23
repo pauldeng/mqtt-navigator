@@ -79,10 +79,6 @@ fn main() {
             gpui_kit::init(cx);
             ui::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.bind_keys([
-                KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("ctrl-q", Quit, None),
-            ]);
             // The settings load in the background. The window opens when they are here, so that
             // the first frame has the saved theme and pane widths.
             let path = persist::settings_path();

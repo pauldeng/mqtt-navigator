@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "broker-tests")]
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::InputState;
-use gpui_kit::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
+use gpui_kit::{
+    AppContext, AsKeystroke as _, Entity, Modifiers, TestAppContext, VisualTestContext, px, size,
+};
 use navigator_core::net::{Profile, Transport};
 use navigator_core::settings::{Load, Settings};
 use navigator_core::store::{Direction, RowView};
@@ -618,6 +620,66 @@ fn enter_in_a_field_shows_the_wrong_field_and_focuses_it(cx: &mut TestAppContext
     assert_eq!(errors, ["will.delay_secs"]);
     assert_eq!(open, [true, false], "Advanced must open");
     assert_eq!(focus, Some("will.delay_secs"));
+}
+
+/// One main key for each platform: Cmd on macOS, Ctrl elsewhere. On Windows and Linux the Cmd
+/// key is the Super key, and no shortcut may use it.
+#[gpui_kit::test]
+fn the_key_bindings_use_the_main_key_of_the_platform(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        super::init(cx);
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let mac = cfg!(target_os = "macos");
+        let mut mains = 0;
+        for b in keymap.bindings() {
+            if !b.action().name().starts_with("navigator_ui::") {
+                continue;
+            }
+            let m = b.keystrokes()[0].as_keystroke().modifiers;
+            if m.control || m.platform {
+                mains += 1;
+                assert!(
+                    m.platform == mac && m.control != mac,
+                    "{} is bound with the wrong main key: {:?}",
+                    b.action().name(),
+                    b.keystrokes()
+                );
+            }
+        }
+        assert!(mains >= 6, "the shortcuts are missing: {mains}");
+    });
+}
+
+/// The shortcut text is read from the key bindings, so the text and the key cannot differ: the
+/// menus, the tooltip, the composer hint and the palette all use it.
+#[gpui_kit::test]
+fn shortcut_text_comes_from_the_key_bindings(cx: &mut TestAppContext) {
+    use super::commands::bound_action;
+    use super::{CONTEXT, OpenPalette, shortcut_text};
+    let (mut cx, _nav) = open(cx);
+    let main = if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl+"
+    };
+    cx.update(|w, _| {
+        assert_eq!(
+            shortcut_text(&OpenPalette, Some(CONTEXT), w).as_deref(),
+            Some(format!("{main}K").as_str())
+        );
+        // Every palette command with a key shows its shortcut.
+        for e in crate::palette::COMMANDS {
+            if let Some((action, context)) = bound_action(e.cmd) {
+                let text = shortcut_text(action.as_ref(), context, w);
+                assert!(
+                    text.is_some_and(|t| t.starts_with(main)),
+                    "no shortcut for {}",
+                    e.id
+                );
+            }
+        }
+    });
 }
 
 /// A wrong field below the visible part of the sheet scrolls into view when Enter focuses it.

@@ -104,7 +104,7 @@ Select a file with the system file dialog.
 
 ### Advanced (collapsed)
 
-Select **Advanced (show)** to open this part. If a field in a collapsed section is not valid, the sheet opens that section and moves the focus to the field.
+Select **Advanced** to open this part. The chevron shows if the part is open. If a field in a collapsed section is not valid, the sheet opens that section and moves the focus to the field.
 
 | Field | Default | Notes |
 |---|---|---|
@@ -211,7 +211,7 @@ The centre pane has two views. Switch with **Messages | Tree**, `Ctrl/Cmd+1` or 
 - The header has one row: **Messages | Tree**, the filter field, the direction menu and **Pause**.
 - The newest message is at the top. The order is always by time. There is no sorting.
 - Each message has two lines. Line 1 shows the topic, **R** if the message is retained, and the time. Line 2 shows a preview of the payload. QoS and size are in the details pane. If you have more than one subscription, a colour edge at the left shows the subscription.
-- Sent messages show in the same list, with an arrow. A sent message shows its result only when the result is not routine: "Sending…", "Rejected: <reason>", "Timed out" or "Lost on disconnect". "Sent" and "Acknowledged" show in the details and in the composer.
+- Sent messages show in the same list, with an arrow. A sent message shows its result only when the result is not routine: "Sending…", "Rejected: <reason>", "Timed out" or "Connection closed". "Sent" and "Acknowledged" show in the details and in the composer.
 - Marker rows show "Reconnected" with the time, and "Removed (memory limit)".
 - The **All ▾** menu next to the filter selects All, Received or Sent. A choice other than All shows as a tag.
 - **Row height:** "1 line" or "2 lines". Use the settings menu (the gear in the title bar) or the command palette. The default is 2 lines. With 1 line, the preview follows the topic. A long payload ends with "…". A payload that is not valid UTF-8 shows as `bin` and at most its first 16 bytes in hex, for example `bin ff 00 10`.
@@ -276,7 +276,7 @@ The composer is closed by default. The bottom of the centre pane then shows one 
 
 The composer stays open after Publish. To close it, select **✕** at the end of the topic row, or press `Esc`. The focus moves to the message list. The draft stays. When you open the composer again, the draft is there. Closing does not put the draft in History.
 
-The result shows as one line below the payload and, if it is not routine, in the list row. It is short: "Sending…", "Sent" (QoS 0), "Acknowledged" (QoS 1), or "Rejected: <ReasonName>", for example "Rejected: NotAuthorized". If the broker sent a reason string, the text is "Rejected: <ReasonName>: <reason string>". The app shows no hex code. A message can also end with "No acknowledgement after 10 s." or "Not sent: the connection closed." The app checks the message before it sends it. An error then shows under the composer, for example "Connect to a broker first." When you are not connected, Publish is off. The 10 s timeout also ends the session (see [Troubleshooting](#other-connection-problems)).
+The result shows as one line below the payload and, if it is not routine, in the list row. It is short: "Sending…", "Sent" (QoS 0), "Acknowledged" (QoS 1), or "Rejected: <ReasonName>", for example "Rejected: NotAuthorized". If the broker sent a reason string, the text is "Rejected: <ReasonName>: <reason string>". The app shows no hex code. A message can also end with "No acknowledgement after 10 s." or "No acknowledgement: the connection closed." (a closed connection does not show whether the broker got the message) The app checks the message before it sends it. An error then shows under the composer, for example "Connect to a broker first." When you are not connected, Publish is off. The 10 s timeout also ends the session (see [Troubleshooting](#other-connection-problems)).
 
 - **Text, Hex or JSON:** the switch is always visible. A Hex payload sends exact bytes. Write the bytes as hex digits. Spaces are ignored.
 - **JSON** sends the same bytes as Text. The composer checks the payload: valid JSON gets syntax colours. Invalid JSON shows a warning under the payload, for example "The payload is not valid JSON: … Publish still sends it as is." You can still publish it. Text and JSON keep the same text when you switch between them.

@@ -11,6 +11,7 @@ This page is the design reference for the user interface. Read [ARCHITECTURE.md]
 - Each area has one primary action: Connect or Disconnect in the title bar, Publish in the composer, Save and connect in the connection sheet. The subscribe input has no button: Enter adds the filter.
 - A choice shows its selected state (a toggle group, a toggle, a selected list row). Do not swap primary and ghost buttons to show a choice.
 - Follow the [gpui-kit design guides](https://gpui-kit.com/docs/design-guides.md) for sizes, copy and states.
+- A shortcut has one source: the key binding. Bind `secondary-<key>` (Cmd on macOS, Ctrl on Windows and Linux). Do not bind both. A menu item takes its action (`PopupMenuItem::action`), a button tooltip uses `tooltip_with_action`, and the palette and hints use `shortcut_text`. Do not type a shortcut into a label.
 - All actions work from the keyboard. The one exception is pane resizing, which uses the mouse ("Reset the layout" is in the command palette).
 
 Sources:
@@ -80,7 +81,7 @@ The window has one place for each job. A control shows when it can act. Rare act
     - Each message has two lines. Line 1: the topic, `R` only if retained, and the time (right-aligned, muted). Line 2: the payload preview in the monospace font (muted).
     - QoS and size show in the details pane. The subscription colour is a 2 px left edge, and only when there is more than one subscription.
     - The order is always chronological, newest first. There is no sorting.
-    - A sent message has the arrow-up marker. It shows its result only when the result is not routine: "Sending…", "Rejected: <reason>", "Timed out" or "Lost on disconnect". "Sent" and "Acknowledged" show in the details and in the composer result line.
+    - A sent message has the arrow-up marker. It shows its result only when the result is not routine: "Sending…", "Rejected: <reason>", "Timed out" or "Connection closed". "Sent" and "Acknowledged" show in the details and in the composer result line.
     - The **direction menu** is a small `All ▾` button after the filter input. It has the checked items All, Received and Sent. A choice other than All also shows as a filter chip with a clear button.
   - **Tree**: the live topic tree, sorted a–z. A leaf shows its last value inline. A branch shows muted counts. It has no activity marker.
   - **Selection** keeps a message ID, not only a topic:
