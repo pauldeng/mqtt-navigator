@@ -24,6 +24,7 @@ use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
@@ -417,6 +418,18 @@ fn readable_on(fill: Hsla, a: Hsla, b: Hsla) -> Hsla {
     } else {
         b
     }
+}
+
+/// The details open as a sheet when the window is narrow, or when the three panes at their least
+/// widths do not fit it. `rem` is the rem size in pixels: the zoom scales the pane limits.
+fn needs_sheet(width: f32, rem: f32) -> bool {
+    let least = (LEFT_W.1 + CENTRE_MIN + RIGHT_W.1) * rem / 16.;
+    width < details::NARROW || width < least
+}
+
+/// "1 topic", "3 topics": the number of topics below a tree node.
+fn topics_label(n: u32) -> String {
+    format!("{n} topic{}", if n == 1 { "" } else { "s" })
 }
 
 /// The text of the "Jump to newest" button. `new` counts the messages since Follow went off.
@@ -1577,6 +1590,7 @@ impl Navigator {
     /// Follow and a pause need no anchor. A scroll that is not yet drawn has no valid offset.
     fn capture_anchor(&mut self) {
         self.anchor = None;
+        self.leave_follow_if_dragged();
         if self.follow.on || self.store.is_paused() {
             return;
         }
@@ -1815,6 +1829,24 @@ impl Navigator {
     fn leave_follow(&mut self) {
         if self.follow.leave(self.store.is_paused()) {
             self.store.watch_new(true);
+        }
+    }
+
+    /// A scrollbar drag moves the list with no wheel event. If the list left its top while Follow
+    /// is on, Follow goes off. A scroll that is not yet drawn has no valid offset.
+    fn leave_follow_if_dragged(&mut self) {
+        if !self.follow.on || self.view != View::Messages {
+            return;
+        }
+        let y = {
+            let state = self.list_scroll.0.borrow();
+            if state.deferred_scroll_to_item.is_some() {
+                return;
+            }
+            f32::from(state.base_handle.offset().y)
+        };
+        if left_the_top(y) {
+            self.leave_follow();
         }
     }
 
@@ -2866,27 +2898,38 @@ impl Navigator {
                     })
             });
         let has_hash = self.subs.contains("#");
+        // The side padding is on the parts, not on the pane: the list scrolls against the pane
+        // edge, and its scrollbar sits there.
         v_flex()
             .size_full()
-            .border_r_1()
-            .border_color(theme.border)
-            .p_2()
+            .py_2()
             .gap_1()
             .child(
                 div()
+                    .px_2()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child("Subscriptions"),
             )
             // Only the visible rows are built. The add input stays pinned below them.
             .child(
-                self.sub_list
-                    .clone()
-                    .cached(StyleRefinement::default().w_full().flex_1().min_h_0()),
+                div()
+                    .relative()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .px_2()
+                    .child(
+                        self.sub_list
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
+                    .vertical_scrollbar(&self.subs_scroll),
             )
             .when(has_hash && self.subs.rows.len() > 1, |d| {
                 d.child(
                     h_flex()
+                        .px_2()
                         .gap_2()
                         .child(
                             div()
@@ -2903,9 +2946,13 @@ impl Navigator {
                         ),
                 )
             })
-            .child(Input::new(&self.sub_input).small().suffix(qos))
+            .child(
+                div()
+                    .px_2()
+                    .child(Input::new(&self.sub_input).small().suffix(qos)),
+            )
             .when_some(self.sub_error.clone(), |d, e| {
-                d.child(div().text_xs().text_color(theme.danger).child(e))
+                d.child(div().px_2().text_xs().text_color(theme.danger).child(e))
             })
     }
 
@@ -3125,7 +3172,6 @@ impl Navigator {
             let focus_input = |label: &'static str, cx: &mut Context<Self>| {
                 Button::new("focus-subscribe-empty")
                     .small()
-                    .primary()
                     .label(label)
                     .on_click(cx.listener(|v, _, window, cx| {
                         v.sub_input.update(cx, |i, cx| i.focus(window, cx))
@@ -3283,7 +3329,6 @@ impl Navigator {
                         .child(
                             Button::new("jump-to-newest")
                                 .small()
-                                .primary()
                                 .icon(IconName::ArrowUp)
                                 .label(jump_label(self.store.watched_new()))
                                 .on_click(
@@ -3358,11 +3403,12 @@ impl Navigator {
         if count == 0 {
             return self.render_empty(cx);
         }
+        self.leave_follow_if_dragged();
         if self.follow.on && !self.store.is_paused() {
             self.list_scroll
                 .scroll_to_item_strict(0, ScrollStrategy::Top);
         }
-        uniform_list(
+        let list = uniform_list(
             "messages",
             count,
             cx.processor(|v, range: std::ops::Range<usize>, window, cx| {
@@ -3415,8 +3461,15 @@ impl Navigator {
             }),
         )
         .track_scroll(&self.list_scroll)
-        .flex_1()
-        .into_any_element()
+        .size_full();
+        // The bar sits at the trailing edge of the list region.
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .vertical_scrollbar(&self.list_scroll)
+            .into_any_element()
     }
 
     /// One row of the message list. Its height is fixed, so that the list can be virtual.
@@ -3455,6 +3508,7 @@ impl Navigator {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
+                    .font_family(mono.clone())
                     .text_sm()
                     .map(|d| {
                         if self.two_lines {
@@ -3585,7 +3639,7 @@ impl Navigator {
         if count == 0 {
             return self.render_empty(cx);
         }
-        uniform_list(
+        let list = uniform_list(
             "topics",
             count,
             cx.processor(|v, range: std::ops::Range<usize>, window, cx| {
@@ -3641,7 +3695,7 @@ impl Navigator {
                                     div()
                                         .text_xs()
                                         .text_color(muted)
-                                        .child(format!("{} topics", n.subtree_topics)),
+                                        .child(topics_label(n.subtree_topics)),
                                 )
                             })
                             .child(div().flex_1())
@@ -3675,8 +3729,14 @@ impl Navigator {
             }),
         )
         .track_scroll(&self.tree_scroll)
-        .flex_1()
-        .into_any_element()
+        .size_full();
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .vertical_scrollbar(&self.tree_scroll)
+            .into_any_element()
     }
 
     /// "used / limit". A click opens the list of limits (the same ones as in the palette).
@@ -3797,27 +3857,41 @@ impl Navigator {
                     ),
             );
         }
+        // Mono is for the numbers only. The words stay in the UI font.
+        let mono = theme.mono_font_family.clone();
+        let num = move |t: String| div().font_family(mono.clone()).child(t);
         StatusBar::new().left(left).right(
             h_flex()
                 .gap_3()
                 .text_xs()
-                .font_family(theme.mono_font_family.clone())
-                .child(format!("{} msg/s", self.rate.per_sec))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(num(self.rate.per_sec.to_string()))
+                        .child("msg/s"),
+                )
                 .when(show.memory, |d| {
-                    d.child(div().text_color(theme.warning).child(format!(
+                    d.child(div().text_color(theme.warning).child(num(format!(
                         "{} MiB / {}",
                         s.used_bytes / MIB,
                         crate::palette::memory_text(self.memory_mib())
-                    )))
+                    ))))
                 })
                 .when(s.list_drops > 0 && show.list_drops, |d| {
-                    d.child(format!("{} rows removed (memory limit)", s.list_drops))
+                    d.child(
+                        h_flex()
+                            .gap_1()
+                            .child(num(s.list_drops.to_string()))
+                            .child("rows removed (memory limit)"),
+                    )
                 })
                 .when(show.drops, |d| {
                     d.child(
-                        div()
+                        h_flex()
+                            .gap_1()
                             .text_color(theme.danger)
-                            .child(format!("{drops} dropped")),
+                            .child(num(drops.to_string()))
+                            .child("dropped"),
                     )
                 })
                 .child(details_button),
@@ -3883,7 +3957,7 @@ impl Render for Navigator {
             self.last_size = (f32::from(s.width), f32::from(s.height));
         }
         // Below NARROW px the details open as a sheet. A wide window shows them in the pane.
-        self.narrow = f32::from(window.viewport_size().width) < details::NARROW;
+        self.narrow = needs_sheet(f32::from(window.viewport_size().width), self.rem);
         if self.narrow && self.insp.want_sheet {
             self.insp.want_sheet = false;
             cx.defer_in(window, |v, window, cx| v.open_details_sheet(window, cx));
@@ -4711,6 +4785,25 @@ mod tests {
         assert!(!left_the_top(-0.2));
         assert!(left_the_top(-1.0));
         assert!(left_the_top(-300.0));
+    }
+
+    #[test]
+    fn the_details_sheet_opens_when_the_three_panes_do_not_fit() {
+        use super::needs_sheet;
+        // 100% zoom: the least widths add up to 820 px. Only the narrow limit counts.
+        assert!(needs_sheet(1099., 16.));
+        assert!(!needs_sheet(1100., 16.));
+        // 150% zoom: the least widths add up to 1230 px, so 1100 px is not enough.
+        assert!(needs_sheet(1100., 24.));
+        assert!(needs_sheet(1229., 24.));
+        assert!(!needs_sheet(1230., 24.));
+    }
+
+    #[test]
+    fn a_topic_count_uses_the_singular_for_one() {
+        use super::topics_label;
+        assert_eq!(topics_label(1), "1 topic");
+        assert_eq!(topics_label(2), "2 topics");
     }
 
     #[test]
