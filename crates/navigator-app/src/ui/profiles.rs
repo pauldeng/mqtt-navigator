@@ -252,6 +252,7 @@ impl Navigator {
     /// state "Choose a connection". One function builds both.
     pub(super) fn connection_menu(
         &self,
+        trigger: &FocusHandle,
         cx: &Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let rows: Vec<(Uuid, SharedString, SharedString)> = self
@@ -262,7 +263,8 @@ impl Navigator {
         let command_line = self.session.as_ref().map(|s| s.id) == active;
         let edit_name = self.profile.as_ref().map(display_name);
         let weak = cx.entity().downgrade();
-        let focus = self.root_focus.clone();
+        // The trigger is the action context: Escape and a chosen action return the focus to it.
+        let focus = trigger.clone();
         move |menu, window, _| {
             let rem = window.rem_size();
             let mut menu = menu
@@ -924,7 +926,8 @@ impl Navigator {
                         .small()
                         .label(choose_text(count))
                         .dropdown_caret(true)
-                        .dropdown_menu(self.connection_menu(cx))
+                        .track_focus(&self.choose_focus)
+                        .dropdown_menu(self.connection_menu(&self.choose_focus, cx))
                         .into_any_element(),
                     Button::new("new-empty")
                         .small()
