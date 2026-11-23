@@ -1863,6 +1863,11 @@ impl Navigator {
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
         let pause = !self.store.is_paused();
+        // Follow was on before the pause: the list returns to its top, as the old frame did.
+        if !pause && self.follow.on {
+            self.list_scroll
+                .scroll_to_item_strict(0, ScrollStrategy::Top);
+        }
         self.store.set_paused(pause);
         self.kick_work();
         cx.notify();

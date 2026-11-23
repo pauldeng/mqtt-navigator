@@ -397,6 +397,8 @@ impl Navigator {
         self.anchor = None;
         // The new store does not count rows: Follow and its counter start again together.
         self.follow = Follow::default();
+        self.list_scroll
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
         self.reconnected_at = None;
         self.last_result = None;
         self.sub_error = None;
