@@ -402,6 +402,7 @@ impl Navigator {
                     self.status.state,
                     ConnState::Connecting | ConnState::Reconnecting { .. }
                 ),
+            disconnecting: self.status.state == ConnState::Disconnecting,
             messages_view: self.view == View::Messages,
             filters_active: self.filters_active(),
             paused: self.store.is_paused(),
@@ -436,6 +437,12 @@ impl Navigator {
             check_updates: self.settings.ui.check_updates,
             sub_qos: self.show_only_sub().map(|s| s.qos),
             composer_open: self.comp.vis.open,
+            sub_removing: self
+                .show_only_sub()
+                .is_some_and(|s| s.state.removal_accepted()),
+            sub_remove_failed: self
+                .show_only_sub()
+                .is_some_and(|s| matches!(s.state, SubState::RemoveFailed(_))),
             sub_failed: self
                 .show_only_sub()
                 .is_some_and(|s| matches!(s.state, SubState::Failed(_))),

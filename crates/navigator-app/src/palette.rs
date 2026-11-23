@@ -85,6 +85,8 @@ pub struct Facts {
     pub connected: bool,
     /// A Connect is on its way, or the net thread tries again (Cancel is the action).
     pub connecting: bool,
+    /// A Disconnect is on its way. Connect waits until it is done.
+    pub disconnecting: bool,
     pub messages_view: bool,
     pub filters_active: bool,
     pub paused: bool,
@@ -114,6 +116,10 @@ pub struct Facts {
     pub check_updates: bool,
     /// The QoS of the subscription in "Show only". `None`: no subscription is in Show only.
     pub sub_qos: Option<Qos>,
+    /// The user removed the subscription in "Show only": its QoS and options are locked.
+    pub sub_removing: bool,
+    /// The broker rejected that removal. Remove can run again.
+    pub sub_remove_failed: bool,
     /// The subscription in Show only was rejected.
     pub sub_failed: bool,
     /// The connection uses MQTT 5 (subscription options).
@@ -206,7 +212,7 @@ pub fn is_current(e: &Entry, f: &Facts) -> bool {
 /// Every action, in the order of the palette.
 pub static COMMANDS: &[Entry] = &[
     e("connect", "Connect", None, Cmd::Connect, |f| {
-        f.has_profile && !f.connected && !f.connecting
+        f.has_profile && !f.connected && !f.connecting && !f.disconnecting
     }),
     e("disconnect", "Disconnect", None, Cmd::Disconnect, |f| {
         f.connected
@@ -786,6 +792,12 @@ pub fn disabled_reason(e: &Entry, f: &Facts) -> Option<&'static str> {
     const SELECT: &str = "Select a subscription first.";
     match (e.cmd, f.sub_qos) {
         (Cmd::SubQos(_) | Cmd::SubOptions | Cmd::SubRetry | Cmd::SubRemove, None) => Some(SELECT),
+        (Cmd::SubRemove, Some(_)) if f.sub_removing && !f.sub_remove_failed => {
+            Some("Wait for the broker to confirm the removal.")
+        }
+        (Cmd::SubQos(_) | Cmd::SubOptions | Cmd::SubRetry, Some(_)) if f.sub_removing => {
+            Some("You removed this subscription.")
+        }
         (Cmd::SubQos(q), Some(now)) if q == now => Some("The subscription has this QoS already."),
         (Cmd::SubRetry, Some(_)) if !f.sub_failed => Some("The subscription did not fail."),
         _ => None,
@@ -845,6 +857,12 @@ mod tests {
         };
         let v = ids(&connecting);
         assert!(v.contains(&"cancel-connect") && !v.contains(&"connect"));
+        // Connect waits until a Disconnect is done (the window would ignore it).
+        let leaving = Facts {
+            disconnecting: true,
+            ..idle
+        };
+        assert!(!ids(&leaving).contains(&"connect"));
         let up = Facts {
             connected: true,
             ..idle
@@ -1010,6 +1028,28 @@ mod tests {
             ..none
         };
         assert_eq!(reason("sub-qos-0", &one), None);
+        let removing = Facts {
+            sub_removing: true,
+            ..one
+        };
+        assert_eq!(
+            reason("sub-qos-0", &removing),
+            Some("You removed this subscription.")
+        );
+        assert_eq!(
+            reason("sub-remove", &removing),
+            Some("Wait for the broker to confirm the removal.")
+        );
+        // A rejected removal can run again.
+        let rejected = Facts {
+            sub_remove_failed: true,
+            ..removing
+        };
+        assert_eq!(reason("sub-remove", &rejected), None);
+        assert_eq!(
+            reason("sub-qos-0", &rejected),
+            Some("You removed this subscription.")
+        );
         assert_eq!(
             reason("sub-qos-1", &one),
             Some("The subscription has this QoS already.")
