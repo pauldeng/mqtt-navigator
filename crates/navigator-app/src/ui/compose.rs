@@ -7,6 +7,7 @@ use gpui_kit::component::button::{Toggle, ToggleGroup};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use navigator_core::decode;
 use navigator_core::publish::{validate_outgoing, validate_v3_size};
@@ -20,6 +21,11 @@ use crate::inspector::size_text;
 
 /// Height of the payload editor (design pixels, see [`ui`]).
 const PAYLOAD_HEIGHT: f32 = 84.;
+/// Properties section: the width of the label column, the width of the column at the end of a row
+/// ("Send empty" and Remove), and the most height of the rows before they scroll.
+const LABEL_WIDTH: f32 = 160.;
+const END_WIDTH: f32 = 150.;
+const PROPS_MAX_HEIGHT: f32 = 168.;
 
 /// Format refuses a payload above this size, and a result above [`FORMAT_MAX_OUT`]: setting a
 /// large text into the editor runs on the UI thread (see docs/ui-design.md, 3.3).
@@ -106,10 +112,11 @@ impl Composer {
             cx.new(|cx| InputState::new(window, cx).placeholder(hint))
         };
         let topic = input(window, cx, "Topic");
-        let content_type = input(window, cx, "Content type");
-        let response_topic = input(window, cx, "Response topic");
-        let correlation = input(window, cx, "Correlation data (hex)");
-        let expiry = input(window, cx, "Message expiry (seconds)");
+        // The name of each property field is its label (see `render_props`). The hint is an example.
+        let content_type = input(window, cx, "For example application/json");
+        let response_topic = input(window, cx, "Topic for the reply");
+        let correlation = input(window, cx, "Hex bytes, for example 0a1b");
+        let expiry = input(window, cx, "Seconds");
         let payload = cx.new(|cx| {
             EditorState::new(window, cx)
                 .line_number(false)
@@ -1008,7 +1015,6 @@ impl Navigator {
     fn render_props(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let shown = self.comp.shown;
-        let note = move |n: Option<String>| n.map(|n| div().text_xs().text_color(muted).child(n));
         let empty_switch =
             |id: &'static str, on: bool| Switch::new(id).checked(on).label("Send empty");
         let remove = |kind: PropKind, cx: &mut Context<Self>| {
@@ -1022,40 +1028,43 @@ impl Navigator {
         let rows = self.comp.rows.iter().map(|r| {
             let id = r.id;
             let n = r.key.note("name", cx).or_else(|| r.value.note("value", cx));
-            v_flex()
+            let names = h_flex()
+                .gap_2()
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().flex_1().child(Input::new(&r.key.input).small()))
-                        .child(div().flex_1().child(Input::new(&r.value.input).small()))
-                        .child(
-                            Switch::new(("user-prop-empty", id as usize))
-                                .checked(r.keep_empty)
-                                .label("Send empty")
-                                .on_click(cx.listener(move |v, on: &bool, _, cx| {
-                                    if let Some(r) = v.comp.rows.iter_mut().find(|r| r.id == id) {
-                                        r.keep_empty = *on;
-                                    }
-                                    v.comp.model.edited();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new(("user-prop-remove", id as usize))
-                                .small()
-                                .ghost()
-                                .icon(IconName::Close)
-                                .tooltip("Remove this property")
-                                .on_click(cx.listener(move |v, _, window, cx| {
-                                    v.comp.rows.retain(|r| r.id != id);
-                                    v.comp.model.edited();
-                                    // The row and its button are gone: focus a control that stays.
-                                    v.comp.payload.update(cx, |e, cx| e.focus(window, cx));
-                                    cx.notify();
-                                })),
-                        ),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&r.key.input).small()),
                 )
-                .children(note(n))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&r.value.input).small()),
+                );
+            let switch = Switch::new(("user-prop-empty", id as usize))
+                .checked(r.keep_empty)
+                .label("Send empty")
+                .on_click(cx.listener(move |v, on: &bool, _, cx| {
+                    if let Some(r) = v.comp.rows.iter_mut().find(|r| r.id == id) {
+                        r.keep_empty = *on;
+                    }
+                    v.comp.model.edited();
+                    cx.notify();
+                }));
+            let remove = Button::new(("user-prop-remove", id as usize))
+                .small()
+                .ghost()
+                .icon(IconName::Close)
+                .tooltip("Remove this property")
+                .on_click(cx.listener(move |v, _, window, cx| {
+                    v.comp.rows.retain(|r| r.id != id);
+                    v.comp.model.edited();
+                    // The row and its button are gone: focus a control that stays.
+                    v.comp.payload.update(cx, |e, cx| e.focus(window, cx));
+                    cx.notify();
+                }));
+            prop_row("User property", muted, names, Some(switch), remove, n)
         });
         let rows: Vec<_> = rows.collect();
         let addable = shown.addable();
@@ -1076,79 +1085,139 @@ impl Navigator {
                     )
                 })
             });
-        v_flex()
-            .gap_1()
-            .when(shown.payload_format, |d| {
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().flex_1().text_sm().child("Payload format: UTF-8"))
-                        .child(remove(PropKind::PayloadFormat, cx)),
-                )
-            })
-            .when(shown.content_type, |d| {
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(Input::new(&self.comp.content_type.input).small()),
-                        )
-                        .child(
+        let section =
+            v_flex()
+                .gap_1()
+                .pr_2()
+                .when(shown.payload_format, |d| {
+                    d.child(prop_row(
+                        "Payload format",
+                        muted,
+                        div().text_sm().child("UTF-8"),
+                        None,
+                        remove(PropKind::PayloadFormat, cx),
+                        None,
+                    ))
+                })
+                .when(shown.content_type, |d| {
+                    d.child(prop_row(
+                        "Content type",
+                        muted,
+                        Input::new(&self.comp.content_type.input).small(),
+                        Some(
                             empty_switch("content-type-empty", self.comp.content_type_empty)
                                 .on_click(cx.listener(|v, on: &bool, _, cx| {
                                     v.comp.content_type_empty = *on;
                                     v.comp.model.edited();
                                     cx.notify();
                                 })),
-                        )
-                        .child(remove(PropKind::ContentType, cx)),
-                )
-                .children(note(self.comp.content_type.note("value", cx)))
-            })
-            .when(shown.response_topic, |d| {
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(Input::new(&self.comp.response_topic.input).small()),
-                        )
-                        .child(remove(PropKind::ResponseTopic, cx)),
-                )
-                .children(note(self.comp.response_topic.note("value", cx)))
-            })
-            .when(shown.correlation, |d| {
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(Input::new(&self.comp.correlation).small()),
-                        )
-                        .child(
+                        ),
+                        remove(PropKind::ContentType, cx),
+                        self.comp.content_type.note("value", cx),
+                    ))
+                })
+                .when(shown.response_topic, |d| {
+                    d.child(prop_row(
+                        "Response topic",
+                        muted,
+                        Input::new(&self.comp.response_topic.input).small(),
+                        None,
+                        remove(PropKind::ResponseTopic, cx),
+                        self.comp.response_topic.note("value", cx),
+                    ))
+                })
+                .when(shown.correlation, |d| {
+                    d.child(prop_row(
+                        "Correlation data (hex)",
+                        muted,
+                        Input::new(&self.comp.correlation).small(),
+                        Some(
                             empty_switch("correlation-empty", self.comp.correlation_empty)
                                 .on_click(cx.listener(|v, on: &bool, _, cx| {
                                     v.comp.correlation_empty = *on;
                                     v.comp.model.edited();
                                     cx.notify();
                                 })),
-                        )
-                        .child(remove(PropKind::Correlation, cx)),
-                )
-            })
-            .when(shown.expiry, |d| {
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().flex_1().child(Input::new(&self.comp.expiry).small()))
-                        .child(remove(PropKind::Expiry, cx)),
-                )
-            })
-            .children(rows)
+                        ),
+                        remove(PropKind::Correlation, cx),
+                        None,
+                    ))
+                })
+                .when(shown.expiry, |d| {
+                    d.child(prop_row(
+                        "Message expiry (seconds)",
+                        muted,
+                        Input::new(&self.comp.expiry).small(),
+                        None,
+                        remove(PropKind::Expiry, cx),
+                        None,
+                    ))
+                })
+                // The Name and Value captions stay visible when the fields have text.
+                .when(!rows.is_empty(), |d| {
+                    d.child(
+                        h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(div().w(ui(LABEL_WIDTH)))
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .gap_2()
+                                    .child(div().flex_1().child("Name"))
+                                    .child(div().flex_1().child("Value")),
+                            )
+                            .child(div().w(ui(END_WIDTH))),
+                    )
+                })
+                .children(rows);
+        // The rows scroll when there are many. The Add button and the action row stay in view.
+        v_flex()
+            .gap_1()
+            .child(section.max_h(ui(PROPS_MAX_HEIGHT)).overflow_y_scrollbar())
             .child(h_flex().child(add))
     }
+}
+
+/// One row of the Properties section: a label column, the field, and a column at the end for
+/// "Send empty" and Remove. A note (a line break or a hidden character) shows under the field.
+fn prop_row(
+    label: &'static str,
+    muted: Hsla,
+    field: impl IntoElement,
+    empty: Option<Switch>,
+    remove: Button,
+    note: Option<String>,
+) -> impl IntoElement {
+    v_flex()
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .w(ui(LABEL_WIDTH))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(label),
+                )
+                .child(div().flex_1().min_w_0().child(field))
+                .child(
+                    h_flex()
+                        .w(ui(END_WIDTH))
+                        .flex_none()
+                        .gap_1()
+                        .justify_end()
+                        .children(empty)
+                        .child(remove),
+                ),
+        )
+        .children(note.map(|n| {
+            div()
+                .pl(ui(LABEL_WIDTH + 8.))
+                .text_xs()
+                .text_color(muted)
+                .child(n)
+        }))
 }
