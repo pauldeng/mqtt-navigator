@@ -94,6 +94,26 @@ struct Spot {
     /// Where the row was drawn last (window coordinates).
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focus: FocusHandle,
+    /// The "Send empty" switch (in a wrapper that is not a tab stop) and the Remove button. A
+    /// move from one to the other stays inside the row, so the row handle sees no focus-in.
+    switch: FocusHandle,
+    remove: FocusHandle,
+}
+
+impl Spot {
+    /// The "Send empty" switch in a wrapper that tracks the switch handle.
+    fn switch_div(&self, switch: Switch) -> Div {
+        div().track_focus(&self.switch).child(switch)
+    }
+
+    fn new(cx: &mut Context<Navigator>) -> Self {
+        Self {
+            bounds: Rc::default(),
+            focus: cx.focus_handle(),
+            switch: cx.focus_handle(),
+            remove: cx.focus_handle().tab_stop(true),
+        }
+    }
 }
 
 /// The row element of a [`Spot`]: it tracks the focus and measures itself.
@@ -138,6 +158,8 @@ pub(super) struct Composer {
     std_spots: [Spot; 5],
     /// The width of the composer at the last layout. It sets the stacking of the property rows.
     width: Rc<Cell<Option<Pixels>>>,
+    /// Frames to draw after a change of the stacking, before the focused row is revealed.
+    settle: Rc<Cell<u8>>,
     /// The scroll position of the Properties area (the standard fields and the user rows).
     props_scroll: ScrollHandle,
     pub(super) mode: PayloadMode,
@@ -207,10 +229,7 @@ impl Composer {
                 v.check_json(cx);
             }
         }));
-        let std_spots: [Spot; 5] = std::array::from_fn(|_| Spot {
-            bounds: Rc::default(),
-            focus: cx.focus_handle(),
-        });
+        let std_spots: [Spot; 5] = std::array::from_fn(|_| Spot::new(cx));
         for kind in [
             PropKind::PayloadFormat,
             PropKind::ContentType,
@@ -218,11 +237,10 @@ impl Composer {
             PropKind::Correlation,
             PropKind::Expiry,
         ] {
-            subs.push(
-                cx.on_focus_in(&std_spots[kind as usize].focus, window, move |v, _, cx| {
-                    v.reveal_std(kind, cx)
-                }),
-            );
+            let spot = &std_spots[kind as usize];
+            for handle in [&spot.focus, &spot.switch, &spot.remove] {
+                subs.push(cx.on_focus_in(handle, window, move |v, _, cx| v.reveal_std(kind, cx)));
+            }
         }
         // A move inside a standard row (from Remove to the input) reveals the row too.
         for (kind, input) in [
@@ -250,6 +268,7 @@ impl Composer {
             next_row: 1,
             std_spots,
             width: Rc::default(),
+            settle: Rc::default(),
             props_scroll: ScrollHandle::new(),
             mode: PayloadMode::Text,
             qos: Qos::AtMostOnce,
@@ -347,10 +366,7 @@ impl Navigator {
         let (k, v) = (mk(window, cx, "Name", key), mk(window, cx, "Value", value));
         let id = self.comp.next_row;
         self.comp.next_row += 1;
-        let spot = Spot {
-            bounds: Rc::default(),
-            focus: cx.focus_handle(),
-        };
+        let spot = Spot::new(cx);
         // A focus that enters the row reveals it. An input also reveals the row when the focus
         // moves inside the row (for example from Name to Value, after the user scrolled away).
         let mut subs: Vec<Subscription> = [&k.input, &v.input]
@@ -363,9 +379,9 @@ impl Navigator {
                 })
             })
             .collect();
-        subs.push(cx.on_focus_in(&spot.focus, window, move |v, _, cx| {
-            v.reveal_user_row_id(id, cx)
-        }));
+        for handle in [&spot.focus, &spot.switch, &spot.remove] {
+            subs.push(cx.on_focus_in(handle, window, move |v, _, cx| v.reveal_user_row_id(id, cx)));
+        }
         UserRow {
             id,
             spot,
@@ -392,6 +408,19 @@ impl Navigator {
     /// The same for a standard property field.
     fn reveal_std(&mut self, kind: PropKind, cx: &mut Context<Self>) {
         let b = self.comp.std_spots[kind as usize].bounds.take();
+        self.reveal(b, cx);
+    }
+
+    /// The same for the row that has the focus, if any.
+    fn reveal_focused_row(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let b = self
+            .comp
+            .rows
+            .iter()
+            .map(|r| &r.spot)
+            .chain(self.comp.std_spots.iter())
+            .find(|s| s.focus.contains_focused(window, cx))
+            .and_then(|s| s.bounds.take());
         self.reveal(b, cx);
     }
 
@@ -466,6 +495,28 @@ impl Navigator {
             .expect("the row was drawn")
             .size
             .height
+    }
+
+    /// For the window tests: the Remove button of the last user row.
+    #[cfg(test)]
+    pub(super) fn last_user_remove_focus(&self) -> FocusHandle {
+        self.comp
+            .rows
+            .last()
+            .expect("a user row")
+            .spot
+            .remove
+            .clone()
+    }
+
+    /// For the window tests: the last user row is inside the scroll viewport.
+    #[cfg(test)]
+    pub(super) fn last_user_row_in_view(&self) -> bool {
+        let row = self.comp.rows.last().expect("a user row");
+        let (Some(b), view) = (row.spot.bounds.get(), self.comp.props_scroll.bounds()) else {
+            return false;
+        };
+        b.top() >= view.top() && b.bottom() <= view.bottom()
     }
 
     /// For the window tests: whether the property rows are stacked now.
@@ -1029,17 +1080,34 @@ impl Navigator {
         let hex = self.comp.mode == PayloadMode::Hex;
         let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();
-        let (rem, width) = (window.rem_size(), self.comp.width.clone());
+        let (rem, width, settle) = (
+            window.rem_size(),
+            self.comp.width.clone(),
+            self.comp.settle.clone(),
+        );
         let stacked = props_stacked(width.get(), rem);
-        // The composer measures itself. A change of the stacking draws the window again.
+        // The composer measures itself. A change of the stacking draws the window again, and two
+        // frames later (the rows have their new height) the row with the focus, if any, is shown.
         let this = cx.entity().downgrade();
         let measure = canvas(
             move |b, window, cx| {
                 let was = props_stacked(width.get(), rem);
                 width.set(Some(b.size.width));
                 if was != props_stacked(Some(b.size.width), rem) {
-                    window.defer(cx, move |_, cx| {
-                        this.update(cx, |_, cx| cx.notify()).ok();
+                    settle.set(2);
+                }
+                let left = settle.get();
+                if left > 0 {
+                    settle.set(left - 1);
+                    let this = this.clone();
+                    window.defer(cx, move |window, cx| {
+                        this.update(cx, |v, cx| {
+                            if left == 1 {
+                                v.reveal_focused_row(window, cx);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
                     });
                 }
             },
@@ -1116,7 +1184,7 @@ impl Navigator {
                     .on_click(cx.listener(|v, _, window, cx| v.close_composer(window, cx))),
             );
 
-        // The last result, the error or the JSON warning, under the payload (three lines at most).
+        // The last result, the error or the JSON warning, under the payload. Show long results on a maximum of three lines.
         let line = if let Some(e) = self.comp.error.clone() {
             div().text_xs().text_color(theme.danger).child(e)
         } else if let Some(w) = self.comp.json_warning.clone() {
@@ -1242,7 +1310,7 @@ impl Navigator {
                         .small(),
                 ),
             )
-            // A long text (a broker reason) takes at most three lines: the action row stays in view.
+            // Show long results on a maximum of three lines: the action row stays in view.
             .child(line.flex_none().line_clamp(3).text_ellipsis())
             .when(v5 && props_open, |d| {
                 d.child(self.render_props(stacked, cx))
@@ -1261,6 +1329,7 @@ impl Navigator {
             |id: &'static str, on: bool| Switch::new(id).checked(on).label("Send empty");
         let remove = |kind: PropKind, cx: &mut Context<Self>| {
             Button::new(("prop-remove", kind as usize))
+                .track_focus(&self.comp.std_spots[kind as usize].remove)
                 .small()
                 .ghost()
                 .icon(IconName::Close)
@@ -1297,6 +1366,7 @@ impl Navigator {
                     cx.notify();
                 }));
             let remove = Button::new(("user-prop-remove", id as usize))
+                .track_focus(&r.spot.remove)
                 .small()
                 .ghost()
                 .icon(IconName::Close)
@@ -1315,7 +1385,7 @@ impl Navigator {
                     "User property",
                     muted,
                     names,
-                    Some(switch),
+                    Some(r.spot.switch_div(switch)),
                     remove,
                     n,
                 ),
@@ -1369,12 +1439,19 @@ impl Navigator {
                                 .small()
                                 .aria_label("Content type"),
                             Some(
-                                empty_switch("content-type-empty", self.comp.content_type_empty)
-                                    .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                        v.comp.content_type_empty = *on;
-                                        v.comp.model.edited();
-                                        cx.notify();
-                                    })),
+                                self.comp.std_spots[PropKind::ContentType as usize].switch_div(
+                                    empty_switch(
+                                        "content-type-empty",
+                                        self.comp.content_type_empty,
+                                    )
+                                    .on_click(cx.listener(
+                                        |v, on: &bool, _, cx| {
+                                            v.comp.content_type_empty = *on;
+                                            v.comp.model.edited();
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
                             ),
                             remove(PropKind::ContentType, cx),
                             self.comp.content_type.note("value", cx),
@@ -1412,12 +1489,14 @@ impl Navigator {
                                 .small()
                                 .aria_label("Correlation data (hex)"),
                             Some(
-                                empty_switch("correlation-empty", self.comp.correlation_empty)
-                                    .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                        v.comp.correlation_empty = *on;
-                                        v.comp.model.edited();
-                                        cx.notify();
-                                    })),
+                                self.comp.std_spots[PropKind::Correlation as usize].switch_div(
+                                    empty_switch("correlation-empty", self.comp.correlation_empty)
+                                        .on_click(cx.listener(|v, on: &bool, _, cx| {
+                                            v.comp.correlation_empty = *on;
+                                            v.comp.model.edited();
+                                            cx.notify();
+                                        })),
+                                ),
                             ),
                             remove(PropKind::Correlation, cx),
                             None,
@@ -1494,7 +1573,7 @@ fn prop_row(
     label: &'static str,
     muted: Hsla,
     field: impl IntoElement,
-    empty: Option<Switch>,
+    empty: Option<Div>,
     remove: Button,
     note: Option<String>,
 ) -> impl IntoElement {

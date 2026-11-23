@@ -776,7 +776,35 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
             nav.read_with(cx, |v, _| v.props_offset()) < px(0.),
             "the area did not show the last row at {width} px"
         );
+        assert!(
+            nav.read_with(cx, |v, _| v.last_user_row_in_view()),
+            "the last row is not in the viewport at {width} px"
+        );
+        if width > 1000. {
+            // The wide order: Remove is the last control of the row.
+            let remove = nav.read_with(cx, |v, _| v.last_user_remove_focus());
+            assert!(
+                cx.update(|w, _| remove.is_focused(w)),
+                "Remove has no focus"
+            );
+        }
     }
+    // A move from "Send empty" to Remove stays inside the row: it reveals the row too.
+    cx.simulate_resize(size(px(1400.), px(900.)));
+    draw(cx);
+    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
+    cx.simulate_keystrokes("tab");
+    nav.update(cx, |v, _| v.scroll_props_to_top());
+    draw(cx);
+    cx.simulate_keystrokes("tab");
+    draw(cx);
+    let remove = nav.read_with(cx, |v, _| v.last_user_remove_focus());
+    assert!(
+        cx.update(|w, _| remove.is_focused(w)),
+        "Remove has no focus"
+    );
+    assert!(nav.read_with(cx, |v, _| v.last_user_row_in_view()));
     // A new standard field is at the top of the area: the area scrolls there. Payload format has
     // no input to focus.
     for kind in [PropKind::ContentType, PropKind::PayloadFormat] {
@@ -967,29 +995,47 @@ fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppCont
             v.profile = v.settings.profiles.first().cloned();
         })
     });
+    cx.update(|w, _| w.activate_window());
     cx.simulate_keystrokes("secondary-shift-n");
-    cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
-    let row_height = |cx: &mut VisualTestContext| {
-        for _ in 0..4 {
+    for _ in 0..20 {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.run_until_parked();
+    }
+    let draw = |cx: &mut VisualTestContext| {
+        for _ in 0..6 {
             cx.update(|w, _| w.refresh());
             cx.run_until_parked();
         }
         let rem = cx.update(|w, _| w.rem_size());
-        let (stacked, height) =
-            nav.read_with(cx, |v, _| (v.rows_stacked(rem), v.last_user_row_height()));
-        (stacked, height)
+        nav.read_with(cx, |v, _| {
+            (
+                v.rows_stacked(rem),
+                v.last_user_row_height(),
+                v.last_user_row_in_view(),
+            )
+        })
     };
-    let (stacked, wide) = row_height(cx);
-    assert!(!stacked, "a wide window");
-    cx.simulate_resize(size(px(700.), px(600.)));
-    let (stacked, narrow) = row_height(cx);
+    // The focus is in the last row (it is the last row of the area).
+    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
+    let (stacked, wide, in_view) = draw(cx);
+    assert!(!stacked && in_view, "a wide window");
+    cx.simulate_resize(size(px(700.), px(900.)));
+    let (stacked, narrow, in_view) = draw(cx);
     assert!(
         stacked && narrow > wide + px(10.),
         "a narrow window: {narrow:?} and {wide:?}"
     );
-    cx.simulate_resize(size(px(1400.), px(600.)));
-    let (stacked, again) = row_height(cx);
-    assert!(!stacked && again == wide, "a wide window again: {again:?}");
+    assert!(
+        in_view,
+        "the row with the focus is not in view after the resize"
+    );
+    cx.simulate_resize(size(px(1400.), px(900.)));
+    let (stacked, again, in_view) = draw(cx);
+    assert!(
+        !stacked && again == wide && in_view,
+        "a wide window again: {again:?}"
+    );
 }
 
 /// A full composer (all the standard properties and many user properties) keeps its action row
