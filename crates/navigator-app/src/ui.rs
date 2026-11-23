@@ -1835,7 +1835,7 @@ impl Navigator {
     /// A scrollbar drag moves the list with no wheel event. If the list left its top while Follow
     /// is on, Follow goes off. A scroll that is not yet drawn has no valid offset.
     fn leave_follow_if_dragged(&mut self) {
-        if !self.follow.on || self.view != View::Messages {
+        if !self.follow.on || self.view != View::Messages || self.store.is_paused() {
             return;
         }
         let y = {
@@ -2981,6 +2981,7 @@ impl Navigator {
             self.connected(),
             self.composer_protocol() == Protocol::V5,
             self.rem.to_bits(),
+            f32::from(self.subs_scroll.0.borrow().base_handle.offset().y).to_bits(),
             theme.theme_name(),
         )
             .hash(&mut h);
@@ -3571,7 +3572,8 @@ impl Navigator {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .px_2()
+                    .pl_2()
+                    .pr_3()
                     .justify_center()
                     .child(line)
                     .when(self.two_lines, |d| d.child(preview_el().w_full()));
@@ -3673,7 +3675,8 @@ impl Navigator {
                             .debug_selector(move || format!("tree-{}", node_key(id)))
                             .h(ui(TREE_ROW_H))
                             .w_full()
-                            .px_2()
+                            .pl_2()
+                            .pr_3()
                             .gap_2()
                             .text_sm()
                             .when_some(look.bg, |d, c| d.bg(c))
@@ -3871,11 +3874,19 @@ impl Navigator {
                         .child("msg/s"),
                 )
                 .when(show.memory, |d| {
-                    d.child(div().text_color(theme.warning).child(num(format!(
-                        "{} MiB / {}",
-                        s.used_bytes / MIB,
-                        crate::palette::memory_text(self.memory_mib())
-                    ))))
+                    let (limit, unit) = crate::palette::memory_text(self.memory_mib())
+                        .split_once(' ')
+                        .map(|(n, u)| (n.to_string(), u.to_string()))
+                        .unwrap_or_default();
+                    d.child(
+                        h_flex()
+                            .gap_1()
+                            .text_color(theme.warning)
+                            .child(num((s.used_bytes / MIB).to_string()))
+                            .child("MiB /")
+                            .child(num(limit))
+                            .child(unit),
+                    )
                 })
                 .when(s.list_drops > 0 && show.list_drops, |d| {
                     d.child(
