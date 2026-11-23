@@ -928,6 +928,27 @@ fn escape_in_a_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
     }
 }
 
+/// The composer stacks its property rows from the width of the centre pane. A narrow window gives a
+/// centre pane below the limit, a wide one gives more.
+#[gpui_kit::test]
+fn the_centre_width_for_the_composer_follows_the_window(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    let centre = |cx: &mut VisualTestContext| {
+        for _ in 0..3 {
+            cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
+        cx.update(|w, cx| nav.read(cx).centre_width(w, cx))
+            .expect("the pane sizes are known")
+    };
+    let wide = centre(cx);
+    cx.simulate_resize(size(px(700.), px(600.)));
+    let narrow = centre(cx);
+    assert!(wide > px(1000.), "wide: {wide:?}");
+    assert!(narrow > px(0.) && narrow < px(560.), "narrow: {narrow:?}");
+}
+
 /// A full composer (all the standard properties and many user properties) keeps its action row
 /// above the status bar in a small window. The properties scroll inside the composer.
 #[gpui_kit::test]

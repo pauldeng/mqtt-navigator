@@ -358,6 +358,19 @@ impl Navigator {
         self.reveal_row(self.comp.rows[ix].id, cx);
     }
 
+    /// The width of the centre pane: the window minus the side panes. The centre size that the pane
+    /// group keeps is not exact while panes show or hide, but the side sizes are.
+    pub(super) fn centre_width(&self, window: &Window, cx: &App) -> Option<Pixels> {
+        let sizes = self.panes.read(cx).sizes();
+        let (left, right) = (sizes.first()?, sizes.get(2)?);
+        let right = if self.details_open && !self.narrow {
+            *right
+        } else {
+            px(0.)
+        };
+        Some(window.viewport_size().width - *left - right)
+    }
+
     /// Writes a draft into the composer fields. It does not touch History.
     fn apply_draft(&mut self, d: &Draft, window: &mut Window, cx: &mut Context<Self>) {
         // A new set of rows starts at the top.
@@ -910,10 +923,7 @@ impl Navigator {
         let hex = self.comp.mode == PayloadMode::Hex;
         let props_open = self.comp.vis.props;
         let weak = cx.entity().downgrade();
-        let stacked = props_stacked(
-            self.panes.read(cx).sizes().get(1).copied(),
-            window.rem_size(),
-        );
+        let stacked = props_stacked(self.centre_width(window, cx), window.rem_size());
         // The `⋯` menu: Beautify JSON, Minify JSON, History… and Properties (MQTT 5).
         let more = Button::new("composer-more")
             .small()
