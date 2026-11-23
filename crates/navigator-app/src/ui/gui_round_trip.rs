@@ -1088,6 +1088,41 @@ fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppCont
     );
 }
 
+/// A result line that wraps takes room from the Properties area while the composer stays at its
+/// maximum height. The row with the focus stays in view.
+#[gpui_kit::test]
+fn a_long_result_line_keeps_the_focused_property_row_in_view(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
+    cx.update(|w, _| w.activate_window());
+    cx.simulate_resize(size(px(960.), px(600.)));
+    cx.simulate_keystrokes("secondary-shift-n");
+    for _ in 0..20 {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.run_until_parked();
+    }
+    let draw = |cx: &mut VisualTestContext| {
+        for _ in 0..6 {
+            cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
+        nav.read_with(cx, |v, _| v.last_user_row_in_view())
+    };
+    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
+    assert!(draw(cx), "the last row is in view first");
+    let long = "The broker refused the message for a long reason. ".repeat(6);
+    nav.update(cx, |v, cx| v.set_composer_error(&long, cx));
+    assert!(draw(cx), "the focused row is clipped by the result line");
+}
+
 /// A full composer (all the standard properties and many user properties) keeps its action row
 /// above the status bar in a small window. The properties scroll inside the composer.
 #[gpui_kit::test]
@@ -1122,11 +1157,17 @@ fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAp
     }
     // The default zoom (16 px rem) and 150% zoom (24 px rem).
     for rem in [16., 24.] {
-        cx.update(|w, _| w.set_rem_size(px(rem)));
+        // The zoom is the theme font size: a redraw sets the rem size from it.
+        cx.update(|_, cx| gpui_kit::component::Theme::global_mut(cx).font_size = px(rem));
         for _ in 0..4 {
             cx.update(|w, _| w.refresh());
             cx.run_until_parked();
         }
+        assert_eq!(
+            cx.update(|w, _| w.rem_size()),
+            px(rem),
+            "the zoom is not in use"
+        );
         let send = cx
             .debug_bounds("send")
             .expect("the Publish button is drawn");

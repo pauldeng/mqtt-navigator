@@ -530,6 +530,13 @@ impl Navigator {
         b.top() >= view.top() && b.bottom() <= view.bottom()
     }
 
+    /// For the window tests: sets the result line (an error) of the composer.
+    #[cfg(test)]
+    pub(super) fn set_composer_error(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.comp.error = Some(text.into());
+        cx.notify();
+    }
+
     /// For the window tests: the focus handles of the `⋯` button and of "Add property".
     #[cfg(test)]
     pub(super) fn menu_buttons_focus(&self) -> [FocusHandle; 2] {
@@ -1316,7 +1323,7 @@ impl Navigator {
                     .on_click(cx.listener(|v, _, window, cx| v.send(window, cx))),
             );
 
-        // The composer has a most height. The properties are the only part that shrinks: they scroll
+        // The composer has a maximum height. The properties are the only part that shrinks: they scroll
         // and the other rows (topic, payload, the action row) stay in view.
         v_flex()
             .relative()
@@ -1581,8 +1588,8 @@ impl Navigator {
                 )
                 .child(div().w(ui(END_WIDTH)).min_w_0())
         });
-        // The properties scroll as one block, down to nothing when the composer is at its most
-        // height. The Add button and the action row stay in view.
+        // The properties scroll as one block, down to nothing when the composer is at its
+        // maximum height. The Add button and the action row stay in view.
         v_flex()
             .gap_1()
             .min_h_0()
