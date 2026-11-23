@@ -24,8 +24,8 @@ use crate::inspector::size_text;
 
 /// Height of the payload editor (design pixels, see [`ui`]).
 const PAYLOAD_HEIGHT: f32 = 84.;
-/// Properties section: the width of the label column, the width of the column at the end of a row
-/// ("Send empty" and Remove), and the most height of the rows before they scroll.
+/// Properties section: the width of the label column, and the width of the column at the end of a
+/// row ("Send empty" and Remove).
 const LABEL_WIDTH: f32 = 160.;
 const END_WIDTH: f32 = 150.;
 /// A centre pane narrower than this stacks the label above the field: the label column, the end
@@ -34,11 +34,21 @@ const STACK_BELOW: f32 = 560.;
 /// The composer takes at most this part of the window height. The message list keeps the rest, and
 /// the properties scroll inside the composer.
 const MAX_HEIGHT_PART: f32 = 0.55;
+/// The least value of that most height, in design pixels.
+const MIN_MAX_HEIGHT: f32 = 330.;
 
 /// Whether a property row puts its label above the field, for a centre pane of width `centre`.
-/// Before the first layout, the width is unknown (`None`): the row stays in one line.
-fn props_stacked(centre: Option<Pixels>, rem: Pixels) -> bool {
-    centre.is_some_and(|w| w < ui(STACK_BELOW).to_pixels(rem))
+fn props_stacked(centre: Pixels, rem: Pixels) -> bool {
+    centre < ui(STACK_BELOW).to_pixels(rem)
+}
+
+/// The most height of the composer, for a window of height `window`: a part of the window, but
+/// not less than the fixed rows need (the topic, the payload, the action row and some room for
+/// the properties), also at a large zoom. The message list keeps the rest.
+fn composer_max_height(window: Pixels, rem: Pixels) -> Pixels {
+    (window * MAX_HEIGHT_PART)
+        .max(ui(MIN_MAX_HEIGHT).to_pixels(rem))
+        .min(window * 0.8)
 }
 
 /// Format refuses a payload above this size, and a result above [`FORMAT_MAX_OUT`]: setting a
@@ -77,6 +87,28 @@ impl Field {
     }
 }
 
+/// The place of a row in the Properties scroll area, and the focus handle that the row element
+/// tracks. A focus anywhere in the row (input, switch, Remove) reveals it.
+struct Spot {
+    /// Where the row was drawn last (window coordinates).
+    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    focus: FocusHandle,
+}
+
+/// The row element of a [`Spot`]: it tracks the focus and measures itself.
+fn spot_div(spot: &Spot, child: impl IntoElement) -> Div {
+    let place = spot.bounds.clone();
+    div()
+        .relative()
+        .track_focus(&spot.focus)
+        .child(
+            canvas(move |b, _, _| place.set(Some(b)), |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+        )
+        .child(child)
+}
+
 /// One row of user properties: two inputs and a remove button. A row with two empty inputs is
 /// unused, unless `keep_empty` is on: then the empty pair is sent.
 struct UserRow {
@@ -84,10 +116,7 @@ struct UserRow {
     key: Field,
     value: Field,
     keep_empty: bool,
-    /// Where the row was drawn last (window coordinates). A focus in the row scrolls to it.
-    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// Tracked by the row element. A focus anywhere in the row (input, switch, Remove) reveals it.
-    focus: FocusHandle,
+    spot: Spot,
     _subs: Vec<Subscription>,
 }
 
@@ -104,7 +133,9 @@ pub(super) struct Composer {
     expiry: Entity<InputState>,
     rows: Vec<UserRow>,
     next_row: u64,
-    /// The scroll position of the property rows.
+    /// The rows of the standard properties, in the order of [`PropKind`] (without `User`).
+    std_spots: [Spot; 5],
+    /// The scroll position of the Properties area (the standard fields and the user rows).
     props_scroll: ScrollHandle,
     pub(super) mode: PayloadMode,
     pub(super) qos: Qos,
@@ -127,6 +158,11 @@ pub(super) struct Composer {
 }
 
 impl Composer {
+    /// The row element of a standard property.
+    fn std_spot(&self, kind: PropKind, child: impl IntoElement) -> Div {
+        spot_div(&self.std_spots[kind as usize], child)
+    }
+
     pub(super) fn new(window: &mut Window, cx: &mut Context<Navigator>) -> Self {
         let input = |window: &mut Window, cx: &mut Context<Navigator>, hint: &'static str| {
             cx.new(|cx| InputState::new(window, cx).placeholder(hint))
@@ -168,6 +204,23 @@ impl Composer {
                 v.check_json(cx);
             }
         }));
+        let std_spots: [Spot; 5] = std::array::from_fn(|_| Spot {
+            bounds: Rc::default(),
+            focus: cx.focus_handle(),
+        });
+        for kind in [
+            PropKind::PayloadFormat,
+            PropKind::ContentType,
+            PropKind::ResponseTopic,
+            PropKind::Correlation,
+            PropKind::Expiry,
+        ] {
+            subs.push(
+                cx.on_focus_in(&std_spots[kind as usize].focus, window, move |v, _, cx| {
+                    v.reveal_std(kind, cx)
+                }),
+            );
+        }
         Self {
             topic: Field::new(topic),
             payload,
@@ -179,6 +232,7 @@ impl Composer {
             expiry,
             rows: Vec::new(),
             next_row: 1,
+            std_spots,
             props_scroll: ScrollHandle::new(),
             mode: PayloadMode::Text,
             qos: Qos::AtMostOnce,
@@ -276,22 +330,28 @@ impl Navigator {
         let (k, v) = (mk(window, cx, "Name", key), mk(window, cx, "Value", value));
         let id = self.comp.next_row;
         self.comp.next_row += 1;
-        let focus = cx.focus_handle();
+        let spot = Spot {
+            bounds: Rc::default(),
+            focus: cx.focus_handle(),
+        };
+        // A focus that enters the row reveals it. An input also reveals the row when the focus
+        // moves inside the row (for example from Name to Value, after the user scrolled away).
         let mut subs: Vec<Subscription> = [&k.input, &v.input]
             .into_iter()
             .map(|i| {
-                cx.subscribe(i, move |v, _, ev: &InputEvent, _| {
-                    if matches!(ev, InputEvent::Change) {
-                        v.comp.model.edited();
-                    }
+                cx.subscribe(i, move |v, _, ev: &InputEvent, cx| match ev {
+                    InputEvent::Change => v.comp.model.edited(),
+                    InputEvent::Focus => v.reveal_user_row_id(id, cx),
+                    _ => {}
                 })
             })
             .collect();
-        subs.push(cx.on_focus_in(&focus, window, move |v, _, cx| v.reveal_row(id, cx)));
+        subs.push(cx.on_focus_in(&spot.focus, window, move |v, _, cx| {
+            v.reveal_user_row_id(id, cx)
+        }));
         UserRow {
             id,
-            bounds: Rc::default(),
-            focus,
+            spot,
             key: k,
             value: v,
             // A pair that comes from a draft or a message is sent also when it is empty.
@@ -300,13 +360,28 @@ impl Navigator {
         }
     }
 
-    /// Scrolls the user property rows the least that shows row `id`. Tab can focus a row that
-    /// the scroll area hides. A row that was never drawn has no place: the caller scrolls.
-    fn reveal_row(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(row) = self.comp.rows.iter().find(|r| r.id == id) else {
-            return;
-        };
-        let Some(b) = row.bounds.get() else {
+    /// Scrolls the Properties area the least that shows the user row `id`. A row that was never
+    /// drawn has no place: the caller scrolls.
+    fn reveal_user_row_id(&mut self, id: u64, cx: &mut Context<Self>) {
+        let b = self
+            .comp
+            .rows
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.spot.bounds.get());
+        self.reveal(b, cx);
+    }
+
+    /// The same for a standard property field.
+    fn reveal_std(&mut self, kind: PropKind, cx: &mut Context<Self>) {
+        let b = self.comp.std_spots[kind as usize].bounds.get();
+        self.reveal(b, cx);
+    }
+
+    /// Scrolls the Properties area the least that shows `b`. Tab can focus a row that the area
+    /// hides.
+    fn reveal(&mut self, b: Option<Bounds<Pixels>>, cx: &mut Context<Self>) {
+        let Some(b) = b else {
             return;
         };
         let scroll = &self.comp.props_scroll;
@@ -333,7 +408,13 @@ impl Navigator {
 
     #[cfg(test)]
     pub(super) fn last_user_row_focus(&self) -> FocusHandle {
-        self.comp.rows.last().expect("a user row").focus.clone()
+        self.comp
+            .rows
+            .last()
+            .expect("a user row")
+            .spot
+            .focus
+            .clone()
     }
 
     #[cfg(test)]
@@ -355,20 +436,28 @@ impl Navigator {
 
     #[cfg(test)]
     pub(super) fn reveal_user_row(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.reveal_row(self.comp.rows[ix].id, cx);
+        self.reveal_user_row_id(self.comp.rows[ix].id, cx);
     }
 
-    /// The width of the centre pane: the window minus the side panes. The centre size that the pane
-    /// group keeps is not exact while panes show or hide, but the side sizes are.
-    pub(super) fn centre_width(&self, window: &Window, cx: &App) -> Option<Pixels> {
-        let sizes = self.panes.read(cx).sizes();
-        let (left, right) = (sizes.first()?, sizes.get(2)?);
-        let right = if self.details_open && !self.narrow {
-            *right
-        } else {
+    /// The width of the centre pane: the window minus the side panes. The side widths are the
+    /// ones that the layout uses (`pane_limits` clamps the saved widths to the window). The pane
+    /// group keeps its own sizes, but they can be old while a pane shows or the window changes.
+    pub(super) fn centre_width(&self, window: &Window, cx: &App) -> Pixels {
+        let limits = self.pane_limits(window);
+        let right = if !self.details_open || self.narrow {
             px(0.)
+        } else if self.insp.expanded {
+            // Expand uses its own, wider width.
+            self.panes
+                .read(cx)
+                .sizes()
+                .get(2)
+                .copied()
+                .unwrap_or(limits.right.0)
+        } else {
+            limits.right.0
         };
-        Some(window.viewport_size().width - *left - right)
+        window.viewport_size().width - limits.left.0 - right
     }
 
     /// Writes a draft into the composer fields. It does not touch History.
@@ -626,7 +715,8 @@ impl Navigator {
         if let Some(input) = focus {
             input.update(cx, |i, cx| i.focus(window, cx));
         }
-        // The new field must be in view: only the user rows scroll.
+        // A new user row is the last in the scroll area, and it has no place yet. The focus in a
+        // standard field reveals it (`reveal_std`).
         if kind == PropKind::User {
             self.comp.props_scroll.scroll_to_bottom();
         }
@@ -1096,7 +1186,10 @@ impl Navigator {
         v_flex()
             .key_context("Composer")
             .debug_selector(|| "composer".into())
-            .max_h(window.viewport_size().height * MAX_HEIGHT_PART)
+            .max_h(composer_max_height(
+                window.viewport_size().height,
+                window.rem_size(),
+            ))
             .on_action(cx.listener(|v, _: &CloseComposer, window, cx| v.close_composer(window, cx)))
             .border_t_1()
             .border_color(theme.border)
@@ -1179,16 +1272,9 @@ impl Navigator {
                     v.comp.payload.update(cx, |e, cx| e.focus(window, cx));
                     cx.notify();
                 }));
-            let place = r.bounds.clone();
-            div()
-                .relative()
-                .track_focus(&r.focus)
-                .child(
-                    canvas(move |b, _, _| place.set(Some(b)), |_, _, _, _| {})
-                        .absolute()
-                        .size_full(),
-                )
-                .child(prop_row(
+            spot_div(
+                &r.spot,
+                prop_row(
                     stacked,
                     "User property",
                     muted,
@@ -1196,7 +1282,8 @@ impl Navigator {
                     Some(switch),
                     remove,
                     n,
-                ))
+                ),
+            )
         });
         let rows: Vec<_> = rows.collect();
         let has_rows = !rows.is_empty();
@@ -1218,11 +1305,12 @@ impl Navigator {
                     )
                 })
             });
-        let section =
-            v_flex()
-                .gap_1()
-                .when(shown.payload_format, |d| {
-                    d.child(prop_row(
+        let section = v_flex()
+            .gap_1()
+            .when(shown.payload_format, |d| {
+                d.child(self.comp.std_spot(
+                    PropKind::PayloadFormat,
+                    prop_row(
                         stacked,
                         "Payload format",
                         muted,
@@ -1230,74 +1318,95 @@ impl Navigator {
                         None,
                         remove(PropKind::PayloadFormat, cx),
                         None,
-                    ))
-                })
-                .when(shown.content_type, |d| {
-                    d.child(prop_row(
-                        stacked,
-                        "Content type",
-                        muted,
-                        Input::new(&self.comp.content_type.input)
-                            .small()
-                            .aria_label("Content type"),
-                        Some(
-                            empty_switch("content-type-empty", self.comp.content_type_empty)
-                                .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                    v.comp.content_type_empty = *on;
-                                    v.comp.model.edited();
-                                    cx.notify();
-                                })),
+                    ),
+                ))
+            })
+            .when(shown.content_type, |d| {
+                d.child(
+                    self.comp.std_spot(
+                        PropKind::ContentType,
+                        prop_row(
+                            stacked,
+                            "Content type",
+                            muted,
+                            Input::new(&self.comp.content_type.input)
+                                .small()
+                                .aria_label("Content type"),
+                            Some(
+                                empty_switch("content-type-empty", self.comp.content_type_empty)
+                                    .on_click(cx.listener(|v, on: &bool, _, cx| {
+                                        v.comp.content_type_empty = *on;
+                                        v.comp.model.edited();
+                                        cx.notify();
+                                    })),
+                            ),
+                            remove(PropKind::ContentType, cx),
+                            self.comp.content_type.note("value", cx),
                         ),
-                        remove(PropKind::ContentType, cx),
-                        self.comp.content_type.note("value", cx),
-                    ))
-                })
-                .when(shown.response_topic, |d| {
-                    d.child(prop_row(
-                        stacked,
-                        "Response topic",
-                        muted,
-                        Input::new(&self.comp.response_topic.input)
-                            .small()
-                            .aria_label("Response topic"),
-                        None,
-                        remove(PropKind::ResponseTopic, cx),
-                        self.comp.response_topic.note("value", cx),
-                    ))
-                })
-                .when(shown.correlation, |d| {
-                    d.child(prop_row(
-                        stacked,
-                        "Correlation data (hex)",
-                        muted,
-                        Input::new(&self.comp.correlation)
-                            .small()
-                            .aria_label("Correlation data (hex)"),
-                        Some(
-                            empty_switch("correlation-empty", self.comp.correlation_empty)
-                                .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                    v.comp.correlation_empty = *on;
-                                    v.comp.model.edited();
-                                    cx.notify();
-                                })),
+                    ),
+                )
+            })
+            .when(shown.response_topic, |d| {
+                d.child(
+                    self.comp.std_spot(
+                        PropKind::ResponseTopic,
+                        prop_row(
+                            stacked,
+                            "Response topic",
+                            muted,
+                            Input::new(&self.comp.response_topic.input)
+                                .small()
+                                .aria_label("Response topic"),
+                            None,
+                            remove(PropKind::ResponseTopic, cx),
+                            self.comp.response_topic.note("value", cx),
                         ),
-                        remove(PropKind::Correlation, cx),
-                        None,
-                    ))
-                })
-                .when(shown.expiry, |d| {
-                    d.child(prop_row(
-                        stacked,
-                        "Message expiry (seconds)",
-                        muted,
-                        Input::new(&self.comp.expiry)
-                            .small()
-                            .aria_label("Message expiry (seconds)"),
-                        None,
-                        remove(PropKind::Expiry, cx),
-                        None,
-                    ))
-                });
+                    ),
+                )
+            })
+            .when(shown.correlation, |d| {
+                d.child(
+                    self.comp.std_spot(
+                        PropKind::Correlation,
+                        prop_row(
+                            stacked,
+                            "Correlation data (hex)",
+                            muted,
+                            Input::new(&self.comp.correlation)
+                                .small()
+                                .aria_label("Correlation data (hex)"),
+                            Some(
+                                empty_switch("correlation-empty", self.comp.correlation_empty)
+                                    .on_click(cx.listener(|v, on: &bool, _, cx| {
+                                        v.comp.correlation_empty = *on;
+                                        v.comp.model.edited();
+                                        cx.notify();
+                                    })),
+                            ),
+                            remove(PropKind::Correlation, cx),
+                            None,
+                        ),
+                    ),
+                )
+            })
+            .when(shown.expiry, |d| {
+                d.child(
+                    self.comp.std_spot(
+                        PropKind::Expiry,
+                        prop_row(
+                            stacked,
+                            "Message expiry (seconds)",
+                            muted,
+                            Input::new(&self.comp.expiry)
+                                .small()
+                                .aria_label("Message expiry (seconds)"),
+                            None,
+                            remove(PropKind::Expiry, cx),
+                            None,
+                        ),
+                    ),
+                )
+            });
         // The Name and Value captions (a stacked row has the hints in the inputs).
         let captions = (has_rows && !stacked).then(|| {
             h_flex()
@@ -1387,15 +1496,24 @@ fn prop_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{STACK_BELOW, props_stacked, ui};
+    use super::{STACK_BELOW, composer_max_height, props_stacked, ui};
     use gpui_kit::px;
 
     #[core::prelude::v1::test]
     fn rows_stack_in_a_narrow_pane_only() {
         let rem = px(16.);
-        // The least centre width (360) stacks. A wide centre and an unknown width do not.
-        assert!(props_stacked(Some(ui(360.).to_pixels(rem)), rem));
-        assert!(!props_stacked(Some(ui(STACK_BELOW).to_pixels(rem)), rem));
-        assert!(!props_stacked(None, rem));
+        // The least centre width (360) stacks. The limit and a wider centre do not.
+        assert!(props_stacked(ui(360.).to_pixels(rem), rem));
+        assert!(!props_stacked(ui(STACK_BELOW).to_pixels(rem), rem));
+    }
+
+    #[core::prelude::v1::test]
+    fn the_composer_height_is_a_part_of_the_window_with_a_floor() {
+        let (rem, big) = (px(16.), px(24.));
+        // 55% of a tall window. The floor of 330 design pixels at the least window height.
+        assert_eq!(composer_max_height(px(900.), rem), px(495.));
+        assert_eq!(composer_max_height(px(600.), rem), px(330.));
+        // At 150% zoom the floor grows with the rem, but the composer keeps 20% of the window.
+        assert_eq!(composer_max_height(px(600.), big), px(480.));
     }
 }
