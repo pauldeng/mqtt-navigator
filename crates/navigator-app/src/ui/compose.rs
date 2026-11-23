@@ -34,7 +34,7 @@ const STACK_BELOW: f32 = 560.;
 /// Two limits for the maximum height of the composer (see [`composer_max_height`]): a part of the
 /// window height, and a floor in design pixels.
 const MAX_HEIGHT_PART: f32 = 0.55;
-const MAX_HEIGHT_FLOOR: f32 = 250.;
+const MAX_HEIGHT_FLOOR: f32 = 280.;
 
 /// Whether a property row puts its label above the field, for a composer of width `width`.
 /// Before the first layout, the width is unknown (`None`): the rows stay in one line.
@@ -43,7 +43,7 @@ fn props_stacked(width: Option<Pixels>, rem: Pixels) -> bool {
 }
 
 /// The maximum height of the composer in a window of height `window`. First take 55% of the
-/// window. If that is less than the floor of 250 design pixels, take the floor: the fixed rows
+/// window. If that is less than the floor of 280 design pixels, take the floor: the fixed rows
 /// (topic, payload, action row) then keep their room at a large zoom. At the end, take at most 80%
 /// of the window. The message list keeps the rest.
 fn composer_max_height(window: Pixels, rem: Pixels) -> Pixels {
@@ -1686,11 +1686,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn the_composer_height_is_a_part_of_the_window_with_a_floor() {
         let (rem, big) = (px(16.), px(24.));
-        // 55% of a window. It is above the floor of 250 design pixels at the default zoom.
+        // 55% of a window. It is above the floor of 280 design pixels at the default zoom.
         assert_eq!(composer_max_height(px(900.), rem), px(495.));
         assert_eq!(composer_max_height(px(600.), rem), px(330.));
-        // At 150% zoom the floor (375 px) is above 55% of the window (330 px).
-        assert_eq!(composer_max_height(px(600.), big), px(375.));
+        // At 150% zoom the floor (420 px) is above 55% of the window (330 px).
+        assert_eq!(composer_max_height(px(600.), big), px(420.));
         // The composer takes at most 80% of the window.
         assert_eq!(composer_max_height(px(400.), big), px(320.));
     }

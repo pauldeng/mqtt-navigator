@@ -985,6 +985,12 @@ fn escape_in_a_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
             cx.update(|w, _| handle.is_focused(w)),
             "Escape did not return the focus to {button}"
         );
+        // The handle belongs to the button in the Tab order: Tab and Shift+Tab come back to it.
+        cx.simulate_keystrokes("tab shift-tab");
+        assert!(
+            cx.update(|w, _| handle.is_focused(w)),
+            "{button} is not in the Tab order"
+        );
     }
 }
 
@@ -1016,6 +1022,12 @@ fn escape_in_a_composer_menu_returns_the_focus_to_its_button(cx: &mut TestAppCon
         assert!(
             cx.update(|w, _| handle.is_focused(w)),
             "Escape did not return the focus to {button}"
+        );
+        // The handle belongs to the button in the Tab order: Tab and Shift+Tab come back to it.
+        cx.simulate_keystrokes("tab shift-tab");
+        assert!(
+            cx.update(|w, _| handle.is_focused(w)),
+            "{button} is not in the Tab order"
         );
     }
 }
@@ -1177,8 +1189,8 @@ fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAp
             .debug_bounds("status-bar")
             .expect("the status bar is drawn");
         // The composer takes 55% of the window at the default zoom, and at 150% zoom the floor
-        // (375 px). The status bar is below it.
-        let most = if rem == 16. { 0.55 } else { 0.625 };
+        // (420 px). The status bar is below it.
+        let most = if rem == 16. { 0.55 } else { 0.7 };
         assert!(
             composer.size.height <= window.height * most + px(1.)
                 && composer.bottom() <= status.top()
