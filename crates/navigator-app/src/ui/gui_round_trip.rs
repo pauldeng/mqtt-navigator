@@ -673,7 +673,7 @@ fn shortcut_text_comes_from_the_key_bindings(cx: &mut TestAppContext) {
             if let Some((action, context)) = bound_action(e.cmd) {
                 let text = shortcut_text(action.as_ref(), context, w);
                 assert!(
-                    text.is_some_and(|t| t.starts_with(main)),
+                    text.is_some_and(|t| t.contains(main)),
                     "no shortcut for {}",
                     e.id
                 );

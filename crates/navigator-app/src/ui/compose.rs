@@ -86,6 +86,8 @@ pub(super) struct Composer {
     expiry: Entity<InputState>,
     rows: Vec<UserRow>,
     next_row: u64,
+    /// The scroll position of the property rows.
+    props_scroll: ScrollHandle,
     pub(super) mode: PayloadMode,
     pub(super) qos: Qos,
     retain: bool,
@@ -159,6 +161,7 @@ impl Composer {
             expiry,
             rows: Vec::new(),
             next_row: 1,
+            props_scroll: ScrollHandle::new(),
             mode: PayloadMode::Text,
             qos: Qos::AtMostOnce,
             retain: false,
@@ -527,6 +530,12 @@ impl Navigator {
         };
         if let Some(input) = focus {
             input.update(cx, |i, cx| i.focus(window, cx));
+        }
+        // The new field must be in view: a user property is the last row, the others are first.
+        if kind == PropKind::User {
+            self.comp.props_scroll.scroll_to_bottom();
+        } else {
+            self.comp.props_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.comp.vis.props = true;
         self.comp.model.edited();
@@ -1175,7 +1184,18 @@ impl Navigator {
         // The rows scroll when there are many. The Add button and the action row stay in view.
         v_flex()
             .gap_1()
-            .child(section.max_h(ui(PROPS_MAX_HEIGHT)).overflow_y_scrollbar())
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        section
+                            .id("props-rows")
+                            .max_h(ui(PROPS_MAX_HEIGHT))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.comp.props_scroll),
+                    )
+                    .vertical_scrollbar(&self.comp.props_scroll),
+            )
             .child(h_flex().child(add))
     }
 }
@@ -1197,7 +1217,7 @@ fn prop_row(
                 .child(
                     div()
                         .w(ui(LABEL_WIDTH))
-                        .flex_none()
+                        .min_w_0()
                         .text_xs()
                         .text_color(muted)
                         .child(label),
@@ -1206,7 +1226,7 @@ fn prop_row(
                 .child(
                     h_flex()
                         .w(ui(END_WIDTH))
-                        .flex_none()
+                        .min_w_0()
                         .gap_1()
                         .justify_end()
                         .children(empty)
