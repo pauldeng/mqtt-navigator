@@ -954,26 +954,42 @@ fn escape_in_a_menu_returns_the_focus_to_its_button(cx: &mut TestAppContext) {
     }
 }
 
-/// The composer measures its own width and stacks the property rows below the limit. A window
-/// resize changes the stacking.
+/// The composer measures its own width and stacks the property rows below the limit: a user row
+/// has two lines in a narrow window. A window resize changes the stacking.
 #[gpui_kit::test]
 fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
     let (mut cx, nav) = open(cx);
     let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
     cx.simulate_keystrokes("secondary-shift-n");
-    let stacked = |cx: &mut VisualTestContext| {
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+    let row_height = |cx: &mut VisualTestContext| {
         for _ in 0..4 {
             cx.update(|w, _| w.refresh());
             cx.run_until_parked();
         }
         let rem = cx.update(|w, _| w.rem_size());
-        nav.read_with(cx, |v, _| v.rows_stacked(rem))
+        let (stacked, height) =
+            nav.read_with(cx, |v, _| (v.rows_stacked(rem), v.last_user_row_height()));
+        (stacked, height)
     };
-    assert!(!stacked(cx), "a wide window");
+    let (stacked, wide) = row_height(cx);
+    assert!(!stacked, "a wide window");
     cx.simulate_resize(size(px(700.), px(600.)));
-    assert!(stacked(cx), "a narrow window");
+    let (stacked, narrow) = row_height(cx);
+    assert!(
+        stacked && narrow > wide + px(10.),
+        "a narrow window: {narrow:?} and {wide:?}"
+    );
     cx.simulate_resize(size(px(1400.), px(600.)));
-    assert!(!stacked(cx), "a wide window again");
+    let (stacked, again) = row_height(cx);
+    assert!(!stacked && again == wide, "a wide window again: {again:?}");
 }
 
 /// A full composer (all the standard properties and many user properties) keeps its action row
