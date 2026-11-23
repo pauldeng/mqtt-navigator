@@ -283,7 +283,9 @@ impl Profile {
         if self.client_id.len() > topic::MAX_LEN || self.client_id.contains('\0') {
             errors.push(err("client_id", "The client ID is not valid."));
         }
-        if self.client_cert.is_some() != self.client_key.is_some() {
+        // Only TLS and WSS use the certificate files. Other transports ignore them.
+        if self.transport.is_encrypted() && self.client_cert.is_some() != self.client_key.is_some()
+        {
             errors.push(err(
                 "client_cert",
                 "Set both the client certificate and the client key, or neither.",
@@ -615,15 +617,15 @@ mod tests {
         };
         assert_eq!(
             fields(&bad, &[]),
-            [
-                "host",
-                "port",
-                "ws_path",
-                "client_cert",
-                "will.topic",
-                "subscriptions"
-            ]
+            ["host", "port", "ws_path", "will.topic", "subscriptions"]
         );
+        // TCP and WS ignore the certificate files. TLS and WSS need the pair.
+        assert!(!fields(&bad, &[]).contains(&"client_cert"));
+        let half = Profile {
+            transport: Transport::Wss,
+            ..bad.clone()
+        };
+        assert!(fields(&half, &[]).contains(&"client_cert"));
         // A hidden WebSocket path is not checked for TLS.
         let tls = Profile {
             ws_path: String::new(),

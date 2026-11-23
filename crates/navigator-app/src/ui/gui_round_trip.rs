@@ -536,3 +536,148 @@ fn a_history_row_shows_its_own_message_when_time_and_size_are_equal(cx: &mut Tes
     cx.run_until_parked();
     assert!(cx.debug_bounds("show-latest").is_some());
 }
+
+/// A key press that a focused button turns into a click: the click comes on the key up, and
+/// `simulate_keystrokes` sends the key down only.
+fn press(cx: &mut VisualTestContext, key: &'static str) {
+    use gpui_kit::{KeyDownEvent, KeyUpEvent, Keystroke};
+    let keystroke = Keystroke::parse(key).expect("key").clone();
+    cx.simulate_event(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(KeyUpEvent { keystroke });
+    cx.run_until_parked();
+}
+
+type Probe = (Option<&'static str>, Vec<&'static str>, [bool; 2], String);
+
+/// What the open connection sheet shows: see `ConnectionSheet::probe`.
+fn sheet_probe(cx: &mut VisualTestContext, nav: &Entity<Navigator>) -> Probe {
+    let sheet = open_sheet(cx, nav);
+    cx.update(|w, cx| sheet.read(cx).probe(w, cx))
+}
+
+fn open_sheet(
+    cx: &mut VisualTestContext,
+    nav: &Entity<Navigator>,
+) -> Entity<crate::connections::ConnectionSheet> {
+    nav.read_with(cx, |v, _| v.sheet.clone().and_then(|s| s.upgrade()))
+        .expect("the sheet is open")
+}
+
+/// Opens the sheet with Ctrl+N, types a name, a host and the port of the test Mosquitto (a
+/// default port could reach a broker on the machine), and leaves the focus in the port.
+fn new_sheet(cx: &mut VisualTestContext, nav: &Entity<Navigator>) {
+    cx.simulate_keystrokes("ctrl-n");
+    cx.run_until_parked();
+    cx.simulate_input("n");
+    cx.simulate_keystrokes("tab secondary-a");
+    cx.simulate_input("localhost");
+    cx.simulate_keystrokes("tab secondary-a");
+    cx.simulate_input("18830");
+    assert_eq!(sheet_probe(cx, nav).0, Some("port"));
+}
+
+/// Enter in a text field checks the form like "Save and connect": a wrong Will delay in the
+/// closed Advanced section opens it and takes the focus.
+#[gpui_kit::test]
+fn enter_in_a_field_shows_the_wrong_field_and_focuses_it(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    new_sheet(cx, &nav);
+    let sheet = open_sheet(cx, &nav);
+    cx.update(|w, cx| sheet.update(cx, |s, cx| s.make_invalid(true, w, cx)));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let (focus, errors, open, _) = sheet_probe(cx, &nav);
+    assert_eq!(errors, ["will.delay_secs"]);
+    assert_eq!(open, [true, false], "Advanced must open");
+    assert_eq!(focus, Some("will.delay_secs"));
+}
+
+/// A certificate without a key blocks Save with TLS: the section opens and "Choose…" has the
+/// focus.
+#[gpui_kit::test]
+fn a_certificate_without_a_key_opens_its_section_and_takes_the_focus(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    new_sheet(cx, &nav);
+    let sheet = open_sheet(cx, &nav);
+    cx.update(|w, cx| sheet.update(cx, |s, cx| s.make_invalid(false, w, cx)));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let (focus, errors, open, _) = sheet_probe(cx, &nav);
+    assert_eq!(errors, ["client_cert"]);
+    assert!(open[1], "the Client certificate section must open");
+    assert_eq!(focus, Some("client_cert"));
+    // The handle belongs to a rendered button: Enter presses it and opens the file prompt.
+    press(cx, "enter");
+    assert!(
+        cx.did_prompt_for_paths(),
+        "the focused handle is not the Choose button"
+    );
+}
+
+/// TCP does not use the certificate: the same draft saves.
+#[gpui_kit::test]
+fn a_certificate_without_a_key_does_not_block_a_tcp_save(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    new_sheet(cx, &nav);
+    let sheet = open_sheet(cx, &nav);
+    cx.update(|w, cx| {
+        sheet.update(cx, |s, cx| {
+            s.make_invalid(false, w, cx);
+            s.use_transport(Transport::Tcp, w, cx);
+        })
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        nav.read_with(cx, |v, _| v.settings.profiles.iter().any(|p| p.name == "n")),
+        "a half certificate blocked a TCP save"
+    );
+}
+
+/// Enter in a valid form saves the profile and starts the connect (without a broker it ends
+/// in a failure; the test checks the save and the start).
+#[gpui_kit::test]
+fn enter_in_a_valid_form_saves_and_connects(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    new_sheet(cx, &nav);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let saved = nav.read_with(cx, |v, _| {
+        v.settings
+            .profiles
+            .iter()
+            .any(|p| p.name == "n" && p.host == "localhost")
+    });
+    assert!(saved, "Enter did not save the profile");
+    assert!(
+        nav.read_with(cx, |v, _| v.connecting()
+            || v.status.state != ConnState::Disconnected),
+        "Enter saved but did not start the connect"
+    );
+}
+
+/// The rows of the saved connections are in the Tab order. Enter presses the row with the focus
+/// and Down moves to the next row.
+#[gpui_kit::test]
+fn the_connection_rows_work_with_the_keyboard(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.simulate_keystrokes("ctrl-n");
+    cx.run_until_parked();
+    assert_eq!(sheet_probe(cx, &nav).3, "New connection");
+    // From the name field: back to the "New connection" row, then to the saved profile.
+    cx.simulate_keystrokes("shift-tab shift-tab");
+    press(cx, "enter");
+    assert_eq!(sheet_probe(cx, &nav).3, "Edit gui round trip");
+    cx.simulate_keystrokes("down");
+    press(cx, "enter");
+    assert_eq!(sheet_probe(cx, &nav).3, "New connection");
+}
