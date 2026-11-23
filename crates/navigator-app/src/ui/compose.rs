@@ -34,7 +34,7 @@ const STACK_BELOW: f32 = 560.;
 /// Two limits for the maximum height of the composer (see [`composer_max_height`]): a part of the
 /// window height, and a floor in design pixels.
 const MAX_HEIGHT_PART: f32 = 0.55;
-const MAX_HEIGHT_FLOOR: f32 = 330.;
+const MAX_HEIGHT_FLOOR: f32 = 250.;
 
 /// Whether a property row puts its label above the field, for a composer of width `width`.
 /// Before the first layout, the width is unknown (`None`): the rows stay in one line.
@@ -43,7 +43,7 @@ fn props_stacked(width: Option<Pixels>, rem: Pixels) -> bool {
 }
 
 /// The maximum height of the composer in a window of height `window`. First take 55% of the
-/// window. If that is less than the floor of 330 design pixels, take the floor: the fixed rows
+/// window. If that is less than the floor of 250 design pixels, take the floor: the fixed rows
 /// (topic, payload, action row) then keep their room at a large zoom. At the end, take at most 80%
 /// of the window. The message list keeps the rest.
 fn composer_max_height(window: Pixels, rem: Pixels) -> Pixels {
@@ -1117,6 +1117,7 @@ impl Navigator {
         // The composer measures itself. A change of the stacking draws the window again, and two
         // frames later (the rows have their new height) the row with the focus, if any, is shown.
         let this = cx.entity().downgrade();
+        let (paint_this, paint_settle) = (this.clone(), settle.clone());
         let measure = canvas(
             move |b, window, cx| {
                 let old = size.get();
@@ -1126,11 +1127,7 @@ impl Navigator {
                     (o.width - b.size.width).abs() > px(0.5)
                         || (o.height - b.size.height).abs() > px(0.5)
                 });
-                // A result line can take room from the Properties area: its height changes.
-                let view = scroll.bounds().size.height;
-                let resized = (view_height.get() - view).abs() > px(0.5);
-                view_height.set(view);
-                if was != props_stacked(Some(b.size.width), rem) || moved || resized {
+                if was != props_stacked(Some(b.size.width), rem) || moved {
                     settle.set(2);
                 }
                 let left = settle.get();
@@ -1148,7 +1145,19 @@ impl Navigator {
                     });
                 }
             },
-            |_, _, _, _| {},
+            // A result line can take room from the Properties area: its height changes. The area
+            // has its new size when the window paints, so the check is here.
+            move |_, _, window, cx| {
+                let view = scroll.bounds().size.height;
+                if (view_height.get() - view).abs() > px(0.5) {
+                    view_height.set(view);
+                    paint_settle.set(2);
+                    let this = paint_this.clone();
+                    window.defer(cx, move |_, cx| {
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
+            },
         )
         .absolute()
         .size_full();
@@ -1677,10 +1686,12 @@ mod tests {
     #[core::prelude::v1::test]
     fn the_composer_height_is_a_part_of_the_window_with_a_floor() {
         let (rem, big) = (px(16.), px(24.));
-        // 55% of a tall window. The floor of 330 design pixels at the least window height.
+        // 55% of a window. It is above the floor of 250 design pixels at the default zoom.
         assert_eq!(composer_max_height(px(900.), rem), px(495.));
         assert_eq!(composer_max_height(px(600.), rem), px(330.));
-        // At 150% zoom the floor grows with the rem. The composer takes at most 80% of the window.
-        assert_eq!(composer_max_height(px(600.), big), px(480.));
+        // At 150% zoom the floor (375 px) is above 55% of the window (330 px).
+        assert_eq!(composer_max_height(px(600.), big), px(375.));
+        // The composer takes at most 80% of the window.
+        assert_eq!(composer_max_height(px(400.), big), px(320.));
     }
 }
