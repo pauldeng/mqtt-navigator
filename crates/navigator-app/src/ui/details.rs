@@ -782,25 +782,6 @@ impl Navigator {
         }
     }
 
-    /// A control of the details pane has the focus, but the pane is not on the screen. The last
-    /// drawn frame can already lack the pane (a dialog was open during a resize), so the check
-    /// does not only ask the pane. The sheet keeps its own focus.
-    pub(super) fn hidden_pane_has_focus(&self, window: &Window, cx: &App) -> bool {
-        use gpui_kit::Focusable as _;
-        let i = &self.insp;
-        !i.sheet_open
-            && (i.pane_focus.contains_focused(window, cx)
-                || i.value_focus.is_focused(window)
-                || i.hist_focus.is_focused(window)
-                || i.editor.read(cx).focus_handle(cx).is_focused(window)
-                || i.kind_select.read(cx).focus_handle(cx).is_focused(window)
-                || i.decoder_select
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window)
-                || i.topic_view.read(cx).focus_handle(cx).is_focused(window))
-    }
-
     /// The one close for the pane and the sheet. The focus returns to the list.
     fn close_details_area(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.narrow {

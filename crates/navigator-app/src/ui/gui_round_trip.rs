@@ -1789,3 +1789,31 @@ fn the_root_takes_the_focus_when_the_details_pane_closes(cx: &mut TestAppContext
         );
     }
 }
+
+/// A resize closes the details sheet while a dialog is open: the focus stays in the dialog and
+/// does not go to the list under it. It needs no broker.
+#[gpui_kit::test]
+fn a_resize_keeps_the_focus_in_an_open_dialog(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.simulate_resize(size(px(700.), px(900.)));
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.open_details_sheet(w, cx)));
+    cx.run_until_parked();
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.open_history(w, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|w, cx| w.has_active_dialog(cx)), "no dialog");
+    let held = cx
+        .update(|w, cx| w.focused(cx))
+        .expect("the dialog has no focus");
+    cx.simulate_resize(size(px(1400.), px(900.)));
+    cx.run_until_parked();
+    assert!(
+        !nav.read_with(cx, |v, _| v.insp.sheet_open),
+        "the sheet is open"
+    );
+    assert!(
+        cx.update(|w, _| held.is_focused(w)),
+        "the focus left the dialog"
+    );
+}

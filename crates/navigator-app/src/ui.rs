@@ -4021,22 +4021,35 @@ impl Render for Navigator {
             self.last_size = (f32::from(s.width), f32::from(s.height));
         }
         // Below NARROW px the details open as a sheet. A wide window shows them in the pane.
-        // The sheet closes in this frame when the window grows. Its focus is not a hidden pane.
-        let sheet_was_open = self.insp.sheet_open;
+        // The sheet closes in this frame when the window grows.
         self.narrow = needs_sheet(f32::from(window.viewport_size().width), self.rem);
         if self.narrow && self.insp.want_sheet {
             self.insp.want_sheet = false;
             cx.defer_in(window, |v, window, cx| v.open_details_sheet(window, cx));
         } else if !self.narrow && self.insp.sheet_open {
             self.insp.sheet_open = false;
-            cx.defer_in(window, |_, window, cx| window.close_sheet(cx));
+            cx.defer_in(window, |_, window, cx| {
+                // `close_sheet` moves the focus to the list: not from under an open dialog.
+                let held = window
+                    .has_active_dialog(cx)
+                    .then(|| window.focused(cx))
+                    .flatten();
+                window.close_sheet(cx);
+                if let Some(h) = held {
+                    h.focus(window, cx);
+                }
+            });
         }
         let chips = self.render_chips(cx);
         let show_details = self.details_open && !self.narrow;
-        // The pane is gone (for example a resize hid it) and held the focus: the root takes it.
-        if !show_details && !sheet_was_open && self.hidden_pane_has_focus(window, cx) {
-            let root = self.root_focus.clone();
-            cx.defer_in(window, move |_, window, cx| root.focus(window, cx));
+        // The pane is gone (a resize hid it) and a control of it holds the focus: the root takes
+        // it. After the draw, `is_rendered` tells if the handle is in the frame without the pane.
+        if let (false, Some(held)) = (show_details, window.focused(cx)) {
+            cx.defer_in(window, move |v, window, cx| {
+                if window.focused(cx).as_ref() == Some(&held) && !held.is_rendered(window) {
+                    v.root_focus.focus(window, cx);
+                }
+            });
         }
         let details = show_details.then(|| self.render_details(window, false, cx));
         if std::mem::take(&mut self.pane_reset) {
