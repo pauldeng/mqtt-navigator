@@ -1707,3 +1707,69 @@ fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAp
         );
     }
 }
+
+/// Enter in History closes it at once and the composer has the focus right away. A late focus
+/// restore could take the focus from a find bar. It needs no broker.
+#[gpui_kit::test]
+fn enter_in_history_closes_it_at_once(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.simulate_keystrokes("secondary-shift-n");
+    cx.run_until_parked();
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    let before = cx
+        .update(|w, cx| w.focused(cx))
+        .expect("a control has the focus");
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.open_history(w, cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|w, cx| w.has_active_dialog(cx)),
+        "History is closed"
+    );
+    cx.simulate_keystrokes("enter");
+    // No clock advance: the close must not wait for the exit time.
+    cx.run_until_parked();
+    assert!(
+        cx.update(|w, _| before.is_focused(w)),
+        "the composer has no focus right after Enter"
+    );
+}
+
+/// The pane closes while it holds the focus (a resize hides it): the root takes the focus. It
+/// needs no broker.
+#[gpui_kit::test]
+fn the_root_takes_the_focus_when_the_details_pane_closes(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    nav.update(cx, |v, cx| {
+        v.details_open = true;
+        cx.notify();
+    });
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    let (pane, root) = nav.read_with(cx, |v, _| (v.insp.pane_focus.clone(), v.root_focus.clone()));
+    cx.update(|w, cx| pane.focus(w, cx));
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.update(|w, _| pane.is_focused(w)),
+        "the pane has no focus"
+    );
+    nav.update(cx, |v, cx| {
+        v.details_open = false;
+        cx.notify();
+    });
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|w, _| root.is_focused(w)),
+        "nothing has the focus after the pane closes"
+    );
+}

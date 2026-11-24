@@ -191,7 +191,7 @@ struct UserRow {
 
 pub(super) struct Composer {
     topic: Field,
-    payload: Entity<EditorState>,
+    pub(super) payload: Entity<EditorState>,
     content_type: Field,
     /// Send the content type also when it is empty.
     content_type_empty: bool,
@@ -982,6 +982,12 @@ impl Navigator {
             let empty = drafts.is_empty() && sent.is_empty();
             dialog
                 .title("History")
+                // Enter closes at once, like Close. The default close restores the focus
+                // 250 ms later, which can take it from a find bar that opened in between.
+                .on_ok(|_, window, cx| {
+                    window.close_dialog(cx);
+                    false
+                })
                 .child(
                     v_flex()
                         .id("history-list")

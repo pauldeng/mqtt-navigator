@@ -4031,6 +4031,11 @@ impl Render for Navigator {
         }
         let chips = self.render_chips(cx);
         let show_details = self.details_open && !self.narrow;
+        // The pane is gone (for example a resize hid it) and held the focus: the root takes it.
+        if !show_details && self.insp.pane_focus.contains_focused(window, cx) {
+            let root = self.root_focus.clone();
+            cx.defer_in(window, move |_, window, cx| root.focus(window, cx));
+        }
         let details = show_details.then(|| self.render_details(window, false, cx));
         if std::mem::take(&mut self.pane_reset) {
             cx.defer_in(window, |v, window, cx| v.reset_panes(window, cx));
