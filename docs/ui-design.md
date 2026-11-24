@@ -110,7 +110,7 @@ The window has one place for each job. A control shows when it can act. Rare act
   - The topic and the property texts are single-line inputs. A text with a line break shows escaped (`\n`) with the note "This topic has line breaks; they are kept.". The composer keeps the exact text until you edit that field.
   - Content type, correlation data and each user property have **Send empty**: a property that is present but empty stays present in Edit and publish and in the sent message.
   - **Beautify JSON** and **Minify JSON** work up to 1 MiB of payload and 2 MiB of result, and it saves the old draft first. The Text/Hex switch saves the old draft, too.
-  - While disconnected, Publish is disabled and the composer shows "Connect to a broker first."
+  - While disconnected, Publish is disabled and the composer shows "Connect to a broker first." when it has no result to show. The result of the last publish stays on screen.
 - **Right pane, details of the selected message or topic:**
   - **Wide window (1 100 px or more):** the pane opens when you select a message or a topic, with the mouse or the keyboard. Its close button closes it. It stays closed until the next selection, or until you open it from the command palette ("Details: Open").
   - **Narrow window:** a click opens the details as a right-side sheet. Keyboard selection keeps the focus in the list, and `Enter` opens the sheet for the selected row. Closing the sheet returns the focus to the list.
