@@ -3989,6 +3989,16 @@ impl Render for Navigator {
         self.metrics.frame_start(window);
         self.arm_frame(window, cx);
         self.rem = f32::from(window.rem_size());
+        // Key bindings of the app need a focused control inside the root. With no focus (the
+        // window starts inactive, or a click on an empty area), the root takes it.
+        if window.focused(cx).is_none() {
+            let root = self.root_focus.clone();
+            cx.defer_in(window, move |_, window, cx| {
+                if window.focused(cx).is_none() {
+                    root.focus(window, cx);
+                }
+            });
+        }
         self.sync_subs();
         // A notify during the draw does not schedule a frame, so it goes out after the draw.
         let sig = self.sub_list_sig(cx.theme());

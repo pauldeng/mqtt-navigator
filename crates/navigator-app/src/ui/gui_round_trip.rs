@@ -605,6 +605,20 @@ fn send_payload(cx: &mut VisualTestContext, nav: &Entity<Navigator>, payload: Ve
     });
 }
 
+/// The app shortcuts work before the user clicks anything, even if no control has the focus
+/// (the window starts inactive on Windows). It needs no broker.
+#[gpui_kit::test]
+fn app_shortcuts_work_when_nothing_has_the_focus(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|w, cx| w.blur(cx));
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    cx.simulate_keystrokes("secondary-shift-n");
+    assert!(nav.read_with(cx, |v, _| v.comp.vis.open), "the composer is closed");
+}
+
 /// A JSON payload over the first limit shows its start as plain text, not a blank pane. It needs
 /// no broker.
 #[gpui_kit::test]
