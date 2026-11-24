@@ -4,6 +4,33 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-25
+
+### Changed
+
+- The app uses gpui-kit 0.11.0. The value pane of the details shows the current line only while it has the focus.
+- The composer has a maximum height. In a narrow centre pane, each property row uses two lines. Only the user property rows scroll. The Name and Value captions stay in view.
+- The message list and the tree take the focus with Tab. The command palette shows the shortcut of each command.
+- Tab is faster in a composer with many user properties. The composer builds only the rows near the visible area.
+- On Windows, the app waits less between two updates of the message list under heavy traffic (25 ms instead of 33 ms). Before, the window updated only 21 to 23 times a second. The new value is not measured on Windows yet.
+- Under very heavy traffic, the tree filter shows its result sooner (before: up to 1 s).
+
+### Fixed
+
+- A JSON payload larger than 256 KiB showed an empty value. The value now shows the start of the payload as plain text. Show more shows more of it, up to 256 KiB.
+- On a topic with fast, large messages, the value could stay at "Formatting…", and Show more and Show all were not available.
+- App shortcuts (for example `Ctrl+Shift+N`) did not work right after the app started.
+- The focus went back to the correct control after a menu, the connection sheet or the History dialog closed. Before, the focus could go to no control or to the wrong control.
+- After a disconnect, the message list said that a sent message was not sent. The composer hid the last publish result.
+- The subscriptions could show old data after a change of the connection profile.
+- History and the value could show the payload of a different message with the same topic, time and size.
+- The command palette could run a command that no longer applied, for example Disconnect after the broker closed the connection.
+- The connection sheet works with the keyboard: arrow keys in the saved list, and Enter in a field runs Save and connect. A validation error moves the focus to its field. TCP and WS do not check the client certificate and key. A new password or passphrase cancels the removal of the saved secret.
+- The message list, the tree, the subscriptions and History have scrollbars. A drag of the message list scrollbar away from the top turns off Follow.
+- At a high zoom, the details open in a sheet when the three panes do not fit.
+- Borders and the status bar had layout errors in the main window.
+- The `url` dependency had a security advisory (RUSTSEC-2026-0592).
+
 ## [0.2.5] - 2026-11-20
 
 ### Changed
@@ -227,7 +254,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.2...v0.2.3

@@ -4740,7 +4740,7 @@ dependencies = [
 
 [[package]]
 name = "navigator-app"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -4767,7 +4767,7 @@ dependencies = [
 
 [[package]]
 name = "navigator-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytes",
  "log",
@@ -4794,7 +4794,7 @@ dependencies = [
 
 [[package]]
 name = "navigator-update"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "dirs 7.0.0",
  "minisign",
