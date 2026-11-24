@@ -1241,11 +1241,10 @@ impl Navigator {
                 .text_color(theme.warning)
                 .child(format!("{w} Publish still sends it as is."))
         } else {
-            div().text_xs().text_color(muted).child(if connected {
-                result
-            } else {
-                "Connect to a broker first.".into()
-            })
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(result_line(connected, result))
         };
 
         let mode_ix = match self.comp.mode {
@@ -1665,10 +1664,31 @@ fn prop_row(
     head.children(note.map(|n| div().pl(ui(indent)).text_xs().text_color(muted).child(n)))
 }
 
+/// The line under the payload: the last result while there is one, else the hint for a closed
+/// connection.
+fn result_line(connected: bool, result: String) -> String {
+    if connected || !result.is_empty() {
+        result
+    } else {
+        "Connect to a broker first.".into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{STACK_BELOW, composer_max_height, props_stacked, ui};
+    use super::{STACK_BELOW, composer_max_height, props_stacked, result_line, ui};
     use gpui_kit::px;
+
+    #[core::prelude::v1::test]
+    fn a_closed_connection_keeps_the_last_result_on_screen() {
+        let unknown = "Unknown: the connection closed before the result.";
+        assert_eq!(result_line(false, unknown.into()), unknown);
+        assert_eq!(
+            result_line(false, String::new()),
+            "Connect to a broker first."
+        );
+        assert_eq!(result_line(true, "Sent".into()), "Sent");
+    }
 
     #[core::prelude::v1::test]
     fn rows_stack_in_a_narrow_pane_only() {
