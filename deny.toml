@@ -7,9 +7,9 @@ yanked = "deny"
 # Unmaintained transitive crates come from gpui; we cannot replace them. Direct dependencies are checked.
 unmaintained = "workspace"
 ignore = [
-  # chrono is unmaintained, and no fixed version exists. gpui-kit also depends on it, so a
-  # replacement in our code does not remove it. We use it only to read the local UTC offset.
-  { id = "RUSTSEC-2026-0543", reason = "transitive through gpui-kit; our use is one offset read" },
+  # chrono is unmaintained, and no fixed version exists. gpui-pre (the engine under gpui-kit)
+  # depends on it. Our own code does not use it.
+  { id = "RUSTSEC-2026-0543", reason = "transitive through gpui-pre; our code does not use it" },
 ]
 
 [licenses]
