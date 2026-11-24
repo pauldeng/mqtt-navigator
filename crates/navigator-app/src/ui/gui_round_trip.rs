@@ -1135,6 +1135,46 @@ fn rows_out_of_view_are_not_built_and_tab_still_walks_them(cx: &mut TestAppConte
     );
 }
 
+/// A window that gets taller shows more rows. The first frame after the resize must build them
+/// all: the scroll area still has its old size in that frame.
+#[gpui_kit::test]
+fn a_taller_window_builds_the_rows_that_it_shows_in_its_first_frame(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
+    cx.simulate_resize(size(px(1400.), px(600.)));
+    cx.update(|w, _| w.activate_window());
+    cx.simulate_keystrokes("secondary-shift-n");
+    for _ in 0..25 {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.run_until_parked();
+    }
+    let settle = |cx: &mut VisualTestContext| {
+        for _ in 0..3 {
+            cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
+    };
+    settle(cx);
+    nav.update(cx, |v, _| v.scroll_props_to_top());
+    settle(cx);
+    cx.simulate_resize(size(px(1400.), px(1100.)));
+    settle(cx);
+    // The frame with the new height ran inside `simulate_resize`.
+    let first = nav.read_with(cx, |v, _| v.resized_rows());
+    let settled = nav.read_with(cx, |v, _| v.drawn_rows());
+    assert!(
+        first >= settled,
+        "the first frame built {first} rows, the window shows {settled}"
+    );
+}
+
 /// Any control of a user property row scrolls the row into view when the focus enters the row, not
 /// only the inputs: Shift+Tab from "Add property" reaches a control of the last row (the Remove
 /// button in a wide pane). A hidden Remove button must not keep the focus (Enter would delete a
