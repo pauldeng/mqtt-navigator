@@ -574,6 +574,47 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
     });
 }
 
+/// The Show more button must stay inside the details pane. It needs no broker.
+#[gpui_kit::test]
+fn the_show_more_button_stays_inside_the_details_pane(cx: &mut TestAppContext) {
+    use navigator_core::net::Protocol;
+    use navigator_core::store::Insert;
+    use navigator_core::{Incoming, MsgProps, Qos};
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    nav.update(cx, |v, cx| {
+        let r = v.store.insert(Incoming {
+            generation: 0,
+            topic: "big".into(),
+            payload: vec![b'x'; 200 * 1024].into(),
+            qos: Qos::AtMostOnce,
+            retain: false,
+            props: MsgProps::default(),
+            received_at: std::time::SystemTime::UNIX_EPOCH,
+            protocol: Protocol::V5,
+        });
+        let Insert::Stored(id) = r else {
+            panic!("not stored");
+        };
+        v.select(id, v.gate.generation(), false, cx);
+    });
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    wait(cx, "the text", |cx| {
+        cx.update(|w, cx| {
+            w.draw(cx).clear(cx);
+        });
+        cx.debug_bounds("show-more").is_some()
+    });
+    let pane = cx.debug_bounds("details-pane").expect("details pane");
+    let button = cx.debug_bounds("show-more").expect("Show more");
+    assert!(
+        button.right() <= pane.right() && button.left() >= pane.left(),
+        "Show more {button:?} is outside the pane {pane:?}"
+    );
+}
+
 /// Two messages of one topic can share the receive time and the size. A History row must still
 /// show its own message. It needs no broker: the test fills the store itself.
 #[gpui_kit::test]
