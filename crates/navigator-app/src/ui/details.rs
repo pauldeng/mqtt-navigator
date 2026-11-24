@@ -792,7 +792,13 @@ impl Navigator {
             && (i.pane_focus.contains_focused(window, cx)
                 || i.value_focus.is_focused(window)
                 || i.hist_focus.is_focused(window)
-                || i.editor.read(cx).focus_handle(cx).is_focused(window))
+                || i.editor.read(cx).focus_handle(cx).is_focused(window)
+                || i.kind_select.read(cx).focus_handle(cx).is_focused(window)
+                || i.decoder_select
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+                || i.topic_view.read(cx).focus_handle(cx).is_focused(window))
     }
 
     /// The one close for the pane and the sheet. The focus returns to the list.

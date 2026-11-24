@@ -4021,6 +4021,8 @@ impl Render for Navigator {
             self.last_size = (f32::from(s.width), f32::from(s.height));
         }
         // Below NARROW px the details open as a sheet. A wide window shows them in the pane.
+        // The sheet closes in this frame when the window grows. Its focus is not a hidden pane.
+        let sheet_was_open = self.insp.sheet_open;
         self.narrow = needs_sheet(f32::from(window.viewport_size().width), self.rem);
         if self.narrow && self.insp.want_sheet {
             self.insp.want_sheet = false;
@@ -4032,7 +4034,7 @@ impl Render for Navigator {
         let chips = self.render_chips(cx);
         let show_details = self.details_open && !self.narrow;
         // The pane is gone (for example a resize hid it) and held the focus: the root takes it.
-        if !show_details && self.hidden_pane_has_focus(window, cx) {
+        if !show_details && !sheet_was_open && self.hidden_pane_has_focus(window, cx) {
             let root = self.root_focus.clone();
             cx.defer_in(window, move |_, window, cx| root.focus(window, cx));
         }
