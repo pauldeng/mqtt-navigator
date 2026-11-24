@@ -223,9 +223,16 @@ pub(super) struct Composer {
     draw_all: Cell<bool>,
     /// The stacking, the rem size and the width that the row heights (`Spot::extent`) belong to.
     rows_key: Cell<(bool, Pixels, Option<Pixels>)>,
+    /// The window height of the last frame. The scroll area has the old size until the next layout.
+    window_h: Cell<Pixels>,
+    #[cfg(all(test, debug_assertions))]
+    resized: Cell<bool>,
     /// For the window tests: how many user rows the last frame built.
     #[cfg(all(test, debug_assertions))]
     drawn_rows: Cell<usize>,
+    /// For the window tests: the rows built in the last frame that had a new window height.
+    #[cfg(all(test, debug_assertions))]
+    resized_rows: Cell<usize>,
     pub(super) mode: PayloadMode,
     pub(super) qos: Qos,
     retain: bool,
@@ -340,8 +347,13 @@ impl Composer {
             focus_row: Cell::new(None),
             draw_all: Cell::new(false),
             rows_key: Cell::new((false, px(0.), None)),
+            window_h: Cell::new(px(0.)),
+            #[cfg(all(test, debug_assertions))]
+            resized: Cell::new(false),
             #[cfg(all(test, debug_assertions))]
             drawn_rows: Cell::new(0),
+            #[cfg(all(test, debug_assertions))]
+            resized_rows: Cell::new(0),
             mode: PayloadMode::Text,
             qos: Qos::AtMostOnce,
             retain: false,
@@ -523,6 +535,11 @@ impl Navigator {
     #[cfg(all(test, debug_assertions))]
     pub(super) fn drawn_rows(&self) -> usize {
         self.comp.drawn_rows.get()
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    pub(super) fn resized_rows(&self) -> usize {
+        self.comp.resized_rows.get()
     }
 
     /// For the window tests: the scroll offset of the user rows.
@@ -1468,13 +1485,25 @@ impl Navigator {
             }
         }
         let scroll = &self.comp.props_scroll;
-        rows_in_view(
-            &extents,
-            &focused,
-            // A wheel scroll past an end is clamped in the next layout.
-            (-scroll.offset().y).clamp(px(0.), scroll.max_offset().y),
-            scroll.bounds().size.height,
-        )
+        // The size of the scroll area is from the last layout. After a resize it is too small for
+        // this frame, so take the largest size that the area can have.
+        let window_h = window.viewport_size().height;
+        let resized = self.comp.window_h.replace(window_h) != window_h;
+        let view = if resized {
+            composer_max_height(window_h, window.rem_size())
+        } else {
+            scroll.bounds().size.height
+        };
+        #[cfg(all(test, debug_assertions))]
+        self.comp.resized.set(resized);
+        let (max, old_view) = (scroll.max_offset().y, scroll.bounds().size.height);
+        // A wheel scroll past an end is clamped in the next layout.
+        let mut top = (-scroll.offset().y).clamp(px(0.), max);
+        if resized {
+            // A taller area has a smaller maximum offset, so the next layout moves the top up.
+            top = top.min(max + old_view - view).max(px(0.));
+        }
+        rows_in_view(&extents, &focused, top, view)
     }
 
     fn render_props(
@@ -1513,9 +1542,13 @@ impl Navigator {
             self.rows_to_draw(window, cx)
         };
         #[cfg(all(test, debug_assertions))]
-        self.comp
-            .drawn_rows
-            .set(draw.iter().filter(|d| **d).count());
+        {
+            let n = draw.iter().filter(|d| **d).count();
+            self.comp.drawn_rows.set(n);
+            if self.comp.resized.get() {
+                self.comp.resized_rows.set(n);
+            }
+        }
         let rows = self.comp.rows.iter().zip(draw).map(|(r, draw)| {
             if !draw {
                 // Out of view: an empty box of the height that the row had. It is no tab stop.
