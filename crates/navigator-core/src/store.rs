@@ -74,6 +74,10 @@ const PAUSED_LIST_FACTOR: usize = 10;
 /// load run (Xvfb, 50k msg/s), and that broke the 4 ms frame budget. 32 items take about 0.3 ms.
 const WORK_CHUNK: usize = 32;
 
+/// A call of `work` with at least this much time left has room for an eviction round and a
+/// rebuild round (an eviction round takes about 0.3 ms).
+const WORK_ROUND_ROOM: Duration = Duration::from_micros(500);
+
 /// Units one snapshot step handles. A unit walks the tree and copies a row. A round of 256
 /// units took up to 0.73 ms with a warm cache.
 const SNAP_CHUNK: usize = 16;
@@ -736,6 +740,9 @@ pub struct TopicStore {
     tree_flags: Vec<u8>,
     /// Nodes with an index below this one have their flags.
     tree_cursor: usize,
+    /// A `work` call with time for one round only evicts (true) or rebuilds the tree filter
+    /// (false). It changes with each call, so neither task starves.
+    evict_first: bool,
 
     // Pause.
     paused: bool,
@@ -814,6 +821,7 @@ impl TopicStore {
             tf: TreeFilterState::default(),
             tree_flags: Vec::new(),
             tree_cursor: 0,
+            evict_first: false,
             paused: false,
             cutoff: 0,
             paused_new: 0,
@@ -1682,13 +1690,33 @@ impl TopicStore {
     /// (paused), the list filter rebuild and the removal of rows above the cap (after a pause).
     /// Returns true while work remains.
     ///
-    /// One round is one step of the first task that has work (at most 32 items, 16 for the snapshot). A step takes
+    /// One round is one step of the first task that has work (at most 32 items, 16 for the snapshot).
+    /// A filter rebuild goes first, except in the first round of a call: that round evicts, so an
+    /// eviction batch and a rebuild do not starve each other (a call with no time left for a
+    /// second round alternates between them). A step takes
     /// some microseconds and never depends on the size of the store. The call does rounds until
     /// `deadline`. If `deadline` has passed already, it does exactly one round, so that repeated
     /// calls always make progress. The UI should not call it after its frame budget is used.
     pub fn work(&mut self, deadline: Instant) -> bool {
+        let mut first = true;
+        self.evict_first = !self.evict_first;
         loop {
-            if self.mem_pending() {
+            // The user waits for a filter rebuild, and it is short. An eviction batch is long (at
+            // 50k msg/s it ran for up to 1 s). So eviction takes the first round of a call that has
+            // time for more rounds, and the rebuild takes all other rounds. A call with time for
+            // one round alternates between them. Both make progress.
+            // Near a limit (more than 12.5% over the budget, or a full node cap) eviction goes
+            // first again, as it did before.
+            let urgent =
+                self.used() > self.limits.budget + self.limits.budget / 8 || self.nodes_pending();
+            let room = deadline.saturating_duration_since(Instant::now()) >= WORK_ROUND_ROOM;
+            let evict = first
+                && (self.evict_first || urgent || room)
+                && (self.mem_pending() || self.nodes_pending());
+            first = false;
+            if self.tf.active && self.tree_cursor < self.nodes.len() && !evict && !urgent {
+                self.tree_step(WORK_CHUNK);
+            } else if self.mem_pending() {
                 self.evict_step(WORK_CHUNK);
             } else if self.nodes_pending() {
                 self.evict_nodes_step(NODE_CHUNK);
@@ -4889,6 +4917,36 @@ mod tests {
              worst {worst3:?}, total {total3:?}, rows() {rows_time:?} ({rows} rows); site3 rows() \
              {rows3_time:?}; pause {pause_time:?} (10k rows), {pause_max_time:?} (cap)"
         );
+    }
+
+    /// A long eviction batch must not starve the filter rebuild, and the rebuild must not starve
+    /// eviction. Calls with a past deadline stand for frames with time for one round only.
+    #[test]
+    fn an_eviction_batch_does_not_starve_the_tree_filter_rebuild() {
+        let mut s = TopicStore::new(Limits {
+            budget: 4 * 1024 * 1024,
+            ..big()
+        });
+        let payload = vec![b'x'; 1000];
+        for i in 0..3000 {
+            s.insert(msg(&format!("g{}/n{i}", i % 10), b"1"));
+        }
+        let mut i = 0;
+        while !s.mem_pending() {
+            s.insert(msg(&format!("c/{}", i % 100), &payload));
+            i += 1;
+        }
+        s.set_tree_filter(TreeFilter {
+            text: "n29".into(),
+            ..TreeFilter::default()
+        });
+        let before = s.hist_order.len();
+        s.work(Instant::now());
+        s.work(Instant::now());
+        assert!(s.tree_cursor > 0, "the rebuild is starved");
+        assert!(s.hist_order.len() < before, "eviction is starved");
+        assert!(s.mem_pending(), "the eviction batch must still run");
+        audit(&s);
     }
 
     /// One `work` round removes at most `WORK_CHUNK` items. Eviction in a full store is slow (cold
