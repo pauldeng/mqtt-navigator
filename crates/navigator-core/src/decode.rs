@@ -142,8 +142,8 @@ fn is_cancelled(cancel: &AtomicBool) -> bool {
 }
 
 /// Decodes the first `limit` bytes of `payload`. Checks `cancel` while it works. For JSON, a
-/// payload longer than `limit` is an error (a cut document is not valid JSON): pass the full
-/// length to format it. The JSON parser itself cannot be cancelled.
+/// payload longer than `limit` shows the start as plain text with an error note (a cut document
+/// is not valid JSON): pass the full length to format it. The JSON parser itself cannot be cancelled.
 pub fn render(decoder: Decoder, payload: &[u8], limit: usize, cancel: &AtomicBool) -> Rendered {
     let cut = payload.len() > limit;
     let head = &payload[..payload.len().min(limit)];
@@ -152,9 +152,16 @@ pub fn render(decoder: Decoder, payload: &[u8], limit: usize, cancel: &AtomicBoo
     }
     match decoder {
         Decoder::Text => text(head, cut),
-        Decoder::Json if cut => Rendered::err(format!(
-            "The payload is larger than {limit} bytes. Show all to format it as JSON."
-        )),
+        // Over the limit: show the start as plain text, with a note. Show all formats the JSON.
+        Decoder::Json if cut => {
+            let mut r = text(head, true);
+            if r.error.is_none() {
+                r.error = Some(format!(
+                    "The payload is larger than {limit} bytes. Show all to format it as JSON."
+                ));
+            }
+            r
+        }
         Decoder::Json => json(head, true, cancel),
         Decoder::Hex => hex(head, cut, cancel),
         Decoder::Base64 => base64(head, cut, cancel),
@@ -617,6 +624,7 @@ mod tests {
     fn json_over_limit_asks_for_show_all() {
         let r = render(Decoder::Json, b"[1,2,3]", 3, &NO);
         assert!(r.error.expect("e").contains("Show all"));
+        assert_eq!((r.text.as_str(), r.truncated_at), ("[1,", Some(3)));
         assert_eq!(render(Decoder::Json, b"[1,2,3]", 7, &NO).error, None);
     }
 

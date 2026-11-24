@@ -124,7 +124,7 @@ pub(super) struct Inspector {
     task: Option<Task<()>>,
     /// A render job runs that nothing replaced.
     pub(super) running: bool,
-    editor: Entity<EditorState>,
+    pub(super) editor: Entity<EditorState>,
     pub(super) decoder_select: Entity<SelectState<Vec<DecoderItem>>>,
     kind_select: Entity<SelectState<Vec<KindItem>>>,
     /// A History row that the user chose. The Value tab shows it instead of the selection.
