@@ -16,7 +16,7 @@ anyhow = "1.0.104"
 bytes = "1.12.2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }  # local UTC offset, read once in the background
 dirs = "7.0.0"
-gpui-kit = { version = "0.10.0", features = ["tree-sitter"] }
+gpui-kit = { version = "0.11.0", features = ["tree-sitter"] }
 keyring-core = "1.0.1"
 navigator-core = { path = "../navigator-core" }
 navigator-update = { path = "../navigator-update" }
@@ -121,7 +121,7 @@ broker-tests = []
 [dev-dependencies]
 # The engine crates that gpui-kit uses, with their test support. Not gpui-kit/test-support: it names
 # optional gpui-fast crates, and Cargo then locks their exact wgpu pin for the whole build.
-gpui-pre = { version = "=0.3.12", features = ["test-support"] }
-gpui-pre-platform = { version = "=0.3.12", features = ["test-support"] }
+gpui-pre = { version = "=0.3.14", features = ["test-support"] }
+gpui-pre-platform = { version = "=0.3.14", features = ["test-support"] }
 tempfile = "3.27.0"
 uuid = { version = "1.29.3", features = ["v4"] }
