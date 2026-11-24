@@ -439,7 +439,7 @@ impl ConnectionSheet {
 
     /// For the window tests: what the user sees. The focused field, the field errors, whether
     /// the two collapsed sections are open, and the title.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn probe(
         &self,
         window: &Window,
@@ -466,25 +466,25 @@ impl ConnectionSheet {
     }
 
     /// For the window tests: the two "Remove the saved ..." boxes.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn removal_boxes(&self) -> [bool; 2] {
         [self.clear_password, self.clear_passphrase]
     }
 
     /// For the window tests: the hint of the password field.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn password_hint(&self) -> String {
         self.hints[0].to_string()
     }
 
     /// For the window tests: the password field takes the focus.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn focus_password(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.password.update(cx, |i, cx| i.focus(window, cx));
     }
 
     /// For the window tests: MQTT 5 with a wrong Will delay, or a certificate without a key.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn make_invalid(
         &mut self,
         will_delay: bool,
@@ -502,7 +502,7 @@ impl ConnectionSheet {
     }
 
     /// For the window tests: the transport, as the user picks it in the tab bar.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn use_transport(
         &mut self,
         t: Transport,
