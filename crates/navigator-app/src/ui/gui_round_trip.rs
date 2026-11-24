@@ -525,9 +525,22 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
             v.select(id, v.gate.generation(), false, cx);
         });
     };
+    // The first render too: a message that comes while the first job runs must not cancel it.
     send(cx, "aa");
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    let first = nav.read_with(cx, |v, _| v.insp.want);
+    send(cx, "zz");
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    assert!(
+        nav.read_with(cx, |v, _| v.insp.want == first),
+        "a new message replaced the first job"
+    );
     wait(cx, "the first text", |cx| {
-        nav.read_with(cx, |v, _| v.insp.full == "aa")
+        nav.read_with(cx, |v, _| v.insp.full == "zz")
     });
     send(cx, "bb");
     // One draw starts the job. The job has not run yet.
