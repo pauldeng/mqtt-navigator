@@ -497,6 +497,52 @@ fn the_sub_list_follows_a_profile_switch_without_a_focus_change(cx: &mut TestApp
     }
 }
 
+/// A topic that sends all the time must not show "Formatting…": a new message of the shown topic
+/// keeps the finished text until the new text is ready. It needs no broker.
+#[gpui_kit::test]
+fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut TestAppContext) {
+    use super::details::PayloadView;
+    use navigator_core::net::Protocol;
+    use navigator_core::store::Insert;
+    use navigator_core::{Incoming, MsgProps, Qos};
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    let send = |cx: &mut VisualTestContext, text: &'static str| {
+        nav.update(cx, |v, cx| {
+            let r = v.store.insert(Incoming {
+                generation: 0,
+                topic: "busy".into(),
+                payload: text.into(),
+                qos: Qos::AtMostOnce,
+                retain: false,
+                props: MsgProps::default(),
+                received_at: std::time::SystemTime::UNIX_EPOCH,
+                protocol: Protocol::V5,
+            });
+            let Insert::Stored(id) = r else {
+                panic!("not stored");
+            };
+            v.select(id, v.gate.generation(), false, cx);
+        });
+    };
+    send(cx, "aa");
+    wait(cx, "the first text", |cx| {
+        nav.read_with(cx, |v, _| v.insp.full == "aa")
+    });
+    send(cx, "bb");
+    // One draw starts the job. The job has not run yet.
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    assert!(
+        nav.read_with(cx, |v, _| matches!(v.insp.view, PayloadView::Done { .. })),
+        "the pane shows Formatting… for a new message of the same topic"
+    );
+    wait(cx, "the second text", |cx| {
+        nav.read_with(cx, |v, _| v.insp.full == "bb")
+    });
+}
+
 /// Two messages of one topic can share the receive time and the size. A History row must still
 /// show its own message. It needs no broker: the test fills the store itself.
 #[gpui_kit::test]

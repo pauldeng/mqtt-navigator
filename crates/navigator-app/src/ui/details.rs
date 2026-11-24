@@ -85,7 +85,7 @@ fn same_subject(a: DetailKey, b: DetailKey) -> bool {
 }
 
 /// The state of the payload view.
-enum PayloadView {
+pub(super) enum PayloadView {
     /// Nothing was built yet.
     Idle,
     /// The job runs. `blank`: the editor shows another message, so it shows "Formatting…".
@@ -117,7 +117,7 @@ pub(super) struct Inspector {
     more_task: Option<Task<()>>,
     jobs: Jobs,
     want: Option<Want>,
-    view: PayloadView,
+    pub(super) view: PayloadView,
     task: Option<Task<()>>,
     editor: Entity<EditorState>,
     pub(super) decoder_select: Entity<SelectState<Vec<DecoderItem>>>,
@@ -483,11 +483,21 @@ impl Navigator {
         if self.insp.want == Some(want) {
             return;
         }
+        // A new message of the shown topic keeps the finished text on screen until the new
+        // text is ready. A busy topic would show "Formatting…" for ever otherwise.
+        let refresh = !subject_changed
+            && self
+                .insp
+                .want
+                .is_some_and(|w| w.choice == want.choice && w.all == want.all)
+            && matches!(self.insp.view, PayloadView::Done { .. });
         self.insp.want = Some(want);
         let (generation, cancel) = self.insp.jobs.start();
-        self.insp.view = PayloadView::Running {
-            blank: subject_changed || matches!(self.insp.view, PayloadView::Idle),
-        };
+        if !refresh {
+            self.insp.view = PayloadView::Running {
+                blank: subject_changed || matches!(self.insp.view, PayloadView::Idle),
+            };
+        }
         let payload = s.msg.payload.clone();
         // Auto scans the payload (UTF-8 check): the job does it, not the UI thread. Only Auto
         // reads the properties.
@@ -537,8 +547,10 @@ impl Navigator {
         } = out;
         // A live topic sends the same text again and again: set_value would reset the scroll
         // position and the selection. The same text for the same subject changes nothing.
-        let same = matches!(self.insp.view, PayloadView::Running { blank: false })
-            && self.insp.text_hash == Some(hash);
+        let same = !matches!(
+            self.insp.view,
+            PayloadView::Idle | PayloadView::Running { blank: true }
+        ) && self.insp.text_hash == Some(hash);
         if !same {
             self.insp.text_hash = Some(hash);
             // The editor takes a small first window. The text then grows in timed steps.
