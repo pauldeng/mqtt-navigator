@@ -1212,6 +1212,32 @@ fn escape_in_the_sheet_from_the_connection_menu_focuses_the_menu_button(cx: &mut
     }
 }
 
+/// "Discard changes" after Escape in the sheet leaves the focus on the menu button. The
+/// question dialog gives the focus back late, and it must not win.
+#[gpui_kit::test]
+fn discard_changes_in_the_sheet_focuses_the_menu_button(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    for (ups, title) in [("up up up", "Edit"), ("up", "Manage")] {
+        click(cx, "connection-menu");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(ups);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        let handle = nav.read_with(cx, |v, _| v.menu_focus.clone());
+        assert!(
+            cx.update(|w, _| handle.is_focused(w)),
+            "the menu button has no focus after Discard ({title})"
+        );
+    }
+}
+
 /// Escape in a menu returns the focus to the button that opened it, not to the window root.
 /// The next Tab then continues from the button.
 #[gpui_kit::test]
