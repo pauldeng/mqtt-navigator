@@ -4043,8 +4043,9 @@ impl Render for Navigator {
         let chips = self.render_chips(cx);
         let show_details = self.details_open && !self.narrow;
         // The pane is gone (a resize hid it) and a control of it holds the focus: the root takes
-        // it. After the draw, `is_rendered` tells if the handle is in the frame without the pane.
-        if let (false, Some(held)) = (show_details, window.focused(cx)) {
+        // it. The sheet keeps its own focus. After the draw, `is_rendered` tells if the handle is
+        // in the frame without the pane.
+        if let (false, Some(held)) = (show_details || self.insp.sheet_open, window.focused(cx)) {
             cx.defer_in(window, move |v, window, cx| {
                 if window.focused(cx).as_ref() == Some(&held) && !held.is_rendered(window) {
                     v.root_focus.focus(window, cx);
