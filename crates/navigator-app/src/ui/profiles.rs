@@ -299,11 +299,15 @@ impl Navigator {
             }
             if let (Some(name), Some(id)) = (&edit_name, active) {
                 let w = weak.clone();
+                let back = focus.clone();
                 menu = menu.item(if command_line {
                     PopupMenuItem::new("Command line: not saved").disabled(true)
                 } else {
                     PopupMenuItem::new(format!("Edit \"{name}\"…")).on_click(
                         move |_, window, cx| {
+                            // The sheet returns the focus to the focus at its opening. The menu
+                            // is still open now, so focus the trigger first.
+                            back.focus(window, cx);
                             w.update(cx, |v, cx| v.open_sheet(Some(id), false, window, cx))
                                 .ok();
                         },
@@ -311,9 +315,11 @@ impl Navigator {
                 });
             }
             let w2 = weak.clone();
+            let back2 = focus.clone();
             menu.item(PopupMenuItem::new("New connection…").action(Box::new(NewConnection)))
                 .item(
                     PopupMenuItem::new("Manage connections…").on_click(move |_, window, cx| {
+                        back2.focus(window, cx);
                         w2.update(cx, |v, cx| v.open_sheet(None, false, window, cx))
                             .ok();
                     }),
