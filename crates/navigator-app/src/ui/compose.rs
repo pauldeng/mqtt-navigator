@@ -459,12 +459,12 @@ impl Navigator {
 
     /// For the window tests: the scroll offset of the user rows, and the reveal that a focus in row `ix` runs
     /// (the test window sends no focus events).
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn props_offset(&self) -> Pixels {
         self.comp.props_scroll.offset().y
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_row_focus(&self) -> FocusHandle {
         self.comp
             .rows
@@ -475,7 +475,7 @@ impl Navigator {
             .clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_value(&self) -> Entity<InputState> {
         self.comp
             .rows
@@ -491,13 +491,13 @@ impl Navigator {
         self.comp.props_scroll.set_offset(point(at.x, px(0.)));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn reveal_user_row(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.reveal_user_row_id(self.comp.rows[ix].id, cx);
     }
 
     /// For the window tests: the height of the last user row at the last layout.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_row_height(&self) -> Pixels {
         let row = self.comp.rows.last().expect("a user row");
         row.spot
@@ -509,7 +509,7 @@ impl Navigator {
     }
 
     /// For the window tests: the Remove button of the last user row.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_remove_focus(&self) -> FocusHandle {
         self.comp
             .rows
@@ -521,7 +521,7 @@ impl Navigator {
     }
 
     /// For the window tests: the last user row is inside the scroll viewport.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_row_in_view(&self) -> bool {
         let row = self.comp.rows.last().expect("a user row");
         let (Some(b), view) = (row.spot.bounds.get(), self.comp.props_scroll.bounds()) else {
@@ -531,20 +531,20 @@ impl Navigator {
     }
 
     /// For the window tests: sets the result line (an error) of the composer.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn set_composer_error(&mut self, text: &str, cx: &mut Context<Self>) {
         self.comp.error = Some(text.into());
         cx.notify();
     }
 
     /// For the window tests: the focus handles of the `⋯` button and of "Add property".
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn menu_buttons_focus(&self) -> [FocusHandle; 2] {
         [self.comp.more_focus.clone(), self.comp.add_focus.clone()]
     }
 
     /// For the window tests: whether the property rows are stacked now.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(super) fn rows_stacked(&self, rem: Pixels) -> bool {
         props_stacked(self.comp.size.get().map(|s| s.width), rem)
     }
