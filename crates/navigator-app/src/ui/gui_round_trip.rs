@@ -616,7 +616,10 @@ fn app_shortcuts_work_when_nothing_has_the_focus(cx: &mut TestAppContext) {
         w.draw(cx).clear(cx);
     });
     cx.simulate_keystrokes("secondary-shift-n");
-    assert!(nav.read_with(cx, |v, _| v.comp.vis.open), "the composer is closed");
+    assert!(
+        nav.read_with(cx, |v, _| v.comp.vis.open),
+        "the composer is closed"
+    );
 }
 
 /// A JSON payload over the first limit shows its start as plain text, not a blank pane. It needs
