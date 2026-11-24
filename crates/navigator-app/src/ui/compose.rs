@@ -457,8 +457,7 @@ impl Navigator {
         }
     }
 
-    /// For the window tests: the scroll offset of the user rows, and the reveal that a focus in row `ix` runs
-    /// (the test window sends no focus events).
+    /// For the window tests: the scroll offset of the user rows.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn props_offset(&self) -> Pixels {
         self.comp.props_scroll.offset().y
@@ -492,8 +491,8 @@ impl Navigator {
     }
 
     #[cfg(all(test, debug_assertions))]
-    pub(super) fn reveal_user_row(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.reveal_user_row_id(self.comp.rows[ix].id, cx);
+    pub(super) fn first_user_row_focus(&self) -> FocusHandle {
+        self.comp.rows[0].spot.focus.clone()
     }
 
     /// For the window tests: the height of the last user row at the last layout.
