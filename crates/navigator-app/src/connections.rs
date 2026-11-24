@@ -239,6 +239,8 @@ pub struct ConnectionSheet {
     /// The "Choose…" buttons of the certificate and the key. A certificate error focuses one.
     cert_focus: FocusHandle,
     key_focus: FocusHandle,
+    /// The focus when the sheet opened (the connection menu button). A closed sheet gives it back.
+    back: Option<FocusHandle>,
     /// The hints of the password and the passphrase field now (see `refresh_secret_hints`).
     hints: [&'static str; 2],
     /// The scroll position of the form. It has its own scroll area: see `render`.
@@ -397,6 +399,7 @@ impl ConnectionSheet {
             will_delay,
             cert_focus: cx.focus_handle(),
             key_focus: cx.focus_handle(),
+            back: window.focused(cx),
             hints: ["", ""],
             scroll,
             tops,
@@ -863,6 +866,18 @@ impl ConnectionSheet {
                 .cancel_text("Cancel")
                 .on_ok(move |_, window, cx| {
                     entity.update(cx, |s, cx| s.run(act, window, cx));
+                    if let (Act::Close, Some(back)) = (act, entity.read(cx).back.clone()) {
+                        // The dialog gives the focus back to the removed sheet after its exit.
+                        // Take the focus again one step later.
+                        let wait = *gpui_kit::component::dialog::ANIMATION_DURATION
+                            + std::time::Duration::from_millis(50);
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor().timer(wait).await;
+                                cx.update(|window, cx| back.focus(window, cx)).ok();
+                            })
+                            .detach();
+                    }
                     true
                 })
         });
