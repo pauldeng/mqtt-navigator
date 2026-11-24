@@ -74,10 +74,6 @@ const PAUSED_LIST_FACTOR: usize = 10;
 /// load run (Xvfb, 50k msg/s), and that broke the 4 ms frame budget. 32 items take about 0.3 ms.
 const WORK_CHUNK: usize = 32;
 
-/// A call of `work` with at least this much time left has room for an eviction round and a
-/// rebuild round (an eviction round takes about 0.3 ms).
-const WORK_ROUND_ROOM: Duration = Duration::from_micros(500);
-
 /// Units one snapshot step handles. A unit walks the tree and copies a row. A round of 256
 /// units took up to 0.73 ms with a warm cache.
 const SNAP_CHUNK: usize = 16;
@@ -740,9 +736,6 @@ pub struct TopicStore {
     tree_flags: Vec<u8>,
     /// Nodes with an index below this one have their flags.
     tree_cursor: usize,
-    /// A `work` call with time for one round only evicts (true) or rebuilds the tree filter
-    /// (false). It changes with each call, so neither task starves.
-    evict_first: bool,
 
     // Pause.
     paused: bool,
@@ -821,7 +814,6 @@ impl TopicStore {
             tf: TreeFilterState::default(),
             tree_flags: Vec::new(),
             tree_cursor: 0,
-            evict_first: false,
             paused: false,
             cutoff: 0,
             paused_new: 0,
@@ -1686,55 +1678,73 @@ impl TopicStore {
             || self.list.len() > self.list_cap()
     }
 
-    /// Does background work until `deadline`: the tree filter rebuild, the snapshot of the tree
-    /// (paused), the list filter rebuild and the removal of rows above the cap (after a pause).
-    /// Returns true while work remains.
+    /// Does background work until `deadline`: eviction, the tree filter rebuild, the snapshot of
+    /// the tree (paused), the list filter rebuild and the removal of rows above the cap (after a
+    /// pause). Returns true while work remains.
     ///
-    /// One round is one step of the first task that has work (at most 32 items, 16 for the snapshot).
-    /// A filter rebuild goes first, except in the first round of a call: that round evicts, so an
-    /// eviction batch and a rebuild do not starve each other (a call with no time left for a
-    /// second round alternates between them). A step takes
-    /// some microseconds and never depends on the size of the store. The call does rounds until
-    /// `deadline`. If `deadline` has passed already, it does exactly one round, so that repeated
-    /// calls always make progress. The UI should not call it after its frame budget is used.
+    /// One round is one step of one task (at most 32 items, 16 for the snapshot). A step takes
+    /// some microseconds and never depends on the size of the store. Every call does round 1 (an
+    /// eviction step, if one is due) and round 2 (a tree filter rebuild step, if one is due),
+    /// also when `deadline` has passed already. So neither task starves the other. If both have
+    /// nothing to do, the call does one step of another task, so that repeated calls always make
+    /// progress. Then the call does rounds until `deadline`. Near a limit (more than 12.5% over
+    /// the budget, or a full node cap) it evicts first. Otherwise it alternates between eviction
+    /// and rebuild. The UI should not call it after its frame budget is used.
     pub fn work(&mut self, deadline: Instant) -> bool {
-        let mut first = true;
-        self.evict_first = !self.evict_first;
+        let evicted = self.evict_round();
+        let rebuilt = self.tree_round();
+        if !evicted && !rebuilt {
+            self.other_round();
+        }
+        let mut rebuild_turn = false;
         loop {
-            // The user waits for a filter rebuild, and it is short. An eviction batch is long (at
-            // 50k msg/s it ran for up to 1 s). So eviction takes the first round of a call that has
-            // time for more rounds, and the rebuild takes all other rounds. A call with time for
-            // one round alternates between them. Both make progress.
-            // Near a limit (more than 12.5% over the budget, or a full node cap) eviction goes
-            // first again, as it did before.
-            let urgent =
-                self.used() > self.limits.budget + self.limits.budget / 8 || self.nodes_pending();
-            let room = deadline.saturating_duration_since(Instant::now()) >= WORK_ROUND_ROOM;
-            let evict = first
-                && (self.evict_first || urgent || room)
-                && (self.mem_pending() || self.nodes_pending());
-            first = false;
-            if self.tf.active && self.tree_cursor < self.nodes.len() && !evict && !urgent {
-                self.tree_step(WORK_CHUNK);
-            } else if self.mem_pending() {
-                self.evict_step(WORK_CHUNK);
-            } else if self.nodes_pending() {
-                self.evict_nodes_step(NODE_CHUNK);
-            } else if self.tf.active && self.tree_cursor < self.nodes.len() {
-                self.tree_step(WORK_CHUNK);
-            } else if self.snap_job.is_some() {
-                self.snap_step(SNAP_CHUNK);
-            } else if self.scanning {
-                self.list_step(WORK_CHUNK);
-            } else {
-                self.trim_rows(WORK_CHUNK);
-            }
             if !self.has_work() {
                 return false;
             }
             if Instant::now() >= deadline {
                 return true;
             }
+            let urgent =
+                self.used() > self.limits.budget + self.limits.budget / 8 || self.nodes_pending();
+            let did = (rebuild_turn && !urgent && self.tree_round())
+                || self.evict_round()
+                || self.tree_round();
+            if !did {
+                self.other_round();
+            }
+            rebuild_turn = !rebuild_turn;
+        }
+    }
+
+    /// One eviction step. Returns false if none is due.
+    fn evict_round(&mut self) -> bool {
+        if self.mem_pending() {
+            self.evict_step(WORK_CHUNK);
+        } else if self.nodes_pending() {
+            self.evict_nodes_step(NODE_CHUNK);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// One tree filter rebuild step. Returns false if none is due.
+    fn tree_round(&mut self) -> bool {
+        let due = self.tf.active && self.tree_cursor < self.nodes.len();
+        if due {
+            self.tree_step(WORK_CHUNK);
+        }
+        due
+    }
+
+    /// One step of the snapshot, the list rebuild or the row trim.
+    fn other_round(&mut self) {
+        if self.snap_job.is_some() {
+            self.snap_step(SNAP_CHUNK);
+        } else if self.scanning {
+            self.list_step(WORK_CHUNK);
+        } else {
+            self.trim_rows(WORK_CHUNK);
         }
     }
 
@@ -4942,10 +4952,33 @@ mod tests {
         });
         let before = s.hist_order.len();
         s.work(Instant::now());
-        s.work(Instant::now());
         assert!(s.tree_cursor > 0, "the rebuild is starved");
         assert!(s.hist_order.len() < before, "eviction is starved");
         assert!(s.mem_pending(), "the eviction batch must still run");
+        audit(&s);
+    }
+
+    /// At the node watermark, node eviction is always due. A call must still advance the
+    /// tree filter rebuild, and it must still evict.
+    #[test]
+    fn node_eviction_at_the_watermark_does_not_starve_the_tree_filter_rebuild() {
+        let mut s = TopicStore::new(Limits {
+            topic_cap: 100,
+            ..big()
+        });
+        let mut i = 0;
+        while !s.nodes_pending() {
+            s.insert(msg(&format!("t{i}"), b"1"));
+            i += 1;
+        }
+        s.set_tree_filter(TreeFilter {
+            text: "t1".into(),
+            ..TreeFilter::default()
+        });
+        let nodes = s.live_nodes;
+        s.work(Instant::now());
+        assert!(s.tree_cursor > 0, "the rebuild is starved");
+        assert!(s.live_nodes < nodes, "node eviction is starved");
         audit(&s);
     }
 
