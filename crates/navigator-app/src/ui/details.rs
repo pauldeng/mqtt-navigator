@@ -488,19 +488,20 @@ impl Navigator {
         if self.insp.want == Some(want) {
             return;
         }
-        // A new message of the shown topic keeps the finished text on screen until the new
-        // text is ready. A busy topic would show "Formatting…" for ever otherwise.
-        let refresh = !subject_changed
+        // A new message of the shown topic changes only the key.
+        let same_job = !subject_changed
             && self
                 .insp
                 .want
-                .is_some_and(|w| w.choice == want.choice && w.all == want.all)
-            && matches!(self.insp.view, PayloadView::Done { .. });
+                .is_some_and(|w| w.choice == want.choice && w.all == want.all);
         // A slow job must finish: a new message each time would cancel it, and the text would
         // never change. `render_done` notifies, and the next frame starts a job for the newest one.
-        if refresh && self.insp.running {
+        if same_job && self.insp.running {
             return;
         }
+        // The finished text stays on screen until the new text is ready. A busy topic would
+        // show "Formatting…" for ever otherwise.
+        let refresh = same_job && matches!(self.insp.view, PayloadView::Done { .. });
         self.insp.want = Some(want);
         self.insp.running = true;
         let (generation, cancel) = self.insp.jobs.start();
