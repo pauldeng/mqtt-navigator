@@ -1063,6 +1063,78 @@ fn focus_in_a_hidden_user_property_row_scrolls_to_it(cx: &mut TestAppContext) {
     );
 }
 
+/// Rows far from the viewport are empty boxes: a focus move draws the whole window, and each input
+/// costs time in every frame. Tab and Shift+Tab still walk through all rows, and the draw count
+/// stays small.
+#[gpui_kit::test]
+fn rows_out_of_view_are_not_built_and_tab_still_walks_them(cx: &mut TestAppContext) {
+    use crate::composer::PropKind;
+    const ROWS: usize = 25;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles[0].protocol = navigator_core::net::Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+        })
+    });
+    cx.update(|w, _| w.activate_window());
+    cx.simulate_keystrokes("secondary-shift-n");
+    let draw = |cx: &mut VisualTestContext| {
+        for _ in 0..3 {
+            cx.update(|w, _| w.refresh());
+            cx.run_until_parked();
+        }
+    };
+    for _ in 0..ROWS {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.run_until_parked();
+    }
+    draw(cx);
+    let drawn = |cx: &mut VisualTestContext| nav.read_with(cx, |v, _| v.drawn_rows());
+    assert!(drawn(cx) < ROWS, "all {ROWS} rows were built");
+    for (key, row) in [
+        (
+            "shift-tab",
+            nav.read_with(cx, |v, _| v.first_user_row_focus()),
+        ),
+        ("tab", nav.read_with(cx, |v, _| v.last_user_row_focus())),
+    ] {
+        let mut steps = 0;
+        while !cx.update(|w, cx| row.contains_focused(w, cx)) {
+            steps += 1;
+            assert!(steps < 6 * ROWS, "{key} did not reach the row");
+            cx.simulate_keystrokes(key);
+            draw(cx);
+            assert!(drawn(cx) < ROWS, "all {ROWS} rows were built after {key}");
+        }
+        assert!(
+            nav.read_with(cx, |v, _| v.props_offset()) <= px(0.),
+            "{key}: bad offset"
+        );
+    }
+    assert!(nav.read_with(cx, |v, _| v.last_user_row_in_view()));
+    // The user scrolls away from the focused last row: Shift+Tab still goes to the row before it.
+    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
+    nav.update(cx, |v, _| v.scroll_props_to_top());
+    draw(cx);
+    let (last_row, before) = nav.read_with(cx, |v, _| {
+        (v.last_user_row_focus(), v.user_row_focus(ROWS - 2))
+    });
+    for _ in 0..6 {
+        if !cx.update(|w, cx| last_row.contains_focused(w, cx)) {
+            break;
+        }
+        cx.simulate_keystrokes("shift-tab");
+        draw(cx);
+    }
+    assert!(
+        cx.update(|w, cx| before.contains_focused(w, cx)),
+        "Shift+Tab skipped the rows before the last row"
+    );
+}
+
 /// Any control of a user property row scrolls the row into view when the focus enters the row, not
 /// only the inputs: Shift+Tab from "Add property" reaches a control of the last row (the Remove
 /// button in a wide pane). A hidden Remove button must not keep the focus (Enter would delete a

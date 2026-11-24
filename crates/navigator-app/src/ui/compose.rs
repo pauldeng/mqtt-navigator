@@ -42,6 +42,43 @@ fn props_stacked(width: Option<Pixels>, rem: Pixels) -> bool {
     width.is_some_and(|w| w < ui(STACK_BELOW).to_pixels(rem))
 }
 
+/// Rows that the Properties area builds: the rows near the viewport `[top, top + view]` of the
+/// scroll content (a margin of two rows on each side), the first and the last row, the rows with
+/// the focus and two rows on each side of them (so that Tab and Shift+Tab find their next stop),
+/// and every row without an extent. `extents` has the top and the height of each row from its
+/// last draw. The first and the last row are always built, so their tops are current. The gap
+/// between rows comes from them (the display scale rounds it), and the tops of the rows between
+/// come from their heights and the gap.
+fn rows_in_view(
+    extents: &[Option<(Pixels, Pixels)>],
+    focused: &[bool],
+    top: Pixels,
+    view: Pixels,
+) -> Vec<bool> {
+    const MARGIN_ROWS: f32 = 2.;
+    let n = extents.len();
+    let all: Option<Vec<(Pixels, Pixels)>> = extents.iter().copied().collect();
+    let (Some(rows), true, true) = (all, n > 1, view > px(0.)) else {
+        return vec![true; n];
+    };
+    let heights: Pixels = rows[..n - 1].iter().map(|r| r.1).sum();
+    let gap = (rows[n - 1].0 - rows[0].0 - heights) / (n - 1) as f32;
+    let margin = (rows[0].1 + gap) * MARGIN_ROWS;
+    let mut y = rows[0].0;
+    let near_focus = |i: usize| (i.saturating_sub(2)..=(i + 2).min(n - 1)).any(|k| focused[k]);
+    rows.iter()
+        .enumerate()
+        .map(|(i, &(_, h))| {
+            let at = y;
+            y += h + gap;
+            i == 0
+                || i == n - 1
+                || near_focus(i)
+                || (at + h >= top - margin && at <= top + view + margin)
+        })
+        .collect()
+}
+
 /// The maximum height of the composer in a window of height `window`. First take 55% of the
 /// window. If that is less than the floor of 280 design pixels, take the floor: the fixed rows
 /// (topic, payload, action row) then keep their room at a large zoom. At the end, take at most 80%
@@ -93,6 +130,9 @@ impl Field {
 struct Spot {
     /// Where the row was drawn last (window coordinates).
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The top of the row in the scroll content, and its height, from the last draw. A row that
+    /// the window skips (see [`rows_to_draw`]) keeps its last value.
+    extent: Rc<Cell<Option<(Pixels, Pixels)>>>,
     focus: FocusHandle,
     /// The "Send empty" switch (in a wrapper that is not a tab stop) and the Remove button. A
     /// move from one to the other stays inside the row, so the row handle sees no focus-in.
@@ -109,6 +149,7 @@ impl Spot {
     fn new(cx: &mut Context<Navigator>) -> Self {
         Self {
             bounds: Rc::default(),
+            extent: Rc::default(),
             focus: cx.focus_handle(),
             switch: cx.focus_handle(),
             remove: cx.focus_handle().tab_stop(true),
@@ -117,15 +158,22 @@ impl Spot {
 }
 
 /// The row element of a [`Spot`]: it tracks the focus and measures itself.
-fn spot_div(spot: &Spot, child: impl IntoElement) -> Div {
-    let place = spot.bounds.clone();
+fn spot_div(spot: &Spot, scroll: &ScrollHandle, child: impl IntoElement) -> Div {
+    let (place, extent, scroll) = (spot.bounds.clone(), spot.extent.clone(), scroll.clone());
     div()
         .relative()
         .track_focus(&spot.focus)
         .child(
-            canvas(move |b, _, _| place.set(Some(b)), |_, _, _, _| {})
-                .absolute()
-                .size_full(),
+            canvas(
+                move |b, _, _| {
+                    place.set(Some(b));
+                    let content_top = scroll.bounds().top() + scroll.offset().y;
+                    extent.set(Some((b.top() - content_top, b.size.height)));
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
         )
         .child(child)
 }
@@ -169,6 +217,15 @@ pub(super) struct Composer {
     view_height: Rc<Cell<Pixels>>,
     /// The scroll position of the Properties area (the standard fields and the user rows).
     props_scroll: ScrollHandle,
+    /// The row that had the focus last (it stays built, see `rows_to_draw`).
+    focus_row: Cell<Option<u64>>,
+    /// Build every user row in the next frame (see `render_props`).
+    draw_all: Cell<bool>,
+    /// The stacking, the rem size and the width that the row heights (`Spot::extent`) belong to.
+    rows_key: Cell<(bool, Pixels, Option<Pixels>)>,
+    /// For the window tests: how many user rows the last frame built.
+    #[cfg(all(test, debug_assertions))]
+    drawn_rows: Cell<usize>,
     pub(super) mode: PayloadMode,
     pub(super) qos: Qos,
     retain: bool,
@@ -192,7 +249,7 @@ pub(super) struct Composer {
 impl Composer {
     /// The row element of a standard property.
     fn std_spot(&self, kind: PropKind, child: impl IntoElement) -> Div {
-        spot_div(&self.std_spots[kind as usize], child)
+        spot_div(&self.std_spots[kind as usize], &self.props_scroll, child)
     }
 
     pub(super) fn new(window: &mut Window, cx: &mut Context<Navigator>) -> Self {
@@ -280,6 +337,11 @@ impl Composer {
             settle: Rc::default(),
             view_height: Rc::default(),
             props_scroll: ScrollHandle::new(),
+            focus_row: Cell::new(None),
+            draw_all: Cell::new(false),
+            rows_key: Cell::new((false, px(0.), None)),
+            #[cfg(all(test, debug_assertions))]
+            drawn_rows: Cell::new(0),
             mode: PayloadMode::Text,
             qos: Qos::AtMostOnce,
             retain: false,
@@ -457,6 +519,12 @@ impl Navigator {
         }
     }
 
+    /// For the window tests: how many user rows the last frame built.
+    #[cfg(all(test, debug_assertions))]
+    pub(super) fn drawn_rows(&self) -> usize {
+        self.comp.drawn_rows.get()
+    }
+
     /// For the window tests: the scroll offset of the user rows.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn props_offset(&self) -> Pixels {
@@ -488,6 +556,11 @@ impl Navigator {
     pub(super) fn scroll_props_to_top(&mut self) {
         let at = self.comp.props_scroll.offset();
         self.comp.props_scroll.set_offset(point(at.x, px(0.)));
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    pub(super) fn user_row_focus(&self, i: usize) -> FocusHandle {
+        self.comp.rows[i].spot.focus.clone()
     }
 
     #[cfg(all(test, debug_assertions))]
@@ -807,6 +880,7 @@ impl Navigator {
         // standard field reveals it (`reveal_std`).
         if kind == PropKind::User {
             self.comp.props_scroll.scroll_to_bottom();
+            self.comp.draw_all.set(true);
         }
         self.comp.vis.props = true;
         self.comp.model.edited();
@@ -1358,7 +1432,7 @@ impl Navigator {
             // Show long results on a maximum of three lines: the action row stays in view.
             .child(line.flex_none().line_clamp(3).text_ellipsis())
             .when(v5 && props_open, |d| {
-                d.child(self.render_props(stacked, cx))
+                d.child(self.render_props(stacked, window, cx))
             })
             .child(controls.flex_none())
             .into_any_element()
@@ -1367,7 +1441,48 @@ impl Navigator {
     /// The "Properties" section: only the fields that are present, and an "Add property" menu
     /// for the others. "Send empty" keeps a property that is present but empty. A line break or
     /// a hidden character in a text is kept (see [`LineKeep`]).
-    fn render_props(&self, stacked: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Which user rows to build in this frame. Each row has two inputs, and each input costs
+    /// about 0.1 ms in every frame (a focus move draws the whole window, also the cached views).
+    /// So the rows far from the viewport are empty boxes. A row that never had a place, the first
+    /// and the last row (the ends of the tab order) and the row with the focus are always built.
+    fn rows_to_draw(&self, window: &Window, cx: &App) -> Vec<bool> {
+        let rows = &self.comp.rows;
+        let extents: Vec<_> = rows.iter().map(|r| r.spot.extent.get()).collect();
+        let mut focused: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                [&r.spot.focus, &r.spot.switch, &r.spot.remove]
+                    .into_iter()
+                    .any(|h| h.contains_focused(window, cx))
+            })
+            .collect();
+        // Another part of the window (the palette) can take the focus and give it back to an
+        // input of a row. The row must stay built, or the focus handle has no element.
+        match focused.iter().position(|f| *f) {
+            Some(i) => self.comp.focus_row.set(Some(rows[i].id)),
+            None => {
+                let at = rows
+                    .iter()
+                    .position(|r| Some(r.id) == self.comp.focus_row.get());
+                at.into_iter().for_each(|i| focused[i] = true);
+            }
+        }
+        let scroll = &self.comp.props_scroll;
+        rows_in_view(
+            &extents,
+            &focused,
+            // A wheel scroll past an end is clamped in the next layout.
+            (-scroll.offset().y).clamp(px(0.), scroll.max_offset().y),
+            scroll.bounds().size.height,
+        )
+    }
+
+    fn render_props(
+        &self,
+        stacked: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let shown = self.comp.shown;
         let empty_switch =
@@ -1381,7 +1496,32 @@ impl Navigator {
                 .tooltip("Remove this property")
                 .on_click(cx.listener(move |v, _, window, cx| v.remove_prop(kind, window, cx)))
         };
-        let rows = self.comp.rows.iter().map(|r| {
+        // The row height depends on the stacking, the rem size and the width: the old heights are wrong.
+        let key = (
+            stacked,
+            window.rem_size(),
+            self.comp.size.get().map(|s| s.width.round()),
+        );
+        if self.comp.rows_key.replace(key) != key {
+            self.comp.rows.iter().for_each(|r| r.spot.extent.set(None));
+        }
+        // A new row scrolls the area to its end in the next layout. The rows that the scroll shows
+        // are built in this frame too.
+        let draw = if self.comp.draw_all.take() {
+            vec![true; self.comp.rows.len()]
+        } else {
+            self.rows_to_draw(window, cx)
+        };
+        #[cfg(all(test, debug_assertions))]
+        self.comp
+            .drawn_rows
+            .set(draw.iter().filter(|d| **d).count());
+        let rows = self.comp.rows.iter().zip(draw).map(|(r, draw)| {
+            if !draw {
+                // Out of view: an empty box of the height that the row had. It is no tab stop.
+                let (_, h) = r.spot.extent.get().expect("a skipped row was drawn");
+                return div().h(h).flex_none().into_any_element();
+            }
             let id = r.id;
             let n = r.key.note("name", cx).or_else(|| r.value.note("value", cx));
             let names = h_flex()
@@ -1425,6 +1565,7 @@ impl Navigator {
                 }));
             spot_div(
                 &r.spot,
+                &self.comp.props_scroll,
                 prop_row(
                     stacked,
                     // A stacked row has no Name and Value captions above it: the label says it.
@@ -1440,6 +1581,7 @@ impl Navigator {
                     n,
                 ),
             )
+            .into_any_element()
         });
         let rows: Vec<_> = rows.collect();
         let has_rows = !rows.is_empty();
