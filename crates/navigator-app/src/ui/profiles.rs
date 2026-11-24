@@ -323,8 +323,11 @@ impl Navigator {
     }
 
     /// Makes `profile` the active one and shows its subscriptions. It starts no connection.
-    fn set_active(&mut self, profile: Option<Profile>) {
+    pub(super) fn set_active(&mut self, profile: Option<Profile>) {
+        // `rev` stays monotonic: the cached sub list compares it, and a new `Subs` would restart it.
+        let rev = self.subs.rev;
         self.subs = Subs::of_profile(profile.as_ref());
+        self.subs.rev += rev + 1;
         self.profile = profile;
     }
 
