@@ -655,6 +655,16 @@ fn show_more_applies_to_the_newest_message_of_a_busy_topic(cx: &mut TestAppConte
     });
 }
 
+/// Publish while disconnected must not store an error: it would hide a recorded result and stay
+/// after a reconnect. It needs no broker.
+#[gpui_kit::test]
+fn publish_while_disconnected_stores_no_error(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.send(w, cx)));
+    assert!(nav.read_with(cx, |v, _| v.comp.error.is_none()));
+}
+
 /// The Show more button must stay inside the details pane. It needs no broker.
 #[gpui_kit::test]
 fn the_show_more_button_stays_inside_the_details_pane(cx: &mut TestAppContext) {

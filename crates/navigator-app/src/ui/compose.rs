@@ -179,7 +179,7 @@ pub(super) struct Composer {
     shown: PropShown,
     pub(super) model: ComposerModel,
     /// Why the last Send or conversion did not work. It shows under the composer.
-    error: Option<String>,
+    pub(super) error: Option<String>,
     format_task: Option<Task<()>>,
     /// JSON mode: why the payload is not valid JSON. A warning only: Publish still works.
     json_warning: Option<String>,
@@ -982,9 +982,8 @@ impl Navigator {
 
     /// Ctrl/Cmd+Enter and the Send button.
     pub(super) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The result line already shows the hint. An error here would hide a recorded result.
         if !self.connected() {
-            self.comp.error = Some("Connect to a broker first.".into());
-            cx.notify();
             return;
         }
         let d = self.read_draft(cx);
