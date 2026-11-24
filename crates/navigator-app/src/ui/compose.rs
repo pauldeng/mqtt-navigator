@@ -596,7 +596,7 @@ impl Navigator {
             self.set_json_lang(false, cx);
             return;
         }
-        let snapshot = self.comp.payload.read(cx).value().to_string();
+        let snapshot = self.comp.payload.read(cx).value();
         let text = snapshot.clone();
         self.comp.json_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
@@ -605,7 +605,7 @@ impl Navigator {
                 .await;
             this.update(cx, |v, cx| {
                 if v.comp.mode != PayloadMode::Json
-                    || v.comp.payload.read(cx).value() != snapshot.as_str()
+                    || v.comp.payload.read(cx).value() != snapshot
                 {
                     return;
                 }
