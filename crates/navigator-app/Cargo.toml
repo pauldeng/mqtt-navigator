@@ -14,9 +14,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 bytes = "1.12.2"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }  # local UTC offset, read once in the background
 dirs = "7.0.0"
 gpui-kit = { version = "0.11.0", features = ["tree-sitter"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }  # local UTC offset, read once in the background
 keyring-core = "1.0.1"
 navigator-core = { path = "../navigator-core" }
 navigator-update = { path = "../navigator-update" }

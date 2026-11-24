@@ -1132,7 +1132,7 @@ impl Navigator {
         cx.spawn(async move |this, cx| {
             let offset = cx
                 .background_executor()
-                .spawn(async { chrono::Local::now().offset().local_minus_utc() })
+                .spawn(async { jiff::ZonedDateTime::now().offset().seconds() })
                 .await;
             this.update(cx, |v, cx| {
                 v.utc_offset = offset;
