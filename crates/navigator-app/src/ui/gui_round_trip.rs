@@ -574,37 +574,38 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
     });
 }
 
-/// While a new message of the shown topic formats, the old text is still on screen. Show more
-/// must not act on it. It needs no broker.
-#[gpui_kit::test]
-fn show_more_waits_while_a_new_message_of_the_topic_formats(cx: &mut TestAppContext) {
+/// Stores a message of `len` bytes on the topic "big", selects it and draws once.
+fn send_big(cx: &mut VisualTestContext, nav: &Entity<Navigator>, len: usize) {
     use navigator_core::net::Protocol;
     use navigator_core::store::Insert;
     use navigator_core::{Incoming, MsgProps, Qos};
+    nav.update(cx, |v, cx| {
+        let r = v.store.insert(Incoming {
+            generation: 0,
+            topic: "big".into(),
+            payload: vec![b'x'; len].into(),
+            qos: Qos::AtMostOnce,
+            retain: false,
+            props: MsgProps::default(),
+            received_at: std::time::SystemTime::UNIX_EPOCH,
+            protocol: Protocol::V5,
+        });
+        let Insert::Stored(id) = r else {
+            panic!("not stored");
+        };
+        v.select(id, v.gate.generation(), false, cx);
+    });
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+}
+
+/// While a new message of the shown topic formats, Show more stays available. It needs no broker.
+#[gpui_kit::test]
+fn show_more_stays_available_while_a_new_message_of_the_topic_formats(cx: &mut TestAppContext) {
     let (mut cx, nav) = open(cx);
     let cx = &mut cx;
-    let send = |cx: &mut VisualTestContext, len: usize| {
-        nav.update(cx, |v, cx| {
-            let r = v.store.insert(Incoming {
-                generation: 0,
-                topic: "big".into(),
-                payload: vec![b'x'; len].into(),
-                qos: Qos::AtMostOnce,
-                retain: false,
-                props: MsgProps::default(),
-                received_at: std::time::SystemTime::UNIX_EPOCH,
-                protocol: Protocol::V5,
-            });
-            let Insert::Stored(id) = r else {
-                panic!("not stored");
-            };
-            v.select(id, v.gate.generation(), false, cx);
-        });
-        cx.update(|w, cx| {
-            w.draw(cx).clear(cx);
-        });
-    };
-    send(cx, 200 * 1024);
+    send_big(cx, &nav, 200 * 1024);
     wait(cx, "the Show more button", |cx| {
         cx.update(|w, cx| {
             w.draw(cx).clear(cx);
@@ -612,14 +613,46 @@ fn show_more_waits_while_a_new_message_of_the_topic_formats(cx: &mut TestAppCont
         cx.debug_bounds("show-more").is_some()
     });
     // The job for the new message has started, but it has not run yet.
-    send(cx, 300 * 1024);
-    cx.update(|w, cx| {
-        w.draw(cx).clear(cx);
-    });
+    send_big(cx, &nav, 300 * 1024);
     assert!(
-        cx.debug_bounds("show-more").is_none(),
-        "Show more is active for the old text"
+        nav.read_with(cx, |v, _| v.insp.running),
+        "the job for the new message does not run"
     );
+    assert!(
+        cx.debug_bounds("show-more").is_some(),
+        "Show more is not available while the new text formats"
+    );
+}
+
+/// Messages come faster than the formatter ends. Show more stays clickable, and its expansion
+/// still applies to the newest message. It needs no broker.
+#[gpui_kit::test]
+fn show_more_applies_to_the_newest_message_of_a_busy_topic(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    send_big(cx, &nav, 200 * 1024);
+    wait(cx, "the first text", |cx| {
+        cx.update(|w, cx| {
+            w.draw(cx).clear(cx);
+        });
+        cx.debug_bounds("show-more").is_some()
+    });
+    // Each message arrives before the job of the one before it ends.
+    send_big(cx, &nav, 210 * 1024);
+    send_big(cx, &nav, 220 * 1024);
+    assert!(
+        cx.debug_bounds("show-more").is_some(),
+        "Show more is not clickable on a busy topic"
+    );
+    // The click handler is `show_more`. A real click mid-flood redraws the pane under the mouse.
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.show_more(w, cx)));
+    send_big(cx, &nav, 230 * 1024);
+    wait(cx, "the newest text", |cx| {
+        nav.read_with(cx, |v, _| v.insp.full.len() == 230 * 1024)
+    });
+    wait(cx, "the expansion", |cx| {
+        nav.read_with(cx, |v, _| v.insp.shown_len >= 64 * 1024)
+    });
 }
 
 /// The Show more button must stay inside the details pane. It needs no broker.

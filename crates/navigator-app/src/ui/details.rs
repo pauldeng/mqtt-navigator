@@ -110,17 +110,20 @@ pub(super) struct Inspector {
     /// The whole rendered text. The editor shows its first `shown_len` bytes. The text grows in
     /// steps (see `crate::inspector::next_step`) up to `more_target`.
     pub(super) full: String,
-    shown_len: usize,
-    more_target: usize,
+    pub(super) shown_len: usize,
+    pub(super) more_target: usize,
+    /// The size that Show more asked for. It belongs to the subject: a later text of the same
+    /// subject grows to it too.
+    pub(super) more_floor: usize,
     /// The size of the next step.
     step: usize,
-    more_task: Option<Task<()>>,
+    pub(super) more_task: Option<Task<()>>,
     jobs: Jobs,
     pub(super) want: Option<Want>,
     pub(super) view: PayloadView,
     task: Option<Task<()>>,
     /// A render job runs that nothing replaced.
-    running: bool,
+    pub(super) running: bool,
     editor: Entity<EditorState>,
     pub(super) decoder_select: Entity<SelectState<Vec<DecoderItem>>>,
     kind_select: Entity<SelectState<Vec<KindItem>>>,
@@ -189,6 +192,7 @@ impl Inspector {
             full: String::new(),
             shown_len: 0,
             more_target: 0,
+            more_floor: 0,
             step: FIRST_BYTES,
             more_task: None,
             jobs: Jobs::default(),
@@ -227,6 +231,7 @@ impl Inspector {
         self.full = String::new();
         self.shown_len = 0;
         self.more_target = 0;
+        self.more_floor = 0;
         self.more_task = None;
     }
 
@@ -362,6 +367,17 @@ impl Navigator {
                 })
     }
 
+    /// The text on screen is of the shown subject, the chosen decoder and the chosen limit. It
+    /// may be of an older message of the topic: the next render replaces it.
+    fn subject_text_ready(&self, s: &Shown) -> bool {
+        matches!(self.insp.view, PayloadView::Done { .. })
+            && self.insp.want.is_some_and(|w| {
+                same_subject(w.key, s.key)
+                    && w.choice == self.insp.choice
+                    && w.all == self.insp.show_all
+            })
+    }
+
     /// Copy needs a finished render of the shown value.
     fn can_copy(&self, shown: Option<&Shown>) -> bool {
         shown.is_some_and(|s| self.render_ready(s)) && !self.insp.full.is_empty()
@@ -377,8 +393,7 @@ impl Navigator {
             return false;
         };
         shown.is_some_and(|s| {
-            self.render_ready(s)
-                && !self.insp.running
+            self.subject_text_ready(s)
                 && !self.insp.show_all
                 && s.msg.payload.len() > DEFAULT_LIMIT
                 && (truncated_at.is_some() || error.is_some())
@@ -387,9 +402,7 @@ impl Navigator {
 
     /// "Show more": the rendered text is longer than the part in the editor.
     fn can_show_more(&self, shown: Option<&Shown>) -> bool {
-        // While a job runs, the text on screen is the old one.
-        shown.is_some_and(|s| self.render_ready(s))
-            && !self.insp.running
+        shown.is_some_and(|s| self.subject_text_ready(s))
             && self.insp.more_task.is_none()
             && self.insp.shown_len < self.insp.full.len()
     }
@@ -482,6 +495,7 @@ impl Navigator {
         let subject_changed = self.insp.want.is_none_or(|w| !same_subject(w.key, s.key));
         if subject_changed {
             self.insp.show_all = self.insp.auto_all;
+            self.insp.more_floor = 0;
         }
         let want = Want {
             key: s.key,
@@ -578,7 +592,11 @@ impl Navigator {
             self.insp
                 .editor
                 .update(cx, |e, cx| e.set_value(first, window, cx));
-            self.insp.more_target = self.insp.full.len().min(AUTO_BYTES);
+            self.insp.more_target = self
+                .insp
+                .full
+                .len()
+                .min(AUTO_BYTES.max(self.insp.more_floor));
             self.insp.more_task = None;
             self.schedule_step(window, cx);
         }
@@ -663,7 +681,9 @@ impl Navigator {
 
     /// "Show more": the text grows by [`MORE_BYTES`], in steps over the next frames.
     pub(super) fn show_more(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = (self.insp.shown_len + MORE_BYTES).min(self.insp.full.len());
+        let want = self.insp.shown_len.max(self.insp.more_floor) + MORE_BYTES;
+        self.insp.more_floor = self.insp.more_floor.max(want);
+        let target = want.min(self.insp.full.len());
         if target > self.insp.more_target {
             self.insp.more_target = target;
         }
