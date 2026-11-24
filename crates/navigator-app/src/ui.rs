@@ -4341,16 +4341,18 @@ impl Metrics {
         q: QueueView,
         now: Instant,
     ) -> String {
-        fn p95(v: &mut [f32]) -> (f32, f32) {
+        /// The median, the 95th percentile and the maximum.
+        fn pcts(v: &mut [f32]) -> (f32, f32, f32) {
             if v.is_empty() {
-                return (0., 0.);
+                return (0., 0., 0.);
             }
             v.sort_by(f32::total_cmp);
-            (v[(v.len() - 1) * 95 / 100], v[v.len() - 1])
+            let at = |p: usize| v[(v.len() - 1) * p / 100];
+            (at(50), at(95), v[v.len() - 1])
         }
         let merges = self.merge_ms.len();
-        let (mp, mm) = p95(&mut self.merge_ms);
-        let (fp, fm) = p95(&mut self.frame_ms.borrow_mut());
+        let (_, mp, mm) = pcts(&mut self.merge_ms);
+        let (f50, fp, fm) = pcts(&mut self.frame_ms.borrow_mut());
         let secs = now.duration_since(self.last).as_secs_f64().max(0.001);
         let per_sec = |a: u64, b: u64| (a.saturating_sub(b) as f64 / secs) as u64;
         let (dq_rate, adm_rate) = (
@@ -4364,7 +4366,7 @@ impl Metrics {
              dequeued={} admitted={} stale={} net_drops={} mem_drops={} topic_drops={} \
              list_drops={} dequeue_rate={dq_rate}/s admit_rate={adm_rate}/s \
              backlog_merges={} queue={} queue_kib={} queue_age_max={:.1}ms \
-             merges={merges} merge_p95={mp:.2}ms merge_max={mm:.2}ms frame_p95={fp:.2}ms frame_max={fm:.2}ms frames={}",
+             merges={merges} merge_p95={mp:.2}ms merge_max={mm:.2}ms frame_p50={f50:.2}ms frame_p95={fp:.2}ms frame_max={fm:.2}ms frames={}",
             s.topics,
             s.used_bytes / (1024 * 1024),
             c.dequeued,
@@ -4392,11 +4394,14 @@ impl Metrics {
 
 /// Writes a metrics line with the RSS. Runs on a background thread (file and stderr I/O).
 async fn write_metrics(line: String) {
-    let rss_mib = std::fs::read_to_string("/proc/self/statm")
+    // Only Linux has /proc. Other platforms print "n/a": a wrong 0 would mislead.
+    let rss = std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map_or(0, |pages| pages * 4096 / (1024 * 1024));
-    eprintln!("{line} rss={rss_mib}MiB");
+        .map_or("n/a".to_string(), |pages| {
+            format!("{}MiB", pages * 4096 / (1024 * 1024))
+        });
+    eprintln!("{line} rss={rss}");
 }
 
 /// A closed receiver, used to take the real receivers out of `Net`.
