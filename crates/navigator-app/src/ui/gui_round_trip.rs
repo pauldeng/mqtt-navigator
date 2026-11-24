@@ -919,29 +919,42 @@ fn shortcut_text_comes_from_the_key_bindings(cx: &mut TestAppContext) {
             Some(format!("{main}K").as_str())
         );
         // The palette commands that the keymap binds. Each one must show its shortcut.
+        // The key text comes from the formatter of the platform, as in the palette.
+        let kbd = |spec: &str| {
+            let m = if cfg!(target_os = "macos") {
+                "cmd"
+            } else {
+                "ctrl"
+            };
+            let k = gpui_kit::Keystroke::parse(format!("{m}-{spec}").leak()).expect("key");
+            gpui_kit::component::kbd::Kbd::format(&k)
+        };
         let expected = [
-            "new-connection",
-            "view-messages",
-            "view-tree",
-            "focus-filter",
-            "send",
-            "new-message",
-            "quit",
+            ("new-connection", kbd("n")),
+            ("view-messages", kbd("1")),
+            ("view-tree", kbd("2")),
+            ("focus-filter", kbd("f")),
+            ("send", kbd("enter")),
+            ("new-message", kbd("shift-n")),
+            ("quit", kbd("q")),
         ];
         let mut texts = Vec::new();
         for e in crate::palette::COMMANDS {
             let bound = bound_action(e.cmd);
+            let key = expected.iter().find(|(id, _)| *id == e.id);
             assert_eq!(
                 bound.is_some(),
-                expected.contains(&e.id),
+                key.is_some(),
                 "the mapping of {} in bound_action is wrong",
                 e.id
             );
-            if let Some((action, context)) = bound {
+            if let (Some((action, context)), Some((_, key))) = (bound, key) {
                 let text = shortcut_text(action.as_ref(), context, w);
-                assert!(
-                    text.as_ref().is_some_and(|t| t.contains(main)),
-                    "no shortcut for {}",
+                // The exact key of each command: a swapped mapping shows the other key.
+                assert_eq!(
+                    text.as_deref(),
+                    Some(key.as_str()),
+                    "wrong shortcut for {}",
                     e.id
                 );
                 texts.extend(text);
