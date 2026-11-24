@@ -66,7 +66,7 @@ All work starts from an event:
 Rules:
 - There are no polling loops.
 - When the app is idle (no traffic, no input), it does not wake up.
-- The 33 ms coalescing timer starts after a message arrives. It stops when the queue is empty.
+- The coalescing timer (33 ms, 25 ms on Windows because its timer ticks are 15.6 ms) starts after a message arrives. It stops when the queue is empty.
 - The msg/s display refreshes once a second, but only while messages arrive.
 - The reconnect timer runs only in the `Reconnecting` state.
 - A settings change starts a write after 500 ms of quiet.

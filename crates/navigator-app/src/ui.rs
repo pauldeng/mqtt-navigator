@@ -238,7 +238,14 @@ enum RowData {
 use crate::ingest;
 
 /// Least time between two frames, so that many messages make one render.
+#[cfg(not(windows))]
 const COALESCE: Duration = Duration::from_millis(33);
+/// Windows rounds a timer up to its tick of 15.625 ms. A wait of 33 ms ends at the third tick
+/// (46.9 ms, 21 frames in a second). A wait of 25 ms ends at the second tick (31.25 ms, 32 frames
+/// in a second), also when the loop wakes up to 6 ms late. A finer timer clock gives a few more
+/// frames, and the merge stays within 4 ms of each 25 ms.
+#[cfg(windows)]
+const COALESCE: Duration = Duration::from_millis(25);
 
 /// Who asks for an allocation.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5361,8 +5368,8 @@ mod tests {
         assert_eq!(coalesce_wait(COALESCE * 3), None);
         assert_eq!(coalesce_wait(Duration::ZERO), Some(COALESCE));
         assert_eq!(
-            coalesce_wait(Duration::from_millis(30)),
-            Some(COALESCE - Duration::from_millis(30))
+            coalesce_wait(Duration::from_millis(20)),
+            Some(COALESCE - Duration::from_millis(20))
         );
     }
 
