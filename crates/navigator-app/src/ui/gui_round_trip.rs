@@ -576,6 +576,11 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
 
 /// Stores a message of `len` bytes on the topic "big", selects it and draws once.
 fn send_big(cx: &mut VisualTestContext, nav: &Entity<Navigator>, len: usize) {
+    send_payload(cx, nav, vec![b'x'; len]);
+}
+
+/// Stores a message with this payload on the topic "big", selects it and draws once.
+fn send_payload(cx: &mut VisualTestContext, nav: &Entity<Navigator>, payload: Vec<u8>) {
     use navigator_core::net::Protocol;
     use navigator_core::store::Insert;
     use navigator_core::{Incoming, MsgProps, Qos};
@@ -583,7 +588,7 @@ fn send_big(cx: &mut VisualTestContext, nav: &Entity<Navigator>, len: usize) {
         let r = v.store.insert(Incoming {
             generation: 0,
             topic: "big".into(),
-            payload: vec![b'x'; len].into(),
+            payload: payload.into(),
             qos: Qos::AtMostOnce,
             retain: false,
             props: MsgProps::default(),
@@ -597,6 +602,29 @@ fn send_big(cx: &mut VisualTestContext, nav: &Entity<Navigator>, len: usize) {
     });
     cx.update(|w, cx| {
         w.draw(cx).clear(cx);
+    });
+}
+
+/// A JSON payload over the first limit shows its start as plain text, not a blank pane. It needs
+/// no broker.
+#[gpui_kit::test]
+fn a_json_payload_over_the_limit_shows_its_start(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    let mut json = b"[".to_vec();
+    while json.len() < 300 * 1024 {
+        json.extend_from_slice(b"{\"a\":1},");
+    }
+    json.extend_from_slice(b"0]");
+    send_payload(cx, &nav, json);
+    wait(cx, "the first part of the text", |cx| {
+        nav.read_with(cx, |v, _| v.insp.full.len() == 256 * 1024)
+    });
+    assert!(nav.read_with(cx, |v, _| v.insp.full.starts_with("[{\"a\":1},")));
+    // The editor, not only the decoded text, has the start of the payload.
+    wait(cx, "the text in the editor", |cx| {
+        let editor = nav.read_with(cx, |v, _| v.insp.editor.clone());
+        cx.update(|_, cx| editor.read(cx).value().starts_with("[{\"a\":1},"))
     });
 }
 
