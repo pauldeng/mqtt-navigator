@@ -952,7 +952,6 @@ pub struct Navigator {
     detail_of: DetailOf,
     /// Keep the newest row at the top of the Messages view.
     follow: Follow,
-    two_lines: bool,
     /// The renderer line of the settings menu. The first menu open reads it, not the start: on
     /// Windows `gpu_specs` loads driver libraries on the UI thread.
     renderer: Rc<OnceCell<SharedString>>,
@@ -1177,7 +1176,6 @@ impl Navigator {
             detail_of: DetailOf::Nothing,
             sel_topic: None,
             follow: Follow::default(),
-            two_lines: true,
             renderer: Rc::default(),
             update: update::UpdateUi::default(),
             direction: DirectionFilter::All,
@@ -1612,9 +1610,13 @@ impl Navigator {
         design * self.rem / 16.
     }
 
+    fn two_lines(&self) -> bool {
+        self.settings.ui.row_height == RowHeight::TwoLines
+    }
+
     /// Height of one message row in pixels (the scroll anchor needs it).
     fn row_height(&self) -> f32 {
-        self.scaled(if self.two_lines { ROW_H2 } else { ROW_H1 })
+        self.scaled(if self.two_lines() { ROW_H2 } else { ROW_H1 })
     }
 
     /// Remembers the top visible row, so that `restore_anchor` can undo the shift of new rows.
@@ -2463,7 +2465,7 @@ impl Navigator {
     fn render_settings_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.settings.ui.theme_mode;
         let current = crate::themes::preset_by_id(&self.settings.ui.theme_preset);
-        let (two_lines, memory) = (self.two_lines, self.memory_mib());
+        let (two_lines, memory) = (self.two_lines(), self.memory_mib());
         let renderer = self.renderer.clone();
         let weak = cx.entity().downgrade();
         let focus = self.settings_focus.clone();
@@ -2698,7 +2700,7 @@ impl Navigator {
                     .checked(options.no_local)
                     .disabled(locked)
                     .label("No Local")
-                    .on_click(move |on: &bool, _, cx| {
+                    .on_change(move |on: &bool, _, cx| {
                         on_nl(
                             SubOptions {
                                 no_local: *on,
@@ -2713,7 +2715,7 @@ impl Navigator {
                     .checked(options.retain_as_published)
                     .disabled(locked)
                     .label("Retain As Published")
-                    .on_click(move |on: &bool, _, cx| {
+                    .on_change(move |on: &bool, _, cx| {
                         on_rap(
                             SubOptions {
                                 retain_as_published: *on,
@@ -3148,7 +3150,7 @@ impl Navigator {
                 .py_1()
                 .border_b_1()
                 .border_color(theme.border)
-                .children(chips.into_iter().enumerate().map(|(i, c)| {
+                .children(chips.into_iter().map(|c| {
                     // "Show only" is the first chip when it is set. The direction is the other.
                     let is_only = c.starts_with("Only: ");
                     h_flex()
@@ -3163,7 +3165,7 @@ impl Navigator {
                                 .child(c),
                         )
                         .child(
-                            Button::new(("clear-chip", i))
+                            Button::new(("clear-chip", usize::from(is_only)))
                                 .xsmall()
                                 .ghost()
                                 .icon(IconName::Close)
@@ -3515,7 +3517,7 @@ impl Navigator {
         focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let height = ui(if self.two_lines { ROW_H2 } else { ROW_H1 });
+        let height = ui(if self.two_lines() { ROW_H2 } else { ROW_H1 });
         let mono = theme.mono_font_family.clone();
         let muted = theme.muted_foreground;
         match row {
@@ -3546,7 +3548,7 @@ impl Navigator {
                     .font_family(mono.clone())
                     .text_sm()
                     .map(|d| {
-                        if self.two_lines {
+                        if self.two_lines() {
                             d.flex_1()
                         } else {
                             d.max_w(ui(320.))
@@ -3583,7 +3585,7 @@ impl Navigator {
                         d.child(Icon::new(IconName::ArrowUp).xsmall().text_color(muted))
                     })
                     .child(topic)
-                    .when(!self.two_lines, |d| d.child(preview_el().flex_1()))
+                    .when(!self.two_lines(), |d| d.child(preview_el().flex_1()))
                     .when(retain, |d| {
                         d.child(
                             div()
@@ -3610,7 +3612,7 @@ impl Navigator {
                     .pr_3()
                     .justify_center()
                     .child(line)
-                    .when(self.two_lines, |d| d.child(preview_el().w_full()));
+                    .when(self.two_lines(), |d| d.child(preview_el().w_full()));
                 h_flex()
                     .id(("msg", id.0 as usize))
                     .h(height)

@@ -136,7 +136,6 @@ impl Navigator {
     }
 
     pub(super) fn set_row_height(&mut self, two_lines: bool, cx: &mut Context<Self>) {
-        self.two_lines = two_lines;
         self.settings.ui.row_height = if two_lines {
             RowHeight::TwoLines
         } else {
