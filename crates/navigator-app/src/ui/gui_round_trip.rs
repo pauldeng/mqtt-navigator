@@ -456,6 +456,47 @@ fn a_palette_action_chosen_after_the_state_changed_does_not_run(cx: &mut TestApp
     assert_eq!(cx.update(|w, cx| w.notifications(cx).len()), before + 1);
 }
 
+/// A switch back to a profile with as many rows as the other one must draw its own rows, also
+/// when the focus does not move. It needs no broker.
+#[gpui_kit::test]
+fn the_sub_list_follows_a_profile_switch_without_a_focus_change(cx: &mut TestAppContext) {
+    use navigator_core::model::Qos;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    let with = |name: &str, filter: &str| Profile {
+        name: name.into(),
+        subscriptions: vec![(filter.into(), Qos::AtMostOnce)],
+        ..Profile::default()
+    };
+    let (a, b) = (with("A", "a/one"), with("B", "b/one"));
+    let (ia, ib) = (a.id, b.id);
+    cx.update(|_, cx| {
+        nav.update(cx, |v, _| {
+            v.settings.profiles = vec![a, b];
+            v.set_active(v.settings.profiles.first().cloned());
+        })
+    });
+    let drawn = |cx: &mut VisualTestContext, f: &str| {
+        for _ in 0..3 {
+            cx.update(|_, cx| nav.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+        }
+        cx.debug_bounds(sub_row(f)).is_some()
+    };
+    assert!(drawn(cx, "a/one"));
+    for (to, shown, gone) in [
+        (ib, "b/one", "a/one"),
+        (ia, "a/one", "b/one"),
+        (ib, "b/one", "a/one"),
+    ] {
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.request_switch(to, false, w, cx)));
+        assert!(
+            drawn(cx, shown) && !drawn(cx, gone),
+            "the list shows {gone} after the switch"
+        );
+    }
+}
+
 /// Two messages of one topic can share the receive time and the size. A History row must still
 /// show its own message. It needs no broker: the test fills the store itself.
 #[gpui_kit::test]
