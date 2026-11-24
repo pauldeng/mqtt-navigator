@@ -604,9 +604,7 @@ impl Navigator {
                 .spawn(async move { decode::json_valid(text.as_bytes()) })
                 .await;
             this.update(cx, |v, cx| {
-                if v.comp.mode != PayloadMode::Json
-                    || v.comp.payload.read(cx).value() != snapshot
-                {
+                if v.comp.mode != PayloadMode::Json || v.comp.payload.read(cx).value() != snapshot {
                     return;
                 }
                 v.comp.json_warning = result.as_ref().err().cloned();
@@ -1313,7 +1311,7 @@ impl Navigator {
                 Switch::new("retain")
                     .checked(self.comp.retain)
                     .label("Retain")
-                    .on_click(cx.listener(|v, on: &bool, _, cx| {
+                    .on_change(cx.listener(|v, on: &bool, _, cx| {
                         v.comp.retain = *on;
                         v.comp.model.edited();
                         cx.notify();
@@ -1408,7 +1406,7 @@ impl Navigator {
             let switch = Switch::new(("user-prop-empty", id as usize))
                 .checked(r.keep_empty)
                 .label("Send empty")
-                .on_click(cx.listener(move |v, on: &bool, _, cx| {
+                .on_change(cx.listener(move |v, on: &bool, _, cx| {
                     if let Some(r) = v.comp.rows.iter_mut().find(|r| r.id == id) {
                         r.keep_empty = *on;
                     }

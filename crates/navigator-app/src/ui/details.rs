@@ -407,7 +407,7 @@ impl Navigator {
             filters_active: self.filters_active(),
             paused: self.store.is_paused(),
             follow: self.follow.on,
-            two_lines: self.two_lines,
+            two_lines: self.two_lines(),
             details_open: if self.narrow {
                 self.insp.sheet_open
             } else {
