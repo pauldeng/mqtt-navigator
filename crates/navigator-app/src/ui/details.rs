@@ -140,6 +140,8 @@ pub(super) struct Inspector {
     props_open: bool,
     /// The Value tab takes the focus when a History row is chosen.
     value_focus: FocusHandle,
+    /// The pane. When it closes with the focus inside, the root takes the focus.
+    pub(super) pane_focus: FocusHandle,
     /// The details sheet of a narrow window is open.
     pub(super) sheet_open: bool,
     /// Open the sheet at the next frame (a row was selected in a narrow window).
@@ -152,6 +154,8 @@ impl Inspector {
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .line_number(false)
+                // The read-only editor shows the active line only while it has the focus.
+                .active_line_only_when_focused(true)
                 .searchable(false)
                 .soft_wrap(true)
         });
@@ -211,6 +215,7 @@ impl Inspector {
             topic_text: String::new(),
             props_open: false,
             value_focus: cx.focus_handle(),
+            pane_focus: cx.focus_handle(),
             sheet_open: false,
             want_sheet: false,
             _subs: subs,
@@ -1059,9 +1064,11 @@ impl Navigator {
             .size_full()
             .debug_selector(|| "details-pane".into())
             .when(!sheet, |d| {
-                d.key_context("DetailsPane").on_action(
-                    cx.listener(|v, _: &CloseDetails, window, cx| v.close_details(window, cx)),
-                )
+                d.track_focus(&self.insp.pane_focus)
+                    .key_context("DetailsPane")
+                    .on_action(
+                        cx.listener(|v, _: &CloseDetails, window, cx| v.close_details(window, cx)),
+                    )
             })
             .p_3()
             .gap_2()
