@@ -1034,6 +1034,7 @@ impl Navigator {
             .map(|s| self.render_actions(s, cx).into_any_element());
         v_flex()
             .size_full()
+            .debug_selector(|| "details-pane".into())
             .when(!sheet, |d| {
                 d.key_context("DetailsPane").on_action(
                     cx.listener(|v, _: &CloseDetails, window, cx| v.close_details(window, cx)),
@@ -1282,7 +1283,8 @@ impl Navigator {
             .when(show_all, |d| {
                 d.child(
                     h_flex()
-                        .gap_2()
+                        .flex_wrap()
+                        .gap_x_2()
                         .text_xs()
                         .text_color(muted)
                         .child(format!("Showing the first {}.", size_text(DEFAULT_LIMIT)))
@@ -1297,7 +1299,8 @@ impl Navigator {
             .when_some(more, |d, (shown_to, next, total)| {
                 d.child(
                     h_flex()
-                        .gap_2()
+                        .flex_wrap()
+                        .gap_x_2()
                         .text_xs()
                         .text_color(muted)
                         .child(format!(
@@ -1306,10 +1309,14 @@ impl Navigator {
                             size_text(total)
                         ))
                         .child(
-                            Button::new("show-more")
-                                .xsmall()
-                                .label(format!("Show more (+{})", size_text(next - shown_to)))
-                                .on_click(cx.listener(|v, _, window, cx| v.show_more(window, cx))),
+                            div().debug_selector(|| "show-more".into()).child(
+                                Button::new("show-more")
+                                    .xsmall()
+                                    .label(format!("Show more (+{})", size_text(next - shown_to)))
+                                    .on_click(
+                                        cx.listener(|v, _, window, cx| v.show_more(window, cx)),
+                                    ),
+                            ),
                         ),
                 )
             })
