@@ -236,8 +236,9 @@ pub struct ConnectionSheet {
     will_topic: Entity<InputState>,
     will_payload: Entity<InputState>,
     will_delay: Entity<InputState>,
-    /// The "Choose…" button of the certificate. A certificate error focuses it.
+    /// The "Choose…" buttons of the certificate and the key. A certificate error focuses one.
     cert_focus: FocusHandle,
+    key_focus: FocusHandle,
     /// The hints of the password and the passphrase field now (see `refresh_secret_hints`).
     hints: [&'static str; 2],
     /// The scroll position of the form. It has its own scroll area: see `render`.
@@ -395,6 +396,7 @@ impl ConnectionSheet {
             will_payload,
             will_delay,
             cert_focus: cx.focus_handle(),
+            key_focus: cx.focus_handle(),
             hints: ["", ""],
             scroll,
             tops,
@@ -455,7 +457,8 @@ impl ConnectionSheet {
         .into_iter()
         .find(|(_, i)| on(i))
         .map(|(f, _)| f)
-        .or(self.cert_focus.is_focused(window).then_some("client_cert"));
+        .or(self.cert_focus.is_focused(window).then_some("client_cert"))
+        .or(self.key_focus.is_focused(window).then_some("client_key"));
         let errors = self.errors.iter().map(|e| e.field).collect();
         (
             focused,
@@ -819,12 +822,17 @@ impl ConnectionSheet {
             "keepalive" => &self.keepalive,
             "will.topic" => &self.will_topic,
             "will.delay_secs" => &self.will_delay,
-            // The certificate fields have no input: the focus goes to "Choose…".
+            // The certificate fields have no input: the focus goes to "Choose…" of the missing
+            // file (the key, if the certificate is set).
             "client_cert" => &self.name,
             _ => return,
         };
         let input = (field != "client_cert").then(|| input.clone());
-        let handle = self.cert_focus.clone();
+        let handle = if self.client_cert.is_some() && self.client_key.is_none() {
+            self.key_focus.clone()
+        } else {
+            self.cert_focus.clone()
+        };
         // An input in a section that has just opened exists only after the next frame. The same
         // is true for its place: `render` scrolls to it after the frame that draws it.
         if let Some((key, top)) = self.tops.get_key_value(field) {
@@ -1010,6 +1018,7 @@ impl ConnectionSheet {
                         .small()
                         .label("Choose…")
                         .when(kind == FileKind::Cert, |b| b.track_focus(&self.cert_focus))
+                        .when(kind == FileKind::Key, |b| b.track_focus(&self.key_focus))
                         .on_click(cx.listener(move |s, _, window, cx| s.pick(kind, window, cx))),
                 )
                 .when(shown.is_some(), |d| {
