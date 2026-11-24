@@ -169,10 +169,13 @@ impl Navigator {
     ) {
         let now = self.palette_target();
         let moved = match cmd {
-            Cmd::CopyValue | Cmd::EditAndPublish | Cmd::Reply | Cmd::ShowAll | Cmd::ShowMore => {
-                now.shown != at_open.shown
-            }
-            Cmd::CopyTopic | Cmd::PublishToTopic | Cmd::ClearRetained => now.topic != at_open.topic,
+            Cmd::CopyValue | Cmd::EditAndPublish | Cmd::Reply => now.shown != at_open.shown,
+            // Show all and Show more act on the subject, not on one message.
+            Cmd::CopyTopic
+            | Cmd::PublishToTopic
+            | Cmd::ClearRetained
+            | Cmd::ShowAll
+            | Cmd::ShowMore => now.topic != at_open.topic,
             Cmd::SubQos(_) | Cmd::SubOptions | Cmd::SubRetry | Cmd::SubRemove => {
                 now.sub != at_open.sub
             }
