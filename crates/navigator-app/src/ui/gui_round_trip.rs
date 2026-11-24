@@ -574,6 +574,54 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
     });
 }
 
+/// While a new message of the shown topic formats, the old text is still on screen. Show more
+/// must not act on it. It needs no broker.
+#[gpui_kit::test]
+fn show_more_waits_while_a_new_message_of_the_topic_formats(cx: &mut TestAppContext) {
+    use navigator_core::net::Protocol;
+    use navigator_core::store::Insert;
+    use navigator_core::{Incoming, MsgProps, Qos};
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    let send = |cx: &mut VisualTestContext, len: usize| {
+        nav.update(cx, |v, cx| {
+            let r = v.store.insert(Incoming {
+                generation: 0,
+                topic: "big".into(),
+                payload: vec![b'x'; len].into(),
+                qos: Qos::AtMostOnce,
+                retain: false,
+                props: MsgProps::default(),
+                received_at: std::time::SystemTime::UNIX_EPOCH,
+                protocol: Protocol::V5,
+            });
+            let Insert::Stored(id) = r else {
+                panic!("not stored");
+            };
+            v.select(id, v.gate.generation(), false, cx);
+        });
+        cx.update(|w, cx| {
+            w.draw(cx).clear(cx);
+        });
+    };
+    send(cx, 200 * 1024);
+    wait(cx, "the Show more button", |cx| {
+        cx.update(|w, cx| {
+            w.draw(cx).clear(cx);
+        });
+        cx.debug_bounds("show-more").is_some()
+    });
+    // The job for the new message has started, but it has not run yet.
+    send(cx, 300 * 1024);
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.debug_bounds("show-more").is_none(),
+        "Show more is active for the old text"
+    );
+}
+
 /// The Show more button must stay inside the details pane. It needs no broker.
 #[gpui_kit::test]
 fn the_show_more_button_stays_inside_the_details_pane(cx: &mut TestAppContext) {

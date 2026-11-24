@@ -378,6 +378,7 @@ impl Navigator {
         };
         shown.is_some_and(|s| {
             self.render_ready(s)
+                && !self.insp.running
                 && !self.insp.show_all
                 && s.msg.payload.len() > DEFAULT_LIMIT
                 && (truncated_at.is_some() || error.is_some())
@@ -386,7 +387,9 @@ impl Navigator {
 
     /// "Show more": the rendered text is longer than the part in the editor.
     fn can_show_more(&self, shown: Option<&Shown>) -> bool {
+        // While a job runs, the text on screen is the old one.
         shown.is_some_and(|s| self.render_ready(s))
+            && !self.insp.running
             && self.insp.more_task.is_none()
             && self.insp.shown_len < self.insp.full.len()
     }
