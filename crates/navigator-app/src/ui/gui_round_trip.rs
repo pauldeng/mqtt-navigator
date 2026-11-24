@@ -1088,8 +1088,8 @@ fn new_password_text_cancels_the_removal_of_the_saved_password(cx: &mut TestAppC
     assert_eq!(boxes(cx), [false, false]);
 }
 
-/// A certificate without a key blocks Save with TLS: the section opens and "Choose…" has the
-/// focus.
+/// A certificate without a key blocks Save with TLS: the section opens and the "Choose…" of the
+/// key has the focus.
 #[gpui_kit::test]
 fn a_certificate_without_a_key_opens_its_section_and_takes_the_focus(cx: &mut TestAppContext) {
     let (mut cx, nav) = open(cx);
@@ -1102,7 +1102,7 @@ fn a_certificate_without_a_key_opens_its_section_and_takes_the_focus(cx: &mut Te
     let (focus, errors, open, _) = sheet_probe(cx, &nav);
     assert_eq!(errors, ["client_cert"]);
     assert!(open[1], "the Client certificate section must open");
-    assert_eq!(focus, Some("client_cert"));
+    assert_eq!(focus, Some("client_key"));
     // The handle belongs to a rendered button: Enter presses it and opens the file prompt.
     press(cx, "enter");
     assert!(
