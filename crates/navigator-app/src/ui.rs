@@ -4032,7 +4032,7 @@ impl Render for Navigator {
         let chips = self.render_chips(cx);
         let show_details = self.details_open && !self.narrow;
         // The pane is gone (for example a resize hid it) and held the focus: the root takes it.
-        if !show_details && self.insp.pane_focus.contains_focused(window, cx) {
+        if !show_details && self.hidden_pane_has_focus(window, cx) {
             let root = self.root_focus.clone();
             cx.defer_in(window, move |_, window, cx| root.focus(window, cx));
         }

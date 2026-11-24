@@ -1733,43 +1733,59 @@ fn enter_in_history_closes_it_at_once(cx: &mut TestAppContext) {
     // No clock advance: the close must not wait for the exit time.
     cx.run_until_parked();
     assert!(
+        !cx.update(|w, cx| w.has_active_dialog(cx)),
+        "History is still open"
+    );
+    assert!(
         cx.update(|w, _| before.is_focused(w)),
         "the composer has no focus right after Enter"
     );
 }
 
-/// The pane closes while it holds the focus (a resize hides it): the root takes the focus. It
-/// needs no broker.
+/// The pane closes while a control inside it holds the focus (a resize hides it): the root takes
+/// the focus. The same when the focus comes back to a control of a pane that is already gone
+/// (a dialog closes after the resize). It needs no broker.
 #[gpui_kit::test]
 fn the_root_takes_the_focus_when_the_details_pane_closes(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
     let (mut cx, nav) = open(cx);
     let cx = &mut cx;
-    nav.update(cx, |v, cx| {
-        v.details_open = true;
-        cx.notify();
-    });
-    cx.update(|w, cx| {
-        w.draw(cx).clear(cx);
-    });
-    let (pane, root) = nav.read_with(cx, |v, _| (v.insp.pane_focus.clone(), v.root_focus.clone()));
-    cx.update(|w, cx| pane.focus(w, cx));
-    cx.update(|w, cx| {
-        w.draw(cx).clear(cx);
-    });
-    assert!(
-        cx.update(|w, _| pane.is_focused(w)),
-        "the pane has no focus"
-    );
-    nav.update(cx, |v, cx| {
-        v.details_open = false;
-        cx.notify();
-    });
-    cx.update(|w, cx| {
-        w.draw(cx).clear(cx);
-    });
-    cx.run_until_parked();
-    assert!(
-        cx.update(|w, _| root.is_focused(w)),
-        "nothing has the focus after the pane closes"
-    );
+    send_payload(cx, &nav, b"{}".to_vec());
+    let root = nav.read_with(cx, |v, _| v.root_focus.clone());
+    let editor = nav.read_with(cx, |v, cx| v.insp.editor.read(cx).focus_handle(cx));
+    for case in ["while the pane is open", "after the pane is gone"] {
+        nav.update(cx, |v, cx| {
+            v.details_open = true;
+            cx.notify();
+        });
+        cx.update(|w, cx| {
+            w.draw(cx).clear(cx);
+        });
+        if case.starts_with("while") {
+            cx.update(|w, cx| editor.focus(w, cx));
+            cx.update(|w, cx| {
+                w.draw(cx).clear(cx);
+            });
+        }
+        nav.update(cx, |v, cx| {
+            v.details_open = false;
+            cx.notify();
+        });
+        cx.update(|w, cx| {
+            w.draw(cx).clear(cx);
+        });
+        if case.starts_with("after") {
+            // The pane is not in the last frame now. The focus returns to the editor.
+            cx.update(|w, cx| editor.focus(w, cx));
+            nav.update(cx, |_, cx| cx.notify());
+            cx.update(|w, cx| {
+                w.draw(cx).clear(cx);
+            });
+        }
+        cx.run_until_parked();
+        assert!(
+            cx.update(|w, _| root.is_focused(w)),
+            "nothing has the focus after the pane closes ({case})"
+        );
+    }
 }
