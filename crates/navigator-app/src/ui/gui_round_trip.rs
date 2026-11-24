@@ -902,6 +902,8 @@ fn focus_in_a_hidden_user_property_row_scrolls_to_it(cx: &mut TestAppContext) {
             v.profile = v.settings.profiles.first().cloned();
         })
     });
+    // Focus-in events run only in an active window.
+    cx.update(|w, _| w.activate_window());
     cx.simulate_keystrokes("secondary-shift-n");
     for _ in 0..12 {
         cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
@@ -913,11 +915,22 @@ fn focus_in_a_hidden_user_property_row_scrolls_to_it(cx: &mut TestAppContext) {
     }
     let offset = |cx: &mut VisualTestContext| nav.read_with(cx, |v, _| v.props_offset());
     assert!(offset(cx) < px(0.), "the area must show the last row");
-    cx.update(|_, cx| nav.update(cx, |v, cx| v.reveal_user_row(0, cx)));
-    for _ in 0..3 {
-        cx.run_until_parked();
-        cx.update(|w, _| w.refresh());
+    // Shift+Tab walks up from the last row. The area must follow the focus to the first row.
+    let first = nav.read_with(cx, |v, _| v.first_user_row_focus());
+    for _ in 0..100 {
+        if cx.update(|w, cx| first.contains_focused(w, cx)) {
+            break;
+        }
+        cx.simulate_keystrokes("shift-tab");
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update(|w, _| w.refresh());
+        }
     }
+    assert!(
+        cx.update(|w, cx| first.contains_focused(w, cx)),
+        "Shift+Tab did not reach the first row"
+    );
     // The Name and Value captions (about 28 px) are above the first row: the least scroll shows the row.
     assert!(
         offset(cx) >= px(-30.),
