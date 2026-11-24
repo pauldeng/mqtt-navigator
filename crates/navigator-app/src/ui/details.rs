@@ -62,7 +62,7 @@ impl SearchableListItem for KindItem {
 
 /// What the payload view was built for.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Want {
+pub(super) struct Want {
     key: DetailKey,
     choice: DecoderChoice,
     all: bool,
@@ -116,9 +116,11 @@ pub(super) struct Inspector {
     step: usize,
     more_task: Option<Task<()>>,
     jobs: Jobs,
-    want: Option<Want>,
+    pub(super) want: Option<Want>,
     pub(super) view: PayloadView,
     task: Option<Task<()>>,
+    /// A render job runs that nothing replaced.
+    running: bool,
     editor: Entity<EditorState>,
     pub(super) decoder_select: Entity<SelectState<Vec<DecoderItem>>>,
     kind_select: Entity<SelectState<Vec<KindItem>>>,
@@ -193,6 +195,7 @@ impl Inspector {
             want: None,
             view: PayloadView::Idle,
             task: None,
+            running: false,
             editor,
             decoder_select,
             kind_select,
@@ -214,6 +217,7 @@ impl Inspector {
     pub(super) fn reset(&mut self) {
         self.jobs.cancel();
         self.task = None;
+        self.running = false;
         self.want = None;
         self.view = PayloadView::Idle;
         self.show_all = false;
@@ -467,6 +471,7 @@ impl Navigator {
             if self.insp.want.take().is_some() {
                 self.insp.jobs.cancel();
                 self.insp.task = None;
+                self.insp.running = false;
                 self.insp.view = PayloadView::Idle;
             }
             return;
@@ -491,7 +496,13 @@ impl Navigator {
                 .want
                 .is_some_and(|w| w.choice == want.choice && w.all == want.all)
             && matches!(self.insp.view, PayloadView::Done { .. });
+        // A slow job must finish: a new message each time would cancel it, and the text would
+        // never change. `render_done` notifies, and the next frame starts a job for the newest one.
+        if refresh && self.insp.running {
+            return;
+        }
         self.insp.want = Some(want);
+        self.insp.running = true;
         let (generation, cancel) = self.insp.jobs.start();
         if !refresh {
             self.insp.view = PayloadView::Running {
@@ -540,6 +551,7 @@ impl Navigator {
         if !self.insp.jobs.is_current(generation) {
             return;
         }
+        self.insp.running = false;
         let Rendered {
             text,
             truncated_at,

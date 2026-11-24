@@ -541,6 +541,24 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
     wait(cx, "the second text", |cx| {
         nav.read_with(cx, |v, _| v.insp.full == "bb")
     });
+    // A message that comes before the job ends must not cancel it: with a slow formatter the
+    // text would never change. The job for "cc" ends first, then one for the newest message.
+    send(cx, "cc");
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    let running = nav.read_with(cx, |v, _| v.insp.want);
+    send(cx, "dd");
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    assert!(
+        nav.read_with(cx, |v, _| v.insp.want == running),
+        "a new message replaced the running job"
+    );
+    wait(cx, "the newest text", |cx| {
+        nav.read_with(cx, |v, _| v.insp.full == "dd")
+    });
 }
 
 /// Two messages of one topic can share the receive time and the size. A History row must still
