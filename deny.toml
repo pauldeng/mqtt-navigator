@@ -6,11 +6,6 @@ version = 2
 yanked = "deny"
 # Unmaintained transitive crates come from gpui; we cannot replace them. Direct dependencies are checked.
 unmaintained = "workspace"
-ignore = [
-  # chrono is unmaintained, and no fixed version exists. gpui-pre (the engine under gpui-kit)
-  # depends on it. Our own code does not use it.
-  { id = "RUSTSEC-2026-0543", reason = "transitive through gpui-pre; our code does not use it" },
-]
 
 [licenses]
 version = 2
