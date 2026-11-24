@@ -875,17 +875,40 @@ fn shortcut_text_comes_from_the_key_bindings(cx: &mut TestAppContext) {
             shortcut_text(&OpenPalette, Some(CONTEXT), w).as_deref(),
             Some(format!("{main}K").as_str())
         );
-        // Every palette command with a key shows its shortcut.
+        // The palette commands that the keymap binds. Each one must show its shortcut.
+        let expected = [
+            "new-connection",
+            "view-messages",
+            "view-tree",
+            "focus-filter",
+            "send",
+            "new-message",
+            "quit",
+        ];
+        let mut texts = Vec::new();
         for e in crate::palette::COMMANDS {
-            if let Some((action, context)) = bound_action(e.cmd) {
+            let bound = bound_action(e.cmd);
+            assert_eq!(
+                bound.is_some(),
+                expected.contains(&e.id),
+                "the mapping of {} in bound_action is wrong",
+                e.id
+            );
+            if let Some((action, context)) = bound {
                 let text = shortcut_text(action.as_ref(), context, w);
                 assert!(
-                    text.is_some_and(|t| t.contains(main)),
+                    text.as_ref().is_some_and(|t| t.contains(main)),
                     "no shortcut for {}",
                     e.id
                 );
+                texts.extend(text);
             }
         }
+        // Each listed command was seen, and no two commands share a shortcut.
+        assert_eq!(texts.len(), expected.len(), "a listed command is missing");
+        texts.sort();
+        texts.dedup();
+        assert_eq!(texts.len(), expected.len(), "two commands share a shortcut");
     });
 }
 
