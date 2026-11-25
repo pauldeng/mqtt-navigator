@@ -116,6 +116,8 @@ pub(super) struct Inspector {
     pub(super) more_task: Option<Task<()>>,
     jobs: Jobs,
     pub(super) want: Option<Want>,
+    /// What `full` was rendered for (`want` of the last finished job).
+    done: Option<Want>,
     pub(super) view: PayloadView,
     task: Option<Task<()>>,
     /// A render job runs that nothing replaced.
@@ -199,6 +201,7 @@ impl Inspector {
             more_task: None,
             jobs: Jobs::default(),
             want: None,
+            done: None,
             view: PayloadView::Idle,
             task: None,
             running: false,
@@ -226,6 +229,7 @@ impl Inspector {
         self.task = None;
         self.running = false;
         self.want = None;
+        self.done = None;
         self.view = PayloadView::Idle;
         self.show_all = false;
         self.hist_pick = None;
@@ -556,13 +560,12 @@ impl DetailsPane {
 
     /// The finished render belongs to `s` (and to the decoder and limit now chosen).
     fn render_ready(&self, s: &Shown) -> bool {
-        matches!(self.insp.view, PayloadView::Done { .. })
-            && self.insp.want
-                == Some(Want {
-                    key: s.key,
-                    choice: self.insp.choice,
-                    all: self.insp.show_all,
-                })
+        self.insp.done
+            == Some(Want {
+                key: s.key,
+                choice: self.insp.choice,
+                all: self.insp.show_all,
+            })
     }
 
     /// The text on screen is of the shown subject, the chosen decoder and the chosen limit. It
@@ -677,7 +680,7 @@ impl DetailsPane {
             // Metrics only (`MQTT_NAVIGATOR_AUTOSELECT`): a new subject starts with Show all.
             self.insp.show_all = self
                 .nav
-                .read_with(cx, |n, _| n.autoselect.is_some())
+                .read_with(cx, |n, _| n.autoselected)
                 .unwrap_or(false);
             self.insp.more_floor = 0;
         }
@@ -754,6 +757,7 @@ impl DetailsPane {
             return;
         }
         self.insp.running = false;
+        self.insp.done = self.insp.want;
         let Rendered {
             text,
             truncated_at,
@@ -1001,6 +1005,7 @@ impl Navigator {
         } else {
             self.details_open = true;
         }
+        self.sync_details(cx);
         cx.notify();
     }
 
@@ -1019,6 +1024,7 @@ impl Navigator {
             return;
         }
         self.sheet_open = true;
+        self.sync_details(cx);
         let pane = self.pane.clone();
         let weak = cx.entity().downgrade();
         window.open_sheet_at(Placement::Right, cx, move |sheet: Sheet, _, _| {
