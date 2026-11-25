@@ -1151,9 +1151,10 @@ impl ComposerPane {
                     settle.set(2);
                 }
                 // The parent gives this height to the cached view (see `Relayout`).
-                if (height.get() - b.size.height).abs() > px(0.5) {
-                    // The canvas fills the padding box: add the 1 px top border of the root.
-                    height.set(b.size.height + px(1.));
+                // The canvas fills the padding box: add the 1 px top border of the root.
+                let full = b.size.height + px(1.);
+                if (height.get() - full).abs() > px(0.5) {
+                    height.set(full);
                     let this = this.clone();
                     window.defer(cx, move |_, cx| {
                         this.update(cx, |_, cx| cx.emit(Relayout)).ok();
