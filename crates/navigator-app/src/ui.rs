@@ -1038,6 +1038,8 @@ pub struct Navigator {
     /// all, as a click would, and the app connects to the saved profile at start. It exists to
     /// measure the frame time of a large payload without UI automation.
     autoselect: Option<String>,
+    /// Metrics only: the topic of `autoselect` was selected. The pane then starts with Show all.
+    autoselected: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1241,6 +1243,7 @@ impl Navigator {
             last_frame: None,
             armed: false,
             metrics: Metrics::from_env(),
+            autoselected: false,
             autoselect: std::env::var("MQTT_NAVIGATOR_AUTOSELECT")
                 .ok()
                 .filter(|_| std::env::var_os("MQTT_NAVIGATOR_METRICS").is_some()),
@@ -1774,6 +1777,7 @@ impl Navigator {
                         self.detail_of = DetailOf::Topic;
                         self.details_open = true;
                         self.selection += 1;
+                        self.autoselected = true;
                     }
                 }
                 n += 1;
@@ -2138,6 +2142,7 @@ impl Navigator {
             // A paused tree takes a new snapshot: wake the frame loop for the work.
             self.kick_work();
         }
+        self.sync_details(cx);
         cx.notify();
     }
 
@@ -2169,6 +2174,7 @@ impl Navigator {
             self.reveal_details();
             self.leave_follow();
             self.list_scroll.scroll_to_item(i, ScrollStrategy::Nearest);
+            self.sync_details(cx);
             cx.notify();
         }
     }
@@ -2192,6 +2198,7 @@ impl Navigator {
             self.open_details_sheet(window, cx);
         } else {
             self.details_open = true;
+            self.sync_details(cx);
             cx.notify();
         }
     }
@@ -2236,6 +2243,7 @@ impl Navigator {
                     if let Some(n) = next {
                         self.tree_scroll.scroll_to_item(n, ScrollStrategy::Nearest);
                     }
+                    self.sync_details(cx);
                     cx.notify();
                 }
             }
