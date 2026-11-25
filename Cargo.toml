@@ -22,9 +22,9 @@ unwrap_used = "warn"
 [profile.dev.package."*"]
 debug = false
 
-# Chosen in P5 by measurement (ADR 0004): the smallest build that passes the budgets.
+# Chosen by measurement (ADR 0004): level 3 uses less UI CPU for each frame than "s". CI has no binary size gate.
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true

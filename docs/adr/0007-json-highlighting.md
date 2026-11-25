@@ -7,7 +7,7 @@ Status: accepted (2026-11-20). Owner decision: the composer gets a JSON payload 
 - The composer has the payload modes Text, Hex and now JSON. JSON mode checks the payload and highlights valid JSON. Invalid JSON gets a warning, and Publish still sends it.
 - Highlighting in the gpui-kit `Editor` needs the gpui-kit feature `tree-sitter`. AGENTS.md allowed this feature only after a size measurement and an ADR.
 
-## Measurements (Linux x64, release profile of ADR 0004, stripped)
+## Measurements (Linux x64, release profile of ADR 0004 at that time: `opt-level = "s"`, `lto = "fat"`, stripped)
 
 | Build | Size |
 |---|---|
