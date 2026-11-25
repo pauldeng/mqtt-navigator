@@ -37,4 +37,4 @@ ntex runs on our tokio `current_thread` runtime inside `ntex_net::with_reactor` 
 - ntex logs through the `log` crate. The app installs no `log` logger, so these lines do not reach the log file.
 - Settings schema is 2. A profile without `protocol` loads as MQTT 5.
 - Every ntex update needs the broker tests and the fake-broker tests.
-- The release binary grows by 755 704 B (2.2%) against v0.1.1 (S4). The CI size gate passes.
+- The release binary grows by 755 704 B (2.2%) against v0.1.1 (S4). The CI size gate passed at that check (2026-11-15). The owner removed the gate on 2026-11-20.
