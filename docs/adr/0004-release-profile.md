@@ -28,10 +28,10 @@ Frames per second are the same in both builds (about 22 in S1 to S3 and 32 in S4
 
 ## Decision
 
-- Use `opt-level = 3` and `lto = "fat"` with `codegen-units = 1`. It uses 6 to 11% less UI CPU for each frame than `opt-level = "s"`, and its merge p95 stays under the 4 ms budget (S1 to S4). We keep `lto = "fat"` because of the table of 2026-11-11: at opt-level 3, thin was larger (47.7 MB against 44.2 MB) and had a worse frame p95 (7.1 ms against 6.4 ms). The frame times of the new runs are the same in both builds, because the software renderer limits them.
+- Use `opt-level = 3` and `lto = "fat"` with `codegen-units = 1`. It uses 6 to 11% less UI CPU for each frame than `opt-level = "s"`, and its worst merge slice stays under the 4 ms budget (3.3 to 3.8 ms, S1 to S4). We keep `lto = "fat"` because of the table of 2026-11-11: at opt-level 3, thin was larger (47.7 MB against 44.2 MB) and had a worse frame p95 (7.1 ms against 6.4 ms). The frame times of the new runs are the same in both builds, because the software renderer limits them.
 - ~~The CI `size` job fails when the Linux x64 binary is larger than 37 317 165 B (measured + 10%).~~ Removed on 2026-11-20: the owner sets no size limit. CI has no size job.
 
 ## Consequences
 
-- A release build takes longer. `cargo build --release` of the app and the flood tool took about 7 minutes with `s` and 9 minutes with `3` on this machine.
+- A release build takes longer. On this machine, `cargo build --release -p navigator-app --bins -p navigator-core --example flood` took about 7 minutes with `s` and 9 minutes with `3`. These builds used `RUSTFLAGS="-C force-frame-pointers=yes"`, `CARGO_PROFILE_RELEASE_STRIP=false`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` and `CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=off`.
 - The worst merge slice is close to the 4 ms budget (3.1 ms on 2026-11-11, 3.8 ms with `opt-level = 3` on 2026-11-26). The CI load test asserts merge p99 ≤ 4 ms and max ≤ 8 ms.
