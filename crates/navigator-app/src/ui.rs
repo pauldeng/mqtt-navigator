@@ -861,25 +861,16 @@ fn send_error_text(e: SendError) -> &'static str {
 
 /// Checks a topic filter before it is sent. `Err` is the text for the user.
 fn validate_filter(filter: &str) -> Result<(), &'static str> {
-    if filter.is_empty() {
-        return Err("Type a topic filter.");
-    }
-    if filter.len() > 65_535 {
-        return Err("The filter is longer than 65535 bytes.");
-    }
-    if filter.contains('\0') {
-        return Err("The filter must not contain a NUL character.");
-    }
-    let levels: Vec<&str> = filter.split('/').collect();
-    for (i, level) in levels.iter().enumerate() {
-        if level.contains('#') && (*level != "#" || i + 1 != levels.len()) {
-            return Err("Use # alone as the last level, for example a/#.");
-        }
-        if level.contains('+') && *level != "+" {
-            return Err("Use + alone as a whole level, for example a/+/b.");
-        }
-    }
-    Ok(())
+    use navigator_core::topic::{FilterError, StringError, check_filter};
+    check_filter(filter).map_err(|e| match e {
+        FilterError::Empty => "Type a topic filter.",
+        FilterError::String(StringError::TooLong) => "The filter is longer than 65535 bytes.",
+        FilterError::String(StringError::Nul) => "The filter must not contain a NUL character.",
+        FilterError::String(_) => "The filter must not contain a control or unassigned character.",
+        FilterError::Share(_) => "Use $share/group/filter with a group that has no + or #.",
+        FilterError::Hash(_) => "Use # alone as the last level, for example a/#.",
+        FilterError::Plus(_) => "Use + alone as a whole level, for example a/+/b.",
+    })
 }
 
 /// See [`Navigator::composer_protocol`].
@@ -5255,10 +5246,24 @@ mod tests {
             assert!(validate_filter(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "", "a/#/b", "a#", "#a", "a/b#", "a+", "+a/b", "a/b+/c", "a\0b",
+            "",
+            "a/#/b",
+            "a#",
+            "#a",
+            "a/b#",
+            "a+",
+            "+a/b",
+            "a/b+/c",
+            "a\0b",
+            "a\u{7}b",
+            "$share/g",
+            "$share//a",
+            "$share/g/",
+            "$share/+/a",
         ] {
             assert!(validate_filter(bad).is_err(), "{bad}");
         }
+        assert!(validate_filter("$share/g/a/+").is_ok());
         assert!(validate_filter(&"a".repeat(65_535)).is_ok());
         assert!(validate_filter(&"a".repeat(65_536)).is_err());
     }

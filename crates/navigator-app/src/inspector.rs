@@ -196,10 +196,7 @@ pub fn next_cut(text: &str, from: usize, chunk: usize) -> usize {
     if let Some(i) = text.as_bytes()[mid..end].iter().rposition(|&b| b == b'\n') {
         return mid + i + 1;
     }
-    let mut e = end;
-    while !text.is_char_boundary(e) {
-        e -= 1;
-    }
+    let mut e = text.floor_char_boundary(end);
     // A character wider than the chunk would give no progress: take the whole character.
     if e <= from {
         e = from + text[from..].chars().next().map_or(0, char::len_utf8);

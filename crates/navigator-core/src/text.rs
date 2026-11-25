@@ -52,27 +52,24 @@ fn is_variation_selector(c: char) -> bool {
     matches!(c, '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
 }
 
-/// Control characters and invisible format characters.
+/// Control characters (Cc) and invisible format characters (Cf), and what the category does not
+/// cover: the line and paragraph separators, look-alikes that are not Cf (the combining
+/// grapheme joiner, the Hangul and Khmer fillers) and the unassigned holes in the two blocks
+/// of invisible operators and tag characters.
 fn is_hidden(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{00ad}'                      // soft hyphen
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061c}'                    // Arabic letter mark
-            | '\u{06dd}' | '\u{070f}' | '\u{08e2}'
-            | '\u{034f}'                    // combining grapheme joiner
-            | '\u{115f}' | '\u{1160}'       // Hangul fillers
-            | '\u{17b4}' | '\u{17b5}'
-            | '\u{180e}'                    // Mongolian vowel separator
-            | '\u{200b}'..='\u{200f}'       // zero width, joiners, direction marks
-            | '\u{2028}'..='\u{202e}'       // line and paragraph separators, direction controls
-            | '\u{2060}'..='\u{206f}'       // word joiner, invisible operators, old controls
-            | '\u{3164}' | '\u{ffa0}'       // Hangul fillers
-            | '\u{feff}'                    // byte order mark, zero width no-break space
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{110bd}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0000}'..='\u{e007f}'     // tag characters
-        )
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory as _};
+    matches!(
+        c.general_category(),
+        GeneralCategory::Control | GeneralCategory::Format
+    ) || matches!(c,
+        '\u{034f}'                     // combining grapheme joiner
+        | '\u{115f}' | '\u{1160}'       // Hangul fillers
+        | '\u{17b4}' | '\u{17b5}'       // Khmer inherent vowels
+        | '\u{2028}' | '\u{2029}'       // line and paragraph separators
+        | '\u{2060}'..='\u{206f}'       // word joiner, invisible operators, old controls
+        | '\u{3164}' | '\u{ffa0}'       // Hangul fillers
+        | '\u{e0000}'..='\u{e007f}'     // tag characters
+    )
 }
 
 #[cfg(test)]
@@ -105,6 +102,36 @@ mod tests {
         assert_eq!(display_safe("a\u{180e}"), "a⟨U+180E⟩");
         assert_eq!(display_safe("a\u{e0041}"), "a⟨U+E0041⟩");
         assert_eq!(display_safe("a\nb\u{7f}"), "a⟨U+000A⟩b⟨U+007F⟩");
+    }
+
+    #[test]
+    fn format_characters_are_hidden_by_category() {
+        // Cf in newer Unicode versions than the old list: Arabic pound marks, hieroglyph format.
+        assert_eq!(display_safe("a\u{0890}"), "a⟨U+0890⟩");
+        assert_eq!(display_safe("a\u{13430}"), "a⟨U+13430⟩");
+    }
+
+    #[test]
+    fn category_exceptions_stay_hidden() {
+        for c in [
+            '\u{034f}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{17b4}',
+            '\u{17b5}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{2065}',
+            '\u{3164}',
+            '\u{ffa0}',
+            '\u{e0000}',
+            '\u{e0002}',
+        ] {
+            assert_eq!(
+                display_safe(&format!("a{c}")),
+                format!("a⟨U+{:04X}⟩", c as u32)
+            );
+        }
     }
 
     #[test]

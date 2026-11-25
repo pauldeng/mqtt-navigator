@@ -171,7 +171,9 @@ pub struct Msg {
     pub original_size: usize,
     pub qos: Qos,
     pub retain: bool,
-    pub props: MsgProps,
+    /// Shared by the latest value, the history entry and the list row of one message. The
+    /// memory budget still counts it once for each copy, so it stays an upper bound.
+    pub props: Arc<MsgProps>,
     pub received_at: SystemTime,
     /// The MQTT version that carried the message. An MQTT 3.1.1 message has no properties.
     pub protocol: Protocol,
@@ -1017,7 +1019,7 @@ impl TopicStore {
             original_size,
             qos,
             retain,
-            props,
+            props: Arc::new(props),
             received_at,
             protocol,
         };
@@ -1160,7 +1162,7 @@ impl TopicStore {
                     original_size,
                     qos,
                     retain,
-                    props,
+                    props: Arc::new(props),
                     received_at: at,
                     protocol,
                 },
@@ -1199,11 +1201,7 @@ impl TopicStore {
         let status = match status {
             SendStatus::Rejected(mut s) => {
                 if s.len() > STATUS_MAX {
-                    let mut n = STATUS_MAX;
-                    while !s.is_char_boundary(n) {
-                        n -= 1;
-                    }
-                    s.truncate(n);
+                    s.truncate(s.floor_char_boundary(STATUS_MAX));
                 }
                 // The row reserves STATUS_MAX bytes. A kept big buffer would be unaccounted.
                 s.shrink_to_fit();
@@ -2158,7 +2156,7 @@ impl TopicStore {
         if let Some(m) = self.nodes[id.ix()].latest.as_mut() {
             self.latest_bytes -= msg_cost(m);
             m.payload = Bytes::new();
-            m.props = MsgProps::default(); // ponytail: props go too, so the cost is exactly 0
+            m.props = Arc::default(); // ponytail: props go too, so the cost is exactly 0
             m.truncated = true;
         }
         true
@@ -3149,7 +3147,7 @@ mod tests {
             + list_len * (ROW_OVERHEAD + 100)
             + 20 * (HIST_OVERHEAD + 100);
         // The batch frees a tenth of the budget, so the budget has room for that, too.
-        let budget = budget + budget / 8;
+        let budget = budget + budget / 16;
         let mut s = TopicStore::new(Limits {
             budget,
             list_len,

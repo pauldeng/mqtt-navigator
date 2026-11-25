@@ -1,5 +1,6 @@
 //! The download: stream to `staging/`, check size and SHA-256, then rename to `staged/`.
 
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -46,7 +47,11 @@ pub fn download(policy: &Policy, release: &Release, install: &Install, dir: &Pat
     if total != want.size {
         return Err(Error::SizeMismatch);
     }
-    let hex: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let digest = hash.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(hex, "{b:02x}");
+    }
     if !hex.eq_ignore_ascii_case(&want.sha256) {
         return Err(Error::HashMismatch);
     }

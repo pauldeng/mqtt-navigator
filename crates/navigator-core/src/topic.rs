@@ -3,27 +3,45 @@
 /// Largest filter or topic length that MQTT allows, in bytes.
 pub const MAX_LEN: usize = 65_535;
 
-/// Why `s` is not a valid MQTT string, in the words of the old client (`bad string: ...`). The
-/// rules: at most 65 535 bytes; no NUL, no control character, no unassigned code point (this
-/// includes the non-characters). `None`: the string is valid.
-fn string_error(s: &str) -> Option<String> {
+/// Why a string is not a valid MQTT string. The rules: at most 65 535 bytes; no NUL, no control
+/// character, no unassigned code point (this includes the non-characters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringError {
+    TooLong,
+    Nul,
+    Control,
+    Unassigned,
+}
+
+impl StringError {
+    /// The text of the old client (`bad string: ...`).
+    fn text(self) -> &'static str {
+        match self {
+            Self::TooLong => "bad string: longer than 65,535 bytes",
+            Self::Nul => "bad string: contains U+0000",
+            Self::Control => "bad string: contains control codepoint",
+            Self::Unassigned => "bad string: contains non-character codepoint",
+        }
+    }
+}
+
+/// Checks that `s` is a valid MQTT string. Does not allocate.
+pub fn check_string(s: &str) -> Result<(), StringError> {
     use unicode_properties::{GeneralCategory, UnicodeGeneralCategory as _};
-    if s.len() > usize::from(u16::MAX) {
-        return Some("bad string: longer than 65,535 bytes".into());
+    if s.len() > MAX_LEN {
+        return Err(StringError::TooLong);
     }
     for c in s.chars() {
-        let why = if c == '\0' {
-            "contains U+0000"
-        } else {
-            match c.general_category() {
-                GeneralCategory::Control => "contains control codepoint",
-                GeneralCategory::Unassigned => "contains non-character codepoint",
-                _ => continue,
-            }
-        };
-        return Some(format!("bad string: {why}"));
+        if c == '\0' {
+            return Err(StringError::Nul);
+        }
+        match c.general_category() {
+            GeneralCategory::Control => return Err(StringError::Control),
+            GeneralCategory::Unassigned => return Err(StringError::Unassigned),
+            _ => {}
+        }
     }
-    None
+    Ok(())
 }
 
 /// Why `topic` is not a valid MQTT topic name, in the words of the old client: "empty topic",
@@ -32,63 +50,74 @@ pub fn topic_error(topic: &str) -> Option<String> {
     if topic.is_empty() {
         return Some("empty topic".into());
     }
-    if let Some(e) = string_error(topic) {
-        return Some(e);
+    if let Err(e) = check_string(topic) {
+        return Some(e.text().into());
     }
     topic
         .contains(['+', '#'])
         .then(|| format!("bad topic {topic}"))
 }
 
+/// Why a topic filter is not valid. The `&str` is the part of the filter that is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterError<'a> {
+    /// No filter, or a `$share` filter without an inner filter.
+    Empty,
+    /// Not a valid MQTT string.
+    String(StringError),
+    /// A `$share` filter with a wildcard in the group, no group or no separator (the whole filter).
+    Share(&'a str),
+    /// A `#` that is not a whole level or not the last level (the filter without `$share/group/`).
+    Hash(&'a str),
+    /// A `+` that is not a whole level (the filter without `$share/group/`).
+    Plus(&'a str),
+}
+
+/// Checks a topic filter. Does not allocate.
+///
+/// - It has 1 to 65 535 bytes and no NUL, control or unassigned character.
+/// - `+` is a whole level. `#` is a whole level and the last level.
+/// - `$share/<group>/<filter>` needs a group without wildcards and a valid inner filter.
+pub fn check_filter(filter: &str) -> Result<(), FilterError<'_>> {
+    if filter.is_empty() {
+        return Err(FilterError::Empty);
+    }
+    check_string(filter).map_err(FilterError::String)?;
+    let body = match shared_inner(filter) {
+        Some(Some(inner)) => inner,
+        Some(None) => {
+            // An empty inner filter is "empty", any other fault is a wrong group.
+            let rest = &filter["$share/".len()..];
+            return Err(match rest.split_once('/') {
+                Some((g, "")) if !g.is_empty() && !g.contains(['+', '#']) => FilterError::Empty,
+                _ => FilterError::Share(filter),
+            });
+        }
+        None => filter,
+    };
+    let mut levels = body.split('/').peekable();
+    while let Some(level) = levels.next() {
+        if level.contains('#') && (level != "#" || levels.peek().is_some()) {
+            return Err(FilterError::Hash(body));
+        }
+        if level.contains('+') && level != "+" {
+            return Err(FilterError::Plus(body));
+        }
+    }
+    Ok(())
+}
+
 /// Why `filter` is not a valid MQTT topic filter, in the words of the old client: "empty
 /// filter", "bad string: ...", or "bad filter {text}" (a wildcard in a wrong place, or a wrong
 /// `$share` group). `None`: the filter is valid.
 pub fn filter_error(filter: &str) -> Option<String> {
-    if filter.is_empty() {
-        return Some("empty filter".into());
-    }
-    if let Some(e) = string_error(filter) {
-        return Some(e);
-    }
-    let bad = |text: &str| Some(format!("bad filter {text}"));
-    let body = match filter.strip_prefix("$share/") {
-        Some(rest) => {
-            let end = rest.find(['+', '#', '/']);
-            // A wildcard in the group, no separator, or an empty group.
-            match end {
-                Some(i) if rest.as_bytes()[i] == b'/' && i > 0 => {}
-                _ => return bad(filter),
-            }
-            let inner = &rest[end.unwrap_or(0) + 1..];
-            if inner.is_empty() {
-                return Some("empty filter".into());
-            }
-            inner
+    Some(match check_filter(filter).err()? {
+        FilterError::Empty => "empty filter".into(),
+        FilterError::String(e) => e.text().into(),
+        FilterError::Share(t) | FilterError::Hash(t) | FilterError::Plus(t) => {
+            format!("bad filter {t}")
         }
-        None => filter,
-    };
-    // Levels: `+` and `#` stand alone, and `#` is last.
-    #[derive(PartialEq)]
-    enum State {
-        Separator,
-        Literal,
-        Single,
-        Multiple,
-    }
-    let mut state = State::Separator;
-    for c in body.chars() {
-        state = match (state, c) {
-            (State::Multiple, _) => return bad(body),
-            (_, '/') => State::Separator,
-            (State::Separator, '+') => State::Single,
-            (State::Separator, '#') => State::Multiple,
-            (State::Separator, _) => State::Literal,
-            (State::Literal, '+' | '#') => return bad(body),
-            (State::Literal, _) => State::Literal,
-            _ => return bad(body),
-        };
-    }
-    None
+    })
 }
 
 /// True for a shared subscription filter (`$share/<group>/<filter>`).
@@ -96,31 +125,9 @@ pub fn is_shared(filter: &str) -> bool {
     filter.starts_with("$share/")
 }
 
-/// True if `filter` is a valid MQTT 5 topic filter.
-///
-/// - It has 1 to 65 535 bytes and no NUL.
-/// - `+` is a whole level. `#` is a whole level and the last level.
-/// - `$share/<group>/<filter>` needs a group without wildcards and a valid inner filter.
+/// True if `filter` is a valid MQTT 5 topic filter (see [`check_filter`]).
 pub fn is_valid_filter(filter: &str) -> bool {
-    if filter.is_empty() || filter.len() > MAX_LEN || filter.contains('\0') {
-        return false;
-    }
-    let filter = match shared_inner(filter) {
-        Some(Some(inner)) => inner,
-        Some(None) => return false,
-        None => filter,
-    };
-    let mut levels = filter.split('/').peekable();
-    while let Some(level) = levels.next() {
-        let wildcard = level.contains(['+', '#']);
-        if wildcard && level.len() != 1 {
-            return false;
-        }
-        if level == "#" && levels.peek().is_some() {
-            return false;
-        }
-    }
-    true
+    check_filter(filter).is_ok()
 }
 
 /// For a `$share/` filter: `Some(Some(inner))` if the group is valid, `Some(None)` if not.

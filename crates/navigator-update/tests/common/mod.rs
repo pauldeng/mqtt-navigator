@@ -35,10 +35,12 @@ impl Keys {
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    use std::fmt::Write as _;
+    let mut hex = String::new();
+    for b in Sha256::digest(bytes) {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// `latest.json` text for one target.
