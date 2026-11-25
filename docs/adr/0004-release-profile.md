@@ -1,6 +1,6 @@
 # ADR 0004: Release profile and size gate
 
-Status: accepted (2026-11-11). The size gate is removed (2026-11-20, owner decision). The release profile uses `opt-level = 3` since 2026-11-26 (owner decision: speed, not size). Advice: Codex (gpt-6.1-sol), decision D7 of P5. The table of 2026-11-11 is for 0.1.x (`ms-mqtt-client`). The 0.2.0 binary is 2.2% larger than the 0.1.1 release binary ([ADR 0006](0006-ntex-mqtt.md)).
+Status: accepted (2026-11-11). The size gate is removed (2026-11-20, owner decision). The release profile uses `opt-level = 3` since 2026-11-26 (owner decision: speed, not size). Advice: Codex (gpt-6.1-sol), decision D7 of P5. The table of 2026-11-11 is for 0.1.x (`ms-mqtt-client`). The ntex build of P8 (S4, before 0.2.0) is 2.2% larger than the 0.1.1 release binary ([ADR 0006](0006-ntex-mqtt.md)).
 
 ## Measurements of 2026-11-11 (Linux x64, stripped, panic = unwind, split debug info)
 
@@ -19,10 +19,10 @@ Linux x64, Xvfb 1500x900 (software rendering), `lto = "fat"`, frame pointers on,
 
 | Scenario | UI CPU per frame, `s` | UI CPU per frame, `3` | Change | Merge p95, `s` / `3` |
 |---|---|---|---|---|
-| S1 Messages view, Follow on | 4.29 ms | 4.01 ms | -6% | 0.57 / 0.53 ms |
-| S2 Tree view | 2.87 ms | 2.62 ms | -9% | 0.56 / 0.53 ms |
-| S3 Messages view, 50 000 msg/s | 6.69 ms | 6.27 ms | -6% | 3.29 / 3.29 ms |
-| S4 Messages view, composer open | 7.85 ms | 7.02 ms | -11% | 0.71 / 0.69 ms |
+| S1 Messages view, Follow on | 4.29 ms | 4.01 ms | -6.5% | 0.57 / 0.53 ms |
+| S2 Tree view | 2.87 ms | 2.62 ms | -8.7% | 0.56 / 0.53 ms |
+| S3 Messages view, 50 000 msg/s | 6.69 ms | 6.27 ms | -6.3% | 3.29 / 3.29 ms |
+| S4 Messages view, composer open | 7.85 ms | 7.02 ms | -10.6% | 0.71 / 0.69 ms |
 
 Frames per second are the same in both builds (about 22 in S1 to S3 and 32 in S4: the software renderer sets the pace). The merge maximum is 3.3 to 4.7 ms with `s` and 3.3 to 3.8 ms with `3`. S1, S2 and S4 have no drops. S3 drops messages at the net queue in both builds in these runs. Merge p95 is the median of the one-second values of a run. The binary (stripped) grows from 36.1 MB to 47.9 MB (+33%).
 
