@@ -523,13 +523,13 @@ impl Navigator {
                 .then_some((pane.insp.choice.kind, pane.insp.choice.endian)),
             can_show_all: pane.can_show_all(shown.as_ref()),
             can_show_more: pane.can_show_more(shown.as_ref()),
-            payload_mode: self.comp.mode,
+            payload_mode: self.comp.read(cx).mode,
             theme: Some(self.settings.ui.theme_mode),
             preset: crate::themes::preset_by_id(&self.settings.ui.theme_preset).id,
             memory_mib: self.memory_mib(),
             check_updates: self.settings.ui.check_updates,
             sub_qos: self.show_only_sub().map(|s| s.qos),
-            composer_open: self.comp.vis.open,
+            composer_open: self.comp.read(cx).vis.open,
             sub_removing: self
                 .show_only_sub()
                 .is_some_and(|s| s.state.removal_accepted()),
@@ -1072,10 +1072,11 @@ impl Navigator {
             return;
         };
         self.close_details_sheet(window, cx);
-        let mut d = self.read_draft(cx);
+        let mut d = self.comp.read(cx).read_draft(cx);
         d.topic = topic;
         let unsent = d.has_content();
-        self.replace_composer(d, unsent, window, cx);
+        self.comp
+            .update(cx, |c, cx| c.replace_composer(d, unsent, window, cx));
     }
 
     pub(super) fn edit_and_publish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1089,20 +1090,22 @@ impl Navigator {
         let notice = self.v3_notice(&s.msg.props);
         self.close_details_sheet(window, cx);
         self.prepare_v3_draft(&mut d, notice, window, cx);
-        self.replace_composer(d, true, window, cx);
+        self.comp
+            .update(cx, |c, cx| c.replace_composer(d, true, window, cx));
     }
 
     pub(super) fn reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(s) = self.shown(cx) else {
             return;
         };
-        let Some(mut d) = Draft::reply(&s.msg, self.comp.qos) else {
+        let Some(mut d) = Draft::reply(&s.msg, self.comp.read(cx).qos) else {
             return;
         };
         let notice = self.v3_notice(&s.msg.props);
         self.close_details_sheet(window, cx);
         self.prepare_v3_draft(&mut d, notice, window, cx);
-        self.replace_composer(d, true, window, cx);
+        self.comp
+            .update(cx, |c, cx| c.replace_composer(d, true, window, cx));
     }
 
     /// True if the notice "MQTT 3.1.1 does not send properties." is due: the composer follows an
@@ -1183,7 +1186,9 @@ impl Navigator {
             retain: true,
             ..Draft::default()
         };
-        self.publish_draft(&d, false, window, cx);
+        if let Err(e) = self.publish_draft(&d, cx) {
+            window.push_notification(Notification::error(e), cx);
+        }
     }
 }
 

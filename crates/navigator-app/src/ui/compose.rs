@@ -57,18 +57,22 @@ fn rows_in_view(
 ) -> Vec<bool> {
     const MARGIN_ROWS: f32 = 2.;
     let n = extents.len();
-    let all: Option<Vec<(Pixels, Pixels)>> = extents.iter().copied().collect();
-    let (Some(rows), true, true) = (all, n > 1, view > px(0.)) else {
+    if n < 2 || view <= px(0.) || extents.iter().any(Option::is_none) {
+        return vec![true; n];
+    }
+    let (Some(first), Some(last)) = (extents[0], extents[n - 1]) else {
         return vec![true; n];
     };
-    let heights: Pixels = rows[..n - 1].iter().map(|r| r.1).sum();
-    let gap = (rows[n - 1].0 - rows[0].0 - heights) / (n - 1) as f32;
-    let margin = (rows[0].1 + gap) * MARGIN_ROWS;
-    let mut y = rows[0].0;
+    let heights: Pixels = extents[..n - 1].iter().flatten().map(|r| r.1).sum();
+    let gap = (last.0 - first.0 - heights) / (n - 1) as f32;
+    let margin = (first.1 + gap) * MARGIN_ROWS;
+    let mut y = first.0;
     let near_focus = |i: usize| (i.saturating_sub(2)..=(i + 2).min(n - 1)).any(|k| focused[k]);
-    rows.iter()
+    extents
+        .iter()
         .enumerate()
-        .map(|(i, &(_, h))| {
+        .map(|(i, e)| {
+            let h = e.map_or(px(0.), |r| r.1);
             let at = y;
             y += h + gap;
             i == 0
@@ -146,7 +150,7 @@ impl Spot {
         div().track_focus(&self.switch).child(switch)
     }
 
-    fn new(cx: &mut Context<Navigator>) -> Self {
+    fn new(cx: &mut Context<ComposerPane>) -> Self {
         Self {
             bounds: Rc::default(),
             extent: Rc::default(),
@@ -189,7 +193,35 @@ struct UserRow {
     _subs: Vec<Subscription>,
 }
 
-pub(super) struct Composer {
+/// What the composer shows from `Navigator`. `Navigator::sync_composer` copies it into the pane
+/// when it changes, and then the pane draws again.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ComposerInputs {
+    pub(super) connected: bool,
+    /// The composer follows an MQTT 5 connection or profile.
+    pub(super) v5: bool,
+    /// The text of the last publish result.
+    pub(super) result: String,
+}
+
+/// Sent when the room that the composer needs changes: it opened or closed, or its content got
+/// another height. `Navigator` then draws again and gives the pane its new height.
+pub(super) struct Relayout;
+
+/// The publish composer. Its own view: gpui reuses its last frame until the pane calls `notify`.
+/// `Navigator` tells the pane when an input of it changes (see `Navigator::composer_sig`). The
+/// pane notifies itself for its own state.
+pub(super) struct ComposerPane {
+    nav: WeakEntity<Navigator>,
+    /// The message list takes the focus when the composer closes.
+    list_focus: FocusHandle,
+    inputs: ComposerInputs,
+    /// The height of the content at the last layout, with the limit of the window. The parent
+    /// gives it to the cached view, which has no content-driven size.
+    pub(super) height: Rc<Cell<Pixels>>,
+    /// Tests only: how often the pane drew.
+    #[cfg(test)]
+    pub(super) renders: usize,
     topic: Field,
     pub(super) payload: Entity<EditorState>,
     content_type: Field,
@@ -253,14 +285,19 @@ pub(super) struct Composer {
     _subs: Vec<Subscription>,
 }
 
-impl Composer {
+impl ComposerPane {
     /// The row element of a standard property.
     fn std_spot(&self, kind: PropKind, child: impl IntoElement) -> Div {
         spot_div(&self.std_spots[kind as usize], &self.props_scroll, child)
     }
 
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Navigator>) -> Self {
-        let input = |window: &mut Window, cx: &mut Context<Navigator>, hint: &'static str| {
+    pub(super) fn new(
+        nav: WeakEntity<Navigator>,
+        list_focus: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<ComposerPane>,
+    ) -> Self {
+        let input = |window: &mut Window, cx: &mut Context<ComposerPane>, hint: &'static str| {
             cx.new(|cx| InputState::new(window, cx).placeholder(hint))
         };
         let topic = input(window, cx, "Topic");
@@ -289,14 +326,14 @@ impl Composer {
         .map(|i| {
             cx.subscribe(i, |v, _, ev: &InputEvent, _| {
                 if matches!(ev, InputEvent::Change) {
-                    v.comp.model.edited();
+                    v.model.edited();
                 }
             })
         })
         .collect();
         subs.push(cx.subscribe(&payload, |v, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
-                v.comp.model.edited();
+                v.model.edited();
                 v.check_json(cx);
             }
         }));
@@ -327,6 +364,12 @@ impl Composer {
             }));
         }
         Self {
+            nav,
+            list_focus,
+            inputs: ComposerInputs::default(),
+            height: Rc::default(),
+            #[cfg(test)]
+            renders: 0,
             topic: Field::new(topic),
             payload,
             content_type: Field::new(content_type),
@@ -370,8 +413,14 @@ impl Composer {
         }
     }
 
+    /// An input from `Navigator` changed (see `Navigator::composer_sig`): draws again.
+    pub(super) fn set_inputs(&mut self, inputs: ComposerInputs, cx: &mut Context<ComposerPane>) {
+        self.inputs = inputs;
+        cx.notify();
+    }
+
     /// The profile changed: the composer and History start empty.
-    pub(super) fn reset(&mut self, window: &mut Window, cx: &mut App) {
+    pub(super) fn reset(&mut self, window: &mut Window, cx: &mut Context<ComposerPane>) {
         self.model.clear();
         self.error = None;
         self.format_task = None;
@@ -402,13 +451,24 @@ impl Composer {
             i.update(cx, |i, cx| i.set_value("", window, cx));
         }
         self.payload.update(cx, |e, cx| e.set_value("", window, cx));
+        cx.emit(Relayout);
+        cx.notify();
     }
 }
 
-impl Navigator {
+impl EventEmitter<Relayout> for ComposerPane {}
+
+impl ComposerPane {
+    /// Opens the composer. `Navigator` then makes room for it.
+    fn show(&mut self, cx: &mut Context<ComposerPane>) {
+        if self.vis.open() {
+            cx.emit(Relayout);
+        }
+    }
+
     /// What the composer holds now.
     pub(super) fn read_draft(&self, cx: &App) -> Draft {
-        let c = &self.comp;
+        let c = &self;
         let text = |i: &Entity<InputState>| i.read(cx).value().to_string();
         // A field with text is present. An empty field is present only if the user said so.
         let present = |t: String, empty: bool| (!t.is_empty() || empty).then_some(t);
@@ -448,8 +508,8 @@ impl Navigator {
             f
         };
         let (k, v) = (mk(window, cx, "Name", key), mk(window, cx, "Value", value));
-        let id = self.comp.next_row;
-        self.comp.next_row += 1;
+        let id = self.next_row;
+        self.next_row += 1;
         let spot = Spot::new(cx);
         // A focus that enters the row reveals it. An input also reveals the row when the focus
         // moves inside the row (for example from Name to Value, after the user scrolled away).
@@ -457,7 +517,7 @@ impl Navigator {
             .into_iter()
             .map(|i| {
                 cx.subscribe(i, move |v, _, ev: &InputEvent, cx| match ev {
-                    InputEvent::Change => v.comp.model.edited(),
+                    InputEvent::Change => v.model.edited(),
                     InputEvent::Focus => v.reveal_user_row_id(id, cx),
                     _ => {}
                 })
@@ -481,7 +541,6 @@ impl Navigator {
     /// drawn has no place: the caller scrolls.
     fn reveal_user_row_id(&mut self, id: u64, cx: &mut Context<Self>) {
         let b = self
-            .comp
             .rows
             .iter()
             .find(|r| r.id == id)
@@ -491,18 +550,17 @@ impl Navigator {
 
     /// The same for a standard property field.
     fn reveal_std(&mut self, kind: PropKind, cx: &mut Context<Self>) {
-        let b = self.comp.std_spots[kind as usize].bounds.take();
+        let b = self.std_spots[kind as usize].bounds.take();
         self.reveal(b, cx);
     }
 
     /// The same for the row that has the focus, if any.
     fn reveal_focused_row(&mut self, window: &Window, cx: &mut Context<Self>) {
         let b = self
-            .comp
             .rows
             .iter()
             .map(|r| &r.spot)
-            .chain(self.comp.std_spots.iter())
+            .chain(self.std_spots.iter())
             .find(|s| s.focus.contains_focused(window, cx))
             .and_then(|s| s.bounds.take());
         self.reveal(b, cx);
@@ -516,7 +574,7 @@ impl Navigator {
         let Some(b) = b else {
             return;
         };
-        let scroll = &self.comp.props_scroll;
+        let scroll = &self.props_scroll;
         let (view, at) = (scroll.bounds(), scroll.offset());
         let mut y = at.y;
         if b.top() < view.top() {
@@ -534,61 +592,49 @@ impl Navigator {
     /// For the window tests: how many user rows the last frame built.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn drawn_rows(&self) -> usize {
-        self.comp.drawn_rows.get()
+        self.drawn_rows.get()
     }
 
     #[cfg(all(test, debug_assertions))]
     pub(super) fn resized_rows(&self) -> usize {
-        self.comp.resized_rows.get()
+        self.resized_rows.get()
     }
 
     /// For the window tests: the scroll offset of the user rows.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn props_offset(&self) -> Pixels {
-        self.comp.props_scroll.offset().y
+        self.props_scroll.offset().y
     }
 
     #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_row_focus(&self) -> FocusHandle {
-        self.comp
-            .rows
-            .last()
-            .expect("a user row")
-            .spot
-            .focus
-            .clone()
+        self.rows.last().expect("a user row").spot.focus.clone()
     }
 
     #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_value(&self) -> Entity<InputState> {
-        self.comp
-            .rows
-            .last()
-            .expect("a user row")
-            .value
-            .input
-            .clone()
+        self.rows.last().expect("a user row").value.input.clone()
     }
 
     pub(super) fn scroll_props_to_top(&mut self) {
-        let at = self.comp.props_scroll.offset();
-        self.comp.props_scroll.set_offset(point(at.x, px(0.)));
+        let at = self.props_scroll.offset();
+        self.props_scroll.set_offset(point(at.x, px(0.)));
     }
 
     #[cfg(all(test, debug_assertions))]
     pub(super) fn user_row_focus(&self, i: usize) -> FocusHandle {
-        self.comp.rows[i].spot.focus.clone()
+        self.rows[i].spot.focus.clone()
     }
 
     #[cfg(all(test, debug_assertions))]
     pub(super) fn first_user_row_focus(&self) -> FocusHandle {
-        self.comp.rows[0].spot.focus.clone()
+        self.rows[0].spot.focus.clone()
     }
 
     /// For the window tests: the height of the last user row at the last layout.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_row_height(&self) -> Pixels {
-        let row = self.comp.rows.last().expect("a user row");
+        let row = self.rows.last().expect("a user row");
         row.spot
             .bounds
             .get()
@@ -600,20 +646,14 @@ impl Navigator {
     /// For the window tests: the Remove button of the last user row.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_remove_focus(&self) -> FocusHandle {
-        self.comp
-            .rows
-            .last()
-            .expect("a user row")
-            .spot
-            .remove
-            .clone()
+        self.rows.last().expect("a user row").spot.remove.clone()
     }
 
     /// For the window tests: the last user row is inside the scroll viewport.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn last_user_row_in_view(&self) -> bool {
-        let row = self.comp.rows.last().expect("a user row");
-        let (Some(b), view) = (row.spot.bounds.get(), self.comp.props_scroll.bounds()) else {
+        let row = self.rows.last().expect("a user row");
+        let (Some(b), view) = (row.spot.bounds.get(), self.props_scroll.bounds()) else {
             return false;
         };
         b.top() >= view.top() && b.bottom() <= view.bottom()
@@ -622,81 +662,77 @@ impl Navigator {
     /// For the window tests: sets the result line (an error) of the composer.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn set_composer_error(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.comp.error = Some(text.into());
+        self.error = Some(text.into());
         cx.notify();
     }
 
     /// For the window tests: the focus handles of the `⋯` button and of "Add property".
     #[cfg(all(test, debug_assertions))]
     pub(super) fn menu_buttons_focus(&self) -> [FocusHandle; 2] {
-        [self.comp.more_focus.clone(), self.comp.add_focus.clone()]
+        [self.more_focus.clone(), self.add_focus.clone()]
     }
 
     /// For the window tests: whether the property rows are stacked now.
     #[cfg(all(test, debug_assertions))]
     pub(super) fn rows_stacked(&self, rem: Pixels) -> bool {
-        props_stacked(self.comp.size.get().map(|s| s.width), rem)
+        props_stacked(self.size.get().map(|s| s.width), rem)
     }
 
     /// Writes a draft into the composer fields. It does not touch History.
     fn apply_draft(&mut self, d: &Draft, window: &mut Window, cx: &mut Context<Self>) {
         // A new set of rows starts at the top.
-        self.comp.props_scroll.set_offset(point(px(0.), px(0.)));
-        self.comp.topic.set(&d.topic, window, cx);
-        self.comp
-            .content_type
+        self.props_scroll.set_offset(point(px(0.), px(0.)));
+        self.topic.set(&d.topic, window, cx);
+        self.content_type
             .set(d.content_type.as_deref().unwrap_or(""), window, cx);
-        self.comp.content_type_empty = d.content_type.as_deref() == Some("");
-        self.comp.response_topic.set(&d.response_topic, window, cx);
+        self.content_type_empty = d.content_type.as_deref() == Some("");
+        self.response_topic.set(&d.response_topic, window, cx);
         let corr = d.correlation.clone().unwrap_or_default();
-        self.comp.correlation_empty = d.correlation.as_deref() == Some("");
-        self.comp
-            .correlation
+        self.correlation_empty = d.correlation.as_deref() == Some("");
+        self.correlation
             .update(cx, |i, cx| i.set_value(corr, window, cx));
-        self.comp
-            .expiry
+        self.expiry
             .update(cx, |i, cx| i.set_value(d.expiry.clone(), window, cx));
-        self.comp
-            .payload
+        self.payload
             .update(cx, |e, cx| e.set_value(d.payload.clone(), window, cx));
-        self.comp.mode = d.mode;
+        self.mode = d.mode;
         self.set_payload_hint(window, cx);
-        self.comp.qos = d.qos;
-        self.comp.retain = d.retain;
-        self.comp.utf8 = d.utf8;
+        self.qos = d.qos;
+        self.retain = d.retain;
+        self.utf8 = d.utf8;
         let rows: Vec<UserRow> = d
             .user
             .iter()
             .map(|(k, v)| self.new_row(k, v, true, window, cx))
             .collect();
-        self.comp.rows = rows;
+        self.rows = rows;
         // A recall, an Edit or a Reply opens Properties when it fills a field.
-        self.comp.shown = PropShown::of_draft(d);
-        self.comp.vis.props |= property_count(d) > 0;
+        self.shown = PropShown::of_draft(d);
+        self.vis.props |= property_count(d) > 0;
     }
 
     /// JSON mode: checks the payload in the background. Valid JSON gets highlighting. Invalid
     /// JSON gets a warning, and Publish still sends it. A result for text that changed since is
     /// dropped. Other modes: no warning and no highlighting.
     fn check_json(&mut self, cx: &mut Context<Self>) {
-        if self.comp.mode != PayloadMode::Json {
-            self.comp.json_task = None;
-            self.comp.json_warning = None;
+        if self.mode != PayloadMode::Json {
+            self.json_task = None;
+            self.json_warning = None;
             self.set_json_lang(false, cx);
             return;
         }
-        let snapshot = self.comp.payload.read(cx).value();
+        let snapshot = self.payload.read(cx).value();
         let text = snapshot.clone();
-        self.comp.json_task = Some(cx.spawn(async move |this, cx| {
+        self.json_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { decode::json_valid(text.as_bytes()) })
                 .await;
             this.update(cx, |v, cx| {
-                if v.comp.mode != PayloadMode::Json || v.comp.payload.read(cx).value() != snapshot {
+                if v.mode != PayloadMode::Json || v.payload.read(cx).value() != snapshot {
                     return;
                 }
-                v.comp.json_warning = result.as_ref().err().cloned();
+                v.json_warning = result.as_ref().err().cloned();
                 v.set_json_lang(result.is_ok(), cx);
                 cx.notify();
             })
@@ -706,24 +742,21 @@ impl Navigator {
 
     /// Changes the highlighting only when it changes, so typing keeps a stable editor.
     fn set_json_lang(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.comp.json_lang != on {
-            self.comp.json_lang = on;
+        if self.json_lang != on {
+            self.json_lang = on;
             let lang = if on { "json" } else { "text" };
-            self.comp
-                .payload
-                .update(cx, |e, cx| e.set_highlighter(lang, cx));
+            self.payload.update(cx, |e, cx| e.set_highlighter(lang, cx));
         }
     }
 
     fn set_payload_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.check_json(cx);
-        let hint = match self.comp.mode {
+        let hint = match self.mode {
             PayloadMode::Text => "Payload",
             PayloadMode::Hex => "Payload as hex bytes, for example 01 ff 7a",
             PayloadMode::Json => "Payload as JSON",
         };
-        self.comp
-            .payload
+        self.payload
             .update(cx, |e, cx| e.set_placeholder(hint, window, cx));
     }
 
@@ -731,7 +764,7 @@ impl Navigator {
     /// Edit, Reply, Publish to this topic, Format and the Text/Hex switch all call this.
     fn save_before_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.read_draft(cx);
-        if !self.comp.model.before_replace(current) {
+        if !self.model.before_replace(current) {
             window.push_notification(
                 Notification::warning("The old draft is larger than 1 MiB. It is not kept."),
                 cx,
@@ -751,16 +784,16 @@ impl Navigator {
     ) {
         self.save_before_replace(window, cx);
         self.apply_draft(&d, window, cx);
-        self.comp.model.loaded(unsent);
-        self.comp.error = None;
-        self.comp.vis.open();
-        self.comp.payload.update(cx, |e, cx| e.focus(window, cx));
+        self.model.loaded(unsent);
+        self.error = None;
+        self.show(cx);
+        self.payload.update(cx, |e, cx| e.focus(window, cx));
         cx.notify();
     }
 
     /// Fills the composer from an entry of History. A draft leaves Drafts.
     fn recall(&mut self, seq: u64, draft: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let h = &mut self.comp.model.history;
+        let h = &mut self.model.history;
         let d = if draft {
             h.take_draft(seq)
         } else {
@@ -783,7 +816,7 @@ impl Navigator {
             Ok(()) => {
                 if old.payload != d.payload {
                     // The unsent original stays in Drafts (Text and Hex are not the same text).
-                    if !self.comp.model.replace_with(old, self.comp.model.unsent) {
+                    if !self.model.replace_with(old, self.model.unsent) {
                         window.push_notification(
                             Notification::warning(
                                 "The old draft is larger than 1 MiB. It is not kept.",
@@ -791,15 +824,14 @@ impl Navigator {
                             cx,
                         );
                     }
-                    self.comp
-                        .payload
+                    self.payload
                         .update(cx, |e, cx| e.set_value(d.payload, window, cx));
                 }
-                self.comp.mode = to;
-                self.comp.error = None;
+                self.mode = to;
+                self.error = None;
                 self.set_payload_hint(window, cx);
             }
-            Err(e) => self.comp.error = Some(e),
+            Err(e) => self.error = Some(e),
         }
         cx.notify();
     }
@@ -807,14 +839,11 @@ impl Navigator {
     /// New message (`Ctrl/Cmd+Shift+N`, the button, the palette): opens the composer. The focus
     /// goes to the topic when it is empty, else to the payload.
     pub(super) fn open_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.comp.vis.open();
-        if self.comp.topic.get(cx).is_empty() {
-            self.comp
-                .topic
-                .input
-                .update(cx, |i, cx| i.focus(window, cx));
+        self.show(cx);
+        if self.topic.get(cx).is_empty() {
+            self.topic.input.update(cx, |i, cx| i.focus(window, cx));
         } else {
-            self.comp.payload.update(cx, |e, cx| e.focus(window, cx));
+            self.payload.update(cx, |e, cx| e.focus(window, cx));
         }
         cx.notify();
     }
@@ -822,8 +851,9 @@ impl Navigator {
     /// The one close operation: the Close item, `Esc` and the palette. The draft stays. The
     /// focus moves to the message list, so that it never stays on a control that is gone.
     pub(super) fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.comp.vis.close() {
+        if self.vis.close() {
             self.list_focus.focus(window, cx);
+            cx.emit(Relayout);
             cx.notify();
         }
     }
@@ -831,23 +861,21 @@ impl Navigator {
     /// "Composer: Properties": opens the composer and the Properties section.
     pub(super) fn open_properties(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_composer(window, cx);
-        self.comp.vis.props = true;
+        self.vis.props = true;
         cx.notify();
     }
 
     pub(super) fn focus_publish_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.comp.vis.open();
-        self.comp
-            .topic
-            .input
-            .update(cx, |i, cx| i.focus(window, cx));
+        self.show(cx);
+        self.topic.input.update(cx, |i, cx| i.focus(window, cx));
         cx.notify();
     }
 
     /// The number in "Properties (N)", from the property fields only.
     fn props_count(&self, cx: &App) -> usize {
-        let c = &self.comp;
-        let filled = |i: &Entity<InputState>| !i.read(cx).value().is_empty();
+        let c = &self;
+        // `text()` borrows the rope. `value()` would build a string of it.
+        let filled = |i: &Entity<InputState>| i.read(cx).text().len() != 0;
         PropPresence {
             payload_format: c.utf8,
             content_type: c.content_type_empty || filled(&c.content_type.input),
@@ -870,23 +898,23 @@ impl Navigator {
             PropKind::User => {
                 let row = self.new_row("", "", false, window, cx);
                 let input = row.key.input.clone();
-                self.comp.rows.push(row);
+                self.rows.push(row);
                 Some(input)
             }
             PropKind::PayloadFormat => {
-                self.comp.utf8 = true;
-                self.comp.shown.set(kind, true);
+                self.utf8 = true;
+                self.shown.set(kind, true);
                 // No input takes the focus: the row is the first in the area.
                 self.scroll_props_to_top();
                 None
             }
             _ => {
-                self.comp.shown.set(kind, true);
+                self.shown.set(kind, true);
                 match kind {
-                    PropKind::ContentType => Some(self.comp.content_type.input.clone()),
-                    PropKind::ResponseTopic => Some(self.comp.response_topic.input.clone()),
-                    PropKind::Correlation => Some(self.comp.correlation.clone()),
-                    _ => Some(self.comp.expiry.clone()),
+                    PropKind::ContentType => Some(self.content_type.input.clone()),
+                    PropKind::ResponseTopic => Some(self.response_topic.input.clone()),
+                    PropKind::Correlation => Some(self.correlation.clone()),
+                    _ => Some(self.expiry.clone()),
                 }
             }
         };
@@ -896,39 +924,35 @@ impl Navigator {
         // A new user row is the last in the scroll area, and it has no place yet. The focus in a
         // standard field reveals it (`reveal_std`).
         if kind == PropKind::User {
-            self.comp.props_scroll.scroll_to_bottom();
-            self.comp.draw_all.set(true);
+            self.props_scroll.scroll_to_bottom();
+            self.draw_all.set(true);
         }
-        self.comp.vis.props = true;
-        self.comp.model.edited();
+        self.vis.props = true;
+        self.model.edited();
         cx.notify();
     }
 
     /// Removes a property: it hides and its value is gone.
     fn remove_prop(&mut self, kind: PropKind, window: &mut Window, cx: &mut Context<Self>) {
         match kind {
-            PropKind::PayloadFormat => self.comp.utf8 = false,
+            PropKind::PayloadFormat => self.utf8 = false,
             PropKind::ContentType => {
-                self.comp.content_type.set("", window, cx);
-                self.comp.content_type_empty = false;
+                self.content_type.set("", window, cx);
+                self.content_type_empty = false;
             }
-            PropKind::ResponseTopic => self.comp.response_topic.set("", window, cx),
+            PropKind::ResponseTopic => self.response_topic.set("", window, cx),
             PropKind::Correlation => {
-                self.comp
-                    .correlation
+                self.correlation
                     .update(cx, |i, cx| i.set_value("", window, cx));
-                self.comp.correlation_empty = false;
+                self.correlation_empty = false;
             }
-            PropKind::Expiry => self
-                .comp
-                .expiry
-                .update(cx, |i, cx| i.set_value("", window, cx)),
+            PropKind::Expiry => self.expiry.update(cx, |i, cx| i.set_value("", window, cx)),
             PropKind::User => return,
         }
-        self.comp.shown.set(kind, false);
-        self.comp.model.edited();
+        self.shown.set(kind, false);
+        self.model.edited();
         // The remove button is gone: the focus moves to the payload, which stays.
-        self.comp.payload.update(cx, |e, cx| e.focus(window, cx));
+        self.payload.update(cx, |e, cx| e.focus(window, cx));
         cx.notify();
     }
 
@@ -940,16 +964,14 @@ impl Navigator {
         }
         let list = |items: Vec<(u64, SharedString)>| items;
         let drafts = list(
-            self.comp
-                .model
+            self.model
                 .history
                 .drafts()
                 .map(|e| (e.seq, e.label.clone().into()))
                 .collect(),
         );
         let sent = list(
-            self.comp
-                .model
+            self.model
                 .history
                 .sent()
                 .map(|e| (e.seq, e.label.clone().into()))
@@ -1017,12 +1039,12 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.comp.mode.is_text() {
+        if !self.mode.is_text() {
             return;
         }
-        let size = self.comp.payload.read(cx).text().len();
+        let size = self.payload.read(cx).text().len();
         if size > FORMAT_MAX_IN {
-            self.comp.error = Some(format!(
+            self.error = Some(format!(
                 "Format works up to {}. This payload has {}.",
                 size_text(FORMAT_MAX_IN),
                 size_text(size)
@@ -1030,9 +1052,9 @@ impl Navigator {
             cx.notify();
             return;
         }
-        let snapshot = self.comp.payload.read(cx).value().to_string();
+        let snapshot = self.payload.read(cx).value().to_string();
         let text = snapshot.clone();
-        self.comp.format_task = Some(cx.spawn_in(window, async move |this, cx| {
+        self.format_task = Some(cx.spawn_in(window, async move |this, cx| {
             let out = cx
                 .background_executor()
                 .spawn(async move {
@@ -1041,13 +1063,13 @@ impl Navigator {
                 })
                 .await;
             this.update_in(cx, |v, window, cx| {
-                if v.comp.payload.read(cx).value() != snapshot.as_str() {
+                if v.payload.read(cx).value() != snapshot.as_str() {
                     return;
                 }
                 match out.error {
-                    Some(e) => v.comp.error = Some(e),
+                    Some(e) => v.error = Some(e),
                     None if out.text.len() > FORMAT_MAX_OUT => {
-                        v.comp.error = Some(format!(
+                        v.error = Some(format!(
                             "The formatted text has {}. Format works up to {}.",
                             size_text(out.text.len()),
                             size_text(FORMAT_MAX_OUT)
@@ -1055,7 +1077,7 @@ impl Navigator {
                     }
                     None => {
                         let old = v.read_draft(cx);
-                        if !v.comp.model.replace_with(old, true) {
+                        if !v.model.replace_with(old, true) {
                             window.push_notification(
                                 Notification::warning(
                                     "The old draft is larger than 1 MiB. It is not kept.",
@@ -1063,10 +1085,9 @@ impl Navigator {
                                 cx,
                             );
                         }
-                        v.comp
-                            .payload
+                        v.payload
                             .update(cx, |e, cx| e.set_value(out.text, window, cx));
-                        v.comp.error = None;
+                        v.error = None;
                         // `set_value` sends no Change event: check the new text here.
                         v.check_json(cx);
                     }
@@ -1077,135 +1098,41 @@ impl Navigator {
         }));
     }
 
-    /// Ctrl/Cmd+Enter and the Send button.
-    pub(super) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The result line already shows the hint. An error here would hide a recorded result.
-        if !self.connected() {
-            return;
-        }
-        let d = self.read_draft(cx);
-        self.publish_draft(&d, true, window, cx);
-    }
-
-    /// Checks `d` with the core rules, sends it and records it in the list. `from_composer`: the
-    /// draft goes to Sent and errors show under the composer.
-    pub(super) fn publish_draft(
+    /// The composer shows the outcome of a publish from it: the draft goes to Sent, or the error
+    /// shows under the payload.
+    pub(super) fn published(
         &mut self,
-        d: &Draft,
-        from_composer: bool,
-        window: &mut Window,
+        d: Draft,
+        result: Result<(), String>,
         cx: &mut Context<Self>,
     ) {
-        let op_id = self.next_op;
-        let v3 = self.composer_protocol() == Protocol::V311;
-        // An MQTT 3.1.1 message has no properties. The hidden fields must not block it.
-        let mut wire = d.clone();
-        if v3 {
-            wire.drop_properties();
-        }
-        let checked = wire.to_outgoing(op_id).and_then(|o| {
-            validate_outgoing(&o, self.net.broker_max_packet())?;
-            if v3 {
-                validate_v3_size(&o, NetLimits::default().max_packet)?;
-            }
-            Ok(o)
-        });
-        let out = match checked {
-            Ok(o) => o,
-            Err(e) => {
-                if from_composer {
-                    self.comp.error = Some(e);
-                } else {
-                    window.push_notification(Notification::error(e), cx);
-                }
-                cx.notify();
-                return;
-            }
-        };
-        self.next_op += 1;
-        match self.net.send(Command::Publish(Box::new(out.clone()))) {
+        match result {
             Ok(()) => {
-                // The list row shows the progress. The broker sends the message back as a
-                // normal received message if a subscription matches.
-                self.capture_anchor();
-                self.store.record_sent(
-                    op_id,
-                    &out.topic,
-                    out.payload,
-                    out.qos,
-                    out.retain,
-                    out.props,
-                    SystemTime::now(),
-                    self.conn_protocol,
-                );
-                self.restore_anchor();
-                self.last_result = Some((op_id, status_text(&SendStatus::Sending)));
-                if from_composer {
-                    self.comp.model.sent(d.clone());
-                    self.comp.error = None;
-                }
+                self.model.sent(d);
+                self.error = None;
             }
-            Err(e) => {
-                let why = send_error_text(e).to_string();
-                if from_composer {
-                    self.comp.error = Some(why);
-                } else {
-                    window.push_notification(Notification::error(why), cx);
-                }
-            }
+            Err(e) => self.error = Some(e),
         }
         cx.notify();
     }
 
-    pub(super) fn render_composer(
-        &mut self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// The open composer. A closed one is a button that `Navigator` draws.
+    fn render_open(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        if !self.comp.vis.open {
-            // Closed: one text button. The editors and the draft stay.
-            return h_flex()
-                .border_t_1()
-                .border_color(theme.border)
-                .p_2()
-                .gap_2()
-                .items_center()
-                .child(
-                    Button::new("new-message")
-                        .small()
-                        .label("New message")
-                        .on_click(cx.listener(|v, _, window, cx| v.open_composer(window, cx))),
-                )
-                .child(div().text_xs().text_color(muted).children(shortcut_text(
-                    &NewMessage,
-                    Some(CONTEXT),
-                    window,
-                )))
-                .into_any_element();
-        }
-        let connected = self.connected();
-        let v5 = self.composer_protocol() == Protocol::V5;
-        let result = self
-            .last_result
-            .as_ref()
-            .map(|(_, t)| t.clone())
-            .unwrap_or_default();
+        let ComposerInputs {
+            connected,
+            v5,
+            result,
+        } = self.inputs.clone();
         // Only for MQTT 5, and from the small property fields: no payload copy in a frame.
         let count = if v5 { self.props_count(cx) } else { 0 };
-        let hex = self.comp.mode == PayloadMode::Hex;
-        let props_open = self.comp.vis.props;
+        let hex = self.mode == PayloadMode::Hex;
+        let props_open = self.vis.props;
         let weak = cx.entity().downgrade();
-        let (rem, size, settle) = (
-            window.rem_size(),
-            self.comp.size.clone(),
-            self.comp.settle.clone(),
-        );
-        let (scroll, view_height) = (
-            self.comp.props_scroll.clone(),
-            self.comp.view_height.clone(),
-        );
+        let (height, nav) = (self.height.clone(), self.nav.clone());
+        let (rem, size, settle) = (window.rem_size(), self.size.clone(), self.settle.clone());
+        let (scroll, view_height) = (self.props_scroll.clone(), self.view_height.clone());
         let stacked = props_stacked(size.get().map(|s| s.width), rem);
         // The composer measures itself. A change of the stacking draws the window again, and two
         // frames later (the rows have their new height) the row with the focus, if any, is shown.
@@ -1222,6 +1149,14 @@ impl Navigator {
                 });
                 if was != props_stacked(Some(b.size.width), rem) || moved {
                     settle.set(2);
+                }
+                // The parent gives this height to the cached view (see `Relayout`).
+                if (height.get() - b.size.height).abs() > px(0.5) {
+                    height.set(b.size.height);
+                    let this = this.clone();
+                    window.defer(cx, move |_, cx| {
+                        this.update(cx, |_, cx| cx.emit(Relayout)).ok();
+                    });
                 }
                 let left = settle.get();
                 if left > 0 {
@@ -1255,10 +1190,10 @@ impl Navigator {
         .absolute()
         .size_full();
         // The `⋯` menu: Beautify JSON, Minify JSON, History… and Properties (MQTT 5).
-        let more_focus = self.comp.more_focus.clone();
+        let more_focus = self.more_focus.clone();
         let more = Button::new("composer-more")
             .debug_selector(|| "composer-more".into())
-            .track_focus(&self.comp.more_focus)
+            .track_focus(&self.more_focus)
             .small()
             .ghost()
             .icon(IconName::Ellipsis)
@@ -1267,7 +1202,7 @@ impl Navigator {
             .dropdown_menu(move |menu, _, _| {
                 let menu = menu.action_context(more_focus.clone());
                 let item = |label: &'static str,
-                            run: fn(&mut Navigator, &mut Window, &mut Context<Navigator>)| {
+                            run: fn(&mut ComposerPane, &mut Window, &mut Context<ComposerPane>)| {
                     let weak = weak.clone();
                     PopupMenuItem::new(label).on_click(move |_, window, cx| {
                         weak.update(cx, |v, cx| run(v, window, cx)).ok();
@@ -1283,7 +1218,7 @@ impl Navigator {
                 if v5 {
                     menu = menu.item(
                         item("Properties", |v, _, cx| {
-                            v.comp.vis.props = !v.comp.vis.props;
+                            v.vis.props = !v.vis.props;
                             cx.notify();
                         })
                         .checked(props_open),
@@ -1292,16 +1227,14 @@ impl Navigator {
                 menu
             });
 
-        let topic_note = self.comp.topic.note("topic", cx);
+        let topic_note = self.topic.note("topic", cx);
         let header = h_flex()
             .gap_2()
             .items_center()
             .child(
-                div().flex_1().child(
-                    Input::new(&self.comp.topic.input)
-                        .small()
-                        .aria_label("Topic"),
-                ),
+                div()
+                    .flex_1()
+                    .child(Input::new(&self.topic.input).small().aria_label("Topic")),
             )
             .when(v5 && count > 0, |d| {
                 d.child(
@@ -1310,7 +1243,7 @@ impl Navigator {
                         .label(format!("Properties ({count})"))
                         .tooltip("Show or hide the properties")
                         .on_click(cx.listener(|v, _, _, cx| {
-                            v.comp.vis.props = !v.comp.vis.props;
+                            v.vis.props = !v.vis.props;
                             cx.notify();
                         })),
                 )
@@ -1328,9 +1261,9 @@ impl Navigator {
             );
 
         // The last result, the error or the JSON warning, under the payload. Show long results on a maximum of three lines.
-        let line = if let Some(e) = self.comp.error.clone() {
+        let line = if let Some(e) = self.error.clone() {
             div().text_xs().text_color(theme.danger).child(e)
-        } else if let Some(w) = self.comp.json_warning.clone() {
+        } else if let Some(w) = self.json_warning.clone() {
             div()
                 .debug_selector(|| "json-warning".into())
                 .text_xs()
@@ -1343,7 +1276,7 @@ impl Navigator {
                 .child(result_line(connected, result))
         };
 
-        let mode_ix = match self.comp.mode {
+        let mode_ix = match self.mode {
             PayloadMode::Text => 0,
             PayloadMode::Hex => 1,
             PayloadMode::Json => 2,
@@ -1356,21 +1289,21 @@ impl Navigator {
             .child(
                 Toggle::new("qos-0")
                     .label("QoS 0")
-                    .checked(self.comp.qos == Qos::AtMostOnce),
+                    .checked(self.qos == Qos::AtMostOnce),
             )
             .child(
                 Toggle::new("qos-1")
                     .label("QoS 1")
-                    .checked(self.comp.qos == Qos::AtLeastOnce),
+                    .checked(self.qos == Qos::AtLeastOnce),
             )
             .on_click(cx.listener(|v, checks: &Vec<bool>, _, cx| {
                 if let Some(ix) = checks.iter().position(|c| *c) {
-                    v.comp.qos = if ix == 0 {
+                    v.qos = if ix == 0 {
                         Qos::AtMostOnce
                     } else {
                         Qos::AtLeastOnce
                     };
-                    v.comp.model.edited();
+                    v.model.edited();
                     cx.notify();
                 }
             }));
@@ -1403,11 +1336,11 @@ impl Navigator {
             .child(qos)
             .child(
                 Switch::new("retain")
-                    .checked(self.comp.retain)
+                    .checked(self.retain)
                     .label("Retain")
                     .on_change(cx.listener(|v, on: &bool, _, cx| {
-                        v.comp.retain = *on;
-                        v.comp.model.edited();
+                        v.retain = *on;
+                        v.model.edited();
                         cx.notify();
                     })),
             )
@@ -1421,13 +1354,17 @@ impl Navigator {
                     .label("Publish")
                     .tooltip_with_action("Publish the message", &SendMessage, Some("Composer"))
                     .disabled(!connected)
-                    .on_click(cx.listener(|v, _, window, cx| v.send(window, cx))),
+                    // Not a listener: `Navigator::send` reads this pane.
+                    .on_click(move |_, _, cx| {
+                        nav.update(cx, |v, cx| v.send(cx)).ok();
+                    }),
             );
 
         // The composer has a maximum height. The properties are the only part that shrinks: they scroll
         // and the other rows (topic, payload, the action row) stay in view.
         v_flex()
             .relative()
+            .w_full()
             .key_context("Composer")
             .debug_selector(|| "composer".into())
             .max_h(composer_max_height(
@@ -1446,7 +1383,7 @@ impl Navigator {
             })
             .child(
                 div().flex_none().child(
-                    Editor::new(&self.comp.payload)
+                    Editor::new(&self.payload)
                         .h(ui(PAYLOAD_HEIGHT))
                         .bordered(true)
                         .small(),
@@ -1458,7 +1395,6 @@ impl Navigator {
                 d.child(self.render_props(stacked, window, cx))
             })
             .child(controls.flex_none())
-            .into_any_element()
     }
 
     /// The "Properties" section: only the fields that are present, and an "Add property" menu
@@ -1469,7 +1405,7 @@ impl Navigator {
     /// So the rows far from the viewport are empty boxes. A row that never had a place, the first
     /// and the last row (the ends of the tab order) and the row with the focus are always built.
     fn rows_to_draw(&self, window: &Window, cx: &App) -> Vec<bool> {
-        let rows = &self.comp.rows;
+        let rows = &self.rows;
         let extents: Vec<_> = rows.iter().map(|r| r.spot.extent.get()).collect();
         let mut focused: Vec<_> = rows
             .iter()
@@ -1482,26 +1418,24 @@ impl Navigator {
         // Another part of the window (the palette) can take the focus and give it back to an
         // input of a row. The row must stay built, or the focus handle has no element.
         match focused.iter().position(|f| *f) {
-            Some(i) => self.comp.focus_row.set(Some(rows[i].id)),
+            Some(i) => self.focus_row.set(Some(rows[i].id)),
             None => {
-                let at = rows
-                    .iter()
-                    .position(|r| Some(r.id) == self.comp.focus_row.get());
+                let at = rows.iter().position(|r| Some(r.id) == self.focus_row.get());
                 at.into_iter().for_each(|i| focused[i] = true);
             }
         }
-        let scroll = &self.comp.props_scroll;
+        let scroll = &self.props_scroll;
         // The size of the scroll area is from the last layout. After a resize it is too small for
         // this frame, so take the largest size that the area can have.
         let window_h = window.viewport_size().height;
-        let resized = self.comp.window_h.replace(window_h) != window_h;
+        let resized = self.window_h.replace(window_h) != window_h;
         let view = if resized {
             composer_max_height(window_h, window.rem_size())
         } else {
             scroll.bounds().size.height
         };
         #[cfg(all(test, debug_assertions))]
-        self.comp.resized.set(resized);
+        self.resized.set(resized);
         let (max, old_view) = (scroll.max_offset().y, scroll.bounds().size.height);
         // A wheel scroll past an end is clamped in the next layout.
         let mut top = (-scroll.offset().y).clamp(px(0.), max);
@@ -1519,12 +1453,12 @@ impl Navigator {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let shown = self.comp.shown;
+        let shown = self.shown;
         let empty_switch =
             |id: &'static str, on: bool| Switch::new(id).checked(on).label("Send empty");
         let remove = |kind: PropKind, cx: &mut Context<Self>| {
             Button::new(("prop-remove", kind as usize))
-                .track_focus(&self.comp.std_spots[kind as usize].remove)
+                .track_focus(&self.std_spots[kind as usize].remove)
                 .small()
                 .ghost()
                 .icon(IconName::Close)
@@ -1535,27 +1469,27 @@ impl Navigator {
         let key = (
             stacked,
             window.rem_size(),
-            self.comp.size.get().map(|s| s.width.round()),
+            self.size.get().map(|s| s.width.round()),
         );
-        if self.comp.rows_key.replace(key) != key {
-            self.comp.rows.iter().for_each(|r| r.spot.extent.set(None));
+        if self.rows_key.replace(key) != key {
+            self.rows.iter().for_each(|r| r.spot.extent.set(None));
         }
         // A new row scrolls the area to its end in the next layout. The rows that the scroll shows
         // are built in this frame too.
-        let draw = if self.comp.draw_all.take() {
-            vec![true; self.comp.rows.len()]
+        let draw = if self.draw_all.take() {
+            vec![true; self.rows.len()]
         } else {
             self.rows_to_draw(window, cx)
         };
         #[cfg(all(test, debug_assertions))]
         {
             let n = draw.iter().filter(|d| **d).count();
-            self.comp.drawn_rows.set(n);
-            if self.comp.resized.get() {
-                self.comp.resized_rows.set(n);
+            self.drawn_rows.set(n);
+            if self.resized.get() {
+                self.resized_rows.set(n);
             }
         }
-        let rows = self.comp.rows.iter().zip(draw).map(|(r, draw)| {
+        let rows = self.rows.iter().zip(draw).map(|(r, draw)| {
             if !draw {
                 // Out of view: an empty box of the height that the row had. It is no tab stop.
                 let (_, h) = r.spot.extent.get().expect("a skipped row was drawn");
@@ -1583,10 +1517,10 @@ impl Navigator {
                 .checked(r.keep_empty)
                 .label("Send empty")
                 .on_change(cx.listener(move |v, on: &bool, _, cx| {
-                    if let Some(r) = v.comp.rows.iter_mut().find(|r| r.id == id) {
+                    if let Some(r) = v.rows.iter_mut().find(|r| r.id == id) {
                         r.keep_empty = *on;
                     }
-                    v.comp.model.edited();
+                    v.model.edited();
                     cx.notify();
                 }));
             let remove = Button::new(("user-prop-remove", id as usize))
@@ -1596,15 +1530,15 @@ impl Navigator {
                 .icon(IconName::Close)
                 .tooltip("Remove this property")
                 .on_click(cx.listener(move |v, _, window, cx| {
-                    v.comp.rows.retain(|r| r.id != id);
-                    v.comp.model.edited();
+                    v.rows.retain(|r| r.id != id);
+                    v.model.edited();
                     // The row and its button are gone: focus a control that stays.
-                    v.comp.payload.update(cx, |e, cx| e.focus(window, cx));
+                    v.payload.update(cx, |e, cx| e.focus(window, cx));
                     cx.notify();
                 }));
             spot_div(
                 &r.spot,
-                &self.comp.props_scroll,
+                &self.props_scroll,
                 prop_row(
                     stacked,
                     // A stacked row has no Name and Value captions above it: the label says it.
@@ -1626,10 +1560,10 @@ impl Navigator {
         let has_rows = !rows.is_empty();
         let addable = shown.addable();
         let weak = cx.entity().downgrade();
-        let add_focus = self.comp.add_focus.clone();
+        let add_focus = self.add_focus.clone();
         let add = Button::new("add-prop")
             .debug_selector(|| "add-prop".into())
-            .track_focus(&self.comp.add_focus)
+            .track_focus(&self.add_focus)
             .xsmall()
             .ghost()
             .icon(IconName::Plus)
@@ -1649,7 +1583,7 @@ impl Navigator {
         let section = v_flex()
             .gap_1()
             .when(shown.payload_format, |d| {
-                d.child(self.comp.std_spot(
+                d.child(self.std_spot(
                     PropKind::PayloadFormat,
                     prop_row(
                         stacked,
@@ -1664,75 +1598,69 @@ impl Navigator {
             })
             .when(shown.content_type, |d| {
                 d.child(
-                    self.comp.std_spot(
+                    self.std_spot(
                         PropKind::ContentType,
                         prop_row(
                             stacked,
                             "Content type",
                             muted,
-                            Input::new(&self.comp.content_type.input)
+                            Input::new(&self.content_type.input)
                                 .small()
                                 .aria_label("Content type"),
                             Some(
-                                self.comp.std_spots[PropKind::ContentType as usize].switch_div(
-                                    empty_switch(
-                                        "content-type-empty",
-                                        self.comp.content_type_empty,
-                                    )
-                                    .on_click(cx.listener(
-                                        |v, on: &bool, _, cx| {
-                                            v.comp.content_type_empty = *on;
-                                            v.comp.model.edited();
+                                self.std_spots[PropKind::ContentType as usize].switch_div(
+                                    empty_switch("content-type-empty", self.content_type_empty)
+                                        .on_click(cx.listener(|v, on: &bool, _, cx| {
+                                            v.content_type_empty = *on;
+                                            v.model.edited();
                                             cx.notify();
-                                        },
-                                    )),
+                                        })),
                                 ),
                             ),
                             remove(PropKind::ContentType, cx),
-                            self.comp.content_type.note("value", cx),
+                            self.content_type.note("value", cx),
                         ),
                     ),
                 )
             })
             .when(shown.response_topic, |d| {
                 d.child(
-                    self.comp.std_spot(
+                    self.std_spot(
                         PropKind::ResponseTopic,
                         prop_row(
                             stacked,
                             "Response topic",
                             muted,
-                            Input::new(&self.comp.response_topic.input)
+                            Input::new(&self.response_topic.input)
                                 .small()
                                 .aria_label("Response topic"),
                             None,
                             remove(PropKind::ResponseTopic, cx),
-                            self.comp.response_topic.note("value", cx),
+                            self.response_topic.note("value", cx),
                         ),
                     ),
                 )
             })
             .when(shown.correlation, |d| {
                 d.child(
-                    self.comp.std_spot(
+                    self.std_spot(
                         PropKind::Correlation,
                         prop_row(
                             stacked,
                             "Correlation data (hex)",
                             muted,
-                            Input::new(&self.comp.correlation)
+                            Input::new(&self.correlation)
                                 .small()
                                 .aria_label("Correlation data (hex)"),
-                            Some(
-                                self.comp.std_spots[PropKind::Correlation as usize].switch_div(
-                                    empty_switch("correlation-empty", self.comp.correlation_empty)
-                                        .on_click(cx.listener(|v, on: &bool, _, cx| {
-                                            v.comp.correlation_empty = *on;
-                                            v.comp.model.edited();
-                                            cx.notify();
-                                        })),
+                            Some(self.std_spots[PropKind::Correlation as usize].switch_div(
+                                empty_switch("correlation-empty", self.correlation_empty).on_click(
+                                    cx.listener(|v, on: &bool, _, cx| {
+                                        v.correlation_empty = *on;
+                                        v.model.edited();
+                                        cx.notify();
+                                    }),
                                 ),
-                            ),
+                            )),
                             remove(PropKind::Correlation, cx),
                             None,
                         ),
@@ -1741,13 +1669,13 @@ impl Navigator {
             })
             .when(shown.expiry, |d| {
                 d.child(
-                    self.comp.std_spot(
+                    self.std_spot(
                         PropKind::Expiry,
                         prop_row(
                             stacked,
                             "Message expiry (seconds)",
                             muted,
-                            Input::new(&self.comp.expiry)
+                            Input::new(&self.expiry)
                                 .small()
                                 .aria_label("Message expiry (seconds)"),
                             None,
@@ -1793,11 +1721,21 @@ impl Navigator {
                             .id("props-rows")
                             .overflow_y_scroll()
                             .lock_scroll_axis()
-                            .track_scroll(&self.comp.props_scroll),
+                            .track_scroll(&self.props_scroll),
                     )
-                    .vertical_scrollbar(&self.comp.props_scroll),
+                    .vertical_scrollbar(&self.props_scroll),
             )
             .child(h_flex().flex_none().child(add))
+    }
+}
+
+impl Render for ComposerPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.render_open(window, cx)
     }
 }
 
@@ -1890,5 +1828,135 @@ mod tests {
         assert_eq!(composer_max_height(px(600.), big), px(420.));
         // The composer takes at most 80% of the window.
         assert_eq!(composer_max_height(px(400.), big), px(320.));
+    }
+}
+
+impl Navigator {
+    /// Tells the pane that an input of it changed (see `composer_sig`). A merge frame changes
+    /// nothing here, and the pane keeps its last frame. The merge calls this too.
+    pub(super) fn sync_composer(&mut self, cx: &mut Context<Self>) {
+        use std::hash::{Hash, Hasher};
+        let result = self.last_result.as_ref().map(|(_, t)| t.as_str());
+        let (connected, v5) = (self.connected(), self.composer_protocol() == Protocol::V5);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (
+            connected,
+            v5,
+            result,
+            self.rem.to_bits(),
+            f32::from(self.comp_view.width).to_bits(),
+            f32::from(self.comp_view.height).to_bits(),
+            cx.theme().theme_name(),
+        )
+            .hash(&mut h);
+        let sig = h.finish();
+        if sig == self.comp_sig {
+            return;
+        }
+        self.comp_sig = sig;
+        let inputs = ComposerInputs {
+            connected,
+            v5,
+            result: result.unwrap_or_default().to_string(),
+        };
+        let pane = self.comp.clone();
+        cx.defer(move |cx| pane.update(cx, |p, cx| p.set_inputs(inputs, cx)));
+    }
+
+    /// The composer below the message list: the button while it is closed, else the pane. The
+    /// pane gets the height that it measured (a cached view has no content-driven size).
+    pub(super) fn render_composer(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.comp_view = window.viewport_size();
+        self.sync_composer(cx);
+        let pane = self.comp.read(cx);
+        if pane.vis.open {
+            let height = pane.height.get();
+            return self
+                .comp
+                .clone()
+                .cached(StyleRefinement::default().w_full().h(height))
+                .into_any_element();
+        }
+        let theme = cx.theme();
+        h_flex()
+            .border_t_1()
+            .border_color(theme.border)
+            .p_2()
+            .gap_2()
+            .items_center()
+            .child(
+                Button::new("new-message")
+                    .small()
+                    .label("New message")
+                    .on_click(cx.listener(|v, _, window, cx| {
+                        v.comp.update(cx, |c, cx| c.open_composer(window, cx));
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .children(shortcut_text(&NewMessage, Some(CONTEXT), window)),
+            )
+            .into_any_element()
+    }
+
+    /// Ctrl/Cmd+Enter and the Send button.
+    pub(super) fn send(&mut self, cx: &mut Context<Self>) {
+        // The result line already shows the hint. An error here would hide a recorded result.
+        if !self.connected() {
+            return;
+        }
+        let d = self.comp.read(cx).read_draft(cx);
+        let result = self.publish_draft(&d, cx);
+        self.comp.update(cx, |c, cx| c.published(d, result, cx));
+    }
+
+    /// Checks `d` with the core rules, sends it and records it in the list. The error text is
+    /// for the caller to show.
+    pub(super) fn publish_draft(
+        &mut self,
+        d: &Draft,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let op_id = self.next_op;
+        let v3 = self.composer_protocol() == Protocol::V311;
+        // An MQTT 3.1.1 message has no properties. The hidden fields must not block it.
+        let mut wire = d.clone();
+        if v3 {
+            wire.drop_properties();
+        }
+        let out = wire.to_outgoing(op_id).and_then(|o| {
+            validate_outgoing(&o, self.net.broker_max_packet())?;
+            if v3 {
+                validate_v3_size(&o, NetLimits::default().max_packet)?;
+            }
+            Ok(o)
+        })?;
+        self.next_op += 1;
+        let sent = self.net.send(Command::Publish(Box::new(out.clone())));
+        if sent.is_ok() {
+            // The list row shows the progress. The broker sends the message back as a
+            // normal received message if a subscription matches.
+            self.capture_anchor();
+            self.store.record_sent(
+                op_id,
+                &out.topic,
+                out.payload,
+                out.qos,
+                out.retain,
+                out.props,
+                SystemTime::now(),
+                self.conn_protocol,
+            );
+            self.restore_anchor();
+            self.last_result = Some((op_id, status_text(&SendStatus::Sending)));
+        }
+        cx.notify();
+        sent.map_err(|e| send_error_text(e).to_string())
     }
 }

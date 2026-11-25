@@ -991,7 +991,11 @@ pub struct Navigator {
     details_open: bool,
     /// The window is narrower than `details::NARROW`: the details open as a sheet.
     narrow: bool,
-    comp: compose::Composer,
+    /// The publish composer (its own view, see `composer_sig`).
+    comp: Entity<compose::ComposerPane>,
+    /// The last `composer_sig` that the composer got, and the window size that it hashes.
+    comp_sig: u64,
+    comp_view: Size<Pixels>,
     /// The widths of the three panes (subscriptions, centre, details).
     panes: Entity<ResizableState>,
     /// The details width before "Expand". "Restore" returns to it.
@@ -1153,6 +1157,14 @@ impl Navigator {
         let subs = Subs::of_profile(profile.as_ref());
         let (writer_errors, writer_errors_rx) = tokio::sync::mpsc::channel(4);
         let writer = crate::persist::settings_path().map(|p| Writer::start(p, writer_errors));
+        let list_focus = cx.focus_handle().tab_stop(true);
+        let comp = {
+            let nav = cx.weak_entity();
+            let list = list_focus.clone();
+            cx.new(|cx| compose::ComposerPane::new(nav, list, window, cx))
+        };
+        // The pane tells when it needs another room.
+        let comp_layout = cx.subscribe(&comp, |_, _, _: &compose::Relayout, cx| cx.notify());
         let mut this = Self {
             session: profile.clone(),
             profile,
@@ -1200,7 +1212,7 @@ impl Navigator {
             utc_offset: 0,
             root_focus,
             // A Tab stop: the keyboard reaches the rows with Tab.
-            list_focus: cx.focus_handle().tab_stop(true),
+            list_focus,
             gate: GenGate::default(),
             pane: {
                 let nav = cx.weak_entity();
@@ -1214,7 +1226,9 @@ impl Navigator {
             expanded: false,
             details_open: false,
             narrow: false,
-            comp: compose::Composer::new(window, cx),
+            comp,
+            comp_sig: 0,
+            comp_view: window.viewport_size(),
             panes: cx.new(|_| ResizableState::default()),
             expand_restore: None,
             pane_reset: false,
@@ -1251,6 +1265,7 @@ impl Navigator {
             _subscriptions: vec![
                 appearance,
                 bounds,
+                comp_layout,
                 sub_events,
                 filter_events,
                 // On quit, the settings writer saves a pending change at once.
@@ -1606,6 +1621,7 @@ impl Navigator {
             cx.background_executor().spawn(write_metrics(line)).detach();
         }
         self.sync_details(cx);
+        self.sync_composer(cx);
         cx.notify();
         self.schedule_rate_zero(cx);
     }
