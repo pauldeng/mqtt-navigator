@@ -1970,6 +1970,40 @@ fn the_pane_draws_for_its_topic_and_not_for_other_topics(cx: &mut TestAppContext
     assert_eq!(cx.update(|_, cx| editor.read(cx).value().to_string()), "bb");
 }
 
+/// A selection that changes while the window is too narrow for the pane: the pane has it in the
+/// frame where a wider window shows it again. It needs no broker.
+#[gpui_kit::test]
+fn the_pane_has_the_new_selection_when_the_window_grows(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.simulate_resize(size(px(1500.), px(900.)));
+    insert_msg(cx, &nav, "t/a", "aa");
+    insert_msg(cx, &nav, "t/b", "bb");
+    draw_twice(cx);
+    wait(cx, "the text of A", |cx| {
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "aa")
+    });
+    cx.simulate_resize(size(px(500.), px(900.)));
+    draw_twice(cx);
+    nav.update(cx, |v, cx| {
+        let id = v.store.find("t/b").expect("t/b");
+        v.select(id, v.gate.generation(), false, cx);
+    });
+    draw_twice(cx);
+    let before = nav.read_with(cx, |v, cx| v.pane.read(cx).drawn_topics.len());
+    cx.simulate_resize(size(px(1500.), px(900.)));
+    draw_twice(cx);
+    let drawn = nav.read_with(cx, |v, cx| v.pane.read(cx).drawn_topics[before..].to_vec());
+    assert!(!drawn.is_empty());
+    assert!(
+        drawn.iter().all(|t| t == "t/b"),
+        "the pane drew the old selection: {drawn:?}"
+    );
+    wait(cx, "the text of B", |cx| {
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "bb")
+    });
+}
+
 fn composer_renders(cx: &mut VisualTestContext, nav: &Entity<Navigator>) -> usize {
     nav.read_with(cx, |v, cx| v.comp.read(cx).renders)
 }
