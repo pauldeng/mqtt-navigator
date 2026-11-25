@@ -1832,8 +1832,9 @@ mod tests {
 }
 
 impl Navigator {
-    /// Tells the pane that an input of it changed (see `composer_sig`). A merge frame changes
-    /// nothing here, and the pane keeps its last frame. The merge calls this too.
+    /// Tells the pane that an input of it changed. A merge frame changes nothing here, and the
+    /// pane keeps its last frame. An observer of this view calls it after each notify, so the pane
+    /// draws in the next frame. A window resize or a zoom draws every view again anyway.
     pub(super) fn sync_composer(&mut self, cx: &mut Context<Self>) {
         use std::hash::{Hash, Hasher};
         let result = self.last_result.as_ref().map(|(_, t)| t.as_str());
@@ -1844,8 +1845,6 @@ impl Navigator {
             v5,
             result,
             self.rem.to_bits(),
-            f32::from(self.comp_view.width).to_bits(),
-            f32::from(self.comp_view.height).to_bits(),
             cx.theme().theme_name(),
         )
             .hash(&mut h);
@@ -1859,8 +1858,7 @@ impl Navigator {
             v5,
             result: result.unwrap_or_default().to_string(),
         };
-        let pane = self.comp.clone();
-        cx.defer(move |cx| pane.update(cx, |p, cx| p.set_inputs(inputs, cx)));
+        self.comp.update(cx, |p, cx| p.set_inputs(inputs, cx));
     }
 
     /// The composer below the message list: the button while it is closed, else the pane. The
@@ -1870,11 +1868,13 @@ impl Navigator {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.comp_view = window.viewport_size();
-        self.sync_composer(cx);
         let pane = self.comp.read(cx);
         if pane.vis.open {
-            let height = pane.height.get();
+            // The first frame has no measure yet: the room for the most that it can take.
+            let height = match pane.height.get() {
+                h if h > px(0.) => h,
+                _ => composer_max_height(window.viewport_size().height, window.rem_size()),
+            };
             return self
                 .comp
                 .clone()
