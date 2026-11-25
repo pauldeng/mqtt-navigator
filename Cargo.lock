@@ -4198,9 +4198,9 @@ dependencies = [
 
 [[package]]
 name = "keyring-core"
-version = "1.0.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29fbf4b551298c67925f38cf341a1ada797a75f1837bdf8ae1fc8e2ebc6efb59"
+checksum = "281c851dbae0de36d405299dd463126df4826dc32665c1314e931696b8cdee77"
 dependencies = [
  "log",
 ]
@@ -4995,9 +4995,9 @@ dependencies = [
 
 [[package]]
 name = "ntex-bytes"
-version = "1.15.4"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cdda494c2768eb94bcbe248d874ec433f828f44f5bff112c4609104ae3e6631"
+checksum = "509e15e0417a8bc6e229c90e7134e7dc6fd357724f2786a98b195c5eddd191be"
 dependencies = [
  "bytes",
  "serde",
@@ -5088,9 +5088,9 @@ dependencies = [
 
 [[package]]
 name = "ntex-io"
-version = "4.8.0"
+version = "4.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6189bbc3da76e1aec3139199d02140d7c18840b9713be04d1b9ff4c17517e4db"
+checksum = "9e9f1e19dacb0427d73657a3e81a7c8794a7ff453078804cb23198783526d5fd"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -5151,9 +5151,9 @@ dependencies = [
 
 [[package]]
 name = "ntex-net"
-version = "4.12.3"
+version = "4.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce38ec56a25537b1b2571be081fe139a4f7c21b75f229b0aebccf027d695112b"
+checksum = "77caa6989a875d1227a98c46d1cd2d6111d092bc362994a1028429cfa1cc0951"
 dependencies = [
  "bitflags 2.13.2",
  "cfg-if",
@@ -5257,9 +5257,9 @@ dependencies = [
 
 [[package]]
 name = "ntex-service"
-version = "5.8.0"
+version = "5.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6d942109caac3b8c3f21332fb35d842aca3ad60a6c97cedc707eabb6a70a96f"
+checksum = "7ae0df0ba0ec6d8103d2219412b185f61bab510f84e64d759376730f400209f8"
 dependencies = [
  "foldhash",
  "log",
@@ -5269,9 +5269,9 @@ dependencies = [
 
 [[package]]
 name = "ntex-tls"
-version = "4.8.0"
+version = "4.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94890868264e04ba1d63fcc810e317340e474541e091b83fd985e0bba9e7b37b"
+checksum = "8c95414b43dfc7c5aed05f18922c0b5c92e1f7fd748ded7b0db4bfbe02fcdf01"
 dependencies = [
  "base64 0.23.1",
  "foreign-types-shared 0.1.1",
@@ -5286,6 +5286,7 @@ dependencies = [
  "ntex-util",
  "openssl",
  "openssl-sys",
+ "pin-project-lite",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
  "x509-parser",
@@ -5294,9 +5295,9 @@ dependencies = [
 
 [[package]]
 name = "ntex-util"
-version = "4.11.0"
+version = "4.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ccfbc525b3b9db6f5be352f75ceb42febf1234ab97b01e8d2fd85f37275cbec"
+checksum = "f899c498e31750b9a91fc6a8eca5b77cf4120b3e0dee697a1710f61d8d42d65f"
 dependencies = [
  "backoff",
  "bitflags 2.13.2",
@@ -8643,9 +8644,9 @@ dependencies = [
 
 [[package]]
 name = "urly"
-version = "1.4.1"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "073de4d561f3a66a8cab95efe5e9ddcaad55b665a6fcd8636baf74e24dd2cf0e"
+checksum = "b72dab80f8eae440625ffdec3f784c391a1ab84745ad80cd130e81127aa8e3dd"
 dependencies = [
  "http",
  "ntex-bytes",
