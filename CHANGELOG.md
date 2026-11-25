@@ -6,7 +6,7 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ### Changed
 
-- When one merge handles 256 or more messages (about 7.7k messages a second, or about 10k on Windows), the message list redraws about 15 times a second, not 30. The app still merges all messages at the same pace. This lowers the UI CPU time. The last messages of a flood show about 50 ms after the last merge.
+- When one merge handles 256 or more messages, the message list redraws at most about 15 times a second, not 30. This is about 7.7k messages a second (about 10k on Windows). Backlog mode does not do this. The app still merges all messages at the same pace. This lowers the UI CPU time. The last messages of a flood show about 50 ms after the last merge.
 
 ## [0.2.6] - 2026-11-25
 
