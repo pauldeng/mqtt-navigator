@@ -412,6 +412,7 @@ impl Navigator {
         self.status = Status::default();
         // The composer and History belong to the profile too.
         self.pane.update(cx, |p, cx| p.reset(cx));
+        self.sync_details(cx);
         self.comp.reset(window, cx);
         self.sub_input
             .update(cx, |i, cx| i.set_value("", window, cx));
