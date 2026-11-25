@@ -162,6 +162,16 @@ pub fn props_rows(p: &MsgProps) -> Vec<(String, String)> {
     rows
 }
 
+/// How many rows `props_rows` gives, without building the strings.
+pub fn props_count(p: &MsgProps) -> usize {
+    usize::from(p.content_type.is_some())
+        + usize::from(p.response_topic.is_some())
+        + usize::from(p.correlation_data.is_some())
+        + usize::from(p.message_expiry.is_some())
+        + usize::from(p.payload_utf8)
+        + p.user.len()
+}
+
 /// The editor sets, wraps and lays out text on the UI thread. Measured cost (release, 360 px
 /// pane): about 0.3 ms for each KiB of JSON and 3 to 4 ms for each KiB of a hex dump (long
 /// lines wrap). So the text goes in small steps and the step size follows the measured time.
@@ -247,7 +257,7 @@ mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro in the parent.
     use super::{
         DecoderChoice, DecoderPick, Jobs, MAX_STEP, MIN_STEP, history_note, meta_line, next_cut,
-        next_step, no_properties_note, props_rows, size_text,
+        next_step, no_properties_note, props_count, props_rows, size_text,
     };
     use bytes::Bytes;
     use navigator_core::decode::Decoder;
@@ -344,6 +354,9 @@ mod tests {
         assert_eq!(rows[3], ("Message expiry".into(), "9 s".into()));
         assert_eq!(rows[5], ("k".into(), "2".into()));
         assert_eq!(rows[6], ("k".into(), "1".into()));
+        // The count of a closed section is the number of rows.
+        assert_eq!(props_count(&p), rows.len());
+        assert_eq!(props_count(&MsgProps::default()), 0);
     }
 
     #[test]

@@ -530,17 +530,17 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
     cx.update(|w, cx| {
         w.draw(cx).clear(cx);
     });
-    let first = nav.read_with(cx, |v, _| v.insp.want);
+    let first = nav.read_with(cx, |v, cx| v.pane.read(cx).insp.want);
     send(cx, "zz");
     cx.update(|w, cx| {
         w.draw(cx).clear(cx);
     });
     assert!(
-        nav.read_with(cx, |v, _| v.insp.want == first),
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.want == first),
         "a new message replaced the first job"
     );
     wait(cx, "the first text", |cx| {
-        nav.read_with(cx, |v, _| v.insp.full == "zz")
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "zz")
     });
     send(cx, "bb");
     // One draw starts the job. The job has not run yet.
@@ -548,11 +548,14 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
         w.draw(cx).clear(cx);
     });
     assert!(
-        nav.read_with(cx, |v, _| matches!(v.insp.view, PayloadView::Done { .. })),
+        nav.read_with(cx, |v, cx| matches!(
+            v.pane.read(cx).insp.view,
+            PayloadView::Done { .. }
+        )),
         "the pane shows Formatting… for a new message of the same topic"
     );
     wait(cx, "the second text", |cx| {
-        nav.read_with(cx, |v, _| v.insp.full == "bb")
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "bb")
     });
     // A message that comes before the job ends must not cancel it: with a slow formatter the
     // text would never change. The job for "cc" ends first, then one for the newest message.
@@ -560,17 +563,17 @@ fn a_busy_topic_keeps_its_finished_text_while_the_next_one_formats(cx: &mut Test
     cx.update(|w, cx| {
         w.draw(cx).clear(cx);
     });
-    let running = nav.read_with(cx, |v, _| v.insp.want);
+    let running = nav.read_with(cx, |v, cx| v.pane.read(cx).insp.want);
     send(cx, "dd");
     cx.update(|w, cx| {
         w.draw(cx).clear(cx);
     });
     assert!(
-        nav.read_with(cx, |v, _| v.insp.want == running),
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.want == running),
         "a new message replaced the running job"
     );
     wait(cx, "the newest text", |cx| {
-        nav.read_with(cx, |v, _| v.insp.full == "dd")
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "dd")
     });
 }
 
@@ -635,12 +638,14 @@ fn a_json_payload_over_the_limit_shows_its_start(cx: &mut TestAppContext) {
     json.extend_from_slice(b"0]");
     send_payload(cx, &nav, json);
     wait(cx, "the first part of the text", |cx| {
-        nav.read_with(cx, |v, _| v.insp.full.len() == 256 * 1024)
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full.len() == 256 * 1024)
     });
-    assert!(nav.read_with(cx, |v, _| v.insp.full.starts_with("[{\"a\":1},")));
+    assert!(nav.read_with(cx, |v, cx| {
+        v.pane.read(cx).insp.full.starts_with("[{\"a\":1},")
+    }));
     // The editor, not only the decoded text, has the start of the payload.
     wait(cx, "the text in the editor", |cx| {
-        let editor = nav.read_with(cx, |v, _| v.insp.editor.clone());
+        let editor = nav.read_with(cx, |v, cx| v.pane.read(cx).insp.editor.clone());
         cx.update(|_, cx| editor.read(cx).value().starts_with("[{\"a\":1},"))
     });
 }
@@ -660,7 +665,7 @@ fn show_more_stays_available_while_a_new_message_of_the_topic_formats(cx: &mut T
     // The job for the new message has started, but it has not run yet.
     send_big(cx, &nav, 300 * 1024);
     assert!(
-        nav.read_with(cx, |v, _| v.insp.running),
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.running),
         "the job for the new message does not run"
     );
     assert!(
@@ -690,13 +695,14 @@ fn show_more_applies_to_the_newest_message_of_a_busy_topic(cx: &mut TestAppConte
         "Show more is not clickable on a busy topic"
     );
     // The click handler is `show_more`. A real click mid-flood redraws the pane under the mouse.
-    cx.update(|w, cx| nav.update(cx, |v, cx| v.show_more(w, cx)));
+    let pane = nav.read_with(cx, |v, _| v.pane.clone());
+    cx.update(|w, cx| pane.update(cx, |p, cx| p.show_more(w, cx)));
     send_big(cx, &nav, 230 * 1024);
     wait(cx, "the newest text", |cx| {
-        nav.read_with(cx, |v, _| v.insp.full.len() == 230 * 1024)
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full.len() == 230 * 1024)
     });
     wait(cx, "the expansion", |cx| {
-        nav.read_with(cx, |v, _| v.insp.shown_len >= 64 * 1024)
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.shown_len >= 64 * 1024)
     });
 }
 
@@ -782,7 +788,10 @@ fn a_history_row_shows_its_own_message_when_time_and_size_are_equal(cx: &mut Tes
         }
         let id = id.expect("node");
         v.select(id, v.gate.generation(), false, cx);
-        v.insp.tab = DetailTab::History;
+        v.pane.update(cx, |p, cx| {
+            p.insp.tab = DetailTab::History;
+            cx.notify();
+        });
         // Newest first.
         v.store.history_seq(id).map(|(q, _)| q).collect::<Vec<_>>()
     });
@@ -790,13 +799,13 @@ fn a_history_row_shows_its_own_message_when_time_and_size_are_equal(cx: &mut Tes
     // What the pane renders, and what a palette action would act on.
     let state = |cx: &mut VisualTestContext, text: &'static str| {
         wait(cx, "the formatted payload", |cx| {
-            nav.read_with(cx, |v, _| v.insp.full == text)
+            nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == text)
         });
-        nav.read_with(cx, |v, _| {
+        nav.read_with(cx, |v, cx| {
             (
-                v.insp.full.clone(),
-                v.palette_target(),
-                v.shown().map(|s| s.msg.payload),
+                v.pane.read(cx).insp.full.clone(),
+                v.palette_target(cx),
+                v.shown(cx).map(|s| s.msg.payload),
             )
         })
     };
@@ -806,10 +815,7 @@ fn a_history_row_shows_its_own_message_when_time_and_size_are_equal(cx: &mut Tes
     let (text_a, target_a, shown_a) = state(cx, "aa");
     assert_eq!(&shown_a.expect("shown")[..], b"aa");
     assert_eq!(text_a, "aa");
-    nav.update(cx, |v, cx| {
-        v.insp.tab = DetailTab::History;
-        cx.notify();
-    });
+    show_history_tab(cx, &nav);
     cx.run_until_parked();
     click(cx, Box::leak(format!("hist-{}", seqs[0]).into_boxed_str()));
     let (_, target_b, shown_b) = state(cx, "bb");
@@ -820,14 +826,11 @@ fn a_history_row_shows_its_own_message_when_time_and_size_are_equal(cx: &mut Tes
     );
     // The equal time must not hide the way back to the latest value. The newest row is the
     // latest message itself, so pick the older row again.
-    nav.update(cx, |v, cx| {
-        v.insp.tab = DetailTab::History;
-        cx.notify();
-    });
+    show_history_tab(cx, &nav);
     cx.run_until_parked();
     click(cx, Box::leak(format!("hist-{}", seqs[1]).into_boxed_str()));
     click(cx, "show-latest");
-    let shown = nav.read_with(cx, |v, _| v.shown().expect("shown").msg.payload.clone());
+    let shown = nav.read_with(cx, |v, cx| v.shown(cx).expect("shown").msg.payload.clone());
     assert_eq!(&shown[..], b"bb");
     // The History copy of a big latest value is cut. Picking it must offer the full value.
     let big_seq = nav.update(cx, |v, cx| {
@@ -845,7 +848,10 @@ fn a_history_row_shows_its_own_message_when_time_and_size_are_equal(cx: &mut Tes
             panic!("not stored");
         };
         v.select(id, v.gate.generation(), false, cx);
-        v.insp.tab = DetailTab::History;
+        v.pane.update(cx, |p, cx| {
+            p.insp.tab = DetailTab::History;
+            cx.notify();
+        });
         v.store.history_seq(id).next().expect("entry").0
     });
     cx.run_until_parked();
@@ -1752,7 +1758,9 @@ fn the_root_takes_the_focus_when_the_details_pane_closes(cx: &mut TestAppContext
     let cx = &mut cx;
     send_payload(cx, &nav, b"{}".to_vec());
     let root = nav.read_with(cx, |v, _| v.root_focus.clone());
-    let editor = nav.read_with(cx, |v, cx| v.insp.editor.read(cx).focus_handle(cx));
+    let editor = nav.read_with(cx, |v, cx| {
+        v.pane.read(cx).insp.editor.read(cx).focus_handle(cx)
+    });
     for case in ["while the pane is open", "after the pane is gone"] {
         nav.update(cx, |v, cx| {
             v.details_open = true;
@@ -1808,12 +1816,143 @@ fn a_resize_keeps_the_focus_in_an_open_dialog(cx: &mut TestAppContext) {
         .expect("the dialog has no focus");
     cx.simulate_resize(size(px(1400.), px(900.)));
     cx.run_until_parked();
-    assert!(
-        !nav.read_with(cx, |v, _| v.insp.sheet_open),
-        "the sheet is open"
-    );
+    assert!(!nav.read_with(cx, |v, _| v.sheet_open), "the sheet is open");
     assert!(
         cx.update(|w, _| held.is_focused(w)),
         "the focus left the dialog"
+    );
+}
+
+/// Opens the History tab of the details pane.
+fn show_history_tab(cx: &mut VisualTestContext, nav: &Entity<Navigator>) {
+    use super::details::DetailTab;
+    let pane = nav.read_with(cx, |v, _| v.pane.clone());
+    pane.update(cx, |p, cx| {
+        p.insp.tab = DetailTab::History;
+        cx.notify();
+    });
+}
+
+/// Stores a message like a merge does (no selection): the main view gets a notify.
+fn insert_msg(cx: &mut VisualTestContext, nav: &Entity<Navigator>, topic: &str, payload: &str) {
+    use navigator_core::net::Protocol;
+    use navigator_core::store::Insert;
+    use navigator_core::{Incoming, MsgProps, Qos};
+    nav.update(cx, |v, cx| {
+        let r = v.store.insert(Incoming {
+            generation: 0,
+            topic: topic.into(),
+            payload: payload.to_owned().into(),
+            qos: Qos::AtMostOnce,
+            retain: false,
+            props: MsgProps::default(),
+            received_at: std::time::SystemTime::UNIX_EPOCH,
+            protocol: Protocol::V5,
+        });
+        let Insert::Stored(id) = r else {
+            panic!("not stored");
+        };
+        if v.sel_topic.is_none() {
+            v.select(id, v.gate.generation(), false, cx);
+        }
+        cx.notify();
+    });
+}
+
+/// Two frames: the first one tells the pane about a change, the second one draws the pane.
+fn draw_twice(cx: &mut VisualTestContext) {
+    for _ in 0..2 {
+        cx.update(|w, cx| {
+            w.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+}
+
+fn pane_renders(cx: &mut VisualTestContext, nav: &Entity<Navigator>) -> usize {
+    nav.read_with(cx, |v, cx| v.pane.read(cx).renders)
+}
+
+/// The pane is its own view: a new message of the shown topic draws it again. A flood on other
+/// topics does not: gpui reuses its last frame. It needs no broker.
+#[gpui_kit::test]
+fn the_pane_draws_for_its_topic_and_not_for_other_topics(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    insert_msg(cx, &nav, "t/shown", "aa");
+    draw_twice(cx);
+    wait(cx, "the text", |cx| {
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "aa")
+    });
+    draw_twice(cx);
+    let editor = nav.read_with(cx, |v, cx| v.pane.read(cx).insp.editor.clone());
+    assert_eq!(cx.update(|_, cx| editor.read(cx).value().to_string()), "aa");
+    let before = pane_renders(cx, &nav);
+    assert!(before > 0);
+    for i in 0..30 {
+        insert_msg(cx, &nav, &format!("t/other/{i}"), "zz");
+        draw_twice(cx);
+    }
+    assert_eq!(
+        pane_renders(cx, &nav),
+        before,
+        "the pane drew for a message of another topic"
+    );
+    insert_msg(cx, &nav, "t/shown", "bb");
+    draw_twice(cx);
+    wait(cx, "the new text", |cx| {
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "bb")
+    });
+    draw_twice(cx);
+    assert!(pane_renders(cx, &nav) > before, "the pane did not draw");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).value().to_string()), "bb");
+}
+
+/// A selected message row that the store removes: the pane says so. It needs no broker.
+#[gpui_kit::test]
+fn the_pane_shows_that_the_selected_row_was_removed(cx: &mut TestAppContext) {
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    insert_msg(cx, &nav, "t/row", "aa");
+    nav.update(cx, |v, cx| {
+        let id = match v.store.list_row(0) {
+            Some(RowView::Message { id, .. }) => id,
+            _ => panic!("no row"),
+        };
+        v.select_row(id, cx);
+    });
+    draw_twice(cx);
+    assert!(cx.debug_bounds("evicted-note").is_none());
+    nav.update(cx, |v, cx| {
+        v.store.clear();
+        cx.notify();
+    });
+    draw_twice(cx);
+    assert!(
+        cx.debug_bounds("evicted-note").is_some(),
+        "the pane keeps its last frame after the eviction"
+    );
+}
+
+/// A finished render draws the pane: the Show more button needs no other event. It needs no
+/// broker.
+#[gpui_kit::test]
+fn a_finished_render_draws_the_pane(cx: &mut TestAppContext) {
+    use super::details::PayloadView;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    send_big(cx, &nav, 200 * 1024);
+    draw_twice(cx);
+    assert!(cx.debug_bounds("show-more").is_none());
+    wait(cx, "the render", |cx| {
+        nav.read_with(cx, |v, cx| {
+            let i = &v.pane.read(cx).insp;
+            matches!(i.view, PayloadView::Done { .. }) && i.more_task.is_none()
+        })
+    });
+    draw_twice(cx);
+    assert!(
+        cx.debug_bounds("show-more").is_some(),
+        "the pane did not draw after the job"
     );
 }

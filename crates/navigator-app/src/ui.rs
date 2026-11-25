@@ -973,7 +973,18 @@ pub struct Navigator {
     /// Connection generation of the shown data. Newer data from the net thread replaces it.
     gate: GenGate,
     /// The details pane (Value and History tabs, decoder, background render job).
-    insp: details::Inspector,
+    /// The details pane (its own view, see `details_sig`).
+    pane: Entity<details::DetailsPane>,
+    /// Counts the user's selections: a new one drops the History row of the pane.
+    selection: u64,
+    /// The last `details_sig` that the pane got.
+    details_sig: u64,
+    /// The details sheet of a narrow window is open.
+    sheet_open: bool,
+    /// Open the sheet at the next frame (a row was selected in a narrow window).
+    want_sheet: bool,
+    /// The details pane is widened over the message list.
+    expanded: bool,
     /// The details pane is open. It stays closed until the user opens it again.
     details_open: bool,
     /// The window is narrower than `details::NARROW`: the details open as a sheet.
@@ -1187,7 +1198,15 @@ impl Navigator {
             // A Tab stop: the keyboard reaches the rows with Tab.
             list_focus: cx.focus_handle().tab_stop(true),
             gate: GenGate::default(),
-            insp: details::Inspector::new(window, cx),
+            pane: {
+                let nav = cx.weak_entity();
+                cx.new(|cx| details::DetailsPane::new(nav, window, cx))
+            },
+            selection: 0,
+            details_sig: 0,
+            sheet_open: false,
+            want_sheet: false,
+            expanded: false,
             details_open: false,
             narrow: false,
             comp: compose::Composer::new(window, cx),
@@ -1730,8 +1749,7 @@ impl Navigator {
                         self.sel_msg = None;
                         self.detail_of = DetailOf::Topic;
                         self.details_open = true;
-                        self.insp.hist_pick = None;
-                        self.insp.set_auto_all();
+                        self.selection += 1;
                     }
                 }
                 n += 1;
@@ -2085,7 +2103,7 @@ impl Navigator {
         self.sel_topic = Some(id);
         self.sel_msg = None;
         self.detail_of = DetailOf::Topic;
-        self.insp.hist_pick = None;
+        self.selection += 1;
         // A topic with subtopics takes a double click. Details that open on the first click
         // change the layout, and the second press lands on another element.
         if !has_children {
@@ -2123,7 +2141,7 @@ impl Navigator {
                 seq,
             });
             self.detail_of = DetailOf::Message;
-            self.insp.hist_pick = None;
+            self.selection += 1;
             self.reveal_details();
             self.leave_follow();
             self.list_scroll.scroll_to_item(i, ScrollStrategy::Nearest);
@@ -2189,7 +2207,7 @@ impl Navigator {
                     self.sel_topic = Some(id);
                     self.sel_msg = None;
                     self.detail_of = DetailOf::Topic;
-                    self.insp.hist_pick = None;
+                    self.selection += 1;
                     self.reveal_details();
                     if let Some(n) = next {
                         self.tree_scroll.scroll_to_item(n, ScrollStrategy::Nearest);
@@ -3630,7 +3648,7 @@ impl Navigator {
                         v.list_focus.focus(window, cx);
                         v.select_row(id, cx);
                         // A click opens the sheet. The keys (Up, Down) must keep the list focus.
-                        v.insp.want_sheet = v.narrow;
+                        v.want_sheet = v.narrow;
                     }))
                     .into_any_element()
             }
@@ -3758,7 +3776,7 @@ impl Navigator {
                                 v.list_focus.focus(window, cx);
                                 v.select(id, generation, ev.click_count() == 2, cx);
                                 // As in `select`: a topic with subtopics opens no sheet.
-                                v.insp.want_sheet = v.narrow && !parent;
+                                v.want_sheet = v.narrow && !parent;
                             }))
                             .into_any_element()
                     })
@@ -3822,7 +3840,7 @@ impl Navigator {
         let right = w(2).or_else(|| saved.get(1).copied());
         if let (Some(l), Some(r)) = (left, right) {
             self.settings.ui.pane_widths = vec![l.round(), r.round()];
-            self.insp.expanded = false;
+            self.expanded = false;
             self.expand_restore = None;
             self.persist();
         }
@@ -4014,11 +4032,11 @@ impl Render for Navigator {
         // Below NARROW px the details open as a sheet. A wide window shows them in the pane.
         // The sheet closes in this frame when the window grows.
         self.narrow = needs_sheet(f32::from(window.viewport_size().width), self.rem);
-        if self.narrow && self.insp.want_sheet {
-            self.insp.want_sheet = false;
+        if self.narrow && self.want_sheet {
+            self.want_sheet = false;
             cx.defer_in(window, |v, window, cx| v.open_details_sheet(window, cx));
-        } else if !self.narrow && self.insp.sheet_open {
-            self.insp.sheet_open = false;
+        } else if !self.narrow && self.sheet_open {
+            self.sheet_open = false;
             cx.defer_in(window, |_, window, cx| {
                 // `close_sheet` moves the focus to the list: not from under an open dialog.
                 let held = window
@@ -4036,14 +4054,28 @@ impl Render for Navigator {
         // The pane is gone (a resize hid it) and a control of it holds the focus: the root takes
         // it. The sheet keeps its own focus. After the draw, `is_rendered` tells if the handle is
         // in the frame without the pane.
-        if let (false, Some(held)) = (show_details || self.insp.sheet_open, window.focused(cx)) {
+        if let (false, Some(held)) = (show_details || self.sheet_open, window.focused(cx)) {
             cx.defer_in(window, move |v, window, cx| {
                 if window.focused(cx).as_ref() == Some(&held) && !held.is_rendered(window) {
                     v.root_focus.focus(window, cx);
                 }
             });
         }
-        let details = show_details.then(|| self.render_details(window, false, cx));
+        // An input of the pane changed: tell the pane after the draw. A merge for another topic
+        // changes nothing, and the pane keeps its last frame.
+        let sig = self.details_sig(cx.theme());
+        if sig != self.details_sig {
+            self.details_sig = sig;
+            let (pane, selection) = (self.pane.clone(), self.selection);
+            window.defer(cx, move |window, cx| {
+                pane.update(cx, |p, cx| p.sync(selection, window, cx))
+            });
+        }
+        let details = show_details.then(|| {
+            self.pane
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+        });
         if std::mem::take(&mut self.pane_reset) {
             cx.defer_in(window, |v, window, cx| v.reset_panes(window, cx));
         }
@@ -4107,7 +4139,7 @@ impl Render for Navigator {
                                 // Expanded: the pane may take the room up to the centre
                                 // minimum; a drag ends Expand and is capped again.
                                 .size_range(
-                                    limits.right.1..if self.insp.expanded {
+                                    limits.right.1..if self.expanded {
                                         Pixels::MAX
                                     } else {
                                         limits.right.2
