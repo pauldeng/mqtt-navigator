@@ -1129,6 +1129,8 @@ impl Navigator {
         let appearance = cx.observe_window_appearance(window, |v, window, cx| {
             if v.settings.ui.theme_mode == ThemeMode::System {
                 v.apply_theme(window, cx);
+                // The refresh draws the pane with the new theme: its signature must follow.
+                v.sync_composer(cx);
             }
         });
         let bounds = cx.observe_window_bounds(window, |v, window, cx| v.on_resize(window, cx));
