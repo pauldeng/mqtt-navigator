@@ -215,7 +215,7 @@ pub(super) struct ComposerPane {
     nav: WeakEntity<Navigator>,
     /// The message list takes the focus when the composer closes.
     list_focus: FocusHandle,
-    inputs: ComposerInputs,
+    pub(super) inputs: ComposerInputs,
     /// The height of the content at the last layout, with the limit of the window. The parent
     /// gives it to the cached view, which has no content-driven size.
     pub(super) height: Rc<Cell<Pixels>>,

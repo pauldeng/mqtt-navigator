@@ -2007,6 +2007,26 @@ fn the_composer_draws_for_its_inputs_and_not_for_a_flood(cx: &mut TestAppContext
     let mut grows =
         |cx: &mut VisualTestContext, what: &str, change: &mut dyn FnMut(&mut VisualTestContext)| {
             change(cx);
+            // The pane has the new inputs before any frame (a test app can draw while the
+            // change flushes, so the count alone would not show a late update).
+            let (shown, result, connected, v5) = nav.read_with(cx, |v, c| {
+                let result = v
+                    .last_result
+                    .as_ref()
+                    .map_or(String::new(), |(_, t)| t.clone());
+                let shown = v.comp.read(c).inputs.clone();
+                (
+                    shown,
+                    result,
+                    v.connected(),
+                    v.composer_protocol() == Protocol::V5,
+                )
+            });
+            assert_eq!(
+                (shown.result, shown.connected, shown.v5),
+                (result, connected, v5),
+                "the composer got an old input for {what}"
+            );
             // One frame: the change shows at once, not one frame later.
             cx.update(|w, cx| {
                 w.draw(cx).clear(cx);
