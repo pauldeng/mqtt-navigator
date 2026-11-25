@@ -681,6 +681,8 @@ pub struct TopicStore {
     touch: BTreeMap<u64, NodeId>,
     /// Shared empty topic for the free slots.
     empty: Arc<str>,
+    /// Shared empty props for the latest values that eviction emptied.
+    empty_props: Arc<MsgProps>,
     /// A batch eviction of data runs (from above the budget to the low watermark).
     evicting: bool,
     /// A batch eviction of nodes runs.
@@ -784,6 +786,7 @@ impl TopicStore {
             live_nodes: 0,
             touch: BTreeMap::new(),
             empty: Arc::from(""),
+            empty_props: Arc::default(),
             evicting: false,
             evicting_nodes: false,
             stuck_mem: false,
@@ -2156,7 +2159,7 @@ impl TopicStore {
         if let Some(m) = self.nodes[id.ix()].latest.as_mut() {
             self.latest_bytes -= msg_cost(m);
             m.payload = Bytes::new();
-            m.props = Arc::default(); // ponytail: props go too, so the cost is exactly 0
+            m.props = Arc::clone(&self.empty_props); // props go too, so the cost is exactly 0
             m.truncated = true;
         }
         true
@@ -3473,6 +3476,12 @@ mod tests {
         let before = s.node(id).latest_seq;
         assert!(s.evict_latest());
         assert_ne!(s.node(id).latest_seq, before);
+        // Emptied latest values share one empty props `Arc`.
+        let id2 = stored(s.insert(msg("u", b"dd")));
+        assert!(s.evict_latest());
+        let pa = Arc::clone(&s.node(id).latest.as_ref().expect("a").props);
+        let pb = Arc::clone(&s.node(id2).latest.as_ref().expect("b").props);
+        assert!(Arc::ptr_eq(&pa, &pb));
         // The identity does not come back after a clear.
         s.clear();
         let id = stored(s.insert(msg("t", b"cc")));
