@@ -1793,45 +1793,6 @@ fn result_line(connected: bool, result: String) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{STACK_BELOW, composer_max_height, props_stacked, result_line, ui};
-    use gpui_kit::px;
-
-    #[core::prelude::v1::test]
-    fn a_closed_connection_keeps_the_last_result_on_screen() {
-        let unknown = "Unknown: the connection closed before the result.";
-        assert_eq!(result_line(false, unknown.into()), unknown);
-        assert_eq!(
-            result_line(false, String::new()),
-            "Connect to a broker first."
-        );
-        assert_eq!(result_line(true, "Sent".into()), "Sent");
-    }
-
-    #[core::prelude::v1::test]
-    fn rows_stack_in_a_narrow_pane_only() {
-        let rem = px(16.);
-        // The least centre width (360) stacks. The limit and a wider centre do not. An unknown
-        // width (before the first layout) does not.
-        assert!(props_stacked(Some(ui(360.).to_pixels(rem)), rem));
-        assert!(!props_stacked(Some(ui(STACK_BELOW).to_pixels(rem)), rem));
-        assert!(!props_stacked(None, rem));
-    }
-
-    #[core::prelude::v1::test]
-    fn the_composer_height_is_a_part_of_the_window_with_a_floor() {
-        let (rem, big) = (px(16.), px(24.));
-        // 55% of a window. It is above the floor of 280 design pixels at the default zoom.
-        assert_eq!(composer_max_height(px(900.), rem), px(495.));
-        assert_eq!(composer_max_height(px(600.), rem), px(330.));
-        // At 150% zoom the floor (420 px) is above 55% of the window (330 px).
-        assert_eq!(composer_max_height(px(600.), big), px(420.));
-        // The composer takes at most 80% of the window.
-        assert_eq!(composer_max_height(px(400.), big), px(320.));
-    }
-}
-
 impl Navigator {
     /// Tells the pane that an input of it changed. A merge frame changes nothing here, and the
     /// pane keeps its last frame. An observer of this view calls it after each notify, so the pane
@@ -1959,5 +1920,44 @@ impl Navigator {
         }
         cx.notify();
         sent.map_err(|e| send_error_text(e).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STACK_BELOW, composer_max_height, props_stacked, result_line, ui};
+    use gpui_kit::px;
+
+    #[core::prelude::v1::test]
+    fn a_closed_connection_keeps_the_last_result_on_screen() {
+        let unknown = "Unknown: the connection closed before the result.";
+        assert_eq!(result_line(false, unknown.into()), unknown);
+        assert_eq!(
+            result_line(false, String::new()),
+            "Connect to a broker first."
+        );
+        assert_eq!(result_line(true, "Sent".into()), "Sent");
+    }
+
+    #[core::prelude::v1::test]
+    fn rows_stack_in_a_narrow_pane_only() {
+        let rem = px(16.);
+        // The least centre width (360) stacks. The limit and a wider centre do not. An unknown
+        // width (before the first layout) does not.
+        assert!(props_stacked(Some(ui(360.).to_pixels(rem)), rem));
+        assert!(!props_stacked(Some(ui(STACK_BELOW).to_pixels(rem)), rem));
+        assert!(!props_stacked(None, rem));
+    }
+
+    #[core::prelude::v1::test]
+    fn the_composer_height_is_a_part_of_the_window_with_a_floor() {
+        let (rem, big) = (px(16.), px(24.));
+        // 55% of a window. It is above the floor of 280 design pixels at the default zoom.
+        assert_eq!(composer_max_height(px(900.), rem), px(495.));
+        assert_eq!(composer_max_height(px(600.), rem), px(330.));
+        // At 150% zoom the floor (420 px) is above 55% of the window (330 px).
+        assert_eq!(composer_max_height(px(600.), big), px(420.));
+        // The composer takes at most 80% of the window.
+        assert_eq!(composer_max_height(px(400.), big), px(320.));
     }
 }
