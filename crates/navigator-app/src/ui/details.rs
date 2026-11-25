@@ -444,9 +444,10 @@ impl Navigator {
     pub(super) fn details_sig(&self, theme: &Theme) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        // A closed pane shows nothing: no work for it. Opening it changes the signature.
+        // A closed pane shows nothing: no work for it, but a selection still drops its History
+        // pick. Opening the pane changes the signature.
         if !self.details_visible() {
-            false.hash(&mut h);
+            (false, self.selection).hash(&mut h);
             return h.finish();
         }
         let node = self.selected_topic().and_then(|(_, n)| n);
