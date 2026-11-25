@@ -2025,6 +2025,8 @@ impl Navigator {
             if self.last_result.as_ref().is_some_and(|(id, _)| id == op_id) {
                 self.last_result = Some((*op_id, text));
             }
+            // The details of a sent row show its result.
+            self.sync_details(cx);
         }
         if !self.accept(g) {
             // A late send result changed its row and maybe the result line: draw again.

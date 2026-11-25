@@ -637,22 +637,23 @@ impl DetailsPane {
     /// The shown subject, the decoder or the limit may have changed: start a job, push the topic
     /// into the header, and draw.
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Nothing on screen: no job. Becoming visible syncs again.
-        let visible = self
+        // Nothing on screen: no job, no text work. Becoming visible syncs again.
+        if !self
             .nav
             .read_with(cx, |n, _| n.details_visible())
-            .unwrap_or(false);
-        if visible {
-            let shown = self.shown(cx);
-            self.ensure_render(shown.as_ref(), window, cx);
-            // A new wrap setting resets the scroll position: apply the last choice only.
-            if self.insp.applied_wrap != self.insp.wrap {
-                self.insp.applied_wrap = self.insp.wrap;
-                let wrap = self.insp.wrap;
-                self.insp
-                    .editor
-                    .update(cx, |e, cx| e.set_soft_wrap(wrap, window, cx));
-            }
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let shown = self.shown(cx);
+        self.ensure_render(shown.as_ref(), window, cx);
+        // A new wrap setting resets the scroll position: apply the last choice only.
+        if self.insp.applied_wrap != self.insp.wrap {
+            self.insp.applied_wrap = self.insp.wrap;
+            let wrap = self.insp.wrap;
+            self.insp
+                .editor
+                .update(cx, |e, cx| e.set_soft_wrap(wrap, window, cx));
         }
         let topic_text = self
             .nav
