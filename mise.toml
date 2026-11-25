@@ -1,3 +1,4 @@
 [tools]
 cargo-deny = "latest"
-rust = "latest"
+# Mise installs rust-analyzer to prevent repeated calls between the rustup proxy and the mise shim.
+rust = { version = "latest", components = "rust-analyzer,clippy,rustfmt" }
