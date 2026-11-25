@@ -280,6 +280,21 @@ fn may_allocate(
     }
 }
 
+/// A merge of this many messages (about 7.7k a second at `COALESCE`) is a flood.
+const FLOOD_MSGS: u64 = 256;
+/// Under a flood the list redraws after this gap at the least (about 15 Hz). A redraw costs about
+/// 4 ms of UI time, whatever the message rate. A merge costs far less, so the merge keeps its
+/// pace and only the redraw skips.
+const REDRAW_GAP: Duration = Duration::from_millis(COALESCE.as_millis() as u64 * 3 / 2);
+
+/// True if the redraw of this merge can wait. Only the loop skips (backlog mode and input draw
+/// as before), only in a flood, and only if the last redraw is younger than `REDRAW_GAP`. So the
+/// first merge after a quiet time draws, and so does every second merge of a flood. A skipped
+/// redraw starts a timer (`Navigator::redraw_later`), so the last messages of a flood show too.
+fn skip_redraw(caller: Caller, msgs: u64, since_redraw: Option<Duration>) -> bool {
+    caller == Caller::Loop && msgs >= FLOOD_MSGS && since_redraw.is_some_and(|d| d < REDRAW_GAP)
+}
+
 /// How long the next frame waits, `since_last` after the start of the last one. `None`: no wait.
 /// The first message after a quiet time gets a frame at once, and a flood gets one frame in each
 /// `COALESCE`. Nothing waits while the loop is idle.
@@ -1035,6 +1050,10 @@ pub struct Navigator {
     last_frame: Option<Instant>,
     /// A frame callback is registered. `arm_frame` keeps it so while backlog mode lasts.
     armed: bool,
+    /// Time of the last redraw that `allocate` asked for, and the time of a skipped one that is
+    /// still due.
+    last_redraw: Option<Instant>,
+    redraw_due: Option<Instant>,
     metrics: Metrics,
     /// Metrics only: `MQTT_NAVIGATOR_AUTOSELECT=<topic>` (ignored without
     /// `MQTT_NAVIGATOR_METRICS`). When this topic arrives, the app selects it and applies Show
@@ -1258,6 +1277,8 @@ impl Navigator {
             last_alloc: None,
             last_frame: None,
             armed: false,
+            last_redraw: None,
+            redraw_due: None,
             metrics: Metrics::from_env(),
             autoselected: false,
             autoselect: std::env::var("MQTT_NAVIGATOR_AUTOSELECT")
@@ -1620,12 +1641,46 @@ impl Navigator {
         };
         self.last_alloc = Some(now);
         let first = self.held.take();
+        let dequeued = self.counts.dequeued;
         if let Some(line) = self.merge(first, &mut rx, caller == Caller::Frame) {
             cx.background_executor().spawn(write_metrics(line)).detach();
         }
+        let msgs = self.counts.dequeued - dequeued;
+        // Backlog mode needs the draw: `render` registers its frame callback.
+        if !self.backlog.on() && skip_redraw(caller, msgs, self.last_redraw.map(|t| now - t)) {
+            self.redraw_later(cx);
+        } else {
+            self.redraw(cx);
+        }
+        self.schedule_rate_zero(cx);
+    }
+
+    /// The redraw of a merge: the pane sync and the notify.
+    fn redraw(&mut self, cx: &mut Context<Self>) {
+        self.last_redraw = Some(Instant::now());
+        self.redraw_due = None;
         self.sync_details(cx);
         cx.notify();
-        self.schedule_rate_zero(cx);
+    }
+
+    /// Skips the redraw of this merge. The next merge of a flood draws. If none comes (the flood
+    /// ended), one timer draws after `REDRAW_GAP`. The timer starts from a skip and ends with it,
+    /// so an idle app has none.
+    fn redraw_later(&mut self, cx: &mut Context<Self>) {
+        if self.redraw_due.is_some() {
+            return;
+        }
+        self.redraw_due = Some(Instant::now());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REDRAW_GAP).await;
+            let _ = this.update(cx, |v, cx| {
+                // An older timer must not draw for a newer skip.
+                if v.redraw_due.is_some_and(|t| t.elapsed() >= REDRAW_GAP / 2) {
+                    v.redraw(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Tells the pane that an input of it changed (see `details_sig`). A merge for another topic
@@ -4568,9 +4623,10 @@ fn row_look(theme: &Theme, selected: bool, list_focused: bool) -> RowLook {
 mod tests {
     // Not `use super::*`: the gpui glob import brings its own `test` macro.
     use super::{
-        COALESCE, Caller, ConnState, ConnectionDetails, DetailsCache, GenGate, Protocol, Status,
-        StatusFacts, StatusItems, SubState, Subs, coalesce_wait, connection_live, may_allocate,
-        scroll_top_of, send_error_text, status_items, top_row, ui, validate_filter,
+        COALESCE, Caller, ConnState, ConnectionDetails, DetailsCache, GenGate, Protocol,
+        REDRAW_GAP, Status, StatusFacts, StatusItems, SubState, Subs, coalesce_wait,
+        connection_live, may_allocate, scroll_top_of, send_error_text, skip_redraw, status_items,
+        top_row, ui, validate_filter,
     };
     use gpui_kit::{px, rems};
     use navigator_core::Qos;
@@ -5473,6 +5529,32 @@ mod tests {
             coalesce_wait(Duration::from_millis(20)),
             Some(COALESCE - Duration::from_millis(20))
         );
+    }
+
+    #[test]
+    fn a_flood_skips_every_second_redraw_and_quiet_traffic_none() {
+        let mut since = None;
+        let (mut drawn, mut skipped) = (0, 0);
+        // 10 s of merges every `COALESCE`, 330 messages each (10k a second).
+        for _ in 0..300 {
+            if skip_redraw(Caller::Loop, 330, since) {
+                skipped += 1;
+                since = since.map(|d| d + COALESCE);
+            } else {
+                drawn += 1;
+                since = Some(COALESCE);
+            }
+        }
+        assert_eq!(drawn, 150);
+        assert_eq!(skipped, 150);
+        // The timer of a skip is later than the next merge, and draws if no merge came.
+        assert!(REDRAW_GAP > COALESCE && REDRAW_GAP < COALESCE * 2);
+        // Quiet traffic, the first merge after a quiet time, backlog mode and input always draw.
+        assert!(!skip_redraw(Caller::Loop, 255, Some(COALESCE)));
+        assert!(!skip_redraw(Caller::Loop, 330, None));
+        assert!(!skip_redraw(Caller::Loop, 330, Some(REDRAW_GAP)));
+        assert!(!skip_redraw(Caller::Frame, 330, Some(COALESCE)));
+        assert!(!skip_redraw(Caller::Fallback, 330, Some(COALESCE)));
     }
 
     /// A 20 Hz display (a frame each 50 ms): the callback allocates at 0, the fallback at 36, and
