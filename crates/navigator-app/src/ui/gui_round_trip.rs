@@ -2002,12 +2002,15 @@ fn the_composer_draws_for_its_inputs_and_not_for_a_flood(cx: &mut TestAppContext
         before,
         "the composer drew for a flood"
     );
-    // Each change must draw the composer: the count grows.
+    // Each change must draw the composer in the next frame: the count grows.
     let mut seen = before;
     let mut grows =
         |cx: &mut VisualTestContext, what: &str, change: &mut dyn FnMut(&mut VisualTestContext)| {
             change(cx);
-            draw_twice(cx);
+            // One frame: the change shows at once, not one frame later.
+            cx.update(|w, cx| {
+                w.draw(cx).clear(cx);
+            });
             let now = composer_renders(cx, &nav);
             assert!(now > seen, "the composer did not draw for {what}");
             seen = now;
