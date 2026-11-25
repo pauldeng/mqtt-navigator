@@ -67,6 +67,7 @@ Rules:
 - There are no polling loops.
 - When the app is idle (no traffic, no input), it does not wake up.
 - The coalescing timer (33 ms, 25 ms on Windows because its timer ticks are 15.6 ms) starts after a message arrives. It stops when the queue is empty.
+- Under a flood (a merge of 256 messages or more, about 7.7k a second), the list redraws at most every 50 ms (about 15 Hz, 37 ms on Windows). The merge keeps its 33 ms pace and its ≤ 4 ms budget, so the store loses nothing. Only the redraw is skipped, because it costs about 4 ms of UI time whatever the message rate. A skipped redraw starts one timer. The next merge of the flood redraws, and if none comes, the timer redraws after 50 ms. The timer stops with that. User input and backlog mode redraw as before.
 - The msg/s display refreshes once a second, but only while messages arrive.
 - The reconnect timer runs only in the `Reconnecting` state.
 - A settings change starts a write after 500 ms of quiet.
