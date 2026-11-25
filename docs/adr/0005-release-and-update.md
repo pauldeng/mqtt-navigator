@@ -46,7 +46,7 @@ Ad-hoc sign the `.app` from the inside out (`codesign -s -`). Updates swap the b
 
 ### HTTPS client (D7)
 
-`ureq` with native-tls (SChannel, Security.framework, and the vendored OpenSSL that the binary already has). No rustls: a second TLS stack would use most of the size margin (ADR 0004).
+`ureq` with native-tls (SChannel, Security.framework, and the vendored OpenSSL that the binary already has). No rustls: a second TLS stack would use most of the size margin (ADR 0004, at the time of this decision, 2026-11-11).
 
 ### Release workflow (D8)
 
