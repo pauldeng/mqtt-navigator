@@ -51,16 +51,22 @@ impl Navigator {
             Cmd::RowHeight2 => self.set_row_height(true, cx),
             Cmd::ToggleDetails => self.toggle_details(window, cx),
             Cmd::DetailsOpen => self.open_details(window, cx),
-            Cmd::ToggleExpand => self.set_expanded(!self.insp.expanded, window, cx),
-            Cmd::Decoder(pick) => self.set_decoder(pick, window, cx),
-            Cmd::NumberKind(kind) => self.set_number(Some(kind), None, window, cx),
-            Cmd::NumberEndian(endian) => self.set_number(None, Some(endian), window, cx),
-            Cmd::WrapOn => self.set_wrap(true, cx),
-            Cmd::WrapOff => self.set_wrap(false, cx),
-            Cmd::ShowAll => self.show_all(cx),
-            Cmd::ShowMore => self.show_more(window, cx),
-            Cmd::CopyValue => self.copy_value(window, cx),
-            Cmd::CopyTopic => self.copy_topic(window, cx),
+            Cmd::ToggleExpand => self.set_expanded(!self.expanded, window, cx),
+            Cmd::Decoder(pick) => {
+                self.in_pane(window, cx, move |p, w, cx| p.set_decoder(pick, w, cx))
+            }
+            Cmd::NumberKind(kind) => self.in_pane(window, cx, move |p, w, cx| {
+                p.set_number(Some(kind), None, w, cx)
+            }),
+            Cmd::NumberEndian(endian) => self.in_pane(window, cx, move |p, w, cx| {
+                p.set_number(None, Some(endian), w, cx)
+            }),
+            Cmd::WrapOn => self.in_pane(window, cx, |p, w, cx| p.set_wrap(true, w, cx)),
+            Cmd::WrapOff => self.in_pane(window, cx, |p, w, cx| p.set_wrap(false, w, cx)),
+            Cmd::ShowAll => self.in_pane(window, cx, |p, w, cx| p.show_all(w, cx)),
+            Cmd::ShowMore => self.in_pane(window, cx, |p, w, cx| p.show_more(w, cx)),
+            Cmd::CopyValue => self.in_pane(window, cx, |p, w, cx| p.copy_value(w, cx)),
+            Cmd::CopyTopic => self.in_pane(window, cx, |p, w, cx| p.copy_topic(w, cx)),
             Cmd::PublishToTopic => self.publish_to_topic(window, cx),
             Cmd::EditAndPublish => self.edit_and_publish(window, cx),
             Cmd::Reply => self.reply(window, cx),
@@ -82,7 +88,7 @@ impl Navigator {
             Cmd::ThemePreset(id) => self.set_preset(id, window, cx),
             Cmd::MemoryLimit(mib) => self.set_memory_limit(mib, cx),
             Cmd::ResetLayout => {
-                self.insp.expanded = false;
+                self.expanded = false;
                 self.expand_restore = None;
                 // The next frame sets the pane widths: the details pane may be hidden now.
                 self.pane_reset = true;
@@ -147,9 +153,9 @@ impl Navigator {
 
     /// What the palette actions act on: the shown message, the selected topic and the
     /// subscription in "Show only".
-    pub(super) fn palette_target(&self) -> PaletteTarget {
+    pub(super) fn palette_target(&self, cx: &App) -> PaletteTarget {
         PaletteTarget {
-            shown: self.shown().map(|s| s.key),
+            shown: self.shown(cx).map(|s| s.key),
             topic: self.selected_topic().map(|(t, _)| t),
             sub: self.show_only.clone(),
         }
@@ -167,7 +173,7 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let now = self.palette_target();
+        let now = self.palette_target(cx);
         let moved = match cmd {
             Cmd::CopyValue | Cmd::EditAndPublish | Cmd::Reply => now.shown != at_open.shown,
             // Show all and Show more act on the subject, not on one message.
@@ -181,7 +187,7 @@ impl Navigator {
             }
             _ => false,
         };
-        let facts = self.facts();
+        let facts = self.facts(cx);
         let why = match palette::COMMANDS.iter().find(|e| e.cmd == cmd) {
             _ if moved => Some("The selection changed. Open the commands again.".to_string()),
             // Copy the value says itself why the value is not ready.
@@ -199,7 +205,7 @@ impl Navigator {
     /// The user chose a palette row that showed a reason. Say the reason now, or that the state
     /// changed since the palette opened.
     fn palette_cmd_off(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
-        let facts = self.facts();
+        let facts = self.facts(cx);
         let reason = palette::COMMANDS
             .iter()
             .find(|e| e.cmd == cmd)
@@ -213,10 +219,10 @@ impl Navigator {
         if window.has_active_dialog(cx) {
             return;
         }
-        let entries = palette::available(&self.facts());
-        let target = Rc::new(self.palette_target());
+        let entries = palette::available(&self.facts(cx));
+        let target = Rc::new(self.palette_target(cx));
         let cmds: Rc<Vec<Cmd>> = Rc::new(entries.iter().map(|e| e.cmd).collect());
-        let facts = self.facts();
+        let facts = self.facts(cx);
         let rows: Rc<Vec<PaletteRow>> = Rc::new(
             entries
                 .iter()

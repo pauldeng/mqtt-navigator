@@ -411,7 +411,7 @@ impl Navigator {
         self.rate = Rate::default();
         self.status = Status::default();
         // The composer and History belong to the profile too.
-        self.insp.reset();
+        self.pane.update(cx, |p, cx| p.reset(cx));
         self.comp.reset(window, cx);
         self.sub_input
             .update(cx, |i, cx| i.set_value("", window, cx));

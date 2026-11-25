@@ -14,7 +14,7 @@ use super::*;
 use crate::composer::{self, Draft};
 use crate::inspector::{
     AUTO_BYTES, DecoderChoice, DecoderPick, FIRST_BYTES, Jobs, MORE_BYTES, NUMBER_KINDS,
-    history_note, meta_line, next_cut, next_step, props_rows, size_text,
+    history_note, meta_line, next_cut, next_step, props_count, props_rows, size_text,
 };
 
 /// Below this window width the details open as a right sheet.
@@ -100,13 +100,9 @@ pub(super) struct Inspector {
     pub(super) tab: DetailTab,
     pub(super) choice: DecoderChoice,
     pub(super) wrap: bool,
-    applied_wrap: bool,
     /// Hash of the text in the payload editor.
     text_hash: Option<u64>,
-    pub(super) expanded: bool,
     show_all: bool,
-    /// Metrics only (`MQTT_NAVIGATOR_AUTOSELECT`): a new subject starts with Show all.
-    auto_all: bool,
     /// The whole rendered text. The editor shows its first `shown_len` bytes. The text grows in
     /// steps (see `crate::inspector::next_step`) up to `more_target`.
     pub(super) full: String,
@@ -136,21 +132,21 @@ pub(super) struct Inspector {
     /// The full topic of the header, as a read-only input, so that the text can be selected.
     topic_view: Entity<InputState>,
     topic_text: String,
+    /// The escaped metadata line of the Value tab, for the message of this identity.
+    meta: Option<(DetailKey, i32, SharedString)>,
+    /// The last `Navigator::selection` that the pane saw: a new one drops the History pick.
+    selection: u64,
     /// The Properties section of the Value tab is open (collapsed by default).
     props_open: bool,
     /// The Value tab takes the focus when a History row is chosen.
     value_focus: FocusHandle,
     /// The pane. When it closes with the focus inside, the root takes the focus.
     pub(super) pane_focus: FocusHandle,
-    /// The details sheet of a narrow window is open.
-    pub(super) sheet_open: bool,
-    /// Open the sheet at the next frame (a row was selected in a narrow window).
-    pub(super) want_sheet: bool,
     _subs: Vec<Subscription>,
 }
 
 impl Inspector {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Navigator>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<DetailsPane>) -> Self {
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .line_number(false)
@@ -166,33 +162,35 @@ impl Inspector {
         let kinds: Vec<KindItem> = NUMBER_KINDS.iter().map(|(k, n)| KindItem(*k, n)).collect();
         let kind_select = cx.new(|cx| SelectState::new(kinds, Some(IndexPath::new(4)), window, cx));
         let subs = vec![
-            cx.subscribe(
+            cx.subscribe_in(
                 &decoder_select,
-                |v, _, ev: &SelectEvent<Vec<DecoderItem>>, cx| {
+                window,
+                |v, _, ev: &SelectEvent<Vec<DecoderItem>>, window, cx| {
                     let SelectEvent::Confirm(pick) = ev;
                     if let Some(p) = pick {
                         v.insp.choice.pick = *p;
-                        cx.notify();
+                        v.changed(window, cx);
                     }
                 },
             ),
-            cx.subscribe(&kind_select, |v, _, ev: &SelectEvent<Vec<KindItem>>, cx| {
-                let SelectEvent::Confirm(kind) = ev;
-                if let Some(k) = kind {
-                    v.insp.choice.kind = *k;
-                    cx.notify();
-                }
-            }),
+            cx.subscribe_in(
+                &kind_select,
+                window,
+                |v, _, ev: &SelectEvent<Vec<KindItem>>, window, cx| {
+                    let SelectEvent::Confirm(kind) = ev;
+                    if let Some(k) = kind {
+                        v.insp.choice.kind = *k;
+                        v.changed(window, cx);
+                    }
+                },
+            ),
         ];
         Self {
             tab: DetailTab::Value,
             choice: DecoderChoice::default(),
             wrap: true,
-            applied_wrap: true,
             text_hash: None,
-            expanded: false,
             show_all: false,
-            auto_all: false,
             full: String::new(),
             shown_len: 0,
             more_target: 0,
@@ -213,11 +211,11 @@ impl Inspector {
             hist_scroll: UniformListScrollHandle::new(),
             topic_view: cx.new(|cx| InputState::new(window, cx)),
             topic_text: String::new(),
+            meta: None,
+            selection: 0,
             props_open: false,
             value_focus: cx.focus_handle(),
             pane_focus: cx.focus_handle(),
-            sheet_open: false,
-            want_sheet: false,
             _subs: subs,
         }
     }
@@ -239,11 +237,6 @@ impl Inspector {
         self.more_floor = 0;
         self.more_task = None;
     }
-
-    /// Metrics only: the next subject starts with Show all.
-    pub(super) fn set_auto_all(&mut self) {
-        self.auto_all = true;
-    }
 }
 
 /// The message that the details show, copied out of the store.
@@ -257,37 +250,40 @@ pub(super) struct Shown {
     pub(super) evicted: bool,
 }
 
-/// A view for the details sheet. It draws the details of the window.
-pub(super) struct DetailsHost {
+/// The details pane. Its own view: gpui reuses its last frame until the pane calls `notify`.
+/// `Navigator` tells the pane when an input of it changes (see `Navigator::details_sig`). The
+/// pane notifies itself for its own state.
+pub(super) struct DetailsPane {
     nav: WeakEntity<Navigator>,
-    _observe: Subscription,
+    pub(super) insp: Inspector,
+    /// Tests only: how often the pane drew.
+    #[cfg(test)]
+    pub(super) renders: usize,
 }
 
-impl DetailsHost {
-    fn new(nav: &Entity<Navigator>, cx: &mut Context<Self>) -> Self {
-        Self {
-            nav: nav.downgrade(),
-            _observe: cx.observe(nav, |_, _, cx| cx.notify()),
-        }
-    }
-}
-
-impl Render for DetailsHost {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match self.nav.upgrade() {
-            Some(nav) => nav
-                .update(cx, |v, cx| v.render_details(window, true, cx))
-                .into_any_element(),
-            None => div().into_any_element(),
-        }
-    }
+/// What the pane reads from `Navigator` when it draws.
+struct Inputs {
+    shown: Option<Shown>,
+    topic: Option<(String, Option<NodeId>)>,
+    /// "Clear retained" is on offer.
+    retained: bool,
+    /// The details are in the sheet of a narrow window.
+    sheet: bool,
+    expanded: bool,
+    utc: i32,
+    /// The result of the selected sent message.
+    sent: Option<(String, bool)>,
+    /// Identity and size of the base of the Value tab (selection or latest value).
+    base_seq: u64,
+    base_len: usize,
+    base_at: Option<SystemTime>,
 }
 
 impl Navigator {
-    /// What the Value tab shows now.
-    pub(super) fn shown(&self) -> Option<Shown> {
+    /// What the Value tab shows now. `pick`: the History row that the user chose.
+    pub(super) fn shown_with(&self, pick: Option<&(u64, Msg)>) -> Option<Shown> {
         let hist = |node: Option<NodeId>, topic: String, direction: Direction| {
-            let (seq, m) = self.insp.hist_pick.clone()?;
+            let (seq, m) = pick?.clone();
             let key = DetailKey::Hist(node?, seq);
             Some(Shown {
                 topic,
@@ -337,6 +333,11 @@ impl Navigator {
         }
     }
 
+    /// What the Value tab shows now.
+    pub(super) fn shown(&self, cx: &App) -> Option<Shown> {
+        self.shown_with(self.pane.read(cx).insp.hist_pick.as_ref())
+    }
+
     /// The topic of the selection and its node. It does not depend on a payload: a branch of the
     /// tree or a topic with an evicted value is a topic, too.
     pub(super) fn selected_topic(&self) -> Option<(String, Option<NodeId>)> {
@@ -359,6 +360,198 @@ impl Navigator {
     fn has_retained(&self) -> bool {
         self.selected_topic()
             .is_some_and(|(topic, _)| self.store.has_retained_topic(&topic))
+    }
+
+    /// The details are on screen: the pane of a wide window or the sheet of a narrow one.
+    pub(super) fn details_visible(&self) -> bool {
+        if self.narrow {
+            self.sheet_open
+        } else {
+            self.details_open
+        }
+    }
+
+    /// The current result of the selected sent message. `None`: no sent row is selected, a
+    /// History row shows, or the row is gone.
+    fn sent_status(&self, pick: Option<&(u64, Msg)>) -> Option<SendStatus> {
+        if pick.is_some() || self.detail_of != DetailOf::Message {
+            return None;
+        }
+        let s = self.sel_msg.as_ref()?;
+        if s.direction != Direction::Sent {
+            return None;
+        }
+        // By row id: a list filter must not hide the result of the selected message.
+        self.store.row_send_status(s.id).cloned()
+    }
+
+    /// The arrival time that the Value tab compares a History row with: the selected message,
+    /// or the latest value of the selected topic.
+    fn base_received_at(&self) -> Option<SystemTime> {
+        match self.detail_of {
+            DetailOf::Nothing => None,
+            DetailOf::Message => self.sel_msg.as_ref().map(|s| s.msg.received_at),
+            DetailOf::Topic => self
+                .store
+                .get(self.sel_topic?)
+                .and_then(|n| n.latest)
+                .map(|m| m.received_at),
+        }
+    }
+
+    /// Everything the pane reads from here. `pick`: its History row.
+    fn pane_inputs(&self, pick: Option<&(u64, Msg)>) -> Inputs {
+        // The pick is the base itself when both have one identity. Its History copy can be
+        // shorter (the store cuts it).
+        let (base_seq, base_len) = match self.detail_of {
+            DetailOf::Topic => self
+                .sel_topic
+                .and_then(|id| self.store.get(id))
+                .map_or((0, 0), |n| {
+                    (n.latest_seq, n.latest.map_or(0, |m| m.payload.len()))
+                }),
+            DetailOf::Message => self
+                .sel_msg
+                .as_ref()
+                .map_or((0, 0), |s| (s.seq, s.msg.payload.len())),
+            DetailOf::Nothing => (0, 0),
+        };
+        Inputs {
+            shown: self.shown_with(pick),
+            topic: self.selected_topic(),
+            retained: self.has_retained() && self.connected(),
+            sheet: self.narrow,
+            expanded: self.expanded,
+            utc: self.utc_offset,
+            sent: self
+                .sent_status(pick)
+                .map(|st| (format!("Result: {}", status_text(&st)), status_failed(&st))),
+            base_seq,
+            base_len,
+            base_at: self.base_received_at(),
+        }
+    }
+
+    /// Changes when the pane must draw again because of an input from here. A merge for another
+    /// topic changes nothing. The pane keeps its own state apart (it notifies itself).
+    pub(super) fn details_sig(&self, theme: &Theme) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let node = self.selected_topic().and_then(|(_, n)| n);
+        let latest = node.and_then(|n| self.store.get(n)).map(|n| n.latest_seq);
+        // A message row can go with the memory limit.
+        let row = self
+            .sel_msg
+            .as_ref()
+            .filter(|_| self.detail_of == DetailOf::Message)
+            .map(|s| (s.id, self.store.row_evicted(s.id)));
+        (
+            self.selection,
+            self.detail_of as u8,
+            self.sel_topic,
+            row,
+            node,
+            latest,
+            node.map(|n| self.store.history(n).count()),
+            self.has_retained(),
+            self.sent_status(None).map(|s| status_text(&s)),
+        )
+            .hash(&mut h);
+        (
+            self.details_visible(),
+            self.connected(),
+            self.narrow,
+            self.expanded,
+            self.utc_offset,
+            self.rem.to_bits(),
+            theme.theme_name(),
+        )
+            .hash(&mut h);
+        h.finish()
+    }
+
+    /// The facts that the registry needs.
+    pub(super) fn facts(&self, cx: &App) -> crate::palette::Facts {
+        let pane = self.pane.read(cx);
+        let shown = self.shown_with(pane.insp.hist_pick.as_ref());
+        let topic = self.selected_topic();
+        let can_edit = shown
+            .as_ref()
+            .is_some_and(|s| composer::edit_unavailable(&s.msg, s.evicted).is_none());
+        crate::palette::Facts {
+            has_profile: self.profile.is_some(),
+            connected: self.connected(),
+            connecting: self.connecting()
+                || matches!(
+                    self.status.state,
+                    ConnState::Connecting | ConnState::Reconnecting { .. }
+                ),
+            disconnecting: self.status.state == ConnState::Disconnecting,
+            messages_view: self.view == View::Messages,
+            filters_active: self.filters_active(),
+            paused: self.store.is_paused(),
+            follow: self.follow.on,
+            two_lines: self.two_lines(),
+            details_open: self.details_visible(),
+            has_value: shown.is_some(),
+            can_publish_to_topic: topic.is_some(),
+            can_edit,
+            has_reply: shown.as_ref().is_some_and(|s| {
+                s.msg
+                    .props
+                    .response_topic
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty())
+            }),
+            has_retained: self.has_retained(),
+            can_copy: pane.can_copy(shown.as_ref()),
+            wrap: pane.insp.wrap,
+            number: (pane.insp.choice.pick == DecoderPick::Number)
+                .then_some((pane.insp.choice.kind, pane.insp.choice.endian)),
+            can_show_all: pane.can_show_all(shown.as_ref()),
+            can_show_more: pane.can_show_more(shown.as_ref()),
+            payload_mode: self.comp.mode,
+            theme: Some(self.settings.ui.theme_mode),
+            preset: crate::themes::preset_by_id(&self.settings.ui.theme_preset).id,
+            memory_mib: self.memory_mib(),
+            check_updates: self.settings.ui.check_updates,
+            sub_qos: self.show_only_sub().map(|s| s.qos),
+            composer_open: self.comp.vis.open,
+            sub_removing: self
+                .show_only_sub()
+                .is_some_and(|s| s.state.removal_accepted()),
+            sub_remove_failed: self
+                .show_only_sub()
+                .is_some_and(|s| matches!(s.state, SubState::RemoveFailed(_))),
+            sub_failed: self
+                .show_only_sub()
+                .is_some_and(|s| matches!(s.state, SubState::Failed(_))),
+            v5: self.composer_protocol() == Protocol::V5,
+        }
+    }
+}
+
+impl DetailsPane {
+    pub(super) fn new(
+        nav: WeakEntity<Navigator>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            nav,
+            insp: Inspector::new(window, cx),
+            #[cfg(test)]
+            renders: 0,
+        }
+    }
+
+    /// What the Value tab shows now.
+    fn shown(&self, cx: &App) -> Option<Shown> {
+        let pick = self.insp.hist_pick.as_ref();
+        self.nav
+            .read_with(cx, |n, _| n.shown_with(pick))
+            .ok()
+            .flatten()
     }
 
     /// The finished render belongs to `s` (and to the decoder and limit now chosen).
@@ -412,67 +605,49 @@ impl Navigator {
             && self.insp.shown_len < self.insp.full.len()
     }
 
-    /// The facts that the registry needs.
-    pub(super) fn facts(&self) -> crate::palette::Facts {
-        let shown = self.shown();
-        let topic = self.selected_topic();
-        let can_edit = shown
-            .as_ref()
-            .is_some_and(|s| composer::edit_unavailable(&s.msg, s.evicted).is_none());
-        crate::palette::Facts {
-            has_profile: self.profile.is_some(),
-            connected: self.connected(),
-            connecting: self.connecting()
-                || matches!(
-                    self.status.state,
-                    ConnState::Connecting | ConnState::Reconnecting { .. }
-                ),
-            disconnecting: self.status.state == ConnState::Disconnecting,
-            messages_view: self.view == View::Messages,
-            filters_active: self.filters_active(),
-            paused: self.store.is_paused(),
-            follow: self.follow.on,
-            two_lines: self.two_lines(),
-            details_open: if self.narrow {
-                self.insp.sheet_open
-            } else {
-                self.details_open
-            },
-            has_value: shown.is_some(),
-            can_publish_to_topic: topic.is_some(),
-            can_edit,
-            has_reply: shown.as_ref().is_some_and(|s| {
-                s.msg
-                    .props
-                    .response_topic
-                    .as_deref()
-                    .is_some_and(|t| !t.is_empty())
-            }),
-            has_retained: self.has_retained(),
-            can_copy: self.can_copy(shown.as_ref()),
-            wrap: self.insp.wrap,
-            number: (self.insp.choice.pick == DecoderPick::Number)
-                .then_some((self.insp.choice.kind, self.insp.choice.endian)),
-            can_show_all: self.can_show_all(shown.as_ref()),
-            can_show_more: self.can_show_more(shown.as_ref()),
-            payload_mode: self.comp.mode,
-            theme: Some(self.settings.ui.theme_mode),
-            preset: crate::themes::preset_by_id(&self.settings.ui.theme_preset).id,
-            memory_mib: self.memory_mib(),
-            check_updates: self.settings.ui.check_updates,
-            sub_qos: self.show_only_sub().map(|s| s.qos),
-            composer_open: self.comp.vis.open,
-            sub_removing: self
-                .show_only_sub()
-                .is_some_and(|s| s.state.removal_accepted()),
-            sub_remove_failed: self
-                .show_only_sub()
-                .is_some_and(|s| matches!(s.state, SubState::RemoveFailed(_))),
-            sub_failed: self
-                .show_only_sub()
-                .is_some_and(|s| matches!(s.state, SubState::Failed(_))),
-            v5: self.composer_protocol() == Protocol::V5,
+    /// The selection is gone (profile switch): forget the shown value.
+    pub(super) fn reset(&mut self, cx: &mut Context<Self>) {
+        self.insp.reset();
+        cx.notify();
+    }
+
+    /// An input from `Navigator` changed (selection, a new message of the shown topic, the
+    /// store, the connection, the layout). `selection` counts the user's selections: a new one
+    /// drops the History row. This is the one entry for such a change.
+    pub(super) fn sync(&mut self, selection: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.insp.selection != selection {
+            self.insp.selection = selection;
+            self.insp.hist_pick = None;
         }
+        self.changed(window, cx);
+    }
+
+    /// The shown subject, the decoder or the limit may have changed: start a job, push the topic
+    /// into the header, and draw.
+    fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing on screen: no job. Becoming visible syncs again.
+        let visible = self
+            .nav
+            .read_with(cx, |n, _| n.details_visible())
+            .unwrap_or(false);
+        if visible {
+            let shown = self.shown(cx);
+            self.ensure_render(shown.as_ref(), window, cx);
+        }
+        let topic_text = self
+            .nav
+            .read_with(cx, |n, _| n.selected_topic())
+            .ok()
+            .flatten()
+            .map(|(t, _)| display_safe(&t).into_owned())
+            .unwrap_or_default();
+        if self.insp.topic_text != topic_text {
+            self.insp
+                .topic_view
+                .update(cx, |i, cx| i.set_value(topic_text.clone(), window, cx));
+            self.insp.topic_text = topic_text;
+        }
+        cx.notify();
     }
 
     // -----------------------------------------------------------------------------------------
@@ -499,7 +674,11 @@ impl Navigator {
         };
         let subject_changed = self.insp.want.is_none_or(|w| !same_subject(w.key, s.key));
         if subject_changed {
-            self.insp.show_all = self.insp.auto_all;
+            // Metrics only (`MQTT_NAVIGATOR_AUTOSELECT`): a new subject starts with Show all.
+            self.insp.show_all = self
+                .nav
+                .read_with(cx, |n, _| n.autoselect.is_some())
+                .unwrap_or(false);
             self.insp.more_floor = 0;
         }
         let want = Want {
@@ -517,7 +696,7 @@ impl Navigator {
                 .want
                 .is_some_and(|w| w.choice == want.choice && w.all == want.all);
         // A slow job must finish: a new message each time would cancel it, and the text would
-        // never change. `render_done` notifies, and the next frame starts a job for the newest one.
+        // never change. `render_done` starts a job for the newest one.
         if same_job && self.insp.running {
             return;
         }
@@ -609,7 +788,7 @@ impl Navigator {
             truncated_at,
             error,
         };
-        cx.notify();
+        self.changed(window, cx);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -626,13 +805,13 @@ impl Navigator {
         self.insp.decoder_select.update(cx, |s, cx| {
             s.set_selected_value(&pick, window, cx);
         });
-        cx.notify();
+        self.changed(window, cx);
     }
 
     /// Copies the whole rendered text, but only if the finished render is the one of the
     /// current selection (not of another message, and not while it runs).
     pub(super) fn copy_value(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = self.shown();
+        let shown = self.shown(cx);
         if !self.can_copy(shown.as_ref()) {
             window.push_notification(
                 Notification::warning("The value is not ready. Open the details and wait."),
@@ -646,7 +825,12 @@ impl Navigator {
 
     /// Copies the original topic of the selection. The label shows the escaped form.
     pub(super) fn copy_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((topic, _)) = self.selected_topic() else {
+        let Some((topic, _)) = self
+            .nav
+            .read_with(cx, |n, _| n.selected_topic())
+            .ok()
+            .flatten()
+        else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(topic));
@@ -673,15 +857,18 @@ impl Navigator {
         self.set_decoder(DecoderPick::Number, window, cx);
     }
 
-    pub(super) fn set_wrap(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_wrap(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.insp.wrap = on;
+        self.insp
+            .editor
+            .update(cx, |e, cx| e.set_soft_wrap(on, window, cx));
         cx.notify();
     }
 
     /// Renders all of the payload (in the background). The editor still gets chunks.
-    pub(super) fn show_all(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn show_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.insp.show_all = true;
-        cx.notify();
+        self.changed(window, cx);
     }
 
     /// "Show more": the text grows by [`MORE_BYTES`], in steps over the next frames.
@@ -739,20 +926,24 @@ impl Navigator {
             e.set_scroll_offset(scroll, cx);
         });
         let took = t.elapsed();
-        self.metrics.ui_step("grow", to - from, took);
+        self.nav
+            .read_with(cx, |n, _| n.metrics.ui_step("grow", to - from, took))
+            .ok();
         self.insp.step = next_step(to - from, took.as_secs_f32() * 1000.);
         self.insp.shown_len = to;
         self.schedule_step(window, cx);
         cx.notify();
     }
+}
 
+impl Navigator {
     /// "Expand" widens the details pane over the message list. "Restore" returns it to the width
     /// that it had before. The expanded width is not saved.
     pub(super) fn set_expanded(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if on == self.insp.expanded {
+        if on == self.expanded {
             return;
         }
-        self.insp.expanded = on;
+        self.expanded = on;
         let limits = self.pane_limits(window);
         let current = self.panes.read(cx).sizes().get(2).copied();
         let target = if on {
@@ -767,15 +958,24 @@ impl Navigator {
         cx.notify();
     }
 
+    /// Runs `f` on the pane after the current update. The pane reads `Navigator` then, which is
+    /// not possible while this update holds it.
+    pub(super) fn in_pane(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut DetailsPane, &mut Window, &mut Context<DetailsPane>) + 'static,
+    ) {
+        let pane = self.pane.clone();
+        window.defer(cx, move |window, cx| {
+            pane.update(cx, |p, cx| f(p, window, cx))
+        });
+    }
+
     /// The palette entry "Show or hide the details". Every close goes through the shared
     /// close, so the focus returns to the list and `sheet_open` stays right.
     pub(super) fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let open = if self.narrow {
-            self.insp.sheet_open
-        } else {
-            self.details_open
-        };
-        if open {
+        if self.details_visible() {
             self.close_details_area(window, cx);
         } else {
             self.open_details(window, cx);
@@ -815,13 +1015,12 @@ impl Navigator {
 
     /// Opens the details as a right sheet. Only one sheet can be open.
     pub(super) fn open_details_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.insp.sheet_open || window.has_active_sheet(cx) {
+        if self.sheet_open || window.has_active_sheet(cx) {
             return;
         }
-        self.insp.sheet_open = true;
-        let nav = cx.entity();
-        let host = cx.new(|cx| DetailsHost::new(&nav, cx));
-        let weak = nav.downgrade();
+        self.sheet_open = true;
+        let pane = self.pane.clone();
+        let weak = cx.entity().downgrade();
         window.open_sheet_at(Placement::Right, cx, move |sheet: Sheet, _, _| {
             let weak = weak.clone();
             sheet
@@ -830,19 +1029,19 @@ impl Navigator {
                 .on_close(move |_, window, cx| {
                     // The focus returns to the list, so it never stays on a closed sheet.
                     weak.update(cx, |v, cx| {
-                        v.insp.sheet_open = false;
+                        v.sheet_open = false;
                         v.list_focus.focus(window, cx);
                     })
                     .ok();
                 })
-                .child(host.clone())
+                .child(pane.clone().cached(StyleRefinement::default().size_full()))
         });
     }
 
     /// The sheet closes before an action fills the composer.
     fn close_details_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.insp.sheet_open {
-            self.insp.sheet_open = false;
+        if self.sheet_open {
+            self.sheet_open = false;
             window.close_sheet(cx);
         }
     }
@@ -859,7 +1058,7 @@ impl Navigator {
     }
 
     pub(super) fn edit_and_publish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(s) = self.shown() else {
+        let Some(s) = self.shown(cx) else {
             return;
         };
         if composer::edit_unavailable(&s.msg, s.evicted).is_some() {
@@ -873,7 +1072,7 @@ impl Navigator {
     }
 
     pub(super) fn reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(s) = self.shown() else {
+        let Some(s) = self.shown(cx) else {
             return;
         };
         let Some(mut d) = Draft::reply(&s.msg, self.comp.qos) else {
@@ -965,45 +1164,31 @@ impl Navigator {
         };
         self.publish_draft(&d, false, window, cx);
     }
+}
 
+impl DetailsPane {
     // -----------------------------------------------------------------------------------------
     // Render
     // -----------------------------------------------------------------------------------------
 
-    /// The pane. `sheet`: it is drawn in the narrow-window sheet (no close or expand button).
-    pub(super) fn render_details(
-        &mut self,
-        window: &mut Window,
-        sheet: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let shown = self.shown();
-        self.ensure_render(shown.as_ref(), window, cx);
-        let wrap = self.insp.wrap;
-        if self.insp.applied_wrap != wrap {
-            self.insp.applied_wrap = wrap;
-            self.insp
-                .editor
-                .update(cx, |e, cx| e.set_soft_wrap(wrap, window, cx));
-        }
-
+    /// The pane. It reads `Navigator` here and changes nothing: the events that cause a change
+    /// (`sync`, the handlers below) start the jobs and set the editor values.
+    fn render_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let pick = self.insp.hist_pick.clone();
+        let Ok(inputs) = self.nav.read_with(cx, |n, _| n.pane_inputs(pick.as_ref())) else {
+            return div().into_any_element();
+        };
+        let sheet = inputs.sheet;
+        let shown = &inputs.shown;
+        let nav = self.nav.clone();
         let theme = cx.theme().clone();
         let tab = self.insp.tab;
         // The header shows the full topic as selectable text. The input is read-only.
-        let topic_text = self
-            .selected_topic()
-            .map(|(t, _)| display_safe(&t).into_owned())
-            .unwrap_or_default();
-        if self.insp.topic_text != topic_text {
-            self.insp.topic_text = topic_text.clone();
-            self.insp
-                .topic_view
-                .update(cx, |i, cx| i.set_value(topic_text.clone(), window, cx));
-        }
+        let topic_empty = self.insp.topic_text.is_empty();
         let head = h_flex()
             .gap_1()
             .items_center()
-            .child(div().flex_1().min_w_0().child(if topic_text.is_empty() {
+            .child(div().flex_1().min_w_0().child(if topic_empty {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
@@ -1016,7 +1201,7 @@ impl Navigator {
                     .appearance(false)
                     .into_any_element()
             }))
-            .child(self.render_details_menu(shown.as_ref(), sheet, cx))
+            .child(self.render_details_menu(&inputs, cx))
             .when(!sheet, |d| {
                 d.child(
                     Button::new("close-details")
@@ -1024,7 +1209,12 @@ impl Navigator {
                         .xsmall()
                         .icon(IconName::Close)
                         .tooltip("Close the details")
-                        .on_click(cx.listener(|v, _, window, cx| v.close_details(window, cx))),
+                        .on_click({
+                            let nav = nav.clone();
+                            move |_, window, cx| {
+                                nav.update(cx, |v, cx| v.close_details(window, cx)).ok();
+                            }
+                        }),
                 )
             });
         let tabs = TabBar::new("detail-tabs")
@@ -1043,8 +1233,8 @@ impl Navigator {
             .child("Value")
             .child("History");
 
-        let has_topic = self.selected_topic().is_some();
-        let body = match &shown {
+        let has_topic = inputs.topic.is_some();
+        let body = match shown {
             None => {
                 if has_topic {
                     empty_state("No message", "This topic has no stored message.", [])
@@ -1053,7 +1243,7 @@ impl Navigator {
                 }
             }
             Some(s) => match tab {
-                DetailTab::Value => self.render_value(s, cx).into_any_element(),
+                DetailTab::Value => self.render_value(s, &inputs, cx).into_any_element(),
                 DetailTab::History => self.render_history(s, cx).into_any_element(),
             },
         };
@@ -1066,9 +1256,9 @@ impl Navigator {
             .when(!sheet, |d| {
                 d.track_focus(&self.insp.pane_focus)
                     .key_context("DetailsPane")
-                    .on_action(
-                        cx.listener(|v, _: &CloseDetails, window, cx| v.close_details(window, cx)),
-                    )
+                    .on_action(move |_: &CloseDetails, window, cx| {
+                        nav.update(cx, |v, cx| v.close_details(window, cx)).ok();
+                    })
             })
             .p_3()
             .gap_2()
@@ -1079,27 +1269,37 @@ impl Navigator {
             .into_any_element()
     }
 
-    fn render_value(&mut self, s: &Shown, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_value(
+        &mut self,
+        s: &Shown,
+        inputs: &Inputs,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let m = &s.msg;
         let sent = s.direction == Direction::Sent;
         // The selected publish keeps its result here, also after the composer shows a newer one.
-        let result = self
-            .sent_status()
-            .map(|st| (format!("Result: {}", status_text(&st)), status_failed(&st)));
-        let meta = format!(
-            "{} · {}",
-            format_time(m.received_at, self.utc_offset, true),
-            meta_line(
-                m.qos,
-                m.retain,
-                m.original_size,
-                m.payload.len(),
-                m.truncated
-            ),
-        );
-        let rows = props_rows(&m.props);
+        let result = inputs.sent.clone();
+        // One text for one message: the pane draws again for a click, with the same message.
+        let meta = match &self.insp.meta {
+            Some((key, utc, text)) if *key == s.key && *utc == inputs.utc => text.clone(),
+            _ => {
+                let text = SharedString::from(format!(
+                    "{} · {}",
+                    format_time(m.received_at, inputs.utc, true),
+                    meta_line(
+                        m.qos,
+                        m.retain,
+                        m.original_size,
+                        m.payload.len(),
+                        m.truncated
+                    ),
+                ));
+                self.insp.meta = Some((s.key, inputs.utc, text.clone()));
+                text
+            }
+        };
         let choice = self.insp.choice;
         let stored = m.payload.len();
         let (running, blank, error) = match &self.insp.view {
@@ -1136,13 +1336,13 @@ impl Navigator {
                                 .segmented()
                                 .small()
                                 .selected_index(usize::from(choice.endian == Endian::Big))
-                                .on_click(cx.listener(|v, ix: &usize, _, cx| {
+                                .on_click(cx.listener(|v, ix: &usize, window, cx| {
                                     v.insp.choice.endian = if *ix == 0 {
                                         Endian::Little
                                     } else {
                                         Endian::Big
                                     };
-                                    cx.notify();
+                                    v.changed(window, cx);
                                 }))
                                 .child("LE")
                                 .child("BE"),
@@ -1173,32 +1373,21 @@ impl Navigator {
         // A History row that differs from the selection: say so, and offer the way back.
         // The pick is the base itself when both have one identity.
         // Its History copy can be shorter (the store cuts it).
-        let (base_seq, base_len) = match self.detail_of {
-            DetailOf::Topic => self
-                .sel_topic
-                .and_then(|id| self.store.get(id))
-                .map_or((0, 0), |n| {
-                    (n.latest_seq, n.latest.map_or(0, |m| m.payload.len()))
-                }),
-            DetailOf::Message => self
-                .sel_msg
-                .as_ref()
-                .map_or((0, 0), |s| (s.seq, s.msg.payload.len())),
-            DetailOf::Nothing => (0, 0),
-        };
+        let (base_seq, base_len) = (inputs.base_seq, inputs.base_len);
         let earlier = self.insp.hist_pick.as_ref().and_then(|(q, p)| {
-            let at = format_time(p.received_at, self.utc_offset, false);
+            let at = format_time(p.received_at, inputs.utc, false);
             if *q == base_seq {
                 return (p.payload.len() != base_len).then(|| format!("Shortened copy from {at}"));
             }
             Some(
-                history_note(p.received_at, self.base_received_at(), &at)
+                history_note(p.received_at, inputs.base_at, &at)
                     // Same time as the base, but another message.
                     .unwrap_or_else(|| format!("Another message from {at}")),
             )
         });
         let props_open = self.insp.props_open;
-        let props_count = rows.len();
+        // A closed section needs the count only: the rows are built when it opens.
+        let props_count = props_count(&m.props);
         v_flex()
             .id("value-tab")
             .track_focus(&self.insp.value_focus)
@@ -1220,7 +1409,7 @@ impl Navigator {
                                     v.insp.hist_pick = None;
                                     // The button goes away: the focus moves to the Value area.
                                     v.insp.value_focus.focus(window, cx);
-                                    cx.notify();
+                                    v.changed(window, cx);
                                 })),
                         ),
                 )
@@ -1248,6 +1437,7 @@ impl Navigator {
             .when(s.evicted, |d| {
                 d.child(
                     div()
+                        .debug_selector(|| "evicted-note".into())
                         .text_xs()
                         .text_color(theme.warning)
                         .child("Removed from the message list (memory limit)."),
@@ -1282,10 +1472,16 @@ impl Navigator {
                                 DescriptionList::new()
                                     .columns(1)
                                     .label_width(ui(120.))
-                                    .children(rows.into_iter().map(|(k, v)| {
-                                        DescriptionItem::new(display_safe(&k).into_owned())
-                                            .value(display_safe(&v).into_owned())
-                                    })),
+                                    .children(
+                                        props_open
+                                            .then(|| props_rows(&m.props))
+                                            .into_iter()
+                                            .flatten()
+                                            .map(|(k, v)| {
+                                                DescriptionItem::new(display_safe(&k).into_owned())
+                                                    .value(display_safe(&v).into_owned())
+                                            }),
+                                    ),
                             ),
                         ),
                 )
@@ -1322,7 +1518,7 @@ impl Navigator {
                             Button::new("show-all")
                                 .xsmall()
                                 .label(format!("Show all ({})", size_text(stored)))
-                                .on_click(cx.listener(|v, _, _, cx| v.show_all(cx))),
+                                .on_click(cx.listener(|v, _, window, cx| v.show_all(window, cx))),
                         ),
                 )
             })
@@ -1356,7 +1552,10 @@ impl Navigator {
         let Some(node) = s.node else {
             return empty_state("No history", "This topic has no history.", []);
         };
-        let count = self.store.history(node).count();
+        let count = self
+            .nav
+            .read_with(cx, |n, _| n.store.history(node).count())
+            .unwrap_or(0);
         if count == 0 {
             return empty_state(
                 "No history",
@@ -1383,22 +1582,27 @@ impl Navigator {
                         let theme = cx.theme().clone();
                         let picked = v.insp.hist_pick.as_ref().map(|(q, _)| *q);
                         let cursor = v.insp.hist_cursor;
-                        let utc = v.utc_offset;
-                        let rows: Vec<_> = v
-                            .store
-                            .history_seq(node)
-                            .skip(range.start)
-                            .take(range.len())
-                            .map(|(seq, m)| {
-                                (
-                                    seq,
-                                    m.received_at,
-                                    m.original_size,
-                                    m.qos.as_u8(),
-                                    SharedString::from(decode::preview(&m.payload, 120)),
-                                )
+                        let (utc, rows): (i32, Vec<_>) = v
+                            .nav
+                            .read_with(cx, |n, _| {
+                                let rows = n
+                                    .store
+                                    .history_seq(node)
+                                    .skip(range.start)
+                                    .take(range.len())
+                                    .map(|(seq, m)| {
+                                        (
+                                            seq,
+                                            m.received_at,
+                                            m.original_size,
+                                            m.qos.as_u8(),
+                                            SharedString::from(decode::preview(&m.payload, 120)),
+                                        )
+                                    })
+                                    .collect();
+                                (n.utc_offset, rows)
                             })
-                            .collect();
+                            .unwrap_or_default();
                         rows.into_iter()
                             .map(|(seq, at, size, qos, text)| {
                                 v.history_row(
@@ -1480,12 +1684,26 @@ impl Navigator {
             .into_any_element()
     }
 
+    /// The node of the selected topic.
+    fn selected_node(&self, cx: &App) -> Option<NodeId> {
+        self.nav
+            .read_with(cx, |n, _| n.selected_topic())
+            .ok()
+            .flatten()
+            .and_then(|(_, node)| node)
+    }
+
     /// Up and Down in History: moves the cursor. The row stays in view.
     fn step_history(&mut self, step: isize, cx: &mut Context<Self>) {
-        let Some((_, Some(node))) = self.selected_topic() else {
+        let Some(node) = self.selected_node(cx) else {
             return;
         };
-        let seqs: Vec<u64> = self.store.history_seq(node).map(|(q, _)| q).collect();
+        let seqs: Vec<u64> = self
+            .nav
+            .read_with(cx, |n, _| {
+                n.store.history_seq(node).map(|(q, _)| q).collect()
+            })
+            .unwrap_or_default();
         if seqs.is_empty() {
             return;
         }
@@ -1506,7 +1724,7 @@ impl Navigator {
 
     /// Enter in History: shows the row of the cursor in the Value tab.
     fn confirm_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some((_, Some(node))), Some(seq)) = (self.selected_topic(), self.insp.hist_cursor) {
+        if let (Some(node), Some(seq)) = (self.selected_node(cx), self.insp.hist_cursor) {
             self.pick_history(node, seq, window, cx);
         }
     }
@@ -1519,39 +1737,21 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((_, m)) = self.store.history_seq(node).find(|(q, _)| *q == seq) {
-            self.insp.hist_pick = Some((seq, m.clone()));
+        let found = self
+            .nav
+            .read_with(cx, |n, _| {
+                n.store
+                    .history_seq(node)
+                    .find(|(q, _)| *q == seq)
+                    .map(|(_, m)| m.clone())
+            })
+            .ok()
+            .flatten();
+        if let Some(m) = found {
+            self.insp.hist_pick = Some((seq, m));
             self.insp.tab = DetailTab::Value;
             self.insp.value_focus.focus(window, cx);
-            cx.notify();
-        }
-    }
-
-    /// The current result of the selected sent message. `None`: no sent row is selected, a
-    /// History row shows, or the row is gone.
-    fn sent_status(&self) -> Option<SendStatus> {
-        if self.insp.hist_pick.is_some() || self.detail_of != DetailOf::Message {
-            return None;
-        }
-        let s = self.sel_msg.as_ref()?;
-        if s.direction != Direction::Sent {
-            return None;
-        }
-        // By row id: a list filter must not hide the result of the selected message.
-        self.store.row_send_status(s.id).cloned()
-    }
-
-    /// The arrival time that the Value tab compares a History row with: the selected message,
-    /// or the latest value of the selected topic.
-    fn base_received_at(&self) -> Option<SystemTime> {
-        match self.detail_of {
-            DetailOf::Nothing => None,
-            DetailOf::Message => self.sel_msg.as_ref().map(|s| s.msg.received_at),
-            DetailOf::Topic => self
-                .store
-                .get(self.sel_topic?)
-                .and_then(|n| n.latest)
-                .map(|m| m.received_at),
+            self.changed(window, cx);
         }
     }
 
@@ -1567,7 +1767,12 @@ impl Navigator {
                         .small()
                         .label("Edit and publish")
                         .disabled(edit_off.is_some())
-                        .on_click(cx.listener(|v, _, window, cx| v.edit_and_publish(window, cx))),
+                        .on_click({
+                            let nav = self.nav.clone();
+                            move |_, window, cx| {
+                                nav.update(cx, |v, cx| v.edit_and_publish(window, cx)).ok();
+                            }
+                        }),
                 ),
             )
             .when_some(edit_off, |d, why| {
@@ -1582,14 +1787,11 @@ impl Navigator {
 
     /// The `⋯` menu of the header: Copy topic, Copy payload, Publish to this topic, Reply,
     /// Decoder, Wrap, Expand and, last, Clear retained….
-    fn render_details_menu(
-        &self,
-        shown: Option<&Shown>,
-        sheet: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let weak = cx.entity().downgrade();
-        let has_topic = self.selected_topic().is_some();
+    fn render_details_menu(&self, inputs: &Inputs, cx: &mut Context<Self>) -> impl IntoElement {
+        let nav = self.nav.clone();
+        let pane = cx.entity().downgrade();
+        let shown = inputs.shown.as_ref();
+        let has_topic = inputs.topic.is_some();
         let has_value = shown.is_some();
         let can_copy = self.can_copy(shown);
         let reply = shown.is_some_and(|s| {
@@ -1599,8 +1801,8 @@ impl Navigator {
                 .as_deref()
                 .is_some_and(|t| !t.is_empty())
         });
-        let retained = self.has_retained() && self.connected();
-        let (pick, wrap, expanded) = (self.insp.choice.pick, self.insp.wrap, self.insp.expanded);
+        let (retained, sheet, expanded) = (inputs.retained, inputs.sheet, inputs.expanded);
+        let (pick, wrap) = (self.insp.choice.pick, self.insp.wrap);
         Button::new("details-more")
             .ghost()
             .xsmall()
@@ -1608,16 +1810,24 @@ impl Navigator {
             .tab_stop(true)
             .tooltip("Details actions")
             .dropdown_menu(move |menu, window, cx| {
+                // An action of the pane and an action of the window.
+                let own = |label: &'static str,
+                           run: fn(&mut DetailsPane, &mut Window, &mut Context<DetailsPane>)| {
+                    let pane = pane.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        pane.update(cx, |v, cx| run(v, window, cx)).ok();
+                    })
+                };
                 let item = |label: &'static str,
                             run: fn(&mut Navigator, &mut Window, &mut Context<Navigator>)| {
-                    let weak = weak.clone();
+                    let nav = nav.clone();
                     PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        weak.update(cx, |v, cx| run(v, window, cx)).ok();
+                        nav.update(cx, |v, cx| run(v, window, cx)).ok();
                     })
                 };
                 let mut menu = menu
-                    .item(item("Copy topic", |v, w, cx| v.copy_topic(w, cx)).disabled(!has_topic))
-                    .item(item("Copy payload", |v, w, cx| v.copy_value(w, cx)).disabled(!can_copy))
+                    .item(own("Copy topic", |v, w, cx| v.copy_topic(w, cx)).disabled(!has_topic))
+                    .item(own("Copy payload", |v, w, cx| v.copy_value(w, cx)).disabled(!can_copy))
                     .item(
                         item("Publish to this topic", |v, w, cx| {
                             v.publish_to_topic(w, cx)
@@ -1627,33 +1837,33 @@ impl Navigator {
                 if reply {
                     menu = menu.item(item("Reply", |v, w, cx| v.reply(w, cx)));
                 }
-                let w = weak.clone();
+                let p = pane.clone();
                 menu = menu
                     .separator()
                     .submenu("Decoder", window, cx, move |m, _, _| {
-                        DecoderPick::ALL.iter().fold(m, |m, p| {
-                            let (w, p) = (w.clone(), *p);
+                        DecoderPick::ALL.iter().fold(m, |m, d| {
+                            let (p, d) = (p.clone(), *d);
                             m.item(
-                                PopupMenuItem::new(p.label())
-                                    .checked(pick == p)
+                                PopupMenuItem::new(d.label())
+                                    .checked(pick == d)
                                     .disabled(!has_value)
                                     .on_click(move |_, window, cx| {
-                                        w.update(cx, |v, cx| v.set_decoder(p, window, cx)).ok();
+                                        p.update(cx, |v, cx| v.set_decoder(d, window, cx)).ok();
                                     }),
                             )
                         })
                     });
-                let w = weak.clone();
+                let p = pane.clone();
                 menu = menu.item(PopupMenuItem::new("Wrap").checked(wrap).on_click(
-                    move |_, _, cx| {
-                        w.update(cx, |v, cx| v.set_wrap(!wrap, cx)).ok();
+                    move |_, window, cx| {
+                        p.update(cx, |v, cx| v.set_wrap(!wrap, window, cx)).ok();
                     },
                 ));
                 if !sheet {
-                    let w = weak.clone();
+                    let nav = nav.clone();
                     menu = menu.item(PopupMenuItem::new("Expand").checked(expanded).on_click(
                         move |_, window, cx| {
-                            w.update(cx, |v, cx| v.set_expanded(!expanded, window, cx))
+                            nav.update(cx, |v, cx| v.set_expanded(!expanded, window, cx))
                                 .ok();
                         },
                     ));
@@ -1665,5 +1875,15 @@ impl Navigator {
                 }
                 menu
             })
+    }
+}
+
+impl Render for DetailsPane {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.render_pane(cx)
     }
 }
