@@ -185,6 +185,9 @@ impl Navigator {
             return;
         }
         self.last_size = now;
+        // The pane must have the current selection in the frame where a wider window shows it.
+        self.narrow = needs_sheet(now.0, self.rem);
+        self.sync_details(cx);
         // A size change before the first frame, or soon after it, comes from the window system.
         if self.resize_settled_at.is_none_or(|t| Instant::now() < t) {
             return;

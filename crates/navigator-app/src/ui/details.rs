@@ -266,6 +266,9 @@ pub(super) struct DetailsPane {
     /// Tests only: how often the pane drew.
     #[cfg(test)]
     pub(super) renders: usize,
+    /// Tests only: the header topic at each draw.
+    #[cfg(test)]
+    pub(super) drawn_topics: Vec<String>,
 }
 
 /// What the pane reads from `Navigator` when it draws.
@@ -555,6 +558,8 @@ impl DetailsPane {
             insp: Inspector::new(window, cx),
             #[cfg(test)]
             renders: 0,
+            #[cfg(test)]
+            drawn_topics: Vec::new(),
         }
     }
 
@@ -1909,6 +1914,7 @@ impl Render for DetailsPane {
         #[cfg(test)]
         {
             self.renders += 1;
+            self.drawn_topics.push(self.insp.topic_text.clone());
         }
         self.render_pane(cx)
     }
