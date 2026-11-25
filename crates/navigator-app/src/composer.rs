@@ -661,7 +661,7 @@ mod tests {
             original_size: payload.len(),
             qos: Qos::AtLeastOnce,
             retain: true,
-            props,
+            props: props.into(),
             received_at: SystemTime::UNIX_EPOCH,
             protocol: Protocol::V5,
         }
