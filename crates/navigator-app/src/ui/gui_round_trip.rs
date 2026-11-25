@@ -1765,13 +1765,11 @@ fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAp
             .debug_bounds("status-bar")
             .expect("the status bar is drawn");
         // The composer takes 55% of the window at the default zoom, and at 150% zoom the floor
-        // (420 px). The status bar is below it. The cached view gets its height from the last
-        // measure, and a parent that is 1 px short cannot shrink the content: 1 px of the
-        // bottom padding can lie under the bar.
+        // (420 px). The status bar is below it.
         let most = if rem == 16. { 0.55 } else { 0.7 };
         assert!(
             composer.size.height <= window.height * most + px(1.)
-                && composer.bottom() <= status.top() + px(1.)
+                && composer.bottom() <= status.top()
                 && send.bottom() <= composer.bottom(),
             "the composer is too tall at {rem} px: {composer:?}, Publish {send:?}, window {window:?}, status {status:?}"
         );
