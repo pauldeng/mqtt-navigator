@@ -100,6 +100,8 @@ pub(super) struct Inspector {
     pub(super) tab: DetailTab,
     pub(super) choice: DecoderChoice,
     pub(super) wrap: bool,
+    /// The wrap that the editor has. A pane that is closed applies the last choice when it opens.
+    applied_wrap: bool,
     /// Hash of the text in the payload editor.
     text_hash: Option<u64>,
     show_all: bool,
@@ -191,6 +193,7 @@ impl Inspector {
             tab: DetailTab::Value,
             choice: DecoderChoice::default(),
             wrap: true,
+            applied_wrap: true,
             text_hash: None,
             show_all: false,
             full: String::new(),
@@ -441,6 +444,11 @@ impl Navigator {
     pub(super) fn details_sig(&self, theme: &Theme) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        // A closed pane shows nothing: no work for it. Opening it changes the signature.
+        if !self.details_visible() {
+            false.hash(&mut h);
+            return h.finish();
+        }
         let node = self.selected_topic().and_then(|(_, n)| n);
         let latest = node.and_then(|n| self.store.get(n)).map(|n| n.latest_seq);
         // A message row can go with the memory limit.
@@ -636,6 +644,14 @@ impl DetailsPane {
         if visible {
             let shown = self.shown(cx);
             self.ensure_render(shown.as_ref(), window, cx);
+            // A new wrap setting resets the scroll position: apply the last choice only.
+            if self.insp.applied_wrap != self.insp.wrap {
+                self.insp.applied_wrap = self.insp.wrap;
+                let wrap = self.insp.wrap;
+                self.insp
+                    .editor
+                    .update(cx, |e, cx| e.set_soft_wrap(wrap, window, cx));
+            }
         }
         let topic_text = self
             .nav
@@ -863,10 +879,7 @@ impl DetailsPane {
 
     pub(super) fn set_wrap(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.insp.wrap = on;
-        self.insp
-            .editor
-            .update(cx, |e, cx| e.set_soft_wrap(on, window, cx));
-        cx.notify();
+        self.changed(window, cx);
     }
 
     /// Renders all of the payload (in the background). The editor still gets chunks.
@@ -1180,8 +1193,8 @@ impl DetailsPane {
     /// The pane. It reads `Navigator` here and changes nothing: the events that cause a change
     /// (`sync`, the handlers below) start the jobs and set the editor values.
     fn render_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let pick = self.insp.hist_pick.clone();
-        let Ok(inputs) = self.nav.read_with(cx, |n, _| n.pane_inputs(pick.as_ref())) else {
+        let pick = self.insp.hist_pick.as_ref();
+        let Ok(inputs) = self.nav.read_with(cx, |n, _| n.pane_inputs(pick)) else {
             return div().into_any_element();
         };
         let sheet = inputs.sheet;
