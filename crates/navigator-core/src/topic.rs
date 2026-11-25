@@ -83,6 +83,11 @@ pub fn check_filter(filter: &str) -> Result<(), FilterError<'_>> {
         return Err(FilterError::Empty);
     }
     check_string(filter).map_err(FilterError::String)?;
+    check_levels(filter)
+}
+
+/// The `$share` and wildcard rules of [`check_filter`], for a filter that is not empty.
+fn check_levels(filter: &str) -> Result<(), FilterError<'_>> {
     let body = match shared_inner(filter) {
         Some(Some(inner)) => inner,
         Some(None) => {
@@ -125,9 +130,14 @@ pub fn is_shared(filter: &str) -> bool {
     filter.starts_with("$share/")
 }
 
-/// True if `filter` is a valid MQTT 5 topic filter (see [`check_filter`]).
+/// True if `filter` has valid MQTT 5 topic filter syntax: [`check_filter`] without the control
+/// and unassigned character rule. A saved profile with such a character still connects, and the
+/// wire check ([`filter_error`]) refuses that one subscription.
 pub fn is_valid_filter(filter: &str) -> bool {
-    check_filter(filter).is_ok()
+    !filter.is_empty()
+        && filter.len() <= MAX_LEN
+        && !filter.contains('\0')
+        && check_levels(filter).is_ok()
 }
 
 /// For a `$share/` filter: `Some(Some(inner))` if the group is valid, `Some(None)` if not.
@@ -153,7 +163,7 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// `None` if `filter` is not valid (see [`is_valid_filter`]).
+    /// `None` if `filter` is not valid (see [`check_filter`]).
     pub fn new(filter: &str) -> Option<Self> {
         inner(filter).map(|inner| Self {
             inner: inner.into(),
@@ -178,7 +188,9 @@ impl Filter {
 
 /// The filter without a `$share/<group>/` prefix. `None` if the filter is not valid.
 fn inner(filter: &str) -> Option<&str> {
-    is_valid_filter(filter).then(|| shared_inner(filter).flatten().unwrap_or(filter))
+    check_filter(filter)
+        .is_ok()
+        .then(|| shared_inner(filter).flatten().unwrap_or(filter))
 }
 
 /// True if `topic` matches `filter` (MQTT 5, section 4.7).
@@ -278,6 +290,14 @@ mod tests {
 
     #[test]
     fn filter_validity() {
+        // Syntax only: a control character is for the wire check (`filter_error`), not here.
+        assert!(is_valid_filter("a\u{7}b"));
+        assert!(!is_valid_filter("a\u{7}\0"));
+        assert!(!is_valid_filter("a/#/\u{7}"));
+        assert_eq!(
+            filter_error("a\u{7}b").as_deref(),
+            Some("bad string: contains control codepoint")
+        );
         for ok in [
             "#",
             "+",
@@ -377,7 +397,7 @@ mod tests {
             let topic = build(&mut rng, false);
             let topic = topic.trim_start_matches("$share/g/").to_owned();
             let parsed = Filter::new(&filter);
-            assert_eq!(parsed.is_some(), is_valid_filter(&filter), "{filter}");
+            assert_eq!(parsed.is_some(), check_filter(&filter).is_ok(), "{filter}");
             let got = matches(&filter, &topic);
             assert_eq!(parsed.as_ref().is_some_and(|f| f.matches(&topic)), got);
             if let Some(f) = &parsed {

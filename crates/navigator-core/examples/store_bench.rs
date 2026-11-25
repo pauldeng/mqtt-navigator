@@ -1,7 +1,8 @@
 //! Store insert benchmark: 200 000 messages with 10 MQTT 5 user properties each, history and
 //! list on. Prints the wall time and the peak RSS.
 //!
-//! `cargo run --release -p navigator-core --example store_bench [topics]` (default 1000 topics)
+//! `cargo run --release -p navigator-core --example store_bench [topics]` (default 1000 topics). Linux only (RSS from
+//! /proc). The history cap (100 for each topic) and the list cap (10 000 rows) still apply.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -26,7 +27,8 @@ fn main() {
     let topic_count: usize = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
-        .unwrap_or(1_000);
+        .unwrap_or(1_000)
+        .max(1);
     // The budget is large: nothing is dropped, so every message pays for all three copies.
     let mut store = TopicStore::new(Limits::with_budget(BUDGET_MAX));
     let topics: Vec<Arc<str>> = (0..topic_count)
