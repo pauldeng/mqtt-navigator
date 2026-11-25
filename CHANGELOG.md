@@ -4,9 +4,19 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-11-26
+
 ### Changed
 
+- The release build is optimized for speed, not for size (`opt-level = 3`). The UI uses 6 to 11% less CPU time for each frame under heavy traffic. The binary is about 33% larger. See ADR 0004.
+- The composer and the details pane are separate views. Most new messages do not redraw them any more. With the composer open (MQTT 5, 20 user properties) under 10k messages a second, the UI CPU time for each frame fell from about 9.4 ms to 5.3 ms in our measurement (Linux, software rendering).
+- The store shares the MQTT 5 properties of a message between the latest value, the history and the message list. A new message is stored faster.
 - When one merge handles 256 or more messages, the message list redraws less often (about 15 times a second on Linux, not 30). This is about 7.7k messages a second (about 10k on Windows). Backlog mode does not do this. The app still merges all messages at the same pace. This lowers the UI CPU time. The last messages of a flood show about 50 ms after the last merge.
+
+### Fixed
+
+- The subscription field shows a clear error for a topic filter with a control character, or with an incorrect shared subscription group (`$share/...`).
+- Topics, filters and property text show more invisible format characters as a visible code (for example `⟨U+0890⟩`).
 
 ## [0.2.6] - 2026-11-25
 
@@ -258,7 +268,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.3...v0.2.4
