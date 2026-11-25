@@ -979,6 +979,8 @@ pub struct Navigator {
     selection: u64,
     /// The last `details_sig` that the pane got.
     details_sig: u64,
+    /// The window of this view. A merge has none, and tells the pane through it.
+    window_handle: AnyWindowHandle,
     /// The details sheet of a narrow window is open.
     sheet_open: bool,
     /// Open the sheet at the next frame (a row was selected in a narrow window).
@@ -1204,6 +1206,7 @@ impl Navigator {
             },
             selection: 0,
             details_sig: 0,
+            window_handle: window.window_handle(),
             sheet_open: false,
             want_sheet: false,
             expanded: false,
@@ -1599,8 +1602,29 @@ impl Navigator {
         if let Some(line) = self.merge(first, &mut rx, caller == Caller::Frame) {
             cx.background_executor().spawn(write_metrics(line)).detach();
         }
+        self.sync_details(cx);
         cx.notify();
         self.schedule_rate_zero(cx);
+    }
+
+    /// Tells the pane that an input of it changed (see `details_sig`). A merge for another topic
+    /// changes nothing, and the pane keeps its last frame. The merge calls this too, so that the
+    /// pane draws in the frame of the merge and not in the next one.
+    fn sync_details(&mut self, cx: &mut Context<Self>) {
+        let sig = self.details_sig(cx.theme());
+        if sig == self.details_sig {
+            return;
+        }
+        self.details_sig = sig;
+        let (pane, selection, window) = (self.pane.clone(), self.selection, self.window_handle);
+        // After this update: the pane reads this view then.
+        cx.defer(move |cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    pane.update(cx, |p, cx| p.sync(selection, window, cx))
+                })
+                .ok();
+        });
     }
 
     /// Registers the frame callback while backlog mode lasts. The callback allocates, and then it
@@ -4061,16 +4085,8 @@ impl Render for Navigator {
                 }
             });
         }
-        // An input of the pane changed: tell the pane after the draw. A merge for another topic
-        // changes nothing, and the pane keeps its last frame.
-        let sig = self.details_sig(cx.theme());
-        if sig != self.details_sig {
-            self.details_sig = sig;
-            let (pane, selection) = (self.pane.clone(), self.selection);
-            window.defer(cx, move |window, cx| {
-                pane.update(cx, |p, cx| p.sync(selection, window, cx))
-            });
-        }
+        // The pane keeps its last frame until an input of it changes (see `sync_details`).
+        self.sync_details(cx);
         let details = show_details.then(|| {
             self.pane
                 .clone()

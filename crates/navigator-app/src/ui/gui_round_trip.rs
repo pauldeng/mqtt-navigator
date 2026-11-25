@@ -1956,3 +1956,29 @@ fn a_finished_render_draws_the_pane(cx: &mut TestAppContext) {
         "the pane did not draw after the job"
     );
 }
+
+/// A message that the broker sends for the shown topic reaches the pane through the merge, and
+/// the pane shows the new text.
+#[cfg(feature = "broker-tests")]
+#[gpui_kit::test]
+fn a_broker_message_for_the_shown_topic_updates_the_pane(cx: &mut TestAppContext) {
+    let (mut cx, nav) = start(cx);
+    let cx = &mut cx;
+    let topic = format!("pane/{}", rid());
+    subscribe(cx, &nav, &topic);
+    publish(cx, &topic, "one", true);
+    wait(cx, "the first message", |cx| {
+        nav.read_with(cx, |v, _| v.store.find(&topic).is_some())
+    });
+    nav.update(cx, |v, cx| {
+        let id = v.store.find(&topic).expect("node");
+        v.select(id, v.gate.generation(), false, cx);
+    });
+    wait(cx, "the first text in the pane", |cx| {
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "one")
+    });
+    publish(cx, &topic, "two", false);
+    wait(cx, "the second text in the pane", |cx| {
+        nav.read_with(cx, |v, cx| v.pane.read(cx).insp.full == "two")
+    });
+}
