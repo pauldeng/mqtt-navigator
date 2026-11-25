@@ -71,16 +71,24 @@ impl Navigator {
             Cmd::EditAndPublish => self.edit_and_publish(window, cx),
             Cmd::Reply => self.reply(window, cx),
             Cmd::ClearRetained => self.confirm_clear_retained(window, cx),
-            Cmd::FocusPublishTopic => self.focus_publish_topic(window, cx),
+            Cmd::FocusPublishTopic => self
+                .comp
+                .update(cx, |c, cx| c.focus_publish_topic(window, cx)),
             // A closed composer opens first: the user must see the draft that goes out.
-            Cmd::Send if !self.comp.vis.open => self.open_composer(window, cx),
-            Cmd::Send => self.send(window, cx),
-            Cmd::PayloadMode(mode) => self.set_payload_mode(mode, window, cx),
-            Cmd::FormatJson(pretty) => self.format_json(pretty, window, cx),
-            Cmd::NewMessage => self.open_composer(window, cx),
-            Cmd::ComposerProperties => self.open_properties(window, cx),
-            Cmd::ComposerHistory => self.open_history(window, cx),
-            Cmd::CloseComposer => self.close_composer(window, cx),
+            Cmd::Send if !self.comp.read(cx).vis.open => {
+                self.comp.update(cx, |c, cx| c.open_composer(window, cx))
+            }
+            Cmd::Send => self.send(cx),
+            Cmd::PayloadMode(mode) => self
+                .comp
+                .update(cx, |c, cx| c.set_payload_mode(mode, window, cx)),
+            Cmd::FormatJson(pretty) => self
+                .comp
+                .update(cx, |c, cx| c.format_json(pretty, window, cx)),
+            Cmd::NewMessage => self.comp.update(cx, |c, cx| c.open_composer(window, cx)),
+            Cmd::ComposerProperties => self.comp.update(cx, |c, cx| c.open_properties(window, cx)),
+            Cmd::ComposerHistory => self.comp.update(cx, |c, cx| c.open_history(window, cx)),
+            Cmd::CloseComposer => self.comp.update(cx, |c, cx| c.close_composer(window, cx)),
             Cmd::SubQos(_) | Cmd::SubOptions | Cmd::SubRetry | Cmd::SubRemove => {
                 self.run_sub_cmd(cmd, window, cx)
             }

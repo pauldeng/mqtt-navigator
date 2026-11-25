@@ -215,7 +215,8 @@ fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestApp
             rows(v).contains(&(Direction::Received, "hello/world".into(), text.clone()))
         })
     });
-    assert!(nav.read_with(cx, |v, _| v.comp.mode == crate::composer::PayloadMode::Json));
+    assert!(nav.read_with(cx, |v, c| v.comp.read(c).mode
+        == crate::composer::PayloadMode::Json));
     assert!(
         cx.debug_bounds("json-warning").is_some(),
         "the warning is not drawn"
@@ -239,7 +240,7 @@ fn a_message_goes_through_the_broker_and_comes_back_as_received(cx: &mut TestApp
     click(cx, "composer-close");
     cx.run_until_parked();
     assert!(
-        !nav.read_with(cx, |v, _| v.comp.vis.open),
+        !nav.read_with(cx, |v, c| v.comp.read(c).vis.open),
         "the composer is still open"
     );
 
@@ -620,7 +621,7 @@ fn app_shortcuts_work_when_nothing_has_the_focus(cx: &mut TestAppContext) {
     });
     cx.simulate_keystrokes("secondary-shift-n");
     assert!(
-        nav.read_with(cx, |v, _| v.comp.vis.open),
+        nav.read_with(cx, |v, c| v.comp.read(c).vis.open),
         "the composer is closed"
     );
 }
@@ -712,8 +713,8 @@ fn show_more_applies_to_the_newest_message_of_a_busy_topic(cx: &mut TestAppConte
 fn publish_while_disconnected_stores_no_error(cx: &mut TestAppContext) {
     let (mut cx, nav) = open(cx);
     let cx = &mut cx;
-    cx.update(|w, cx| nav.update(cx, |v, cx| v.send(w, cx)));
-    assert!(nav.read_with(cx, |v, _| v.comp.error.is_none()));
+    cx.update(|_, cx| nav.update(cx, |v, cx| v.send(cx)));
+    assert!(nav.read_with(cx, |v, c| v.comp.read(c).error.is_none()));
 }
 
 /// The Show more button must stay inside the details pane. It needs no broker.
@@ -1036,17 +1037,22 @@ fn focus_in_a_hidden_user_property_row_scrolls_to_it(cx: &mut TestAppContext) {
     cx.update(|w, _| w.activate_window());
     cx.simulate_keystrokes("secondary-shift-n");
     for _ in 0..12 {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+            })
+        });
         cx.run_until_parked();
     }
     for _ in 0..3 {
         cx.update(|w, _| w.refresh());
         cx.run_until_parked();
     }
-    let offset = |cx: &mut VisualTestContext| nav.read_with(cx, |v, _| v.props_offset());
+    let offset =
+        |cx: &mut VisualTestContext| nav.read_with(cx, |v, c| v.comp.read(c).props_offset());
     assert!(offset(cx) < px(0.), "the area must show the last row");
     // Shift+Tab walks up from the last row. The area must follow the focus to the first row.
-    let first = nav.read_with(cx, |v, _| v.first_user_row_focus());
+    let first = nav.read_with(cx, |v, c| v.comp.read(c).first_user_row_focus());
     for _ in 0..100 {
         if cx.update(|w, cx| first.contains_focused(w, cx)) {
             break;
@@ -1093,18 +1099,25 @@ fn rows_out_of_view_are_not_built_and_tab_still_walks_them(cx: &mut TestAppConte
         }
     };
     for _ in 0..ROWS {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+            })
+        });
         cx.run_until_parked();
     }
     draw(cx);
-    let drawn = |cx: &mut VisualTestContext| nav.read_with(cx, |v, _| v.drawn_rows());
+    let drawn = |cx: &mut VisualTestContext| nav.read_with(cx, |v, c| v.comp.read(c).drawn_rows());
     assert!(drawn(cx) < ROWS, "all {ROWS} rows were built");
     for (key, row) in [
         (
             "shift-tab",
-            nav.read_with(cx, |v, _| v.first_user_row_focus()),
+            nav.read_with(cx, |v, c| v.comp.read(c).first_user_row_focus()),
         ),
-        ("tab", nav.read_with(cx, |v, _| v.last_user_row_focus())),
+        (
+            "tab",
+            nav.read_with(cx, |v, c| v.comp.read(c).last_user_row_focus()),
+        ),
     ] {
         let mut steps = 0;
         while !cx.update(|w, cx| row.contains_focused(w, cx)) {
@@ -1115,18 +1128,21 @@ fn rows_out_of_view_are_not_built_and_tab_still_walks_them(cx: &mut TestAppConte
             assert!(drawn(cx) < ROWS, "all {ROWS} rows were built after {key}");
         }
         assert!(
-            nav.read_with(cx, |v, _| v.props_offset()) <= px(0.),
+            nav.read_with(cx, |v, c| v.comp.read(c).props_offset()) <= px(0.),
             "{key}: bad offset"
         );
     }
-    assert!(nav.read_with(cx, |v, _| v.last_user_row_in_view()));
+    assert!(nav.read_with(cx, |v, c| v.comp.read(c).last_user_row_in_view()));
     // The user scrolls away from the focused last row: Shift+Tab still goes to the row before it.
-    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    let last = nav.read_with(cx, |v, c| v.comp.read(c).last_user_value());
     cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
-    nav.update(cx, |v, _| v.scroll_props_to_top());
+    nav.update(cx, |v, cx| {
+        v.comp.update(cx, |c, _| c.scroll_props_to_top())
+    });
     draw(cx);
-    let (last_row, before) = nav.read_with(cx, |v, _| {
-        (v.last_user_row_focus(), v.user_row_focus(ROWS - 2))
+    let (last_row, before) = nav.read_with(cx, |v, c| {
+        let p = v.comp.read(c);
+        (p.last_user_row_focus(), p.user_row_focus(ROWS - 2))
     });
     for _ in 0..6 {
         if !cx.update(|w, cx| last_row.contains_focused(w, cx)) {
@@ -1158,7 +1174,11 @@ fn a_taller_window_builds_the_rows_that_it_shows_in_its_first_frame(cx: &mut Tes
     cx.update(|w, _| w.activate_window());
     cx.simulate_keystrokes("secondary-shift-n");
     for _ in 0..25 {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+            })
+        });
         cx.run_until_parked();
     }
     let settle = |cx: &mut VisualTestContext| {
@@ -1168,13 +1188,15 @@ fn a_taller_window_builds_the_rows_that_it_shows_in_its_first_frame(cx: &mut Tes
         }
     };
     settle(cx);
-    nav.update(cx, |v, _| v.scroll_props_to_top());
+    nav.update(cx, |v, cx| {
+        v.comp.update(cx, |c, _| c.scroll_props_to_top())
+    });
     settle(cx);
     cx.simulate_resize(size(px(1400.), px(1100.)));
     settle(cx);
     // The frame with the new height ran inside `simulate_resize`.
-    let first = nav.read_with(cx, |v, _| v.resized_rows());
-    let settled = nav.read_with(cx, |v, _| v.drawn_rows());
+    let first = nav.read_with(cx, |v, c| v.comp.read(c).resized_rows());
+    let settled = nav.read_with(cx, |v, c| v.comp.read(c).drawn_rows());
     assert!(
         first >= settled,
         "the first frame built {first} rows, the window shows {settled}"
@@ -1200,7 +1222,11 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
     cx.update(|w, _| w.activate_window());
     cx.simulate_keystrokes("secondary-shift-n");
     for _ in 0..12 {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+            })
+        });
         cx.run_until_parked();
     }
     let draw = |cx: &mut VisualTestContext| {
@@ -1215,9 +1241,9 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
     for width in [1400., 700.] {
         cx.simulate_resize(size(px(width), px(900.)));
         draw(cx);
-        let last = nav.read_with(cx, |v, _| v.last_user_value());
+        let last = nav.read_with(cx, |v, c| v.comp.read(c).last_user_value());
         cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
-        let row = nav.read_with(cx, |v, _| v.last_user_row_focus());
+        let row = nav.read_with(cx, |v, c| v.comp.read(c).last_user_row_focus());
         for _ in 0..6 {
             if !cx.update(|w, cx| row.contains_focused(w, cx)) {
                 break;
@@ -1228,23 +1254,28 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
             !cx.update(|w, cx| row.contains_focused(w, cx)),
             "Tab did not leave the last row at {width} px"
         );
-        nav.update(cx, |v, _| v.scroll_props_to_top());
+        nav.update(cx, |v, cx| {
+            v.comp.update(cx, |c, _| c.scroll_props_to_top())
+        });
         draw(cx);
-        assert_eq!(nav.read_with(cx, |v, _| v.props_offset()), px(0.));
+        assert_eq!(
+            nav.read_with(cx, |v, c| v.comp.read(c).props_offset()),
+            px(0.)
+        );
         cx.simulate_keystrokes("shift-tab");
         draw(cx);
         assert!(cx.update(|w, cx| row.contains_focused(w, cx)));
         assert!(
-            nav.read_with(cx, |v, _| v.props_offset()) < px(0.),
+            nav.read_with(cx, |v, c| v.comp.read(c).props_offset()) < px(0.),
             "the area did not show the last row at {width} px"
         );
         assert!(
-            nav.read_with(cx, |v, _| v.last_user_row_in_view()),
+            nav.read_with(cx, |v, c| v.comp.read(c).last_user_row_in_view()),
             "the last row is not in the viewport at {width} px"
         );
         if width > 1000. {
             // The wide order: Remove is the last control of the row.
-            let remove = nav.read_with(cx, |v, _| v.last_user_remove_focus());
+            let remove = nav.read_with(cx, |v, c| v.comp.read(c).last_user_remove_focus());
             assert!(
                 cx.update(|w, _| remove.is_focused(w)),
                 "Remove has no focus"
@@ -1255,20 +1286,22 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
     // is scrolled away before each step.
     cx.simulate_resize(size(px(1400.), px(900.)));
     draw(cx);
-    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    let last = nav.read_with(cx, |v, c| v.comp.read(c).last_user_value());
     cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
     for step in ["Send empty", "Remove"] {
-        nav.update(cx, |v, _| v.scroll_props_to_top());
+        nav.update(cx, |v, cx| {
+            v.comp.update(cx, |c, _| c.scroll_props_to_top())
+        });
         draw(cx);
-        assert!(!nav.read_with(cx, |v, _| v.last_user_row_in_view()));
+        assert!(!nav.read_with(cx, |v, c| v.comp.read(c).last_user_row_in_view()));
         cx.simulate_keystrokes("tab");
         draw(cx);
         assert!(
-            nav.read_with(cx, |v, _| v.last_user_row_in_view()),
+            nav.read_with(cx, |v, c| v.comp.read(c).last_user_row_in_view()),
             "the row is not in view after Tab to {step}"
         );
     }
-    let remove = nav.read_with(cx, |v, _| v.last_user_remove_focus());
+    let remove = nav.read_with(cx, |v, c| v.comp.read(c).last_user_remove_focus());
     assert!(
         cx.update(|w, _| remove.is_focused(w)),
         "Remove has no focus"
@@ -1276,13 +1309,21 @@ fn shift_tab_to_a_hidden_remove_button_scrolls_to_its_row(cx: &mut TestAppContex
     // A new standard field is at the top of the area: the area scrolls there. Payload format has
     // no input to focus.
     for kind in [PropKind::ContentType, PropKind::PayloadFormat] {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+            })
+        });
         draw(cx);
-        assert!(nav.read_with(cx, |v, _| v.props_offset()) < px(0.));
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(kind, w, cx)));
+        assert!(nav.read_with(cx, |v, c| v.comp.read(c).props_offset()) < px(0.));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(kind, w, cx))
+            })
+        });
         draw(cx);
         assert_eq!(
-            nav.read_with(cx, |v, _| v.props_offset()),
+            nav.read_with(cx, |v, c| v.comp.read(c).props_offset()),
             px(0.),
             "{kind:?}"
         );
@@ -1521,11 +1562,15 @@ fn escape_in_a_composer_menu_returns_the_focus_to_its_button(cx: &mut TestAppCon
         })
     });
     cx.simulate_keystrokes("secondary-shift-n");
-    cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+    cx.update(|w, cx| {
+        nav.update(cx, |v, cx| {
+            v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+        })
+    });
     cx.run_until_parked();
     cx.update(|w, _| w.refresh());
     cx.run_until_parked();
-    let handles = nav.read_with(cx, |v, _| v.menu_buttons_focus());
+    let handles = nav.read_with(cx, |v, c| v.comp.read(c).menu_buttons_focus());
     for (button, handle) in ["composer-more", "add-prop"].into_iter().zip(handles) {
         // The focus is in the payload, not on the button.
         cx.simulate_keystrokes("secondary-a");
@@ -1562,7 +1607,11 @@ fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppCont
     cx.update(|w, _| w.activate_window());
     cx.simulate_keystrokes("secondary-shift-n");
     for _ in 0..20 {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+            })
+        });
         cx.run_until_parked();
     }
     let draw = |cx: &mut VisualTestContext| {
@@ -1571,16 +1620,17 @@ fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppCont
             cx.run_until_parked();
         }
         let rem = cx.update(|w, _| w.rem_size());
-        nav.read_with(cx, |v, _| {
+        nav.read_with(cx, |v, c| {
+            let p = v.comp.read(c);
             (
-                v.rows_stacked(rem),
-                v.last_user_row_height(),
-                v.last_user_row_in_view(),
+                p.rows_stacked(rem),
+                p.last_user_row_height(),
+                p.last_user_row_in_view(),
             )
         })
     };
     // The focus is in the last row (it is the last row of the area).
-    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    let last = nav.read_with(cx, |v, c| v.comp.read(c).last_user_value());
     cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
     let (stacked, wide, in_view) = draw(cx);
     assert!(!stacked && in_view, "a wide window");
@@ -1597,7 +1647,9 @@ fn the_composer_stacks_its_property_rows_from_its_own_width(cx: &mut TestAppCont
     // A lower window gives the properties less height. The row with the focus stays in view.
     cx.simulate_resize(size(px(1400.), px(900.)));
     draw(cx);
-    nav.update(cx, |v, _| v.scroll_props_to_top());
+    nav.update(cx, |v, cx| {
+        v.comp.update(cx, |c, _| c.scroll_props_to_top())
+    });
     let (_, _, in_view) = draw(cx);
     assert!(!in_view, "the row is scrolled away");
     cx.simulate_resize(size(px(1400.), px(600.)));
@@ -1631,7 +1683,11 @@ fn a_long_result_line_keeps_the_focused_property_row_in_view(cx: &mut TestAppCon
     cx.simulate_resize(size(px(960.), px(600.)));
     cx.simulate_keystrokes("secondary-shift-n");
     for _ in 0..20 {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(PropKind::User, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(PropKind::User, w, cx))
+            })
+        });
         cx.run_until_parked();
     }
     let draw = |cx: &mut VisualTestContext| {
@@ -1639,13 +1695,15 @@ fn a_long_result_line_keeps_the_focused_property_row_in_view(cx: &mut TestAppCon
             cx.update(|w, _| w.refresh());
             cx.run_until_parked();
         }
-        nav.read_with(cx, |v, _| v.last_user_row_in_view())
+        nav.read_with(cx, |v, c| v.comp.read(c).last_user_row_in_view())
     };
-    let last = nav.read_with(cx, |v, _| v.last_user_value());
+    let last = nav.read_with(cx, |v, c| v.comp.read(c).last_user_value());
     cx.update(|w, cx| last.update(cx, |i, cx| i.focus(w, cx)));
     assert!(draw(cx), "the last row is in view first");
     let long = "The broker refused the message for a long reason. ".repeat(6);
-    nav.update(cx, |v, cx| v.set_composer_error(&long, cx));
+    nav.update(cx, |v, cx| {
+        v.comp.update(cx, |c, cx| c.set_composer_error(&long, cx))
+    });
     assert!(draw(cx), "the focused row is clipped by the result line");
 }
 
@@ -1674,7 +1732,11 @@ fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAp
     .into_iter()
     .chain([PropKind::User; 20])
     {
-        cx.update(|w, cx| nav.update(cx, |v, cx| v.add_prop(kind, w, cx)));
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp.update(cx, |c, cx| c.add_prop(kind, w, cx))
+            })
+        });
         cx.run_until_parked();
     }
     for _ in 0..3 {
@@ -1703,13 +1765,15 @@ fn a_full_composer_keeps_the_publish_button_above_the_status_bar(cx: &mut TestAp
             .debug_bounds("status-bar")
             .expect("the status bar is drawn");
         // The composer takes 55% of the window at the default zoom, and at 150% zoom the floor
-        // (420 px). The status bar is below it.
+        // (420 px). The status bar is below it. The cached view gets its height from the last
+        // measure, and a parent that is 1 px short cannot shrink the content: 1 px of the
+        // bottom padding can lie under the bar.
         let most = if rem == 16. { 0.55 } else { 0.7 };
         assert!(
             composer.size.height <= window.height * most + px(1.)
-                && composer.bottom() <= status.top()
+                && composer.bottom() <= status.top() + px(1.)
                 && send.bottom() <= composer.bottom(),
-            "the composer is too tall at {rem} px: {composer:?}, Publish {send:?}, window {window:?}"
+            "the composer is too tall at {rem} px: {composer:?}, Publish {send:?}, window {window:?}, status {status:?}"
         );
     }
 }
@@ -1729,7 +1793,7 @@ fn enter_in_history_closes_it_at_once(cx: &mut TestAppContext) {
     let before = cx
         .update(|w, cx| w.focused(cx))
         .expect("a control has the focus");
-    cx.update(|w, cx| nav.update(cx, |v, cx| v.open_history(w, cx)));
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.comp.update(cx, |c, cx| c.open_history(w, cx))));
     cx.run_until_parked();
     assert!(
         cx.update(|w, cx| w.has_active_dialog(cx)),
@@ -1808,7 +1872,7 @@ fn a_resize_keeps_the_focus_in_an_open_dialog(cx: &mut TestAppContext) {
     cx.simulate_resize(size(px(700.), px(900.)));
     cx.update(|w, cx| nav.update(cx, |v, cx| v.open_details_sheet(w, cx)));
     cx.run_until_parked();
-    cx.update(|w, cx| nav.update(cx, |v, cx| v.open_history(w, cx)));
+    cx.update(|w, cx| nav.update(cx, |v, cx| v.comp.update(cx, |c, cx| c.open_history(w, cx))));
     cx.run_until_parked();
     assert!(cx.update(|w, cx| w.has_active_dialog(cx)), "no dialog");
     let held = cx
@@ -1906,6 +1970,92 @@ fn the_pane_draws_for_its_topic_and_not_for_other_topics(cx: &mut TestAppContext
     draw_twice(cx);
     assert!(pane_renders(cx, &nav) > before, "the pane did not draw");
     assert_eq!(cx.update(|_, cx| editor.read(cx).value().to_string()), "bb");
+}
+
+fn composer_renders(cx: &mut VisualTestContext, nav: &Entity<Navigator>) -> usize {
+    nav.read_with(cx, |v, cx| v.comp.read(cx).renders)
+}
+
+/// The composer is its own view: a flood that it does not show does not draw it. Each input that
+/// it shows does. It needs no broker.
+#[gpui_kit::test]
+fn the_composer_draws_for_its_inputs_and_not_for_a_flood(cx: &mut TestAppContext) {
+    use crate::composer::Draft;
+    use navigator_core::net::Protocol;
+    use navigator_core::settings::ThemeMode;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|w, _| w.activate_window());
+    cx.simulate_keystrokes("secondary-shift-n");
+    // The first message selects its row: the list changes once.
+    insert_msg(cx, &nav, "t/first", "zz");
+    draw_twice(cx);
+    draw_twice(cx);
+    let before = composer_renders(cx, &nav);
+    assert!(before > 0);
+    for i in 0..30 {
+        insert_msg(cx, &nav, &format!("t/flood/{i}"), "zz");
+        draw_twice(cx);
+    }
+    assert_eq!(
+        composer_renders(cx, &nav),
+        before,
+        "the composer drew for a flood"
+    );
+    // Each change must draw the composer: the count grows.
+    let mut seen = before;
+    let mut grows =
+        |cx: &mut VisualTestContext, what: &str, change: &mut dyn FnMut(&mut VisualTestContext)| {
+            change(cx);
+            draw_twice(cx);
+            let now = composer_renders(cx, &nav);
+            assert!(now > seen, "the composer did not draw for {what}");
+            seen = now;
+        };
+    grows(cx, "an edit", &mut |cx| cx.simulate_input("a"));
+    grows(cx, "a result", &mut |cx| {
+        nav.update(cx, |v, cx| {
+            v.last_result = Some((1, "Sent".into()));
+            cx.notify();
+        })
+    });
+    grows(cx, "a connection", &mut |cx| {
+        nav.update(cx, |v, cx| {
+            v.status.state = ConnState::Connected;
+            cx.notify();
+        })
+    });
+    grows(cx, "a protocol", &mut |cx| {
+        nav.update(cx, |v, cx| {
+            v.settings.profiles[0].protocol = Protocol::V5;
+            v.profile = v.settings.profiles.first().cloned();
+            cx.notify();
+        })
+    });
+    grows(cx, "a fill", &mut |cx| {
+        let d = Draft {
+            topic: "t/fill".into(),
+            ..Draft::default()
+        };
+        cx.update(|w, cx| {
+            nav.update(cx, |v, cx| {
+                v.comp
+                    .update(cx, |c, cx| c.replace_composer(d, true, w, cx))
+            })
+        })
+    });
+    grows(cx, "a theme", &mut |cx| {
+        let dark = nav.read_with(cx, |v, _| v.settings.ui.theme_mode == ThemeMode::Dark);
+        let to = if dark {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        };
+        cx.update(|w, cx| nav.update(cx, |v, cx| v.set_appearance(to, w, cx)))
+    });
+    grows(cx, "a resize", &mut |cx| {
+        cx.simulate_resize(size(px(1300.), px(800.)))
+    });
 }
 
 /// A selected message row that the store removes: the pane says so. It needs no broker.

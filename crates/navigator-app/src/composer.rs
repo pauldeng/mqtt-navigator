@@ -244,7 +244,17 @@ pub fn edit_unavailable(msg: &Msg, row_evicted: bool) -> Option<&'static str> {
 /// string escaped (`\n`, `\r`, `\\` for line breaks, `⟨U+202E⟩` for hidden characters) and keeps
 /// the exact string until the user edits the field. Then the text of the field is the value.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LineKeep(Option<(String, String)>);
+pub struct LineKeep(Option<Kept>);
+
+/// The shown text, the exact string, and what the exact string has: (line breaks, hidden
+/// characters). `set` finds it once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Kept {
+    shown: String,
+    exact: String,
+    breaks: bool,
+    hidden: bool,
+}
 
 /// The note that the UI shows under a field with a kept line break. `what`: "topic", "value".
 pub fn line_breaks_note(what: &str) -> String {
@@ -276,14 +286,23 @@ impl LineKeep {
         } else {
             safe.into_owned()
         };
-        self.0 = Some((shown.clone(), exact.to_string()));
+        let hidden = matches!(
+            display_safe(&exact.replace(['\n', '\r'], "")),
+            Cow::Owned(_)
+        );
+        self.0 = Some(Kept {
+            shown: shown.clone(),
+            exact: exact.to_string(),
+            breaks,
+            hidden,
+        });
         shown
     }
 
     /// The value of the field. `current` is the text in the input.
     pub fn value(&self, current: &str) -> String {
         match &self.0 {
-            Some((shown, exact)) if shown == current => exact.clone(),
+            Some(k) if k.shown == current => k.exact.clone(),
             _ => current.to_string(),
         }
     }
@@ -291,19 +310,14 @@ impl LineKeep {
     /// True if the exact string (not the text of the input) is still the value.
     #[cfg(test)]
     fn active(&self, current: &str) -> bool {
-        self.0.as_ref().is_some_and(|(shown, _)| shown == current)
+        self.0.as_ref().is_some_and(|k| k.shown == current)
     }
 
     /// The note for the field, if the exact string (not the text of the input) is still the
     /// value. `what`: "topic", "value".
     pub fn note(&self, what: &str, current: &str) -> Option<String> {
-        let (_, exact) = self.0.as_ref().filter(|(shown, _)| shown == current)?;
-        let breaks = exact.contains(['\n', '\r']);
-        let hidden = matches!(
-            display_safe(&exact.replace(['\n', '\r'], "")),
-            Cow::Owned(_)
-        );
-        Some(match (breaks, hidden) {
+        let k = self.0.as_ref().filter(|k| k.shown == current)?;
+        Some(match (k.breaks, k.hidden) {
             (true, true) => {
                 format!("This {what} has line breaks and hidden characters; they are kept.")
             }
