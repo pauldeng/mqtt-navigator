@@ -64,7 +64,7 @@ pub enum Decoder {
     Text,
     /// JSON, pretty printed. Keys keep their order.
     Json,
-    /// The bytes as hex pairs ("00 ff 10"), on one line. The composer reads this format.
+    /// The bytes as hex pairs ("00 ff 10"), 16 on each line. The composer reads this format.
     Hex,
     /// Standard Base64 with padding, on one line.
     Base64,
@@ -158,6 +158,18 @@ fn is_cancelled(cancel: &AtomicBool) -> bool {
 /// payload longer than `limit` shows the start as plain text with an error note (a cut document
 /// is not valid JSON): pass the full length to format it. The JSON parser itself cannot be cancelled.
 pub fn render(decoder: Decoder, payload: &[u8], limit: usize, cancel: &AtomicBool) -> Rendered {
+    render_stored(decoder, payload, limit, false, cancel)
+}
+
+/// Like [`render`]. `stored_cut` is true when `payload` is itself the start of a longer payload
+/// (the store cut it). A Base64 to Hex decoder then decodes only whole groups of 4 characters.
+pub fn render_stored(
+    decoder: Decoder,
+    payload: &[u8],
+    limit: usize,
+    stored_cut: bool,
+    cancel: &AtomicBool,
+) -> Rendered {
     let cut = payload.len() > limit;
     let head = &payload[..payload.len().min(limit)];
     if is_cancelled(cancel) {
@@ -179,12 +191,20 @@ pub fn render(decoder: Decoder, payload: &[u8], limit: usize, cancel: &AtomicBoo
         Decoder::Hex => hex(head, cut, cancel),
         Decoder::Base64 => base64(&STANDARD, head, cut, cancel),
         Decoder::Base64Url => base64(&URL_SAFE_NO_PAD, head, cut, cancel),
-        Decoder::Base64ToHex => {
-            base64_to_hex(&STANDARD_NO_PAD_INDIFFERENT, "Base64", head, cut, cancel)
-        }
-        Decoder::Base64UrlToHex => {
-            base64_to_hex(&URL_SAFE_NO_PAD_INDIFFERENT, "Base64URL", head, cut, cancel)
-        }
+        Decoder::Base64ToHex => base64_to_hex(
+            &STANDARD_NO_PAD_INDIFFERENT,
+            "Base64",
+            head,
+            cut || stored_cut,
+            cancel,
+        ),
+        Decoder::Base64UrlToHex => base64_to_hex(
+            &URL_SAFE_NO_PAD_INDIFFERENT,
+            "Base64URL",
+            head,
+            cut || stored_cut,
+            cancel,
+        ),
         Decoder::Number(kind, endian) => number(kind, endian, head, cut, cancel),
     }
 }
@@ -289,20 +309,23 @@ pub fn json(head: &[u8], pretty: bool, cancel: &AtomicBool) -> Rendered {
 }
 
 /// Bytes per step of the hex and Base64 loops: the cancel flag is read between steps. A multiple
-/// of 3, so each Base64 step but the last ends on a group.
+/// of 3 and of 16, so each Base64 step but the last ends on a group and each hex step on a line.
 const STEP: usize = 3 * 4096;
 
-/// `bytes` as hex pairs. `Err` has the number of bytes done when `cancel` was set.
+/// `bytes` as hex pairs: 16 on each line, one space between pairs. `STEP` is a multiple of 16,
+/// so each step ends on a line. `Err` has the number of bytes done when `cancel` was set.
 fn hex_text(bytes: &[u8], cancel: &AtomicBool) -> Result<String, (String, usize)> {
     let mut out = String::with_capacity(bytes.len() * 3);
     for (i, c) in bytes.chunks(STEP).enumerate() {
         if is_cancelled(cancel) {
             return Err((out, i * STEP));
         }
-        if i > 0 {
-            out.push(' ');
+        for (j, line) in c.chunks(16).enumerate() {
+            if i > 0 || j > 0 {
+                out.push('\n');
+            }
+            out.push_str(&to_hex(line));
         }
-        out.push_str(&to_hex(c));
     }
     Ok(out)
 }
@@ -710,7 +733,17 @@ mod tests {
         assert_eq!(ok(Decoder::Hex, b""), "");
         let big = vec![0xabu8; STEP + 1];
         let t = ok(Decoder::Hex, &big);
-        assert_eq!(t, vec!["ab"; STEP + 1].join(" "));
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines.len(), (STEP + 1).div_ceil(16));
+        assert!(
+            lines[..lines.len() - 1]
+                .iter()
+                .all(|l| *l == vec!["ab"; 16].join(" "))
+        );
+        assert_eq!(lines[lines.len() - 1], "ab");
+        assert!(!t.ends_with(['\n', ' ']));
+        // The composer reads it back.
+        assert_eq!(crate::publish::parse_hex(&t).expect("hex"), big);
     }
 
     #[test]
@@ -804,6 +837,12 @@ mod tests {
         assert_eq!((r.text.as_str(), r.truncated_at), ("", Some(0)));
         let r = render(Decoder::Base64ToHex, b"Zm9vYmFy", 8, &NO);
         assert_eq!(r.truncated_at, None);
+        // A stored copy that is cut: the partial group is dropped, with no error.
+        let r = render_stored(Decoder::Base64ToHex, b"Zm9vYmF", 100, true, &NO);
+        assert_eq!(r.error, None);
+        assert_eq!((r.text.as_str(), r.truncated_at), ("66 6f 6f", Some(4)));
+        let r = render_stored(Decoder::Base64UrlToHex, b"Zm9vYmFy", 100, true, &NO);
+        assert_eq!(r.truncated_at, Some(8));
     }
 
     #[test]
@@ -840,7 +879,10 @@ mod tests {
         );
         let r = render(Decoder::Hex, &[0u8; 40], 20, &NO);
         assert_eq!(r.truncated_at, Some(20));
-        assert_eq!(r.text, vec!["00"; 20].join(" "));
+        assert_eq!(
+            r.text,
+            format!("{}\n{}", vec!["00"; 16].join(" "), ["00"; 4].join(" "))
+        );
         let r = render(Decoder::Text, b"abcdef", 4, &NO);
         assert_eq!((r.text.as_str(), r.truncated_at), ("abcd", Some(4)));
         let r = render(Decoder::Text, b"abcdef", 6, &NO);

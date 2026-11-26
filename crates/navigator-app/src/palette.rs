@@ -53,7 +53,7 @@ pub enum Cmd {
     PayloadMode(PayloadMode),
     /// Beautify (`true`) or Minify (`false`) the JSON payload.
     FormatJson(bool),
-    /// Convert the message to Base64 (`false`) or Base64URL (`true`) text.
+    /// Convert the payload to Base64 (`false`) or Base64URL (`true`) text.
     ConvertBase64(bool),
     NewMessage,
     ComposerProperties,
@@ -109,7 +109,7 @@ pub struct Facts {
     pub can_show_all: bool,
     pub can_show_more: bool,
     pub payload_mode: PayloadMode,
-    /// The composer message has bytes to convert to Base64 (not empty, valid Hex).
+    /// The composer payload has bytes to convert to Base64 (not empty, valid Hex).
     pub can_convert: bool,
     pub theme: Option<ThemeMode>,
     /// The id of the colour theme preset now.

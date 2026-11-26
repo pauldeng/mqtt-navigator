@@ -6,13 +6,13 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ### Added
 
-- Decoders **Base64URL**, **Base64 → Hex** and **Base64URL → Hex**. Base64URL shows the bytes as URL-safe Base64 text without padding. The two Hex decoders read the payload as Base64 or Base64URL text, with or without padding, and show the bytes as hex. White space in the text is ignored. Auto never picks them.
-- The composer `⋯` menu and the command palette have **Convert to Base64** and **Convert to Base64URL**. They encode the bytes that Publish would send now, put the text in the payload box and switch to Text mode. The old draft goes to Drafts.
+- Decoders **Base64URL**, **Base64 → Hex** and **Base64URL → Hex**. Base64URL shows the bytes as URL-safe Base64 text without padding. The two Hex decoders read the payload as Base64 or Base64URL text, with or without padding, and show the bytes as hex. White space in the text is ignored. A payload that the app stored in part shows the whole groups of 4 characters. Auto never picks them.
+- The composer `⋯` menu and the command palette have **Convert to Base64** and **Convert to Base64URL**. They encode the bytes that Publish would send now, put the text in the payload box and switch to Text mode. The old draft goes to Drafts if it is unsent and not empty.
 
 ### Changed
 
 - The details pane shows a **Topic** caption before the topic. The **Value** tab is now **Message**.
-- The Hex decoder shows only the bytes as hex pairs, like `00 ff 10`. The offset and ASCII columns are gone. You can copy the text into the composer in Hex mode.
+- The Hex decoder shows only the bytes as hex pairs, 16 on each line, like `00 ff 10`. The offset and ASCII columns are gone. You can copy the text into the composer in Hex mode.
 
 ### Fixed
 

@@ -275,7 +275,7 @@ Every view designs these states: empty, loading, error with a recovery action, d
 Rules, in this order:
 
 1. An open layer (menu, popover, dialog, sheet, palette) gets `Esc` first, and `Esc` closes it.
-2. The focused control keeps `Esc` when it has a use: the filter clears its text, and the message editor keeps its keys.
+2. The focused control keeps `Esc` when it has a use: the filter clears its text, and the payload editor keeps its keys.
 3. Else `Esc` closes the area that has the focus: the composer (the draft stays) or the details pane. The focus moves to the message list.
 4. App shortcuts always use a modifier key, so they do not take text input.
 

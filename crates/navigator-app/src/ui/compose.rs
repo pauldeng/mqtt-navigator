@@ -1100,7 +1100,7 @@ impl ComposerPane {
         }));
     }
 
-    /// Convert the message to Base64 (or `url`: Base64URL) text, and switch to Text mode. The old
+    /// Convert the payload to Base64 (or `url`: Base64URL) text, and switch to Text mode. The old
     /// draft stays in Drafts, like after Beautify.
     pub(super) fn convert_base64(
         &mut self,
@@ -1142,7 +1142,7 @@ impl ComposerPane {
         cx.notify();
     }
 
-    /// The message has bytes to convert: it is not empty, it is within the Convert limit, and Hex
+    /// The payload has bytes to convert: it is not empty, it is within the Convert limit, and Hex
     /// text is valid.
     pub(super) fn can_convert(&self, cx: &App) -> bool {
         // The length comes from the editor without a copy of the text.
