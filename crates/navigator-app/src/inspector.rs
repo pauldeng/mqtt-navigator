@@ -205,7 +205,8 @@ pub fn next_step(bytes: usize, took_ms: f32) -> usize {
 }
 
 /// End of the next chunk of `text`, from the byte `from` (a character boundary). The chunk has
-/// at most `chunk` bytes, with one exception. It ends after a line break in its second half if
+/// at most `chunk` bytes, with two exceptions (the 64-byte rule below, and a character wider than the
+/// chunk). It ends after a line break in its second half if
 /// there is one, so a line is not cut. Else a line break (or the end of the text) within 64
 /// bytes after the chunk ends it there: a hex line is not cut in a pair. Else it ends at the
 /// last character boundary that fits. `text.len()` when the rest fits. The result is always
