@@ -283,7 +283,7 @@ Key bindings are scoped to each area (`KeyBinding` with a context). There is no 
 
 Other rules:
 
-- `Tab` always moves focus, also in the message editor. To indent JSON, use **Format** in the composer.
+- `Tab` always moves focus, also in the message editor. To indent JSON, use **Beautify JSON** in the composer.
 - `Ctrl/Cmd+F` always focuses the app filter. The message editor has no separate find.
 
 | Keys | Action |

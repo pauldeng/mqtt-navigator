@@ -1143,10 +1143,11 @@ impl ComposerPane {
     /// The message has bytes to convert: it is not empty, it is within the Convert limit, and Hex
     /// text is valid.
     pub(super) fn can_convert(&self, cx: &App) -> bool {
-        let text = self.payload.read(cx).value();
-        if text.len() > FORMAT_MAX_IN {
+        // The length comes from the editor without a copy of the text.
+        if self.payload.read(cx).text().len() > FORMAT_MAX_IN {
             return false;
         }
+        let text = self.payload.read(cx).value();
         match self.mode {
             PayloadMode::Hex => {
                 navigator_core::publish::parse_hex(&text).is_ok_and(|b| !b.is_empty())
