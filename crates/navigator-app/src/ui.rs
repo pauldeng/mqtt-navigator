@@ -1539,7 +1539,9 @@ impl Navigator {
         cx.notify();
     }
 
-    /// Starts the removal. The row stays until the UNSUBACK (or the offline answer) arrives.
+    /// Starts the removal. While connected, the row stays until the UNSUBACK arrives. With no
+    /// connection there is nothing to wait for: the row goes at once, and the net thread only
+    /// drops the filter from its desired list (best effort).
     fn remove_sub(&mut self, filter: &str, cx: &mut Context<Self>) {
         if self
             .subs
@@ -1551,6 +1553,13 @@ impl Navigator {
         let cmd = Command::Unsubscribe {
             filter: filter.to_string(),
         };
+        if !self.is_live() {
+            let _ = self.net.send(cmd);
+            self.subs.remove(filter);
+            self.persist_subs();
+            cx.notify();
+            return;
+        }
         match self.net.send(cmd) {
             Ok(()) => {
                 self.subs.begin_remove(filter);

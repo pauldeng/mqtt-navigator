@@ -717,6 +717,33 @@ fn publish_while_disconnected_stores_no_error(cx: &mut TestAppContext) {
     assert!(nav.read_with(cx, |v, c| v.comp.read(c).error.is_none()));
 }
 
+/// With no connection, Remove drops the row at once (also one that is stuck in NotRemoved) and
+/// saves the list. It needs no broker.
+#[gpui_kit::test]
+fn remove_while_disconnected_drops_the_row_and_saves(cx: &mut TestAppContext) {
+    use navigator_core::model::Qos;
+    let (mut cx, nav) = open(cx);
+    let cx = &mut cx;
+    cx.update(|_, cx| {
+        nav.update(cx, |v, cx| {
+            let id = v.profile.as_ref().expect("profile").id;
+            v.settings.profiles[0].subscriptions = vec![
+                ("a/one".into(), Qos::AtMostOnce),
+                ("b/one".into(), Qos::AtMostOnce),
+            ];
+            v.set_active(v.settings.profiles.first().cloned());
+            assert_eq!(v.profile.as_ref().map(|p| p.id), Some(id));
+            v.subs.rows[1].state = SubState::NotRemoved("Queue full.".into());
+            v.remove_sub("a/one", cx);
+            v.remove_sub("b/one", cx);
+        })
+    });
+    nav.read_with(cx, |v, _| {
+        assert!(v.subs.rows.is_empty());
+        assert!(v.settings.profiles[0].subscriptions.is_empty());
+    });
+}
+
 /// The Show more button must stay inside the details pane. It needs no broker.
 #[gpui_kit::test]
 fn the_show_more_button_stays_inside_the_details_pane(cx: &mut TestAppContext) {
