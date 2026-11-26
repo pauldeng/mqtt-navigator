@@ -527,7 +527,7 @@ impl Navigator {
             can_show_all: pane.can_show_all(shown.as_ref()),
             can_show_more: pane.can_show_more(shown.as_ref()),
             payload_mode: self.comp.read(cx).mode,
-            can_convert: self.comp.read(cx).can_convert(cx),
+            can_convert: self.comp.read(cx).vis.open && self.comp.read(cx).can_convert(cx),
             theme: Some(self.settings.ui.theme_mode),
             preset: crate::themes::preset_by_id(&self.settings.ui.theme_preset).id,
             memory_mib: self.memory_mib(),
