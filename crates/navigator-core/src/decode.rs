@@ -381,7 +381,12 @@ fn base64_to_hex(
     }
     let bytes = match engine.decode(&clean) {
         Ok(b) => b,
-        Err(e) => return Rendered::err(format!("The payload is not valid {name}: {e}.")),
+        Err(e) => {
+            return Rendered::err(format!(
+                "The payload is not valid {name}: {}.",
+                e.to_string().trim_end_matches('.')
+            ));
+        }
     };
     match hex_text(&bytes, cancel) {
         Ok(text) => Rendered {
