@@ -1106,17 +1106,27 @@ impl ComposerPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let size = self.payload.read(cx).text().len();
+        if size > FORMAT_MAX_IN {
+            self.error = Some(format!(
+                "Convert works up to {}. This message has {}.",
+                size_text(FORMAT_MAX_IN),
+                size_text(size)
+            ));
+            cx.notify();
+            return;
+        }
         let mut d = self.read_draft(cx);
         let old = d.clone();
         match d.convert_base64(url) {
             Ok(()) => {
+                // The old draft is the only copy of the text: keep it, or do not convert.
                 if !self.model.replace_with(old, true) {
                     window.push_notification(
-                        Notification::warning(
-                            "The old draft is larger than 1 MiB. It is not kept.",
-                        ),
+                        Notification::warning("The old draft is larger than 1 MiB. Not converted."),
                         cx,
                     );
+                    return;
                 }
                 self.payload
                     .update(cx, |e, cx| e.set_value(d.payload, window, cx));
@@ -1134,6 +1144,8 @@ impl ComposerPane {
     pub(super) fn can_convert(&self, cx: &App) -> bool {
         let text = self.payload.read(cx).value();
         match self.mode {
+            // A large message is not parsed here: the action says why it cannot convert.
+            PayloadMode::Hex if text.len() > FORMAT_MAX_IN => true,
             PayloadMode::Hex => {
                 navigator_core::publish::parse_hex(&text).is_ok_and(|b| !b.is_empty())
             }

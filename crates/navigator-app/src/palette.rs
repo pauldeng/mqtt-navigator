@@ -487,13 +487,13 @@ pub static COMMANDS: &[Entry] = &[
         "convert-base64",
         "Convert to Base64",
         Cmd::ConvertBase64(false),
-        |f| f.can_convert,
+        |f| f.composer_open && f.can_convert,
     ),
     e(
         "convert-base64url",
         "Convert to Base64URL",
         Cmd::ConvertBase64(true),
-        |f| f.can_convert,
+        |f| f.composer_open && f.can_convert,
     ),
     e("new-message", "New message", Cmd::NewMessage, always),
     e(
