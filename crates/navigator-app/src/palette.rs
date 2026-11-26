@@ -51,7 +51,7 @@ pub enum Cmd {
     FocusPublishTopic,
     Send,
     PayloadMode(PayloadMode),
-    /// Beautify (`true`) or Minify (`false`) the JSON message.
+    /// Beautify (`true`) or Minify (`false`) the JSON payload.
     FormatJson(bool),
     /// Convert the message to Base64 (`false`) or Base64URL (`true`) text.
     ConvertBase64(bool),
@@ -455,31 +455,31 @@ pub static COMMANDS: &[Entry] = &[
     e("send", "Publish", Cmd::Send, |f| f.connected),
     e(
         "payload-text",
-        "Message mode: Text",
+        "Payload mode: Text",
         Cmd::PayloadMode(PayloadMode::Text),
         |f| f.payload_mode != PayloadMode::Text,
     ),
     e(
         "payload-hex",
-        "Message mode: Hex",
+        "Payload mode: Hex",
         Cmd::PayloadMode(PayloadMode::Hex),
         |f| f.payload_mode != PayloadMode::Hex,
     ),
     e(
         "payload-json",
-        "Message mode: JSON",
+        "Payload mode: JSON",
         Cmd::PayloadMode(PayloadMode::Json),
         |f| f.payload_mode != PayloadMode::Json,
     ),
     e(
         "beautify-json",
-        "Beautify the JSON message",
+        "Beautify the JSON payload",
         Cmd::FormatJson(true),
         |f| f.payload_mode.is_text(),
     ),
     e(
         "minify-json",
-        "Minify the JSON message",
+        "Minify the JSON payload",
         Cmd::FormatJson(false),
         |f| f.payload_mode.is_text(),
     ),
