@@ -421,9 +421,7 @@ pub static COMMANDS: &[Entry] = &[
     e("show-more", "Show more of the text", Cmd::ShowMore, |f| {
         f.can_show_more
     }),
-    e("copy-value", "Copy the value", Cmd::CopyValue, |f| {
-        f.can_copy
-    }),
+    e("copy-value", "Copy payload", Cmd::CopyValue, |f| f.can_copy),
     e("copy-topic", "Copy the topic", Cmd::CopyTopic, |f| {
         f.can_publish_to_topic
     }),
