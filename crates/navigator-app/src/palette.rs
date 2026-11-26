@@ -53,6 +53,8 @@ pub enum Cmd {
     PayloadMode(PayloadMode),
     /// Beautify (`true`) or Minify (`false`) the JSON payload.
     FormatJson(bool),
+    /// Convert the message to Base64 (`false`) or Base64URL (`true`) text.
+    ConvertBase64(bool),
     NewMessage,
     ComposerProperties,
     ComposerHistory,
@@ -478,6 +480,18 @@ pub static COMMANDS: &[Entry] = &[
         "Minify the JSON payload",
         Cmd::FormatJson(false),
         |f| f.payload_mode.is_text(),
+    ),
+    e(
+        "convert-base64",
+        "Convert the message to Base64",
+        Cmd::ConvertBase64(false),
+        always,
+    ),
+    e(
+        "convert-base64url",
+        "Convert the message to Base64URL",
+        Cmd::ConvertBase64(true),
+        always,
     ),
     e("new-message", "New message", Cmd::NewMessage, always),
     e(

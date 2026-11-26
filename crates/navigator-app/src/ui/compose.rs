@@ -1098,6 +1098,37 @@ impl ComposerPane {
         }));
     }
 
+    /// Convert the message to Base64 (or `url`: Base64URL) text, and switch to Text mode. The old
+    /// draft stays in Drafts, like after Beautify.
+    pub(super) fn convert_base64(
+        &mut self,
+        url: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut d = self.read_draft(cx);
+        let old = d.clone();
+        match d.convert_base64(url) {
+            Ok(()) => {
+                if !self.model.replace_with(old, true) {
+                    window.push_notification(
+                        Notification::warning(
+                            "The old draft is larger than 1 MiB. It is not kept.",
+                        ),
+                        cx,
+                    );
+                }
+                self.payload
+                    .update(cx, |e, cx| e.set_value(d.payload, window, cx));
+                self.mode = PayloadMode::Text;
+                self.error = None;
+                self.set_payload_hint(window, cx);
+            }
+            Err(e) => self.error = Some(e),
+        }
+        cx.notify();
+    }
+
     /// The composer shows the outcome of a publish from it: the draft goes to Sent, or the error
     /// shows under the payload.
     pub(super) fn published(
@@ -1191,7 +1222,7 @@ impl ComposerPane {
         )
         .absolute()
         .size_full();
-        // The `⋯` menu: Beautify JSON, Minify JSON, History… and Properties (MQTT 5).
+        // The `⋯` menu: Beautify JSON, Minify JSON, Convert to Base64 and Base64URL, History… and Properties (MQTT 5).
         let more_focus = self.more_focus.clone();
         let more = Button::new("composer-more")
             .debug_selector(|| "composer-more".into())
@@ -1215,6 +1246,12 @@ impl ComposerPane {
                         item("Beautify JSON", |v, w, cx| v.format_json(true, w, cx)).disabled(hex),
                     )
                     .item(item("Minify JSON", |v, w, cx| v.format_json(false, w, cx)).disabled(hex))
+                    .item(item("Convert to Base64", |v, w, cx| {
+                        v.convert_base64(false, w, cx)
+                    }))
+                    .item(item("Convert to Base64URL", |v, w, cx| {
+                        v.convert_base64(true, w, cx)
+                    }))
                     .separator()
                     .item(item("History…", |v, w, cx| v.open_history(w, cx)));
                 if v5 {

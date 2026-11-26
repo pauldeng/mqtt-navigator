@@ -85,6 +85,9 @@ impl Navigator {
             Cmd::FormatJson(pretty) => self
                 .comp
                 .update(cx, |c, cx| c.format_json(pretty, window, cx)),
+            Cmd::ConvertBase64(url) => self
+                .comp
+                .update(cx, |c, cx| c.convert_base64(url, window, cx)),
             Cmd::NewMessage => self.comp.update(cx, |c, cx| c.open_composer(window, cx)),
             Cmd::ComposerProperties => self.comp.update(cx, |c, cx| c.open_properties(window, cx)),
             Cmd::ComposerHistory => self.comp.update(cx, |c, cx| c.open_history(window, cx)),

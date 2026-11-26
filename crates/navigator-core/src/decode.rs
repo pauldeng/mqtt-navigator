@@ -318,6 +318,16 @@ fn hex(head: &[u8], cut: bool, cancel: &AtomicBool) -> Rendered {
     }
 }
 
+/// `bytes` as Base64 text: standard with padding, or (`url`) Base64URL without padding. The
+/// composer uses it for its Convert actions.
+pub fn to_base64(bytes: &[u8], url: bool) -> String {
+    if url {
+        URL_SAFE_NO_PAD.encode(bytes)
+    } else {
+        STANDARD.encode(bytes)
+    }
+}
+
 fn base64(engine: &GeneralPurpose, head: &[u8], cut: bool, cancel: &AtomicBool) -> Rendered {
     // A cut at a multiple of 3 bytes keeps the text a prefix of the full encoding.
     let head = if cut {
@@ -737,6 +747,15 @@ mod tests {
         assert_eq!(ok(Decoder::Base64Url, &[0xfb, 0xff, 0xfe]), "-__-");
         let r = render(Decoder::Base64Url, b"foobar", 4, &NO);
         assert_eq!((r.text.as_str(), r.truncated_at), ("Zm9v", Some(3)));
+    }
+
+    #[test]
+    fn to_base64_vectors() {
+        assert_eq!(to_base64(b"Hello", false), "SGVsbG8=");
+        assert_eq!(to_base64(b"Hello", true), "SGVsbG8");
+        assert_eq!(to_base64(&[0xfb, 0xff, 0xfe], false), "+//+");
+        assert_eq!(to_base64(&[0xfb, 0xff, 0xfe], true), "-__-");
+        assert_eq!(to_base64(b"", true), "");
     }
 
     #[test]
