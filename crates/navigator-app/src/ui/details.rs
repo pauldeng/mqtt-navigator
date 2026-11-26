@@ -843,13 +843,13 @@ impl DetailsPane {
         let shown = self.shown(cx);
         if !self.can_copy(shown.as_ref()) {
             window.push_notification(
-                Notification::warning("The value is not ready. Open the details and wait."),
+                Notification::warning("The payload is not ready. Open the details and wait."),
                 cx,
             );
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(self.insp.full.clone()));
-        window.push_notification(Notification::success("Value copied."), cx);
+        window.push_notification(Notification::success("Payload copied."), cx);
     }
 
     /// Copies the original topic of the selection. The label shows the escaped form.
