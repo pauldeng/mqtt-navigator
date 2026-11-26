@@ -1111,7 +1111,7 @@ impl ComposerPane {
         let size = self.payload.read(cx).text().len();
         if size > CONVERT_MAX_IN {
             self.error = Some(format!(
-                "Convert works up to {}. This message has {}.",
+                "Convert works up to {}. This payload has {}.",
                 size_text(CONVERT_MAX_IN),
                 size_text(size)
             ));

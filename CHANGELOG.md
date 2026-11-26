@@ -7,6 +7,7 @@ All notable changes to this project are in this file. The format follows [Keep a
 ### Added
 
 - Decoders **Base64URL**, **Base64 → Hex** and **Base64URL → Hex**. Base64URL shows the bytes as URL-safe Base64 text without padding. The two Hex decoders read the payload as Base64 or Base64URL text, with or without padding, and show the bytes as hex. White space in the text is ignored. Auto never picks them.
+- The composer `⋯` menu and the command palette have **Convert to Base64** and **Convert to Base64URL**. They encode the bytes that Publish would send now, put the text in the payload box and switch to Text mode. The old draft goes to Drafts.
 
 ### Changed
 
