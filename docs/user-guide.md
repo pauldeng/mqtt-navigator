@@ -244,13 +244,13 @@ Each active Show only or direction filter is a tag under the header. Its **×** 
 
 ### Details pane
 
-The right pane has two tabs: **Value** and **History**.
+The right pane has two tabs: **Message** and **History**.
 
 - In a window that is 1 100 px wide or more, the pane opens when you select a message or a topic. Its close button closes it. It stays closed until the next selection. To open it again, use "Details: Open" in the command palette.
 - In a narrower window, a click opens the details as a sheet. If you select with the keyboard, the focus stays in the list. Press **Enter** to open the sheet for the selected row. When you close the sheet, the focus returns to the list.
 - The header shows the full topic (you can select the text) and a **⋯** menu. **Edit and publish** is the one action button.
 - The **⋯** menu has: **Copy topic**, **Copy payload**, **Publish to this topic**, **Reply** (only when the message has a Response Topic), **Decoder**, **Wrap**, **Expand** and **Clear retained…**. Use **Expand** to widen the pane.
-- **Value:** the full payload. Choose a **decoder** in the **⋯** menu: Auto, Text, JSON, Hex, Base64 or Number. Auto decides in this order:
+- **Message:** the full payload. Choose a **decoder** in the **⋯** menu: Auto, Text, JSON, Hex, Base64 or Number. Auto decides in this order:
   1. JSON, if the content type is `application/json` or ends with `+json`, or if the payload starts and ends like `{…}` or `[…]` (spaces around it do not count).
   2. Text, if the payload format flag says UTF-8, or if the payload is valid UTF-8.
   3. Hex, for all other payloads.
@@ -261,7 +261,7 @@ The right pane has two tabs: **Value** and **History**.
 - JSON shows pretty-printed. Wrap is on. **Copy payload** copies the whole formatted text.
 - **Long payloads:** the pane shows the first 256 KiB and a **Show all** button. It formats in the background. For very long text, it shows the first part and **Show more (+N KiB)**. Each press adds more.
 - MQTT 5 properties show in a **Properties** section under the payload (MQTT 3.1.1 messages have none). It is collapsed. It has: content type, response topic, correlation data (hex), message expiry, payload format and user properties.
-- **History:** the last 100 messages of the topic (each stored up to 64 KiB). Select a row to show it in the Value tab. The focus moves to the Value tab. The tab then shows "Earlier message from 12:03:58" and a **Show latest** button. The button returns to the selected message or to the latest value of the topic. You can also use Up and Down to move the cursor, and press Enter to show the row.
+- **History:** the last 100 messages of the topic (each stored up to 64 KiB). Select a row to show it in the Message tab. The focus moves to the Message tab. The tab then shows "Earlier message from 12:03:58" and a **Show latest** button. The button returns to the selected message or to the latest value of the topic. You can also use Up and Down to move the cursor, and press Enter to show the row.
 - If the memory limit removed the selected message, the pane says "Removed from the message list (memory limit)."
 
 ## Publish
@@ -359,7 +359,7 @@ Version 0.1.x does not load a schema 2 settings file. It leaves the file unchang
 | `Tab` / `Shift+Tab` | Next / previous control. In the composer, it moves focus and does not type a tab. |
 | `Up` / `Down` | Select the previous / next row in the Messages list or the tree. Click a row first. The first key press selects the top row. |
 | `Left` / `Right` | In the tree only: collapse / expand the selected topic |
-| `Up`, `Down`, `Enter` (History tab) | Move the cursor, and show the row in the Value tab. Click the History list first. |
+| `Up`, `Down`, `Enter` (History tab) | Move the cursor, and show the row in the Message tab. Click the History list first. |
 
 In a narrow window, `Enter` in the Messages list or the tree opens the details sheet for the selected row. In a wide window, it does nothing. Pause, Edit and publish, Reply, Publish to this topic and the details pane have no shortcut. Use the buttons or the command palette. Pane widths change with the mouse. "Reset the layout" is in the command palette.
 
