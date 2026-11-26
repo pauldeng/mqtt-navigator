@@ -122,6 +122,15 @@ impl Draft {
         Ok(())
     }
 
+    /// Replaces the payload with the Base64 text (or `url`: Base64URL without padding) of the bytes
+    /// that a publish would send now, and switches to Text mode. `Err` is the text for the user,
+    /// and the draft does not change.
+    pub fn convert_base64(&mut self, url: bool) -> Result<(), String> {
+        self.payload = decode::to_base64(&self.payload_bytes()?, url);
+        self.mode = PayloadMode::Text;
+        Ok(())
+    }
+
     /// The message to send. The core checks the result with `validate_outgoing`.
     pub fn to_outgoing(&self, op_id: u64) -> Result<Outgoing, String> {
         let payload = Bytes::from(self.payload_bytes()?);
@@ -666,6 +675,34 @@ mod tests {
             payload: payload.into(),
             ..Draft::default()
         }
+    }
+
+    #[test]
+    fn convert_to_base64_from_text_and_hex() {
+        for (mode, payload) in [
+            (PayloadMode::Text, "Hello"),
+            (PayloadMode::Hex, "48 65 6c 6c 6f"),
+        ] {
+            for (url, want) in [(false, "SGVsbG8="), (true, "SGVsbG8")] {
+                let mut d = Draft {
+                    mode,
+                    ..draft("t", payload)
+                };
+                assert_eq!(d.convert_base64(url), Ok(()));
+                assert_eq!((d.payload.as_str(), d.mode), (want, PayloadMode::Text));
+                // Publish sends the text itself.
+                assert_eq!(d.payload_bytes(), Ok(want.as_bytes().to_vec()));
+            }
+        }
+        let mut d = draft("t", "");
+        assert_eq!(d.convert_base64(false), Ok(()));
+        assert_eq!(d.payload, "");
+        let mut d = Draft {
+            mode: PayloadMode::Hex,
+            ..draft("t", "4g")
+        };
+        assert!(d.convert_base64(false).is_err());
+        assert_eq!((d.payload.as_str(), d.mode), ("4g", PayloadMode::Hex));
     }
 
     fn msg(payload: &'static [u8], props: MsgProps) -> Msg {
