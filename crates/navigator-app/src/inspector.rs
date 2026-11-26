@@ -206,7 +206,7 @@ pub fn next_step(bytes: usize, took_ms: f32) -> usize {
 
 /// End of the next chunk of `text`, from the byte `from` (a character boundary). The chunk has
 /// at most `chunk` bytes. It ends after a line break in its second half if there is one, so a
-/// line is not cut. Else it ends at the last character boundary that fits. `text.len()` when
+/// line is not cut. Else it ends after a line break within 64 bytes after the chunk. Else it ends at the last character boundary that fits. `text.len()` when
 /// the rest fits. The result is always above `from` (a whole character at least) unless
 /// `from` is the end of the text.
 pub fn next_cut(text: &str, from: usize, chunk: usize) -> usize {
@@ -217,6 +217,14 @@ pub fn next_cut(text: &str, from: usize, chunk: usize) -> usize {
     let mid = from + chunk / 2;
     if let Some(i) = text.as_bytes()[mid..end].iter().rposition(|&b| b == b'\n') {
         return mid + i + 1;
+    }
+    // A line break just after the chunk: a hex line (48 bytes) is not cut in a pair.
+    if let Some(i) = text.as_bytes()[end..]
+        .iter()
+        .take(64)
+        .position(|&b| b == b'\n')
+    {
+        return end + i + 1;
     }
     let mut e = text.floor_char_boundary(end);
     // A character wider than the chunk would give no progress: take the whole character.
@@ -380,6 +388,8 @@ mod tests {
         assert_eq!(next_cut(t, 0, 12), 10);
         // No line break in the second half: cut at the limit.
         assert_eq!(next_cut("aaaaaaaaaaaaaaaa", 0, 8), 8);
+        // A line break within 64 bytes after the chunk: a hex line is not cut.
+        assert_eq!(next_cut("aaaaaaaaaaaaaaaa\nb", 0, 8), 17);
         // Never inside a character: "é" has two bytes.
         let t = "aaaaaaaé";
         assert_eq!(next_cut(t, 0, 8), 7);

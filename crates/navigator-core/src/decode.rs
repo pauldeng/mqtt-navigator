@@ -13,7 +13,6 @@ use base64::engine::general_purpose::{
 };
 
 use crate::model::MsgProps;
-use crate::publish::to_hex;
 use crate::text::{escape, is_bidi_control};
 
 /// Default input limit of the UI: it renders the first 256 KiB. "Show all" passes the length of
@@ -324,7 +323,12 @@ fn hex_text(bytes: &[u8], cancel: &AtomicBool) -> Result<String, (String, usize)
             if i > 0 || j > 0 {
                 out.push('\n');
             }
-            out.push_str(&to_hex(line));
+            for (k, b) in line.iter().enumerate() {
+                if k > 0 {
+                    out.push(' ');
+                }
+                let _ = write!(out, "{b:02x}");
+            }
         }
     }
     Ok(out)
