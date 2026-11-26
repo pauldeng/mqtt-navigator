@@ -11,6 +11,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Base64 and Base64URL decoders (the version that ntex and ureq already use).
+base64 = "0.23.1"
 bytes = "1.12.2"
 # The MQTT client (D4 of the ntex plan). The maintainer breaks the API in each major: run the broker tests on each update.
 ntex = { version = "4.9.2", default-features = false, features = ["tokio", "ws"] }

@@ -250,12 +250,14 @@ The right pane has two tabs: **Message** and **History**.
 - In a narrower window, a click opens the details as a sheet. If you select with the keyboard, the focus stays in the list. Press **Enter** to open the sheet for the selected row. When you close the sheet, the focus returns to the list.
 - The header shows the full topic (you can select the text) and a **⋯** menu. **Edit and publish** is the one action button.
 - The **⋯** menu has: **Copy topic**, **Copy payload**, **Publish to this topic**, **Reply** (only when the message has a Response Topic), **Decoder**, **Wrap**, **Expand** and **Clear retained…**. Use **Expand** to widen the pane.
-- **Message:** the full payload. Choose a **decoder** in the **⋯** menu: Auto, Text, JSON, Hex, Base64 or Number. Auto decides in this order:
+- **Message:** the full payload. Choose a **decoder** in the **⋯** menu: Auto, Text, JSON, Hex, Base64, Base64URL, Base64 → Hex, Base64URL → Hex or Number. Auto decides in this order:
   1. JSON, if the content type is `application/json` or ends with `+json`, or if the payload starts and ends like `{…}` or `[…]` (spaces around it do not count).
   2. Text, if the payload format flag says UTF-8, or if the payload is valid UTF-8.
   3. Hex, for all other payloads.
 
-  Auto never picks Number. For Number, set the type (int8, uint8, int16, uint16, int32, uint32, int64, uint64, float32 or float64) and the byte order (LE or BE).
+  Hex shows the bytes as pairs, like `00 ff 10`. You can copy them into the composer in Hex mode. Base64 and Base64URL show the bytes as text (Base64URL has no padding). Base64 → Hex and Base64URL → Hex read the payload as Base64 text (with or without padding, spaces and line breaks ignored) and show the bytes as hex.
+
+  Auto never picks Number, Base64 or Base64URL. For Number, set the type (int8, uint8, int16, uint16, int32, uint32, int64, uint64, float32 or float64) and the byte order (LE or BE).
 - One muted line under the payload shows QoS, retained, size and arrival time.
 - If a decoder cannot show the payload, the pane shows the cause and **Use Hex**.
 - JSON shows pretty-printed. Wrap is on. **Copy payload** copies the whole formatted text.

@@ -24,7 +24,7 @@ Status: `done`, `dropped` (with a reason), `better` (we do more than the referen
 | Topic filter | substring | Substring, debounced, keeps ancestors; also searches the first 1 KiB of the payload in the Messages view | P3 | better |
 | Sort | a-z, messages, topics | Tree a–z only. The message list is always chronological. | P3 | dropped (simpler) |
 | Pause | stop merge, buffer up to 100 MB | Pause with the store budget, drops shown | P3 | done |
-| Value view | JSON/Text | JSON, Text, Hex, Base64, Number (8–64 bit, float, both byte orders); auto from content-type; background formatting; Show all and Show more for long payloads | P5 | better |
+| Value view | JSON/Text | JSON, Text, Hex, Base64, Base64URL, Base64 → Hex, Base64URL → Hex, Number (8–64 bit, float, both byte orders); auto from content-type; background formatting; Show all and Show more for long payloads | P5 | better |
 | MQTT 5 properties (receive) | user properties only | Content type, response topic, correlation data, message expiry, payload format and user properties | P5 | better |
 | Subscription options and connection details | — | No Local, Retain As Published, Retain Handling (MQTT 5); a "Connection details" popover with the CONNACK facts | P8 | better |
 | MQTT 5 properties (publish) | none | content-type, response topic, correlation data, expiry, user properties | P5 | better |
