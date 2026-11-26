@@ -4,6 +4,8 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-11-26
+
 ### Added
 
 - Decoders **Base64URL**, **Base64 → Hex** and **Base64URL → Hex**. Base64URL shows the bytes as URL-safe Base64 text without padding. The two Hex decoders read the payload as Base64 or Base64URL text, with or without padding, and show the bytes as hex. White space in the text is ignored. A payload that the app stored in part is decoded in complete groups of 4 characters, and the bytes show as hex. Auto never picks them.
@@ -13,6 +15,7 @@ All notable changes to this project are in this file. The format follows [Keep a
 
 - The details pane shows a **Topic** caption before the topic. The **Value** tab is now **Message**.
 - The Hex decoder shows only the bytes as hex pairs, 16 on each line, like `00 ff 10`. The offset and ASCII columns are gone. You can copy the text into the composer in Hex mode.
+- The command palette entry **Copy the value** is now **Copy payload**, the same name as in the details menu.
 
 ### Fixed
 
@@ -282,7 +285,8 @@ First version.
 - The `ms-mqtt-client` library has no limit for the packet size. The app uses a local patch.
 - Software rendering is only partly tested. On Linux the app starts with the Mesa lavapipe driver. Windows WARP, virtual machines and remote desktops are not tested.
 
-[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/pauldeng/mqtt-navigator/compare/v0.2.4...v0.2.5
