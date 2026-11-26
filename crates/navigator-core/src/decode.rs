@@ -739,11 +739,8 @@ mod tests {
         let t = ok(Decoder::Hex, &big);
         let lines: Vec<&str> = t.lines().collect();
         assert_eq!(lines.len(), (STEP + 1).div_ceil(16));
-        assert!(
-            lines[..lines.len() - 1]
-                .iter()
-                .all(|l| *l == vec!["ab"; 16].join(" "))
-        );
+        let full = vec!["ab"; 16].join(" ");
+        assert!(lines[..lines.len() - 1].iter().all(|l| *l == full));
         assert_eq!(lines[lines.len() - 1], "ab");
         assert!(!t.ends_with(['\n', ' ']));
         // The composer reads it back.
