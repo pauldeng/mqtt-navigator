@@ -1,4 +1,4 @@
-//! The details pane (inspector): Value and History tabs, the decoder, the background render
+//! The details pane (inspector): Message and History tabs, the decoder, the background render
 //! job, and the actions that fill the composer. Below 1 100 px the pane opens as a sheet.
 
 use gpui_kit::component::collapsible::Collapsible;
@@ -127,7 +127,7 @@ pub(super) struct Inspector {
     pub(super) editor: Entity<EditorState>,
     pub(super) decoder_select: Entity<SelectState<Vec<DecoderItem>>>,
     kind_select: Entity<SelectState<Vec<KindItem>>>,
-    /// A History row that the user chose. The Value tab shows it instead of the selection.
+    /// A History row that the user chose. The Message tab shows it instead of the selection.
     pub(super) hist_pick: Option<(u64, Msg)>,
     /// The History list takes the keys. `hist_cursor` is the row that Up and Down moved to.
     hist_focus: FocusHandle,
@@ -136,13 +136,13 @@ pub(super) struct Inspector {
     /// The full topic of the header, as a read-only input, so that the text can be selected.
     topic_view: Entity<InputState>,
     topic_text: String,
-    /// The escaped metadata line of the Value tab, for the message of this identity.
+    /// The escaped metadata line of the Message tab, for the message of this identity.
     meta: Option<(DetailKey, i32, SharedString)>,
     /// The last `Navigator::selection` that the pane saw: a new one drops the History pick.
     selection: u64,
-    /// The Properties section of the Value tab is open (collapsed by default).
+    /// The Properties section of the Message tab is open (collapsed by default).
     props_open: bool,
-    /// The Value tab takes the focus when a History row is chosen.
+    /// The Message tab takes the focus when a History row is chosen.
     value_focus: FocusHandle,
     /// The pane. When it closes with the focus inside, the root takes the focus.
     pub(super) pane_focus: FocusHandle,
@@ -283,14 +283,14 @@ struct Inputs {
     utc: i32,
     /// The result of the selected sent message.
     sent: Option<(String, bool)>,
-    /// Identity and size of the base of the Value tab (selection or latest value).
+    /// Identity and size of the base of the Message tab (selection or latest value).
     base_seq: u64,
     base_len: usize,
     base_at: Option<SystemTime>,
 }
 
 impl Navigator {
-    /// What the Value tab shows now. `pick`: the History row that the user chose.
+    /// What the Message tab shows now. `pick`: the History row that the user chose.
     pub(super) fn shown_with(&self, pick: Option<&(u64, Msg)>) -> Option<Shown> {
         let hist = |node: Option<NodeId>, topic: String, direction: Direction| {
             let (seq, m) = pick?.clone();
@@ -343,7 +343,7 @@ impl Navigator {
         }
     }
 
-    /// What the Value tab shows now.
+    /// What the Message tab shows now.
     pub(super) fn shown(&self, cx: &App) -> Option<Shown> {
         self.shown_with(self.pane.read(cx).insp.hist_pick.as_ref())
     }
@@ -395,7 +395,7 @@ impl Navigator {
         self.store.row_send_status(s.id).cloned()
     }
 
-    /// The arrival time that the Value tab compares a History row with: the selected message,
+    /// The arrival time that the Message tab compares a History row with: the selected message,
     /// or the latest value of the selected topic.
     fn base_received_at(&self) -> Option<SystemTime> {
         match self.detail_of {
@@ -563,7 +563,7 @@ impl DetailsPane {
         }
     }
 
-    /// What the Value tab shows now.
+    /// What the Message tab shows now.
     fn shown(&self, cx: &App) -> Option<Shown> {
         let pick = self.insp.hist_pick.as_ref();
         self.nav
@@ -1226,10 +1226,23 @@ impl DetailsPane {
                     .child("Details")
                     .into_any_element()
             } else {
-                Input::new(&self.insp.topic_view)
-                    .small()
-                    .readonly(true)
-                    .appearance(false)
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Topic"),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.insp.topic_view)
+                                .small()
+                                .readonly(true)
+                                .appearance(false),
+                        ),
+                    )
                     .into_any_element()
             }))
             .child(self.render_details_menu(&inputs, cx))
@@ -1261,7 +1274,7 @@ impl DetailsPane {
                 };
                 cx.notify();
             }))
-            .child("Value")
+            .child("Message")
             .child("History");
 
         let has_topic = inputs.topic.is_some();
@@ -1438,7 +1451,7 @@ impl DetailsPane {
                                 .label("Show latest")
                                 .on_click(cx.listener(|v, _, window, cx| {
                                     v.insp.hist_pick = None;
-                                    // The button goes away: the focus moves to the Value area.
+                                    // The button goes away: the focus moves to the Message area.
                                     v.insp.value_focus.focus(window, cx);
                                     v.changed(window, cx);
                                 })),
@@ -1753,14 +1766,14 @@ impl DetailsPane {
         cx.notify();
     }
 
-    /// Enter in History: shows the row of the cursor in the Value tab.
+    /// Enter in History: shows the row of the cursor in the Message tab.
     fn confirm_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let (Some(node), Some(seq)) = (self.selected_node(cx), self.insp.hist_cursor) {
             self.pick_history(node, seq, window, cx);
         }
     }
 
-    /// A History row was chosen: the Value tab shows it, and the focus moves to that tab.
+    /// A History row was chosen: the Message tab shows it, and the focus moves to that tab.
     fn pick_history(
         &mut self,
         node: NodeId,

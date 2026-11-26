@@ -115,9 +115,10 @@ The window has one place for each job. A control shows when it can act. Rare act
   - **Wide window (1 100 px or more):** the pane opens when you select a message or a topic, with the mouse or the keyboard. Its close button closes it. It stays closed until the next selection, or until you open it from the command palette ("Details: Open").
   - **Narrow window:** a click opens the details as a right-side sheet. Keyboard selection keeps the focus in the list, and `Enter` opens the sheet for the selected row. Closing the sheet returns the focus to the list.
   - Header: the full topic as selectable text, and a `⋯` menu. There is no breadcrumb.
-  - Tabs: **Value** and **History**.
-  - The Value tab shows the payload (pretty JSON, wrap on) and one muted line under it: QoS · retained · size · arrival time. MQTT 5 properties show in a "Properties" section under that line. It is collapsed by default.
-  - **History:** choosing a row shows that message in the Value tab and moves the focus to the Value tab. The Value tab then shows "Earlier message from 12:03:58" and a **Show latest** button. The button returns to the selected message or to the latest value of the topic.
+  - The header shows a muted "Topic" caption before the full topic.
+  - Tabs: **Message** and **History**.
+  - The Message tab shows the payload (pretty JSON, wrap on) and one muted line under it: QoS · retained · size · arrival time. MQTT 5 properties show in a "Properties" section under that line. It is collapsed by default.
+  - **History:** choosing a row shows that message in the Message tab and moves the focus to the Message tab. The Message tab then shows "Earlier message from 12:03:58" and a **Show latest** button. The button returns to the selected message or to the latest value of the topic.
   - **Edit and publish** is the one visible action button. It fills the composer. **No action sends.** The old composer content goes to Drafts, so you can get it back. After the action, focus moves to the composer payload. In a narrow window, the details sheet closes first.
     - **Edit and publish** fills topic, payload bytes, QoS, retain and properties from the message.
       - A payload that is not valid UTF-8 opens in Hex mode with the exact bytes.
@@ -169,7 +170,7 @@ Payloads are often long (400 characters or more, often JSON). Some are a single 
   - Truncation never cuts a character in half (grapheme-safe).
   - The app builds the preview only for visible rows, from the first 512 bytes. There is no work for each arriving message.
 - **Tree view:** one line for each row. A leaf shows a short preview of the last value. A branch shows muted counts.
-- **Details pane, Value tab:**
+- **Details pane, Message tab:**
   - The full payload. JSON is pretty-printed. Lines wrap by default, and the **Wrap** toggle turns wrapping off. Long topics and tokens wrap and do not overflow.
   - **Expand** widens the details pane over the message list. **Restore** returns it to its size.
   - A payload larger than 256 KiB shows its first 256 KiB and **Show all (1.2 MiB)**. Formatting runs in the background (see ARCHITECTURE.md, "Responsive UI").
@@ -194,7 +195,7 @@ This table lists what the app uses now.
 | Filter chips, status warnings | `Tag`, `Tag::warning()` |
 | Topic tree | Our own flat rows on `uniform_list` (chevron icons from `IconName`). gpui-kit `Tree` rebuilds all entries on each change, which is too slow for 100k topics. |
 | Message list | Our own rows on `uniform_list`: one fixed row height for 1-line or 2-line rows, so the scroll anchor stays exact. |
-| Detail tabs (Value, History) | `TabBar::underline()`. We switch the content ourselves. History rows are `ListItem`s. The header has a `⋯` `dropdown_menu`. |
+| Detail tabs (Message, History) | `TabBar::underline()`. We switch the content ourselves. History rows are `ListItem`s. The header has a `⋯` `dropdown_menu`. |
 | Publish composer | `v_flex` at the bottom of the centre pane. closed: one text `Button` (New message). Open: `Input` (topic), `Editor` (payload), `TabBar::segmented()` (Text / Hex), `ToggleGroup` (QoS), `Switch` (Retain), `Button` with `dropdown_menu` (the `⋯` menu), `Tag` (Properties (N)), `Button::primary()` (Send). |
 | Narrow window details | `open_sheet_at(Placement::Right, ..)` below 1 100 px |
 | Decoder choice | `Select` |
@@ -300,7 +301,7 @@ Other rules:
 | `Up`, `Down` | Move the selection in the tree and the list |
 | `Left`, `Right` (tree) | Collapse, expand the selected topic |
 | `Enter` (in the list, narrow window) | Open the details sheet for the selected row |
-| `Up`, `Down`, `Enter` (in History) | Move the cursor in the rows of the History tab, show the row in the Value tab |
+| `Up`, `Down`, `Enter` (in History) | Move the cursor in the rows of the History tab, show the row in the Message tab |
 
 - Pause, Edit and publish, Reply, Publish to this topic and the details pane have buttons, menu items and command palette entries. They have no shortcut, so that they cannot conflict with system or editor keys.
 - Pane widths change with the mouse. The command palette has "Reset the layout".
