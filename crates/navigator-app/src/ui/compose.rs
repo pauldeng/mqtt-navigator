@@ -1123,10 +1123,22 @@ impl ComposerPane {
                 self.mode = PayloadMode::Text;
                 self.error = None;
                 self.set_payload_hint(window, cx);
+                self.payload.update(cx, |e, cx| e.focus(window, cx));
             }
             Err(e) => self.error = Some(e),
         }
         cx.notify();
+    }
+
+    /// The message has bytes to convert: it is not empty, and Hex text is valid.
+    pub(super) fn can_convert(&self, cx: &App) -> bool {
+        let text = self.payload.read(cx).value();
+        match self.mode {
+            PayloadMode::Hex => {
+                navigator_core::publish::parse_hex(&text).is_ok_and(|b| !b.is_empty())
+            }
+            PayloadMode::Text | PayloadMode::Json => !text.is_empty(),
+        }
     }
 
     /// The composer shows the outcome of a publish from it: the draft goes to Sent, or the error
@@ -1232,8 +1244,12 @@ impl ComposerPane {
             .icon(IconName::Ellipsis)
             .tab_stop(true)
             .tooltip("Composer actions")
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu(move |menu, _, app| {
                 let menu = menu.action_context(more_focus.clone());
+                // Read when the menu opens: a Hex check can cost more than a frame allows.
+                let convertible = weak
+                    .read_with(app, |v, app| v.can_convert(app))
+                    .unwrap_or(false);
                 let item = |label: &'static str,
                             run: fn(&mut ComposerPane, &mut Window, &mut Context<ComposerPane>)| {
                     let weak = weak.clone();
@@ -1246,12 +1262,18 @@ impl ComposerPane {
                         item("Beautify JSON", |v, w, cx| v.format_json(true, w, cx)).disabled(hex),
                     )
                     .item(item("Minify JSON", |v, w, cx| v.format_json(false, w, cx)).disabled(hex))
-                    .item(item("Convert to Base64", |v, w, cx| {
-                        v.convert_base64(false, w, cx)
-                    }))
-                    .item(item("Convert to Base64URL", |v, w, cx| {
-                        v.convert_base64(true, w, cx)
-                    }))
+                    .item(
+                        item("Convert to Base64", |v, w, cx| {
+                            v.convert_base64(false, w, cx)
+                        })
+                        .disabled(!convertible),
+                    )
+                    .item(
+                        item("Convert to Base64URL", |v, w, cx| {
+                            v.convert_base64(true, w, cx)
+                        })
+                        .disabled(!convertible),
+                    )
                     .separator()
                     .item(item("History…", |v, w, cx| v.open_history(w, cx)));
                 if v5 {
