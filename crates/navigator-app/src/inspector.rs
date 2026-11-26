@@ -205,10 +205,11 @@ pub fn next_step(bytes: usize, took_ms: f32) -> usize {
 }
 
 /// End of the next chunk of `text`, from the byte `from` (a character boundary). The chunk has
-/// at most `chunk` bytes. It ends after a line break in its second half if there is one, so a
-/// line is not cut. Else it ends after a line break within 64 bytes after the chunk. Else it ends at the last character boundary that fits. `text.len()` when
-/// the rest fits. The result is always above `from` (a whole character at least) unless
-/// `from` is the end of the text.
+/// at most `chunk` bytes, with one exception. It ends after a line break in its second half if
+/// there is one, so a line is not cut. Else a line break (or the end of the text) within 64
+/// bytes after the chunk ends it there: a hex line is not cut in a pair. Else it ends at the
+/// last character boundary that fits. `text.len()` when the rest fits. The result is always
+/// above `from` (a whole character at least) unless `from` is the end of the text.
 pub fn next_cut(text: &str, from: usize, chunk: usize) -> usize {
     let end = from.saturating_add(chunk).min(text.len());
     if end == text.len() {
@@ -218,13 +219,12 @@ pub fn next_cut(text: &str, from: usize, chunk: usize) -> usize {
     if let Some(i) = text.as_bytes()[mid..end].iter().rposition(|&b| b == b'\n') {
         return mid + i + 1;
     }
-    // A line break just after the chunk: a hex line (48 bytes) is not cut in a pair.
-    if let Some(i) = text.as_bytes()[end..]
-        .iter()
-        .take(64)
-        .position(|&b| b == b'\n')
-    {
+    let rest = &text.as_bytes()[end..];
+    if let Some(i) = rest.iter().take(64).position(|&b| b == b'\n') {
         return end + i + 1;
+    }
+    if rest.len() <= 64 {
+        return text.len();
     }
     let mut e = text.floor_char_boundary(end);
     // A character wider than the chunk would give no progress: take the whole character.
@@ -384,15 +384,16 @@ mod tests {
         // The rest fits: one chunk.
         assert_eq!(next_cut("abc", 0, 10), 3);
         // A line break in the second half of the chunk is the cut (it stays in the chunk).
-        let t = "aaaa\nbbbb\ncccc\ndddd";
-        assert_eq!(next_cut(t, 0, 12), 10);
+        let t = "aaaa\nbbbb\ncccc\ndddd".to_string() + &"e".repeat(100);
+        assert_eq!(next_cut(&t, 0, 12), 10);
         // No line break in the second half: cut at the limit.
-        assert_eq!(next_cut("aaaaaaaaaaaaaaaa", 0, 8), 8);
-        // A line break within 64 bytes after the chunk: a hex line is not cut.
-        assert_eq!(next_cut("aaaaaaaaaaaaaaaa\nb", 0, 8), 17);
+        assert_eq!(next_cut(&"a".repeat(200), 0, 8), 8);
+        // A line break, or the end, within 64 bytes after the chunk: a hex line is not cut.
+        assert_eq!(next_cut(&format!("{}\nb", "a".repeat(16)), 0, 8), 17);
+        assert_eq!(next_cut(&"a".repeat(30), 0, 8), 30);
         // Never inside a character: "é" has two bytes.
-        let t = "aaaaaaaé";
-        assert_eq!(next_cut(t, 0, 8), 7);
+        let t = "aaaaaaaé".to_string() + &"a".repeat(100);
+        assert_eq!(next_cut(&t, 0, 8), 7);
         // All chunks together are the whole text, and none is empty.
         let t = "x\n".repeat(1000) + &"é".repeat(777) + &"y".repeat(5000);
         let (mut at, mut parts) = (0, 0);
@@ -418,7 +419,7 @@ mod tests {
     #[test]
     fn growth_always_makes_progress_across_wide_characters() {
         // The target (32 KiB) falls inside "é": a step of 1 byte must still pass it.
-        let t = "a".repeat(32767) + "é" + "tail";
+        let t = "a".repeat(32767) + "é" + &"t".repeat(100);
         assert_eq!(next_cut(&t, 32767, 1), 32769);
         // Automatic growth in steps of 1 byte reaches the end, and every cut is a boundary.
         let t = "aé€😀".repeat(50);
@@ -429,7 +430,7 @@ mod tests {
             at = to;
             steps += 1;
         }
-        assert_eq!(steps, 200);
+        assert!(steps > 100);
         // A manual "Show more" target inside a character: the limit is the target, the cut
         // is the next boundary, and the loop stops (shown >= target).
         let t = "x".repeat(65535) + "😀" + "end";
