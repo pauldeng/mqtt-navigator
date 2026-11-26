@@ -739,6 +739,7 @@ impl DetailsPane {
             };
         }
         let payload = s.msg.payload.clone();
+        let stored_cut = s.msg.truncated;
         // Auto scans the payload (UTF-8 check): the job does it, not the UI thread. Only Auto
         // reads the properties.
         let choice = want.choice;
@@ -757,7 +758,7 @@ impl DetailsPane {
                 .background_executor()
                 .spawn(async move {
                     let decoder = choice.resolve(&payload, &props);
-                    let out = decode::render(decoder, &payload, limit, &cancel);
+                    let out = decode::render_stored(decoder, &payload, limit, stored_cut, &cancel);
                     let hash = text_hash(&out);
                     (out, hash)
                 })

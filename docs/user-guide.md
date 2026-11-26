@@ -255,7 +255,7 @@ The right pane has two tabs: **Message** and **History**.
   2. Text, if the payload format flag says UTF-8, or if the payload is valid UTF-8.
   3. Hex, for all other payloads.
 
-  Hex shows the bytes as pairs, like `00 ff 10`. You can copy them into the composer in Hex mode. Base64 and Base64URL show the bytes as text (Base64URL has no padding). Base64 → Hex and Base64URL → Hex read the payload as Base64 text (with or without padding, spaces and line breaks ignored) and show the bytes as hex.
+  Hex shows the bytes as pairs, like `00 ff 10`, 16 on each line. You can copy them into the composer in Hex mode. Base64 and Base64URL show the bytes as text (Base64URL has no padding). Base64 → Hex and Base64URL → Hex read the payload as Base64 text (with or without padding, spaces and line breaks ignored) and show the bytes as hex.
 
   Auto never picks Number, Base64 or Base64URL. For Number, set the type (int8, uint8, int16, uint16, int32, uint32, int64, uint64, float32 or float64) and the byte order (LE or BE).
 - One muted line under the payload shows QoS, retained, size and arrival time.
@@ -272,7 +272,7 @@ The composer is closed by default. The bottom of the centre pane then shows one 
 
 1. Select **New message**.
 2. Type the topic.
-3. Type the message.
+3. Type the payload.
 4. Set QoS 0 or 1, and **Retain** if you need it.
 5. Press **Publish** or `Ctrl/Cmd+Enter`.
 
@@ -284,7 +284,7 @@ The result shows below the payload and, if it is not routine, in the list row. A
 - **JSON** sends the same bytes as Text. The composer checks the payload: valid JSON gets syntax colours. Invalid JSON shows a warning under the payload, for example "The payload is not valid JSON: … Publish still sends it as is." You can still publish it. Text and JSON keep the same text when you switch between them.
 - The **⋯** menu of the composer has: **Beautify JSON**, **Minify JSON**, **Convert to Base64**, **Convert to Base64URL**, **History…** and **Properties** (MQTT 5).
 - **Beautify JSON** indents the JSON payload. **Minify JSON** removes all spaces and line breaks outside strings. Both keep the key order. They work up to 1 MiB, in Text and JSON mode.
-- **Convert to Base64** and **Convert to Base64URL** (in the composer **⋯** menu) encode the bytes that Publish would send now. For example, Hex `48 65 6c 6c 6f` becomes `SGVsbG8=` (Base64) or `SGVsbG8` (Base64URL, no padding). The text goes in the payload box, and the mode changes to Text. The focus returns to the payload box. The old draft goes to Drafts. The two items are off when the payload has no bytes, or when the Hex text is not valid. To go back, open the old draft in **History…**. The items work up to 256 KiB of text in the payload box (spaces in Hex count).
+- **Convert to Base64** and **Convert to Base64URL** (in the composer **⋯** menu) encode the bytes that Publish would send now. For example, Hex `48 65 6c 6c 6f` becomes `SGVsbG8=` (Base64) or `SGVsbG8` (Base64URL, no padding). The text goes in the payload box, and the mode changes to Text. The focus returns to the payload box. The old draft goes to Drafts if it is unsent and not empty (a payload that you sent stays in Sent). The two items are off when the payload has no bytes, or when the Hex text is not valid. To go back, open the old draft in **History…**. The items work up to 256 KiB of text in the payload box (spaces in Hex count).
 - **Properties** (MQTT 5): a **Properties (N)** tag shows next to the topic when a property is present. Select it to open the section. The section shows only the properties that are present. Use **Add property** to add: **Payload format: UTF-8**, content type, response topic, correlation data (hex), message expiry or user property. **Send empty** keeps an empty property in the message. A property that you add stays visible while it is empty.
 - **History** menu: **Drafts** (the last 5 drafts that you replaced) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. A draft leaves **Drafts** when you choose it. The app does not save History to disk. It clears History when you change the connection.
 - The composer saves the old content as a draft before something replaces it. These actions replace it: a choice in History, Edit and publish, Reply, Publish to this topic, Beautify JSON, Minify JSON and the Text/Hex switch. Convert to Base64 and Convert to Base64URL also save it, but they stop and keep the text if the draft is too large. The app saves the old content only if it is unsent, it is not empty (a topic alone is empty) and it is at most 1 MiB. A larger draft is dropped, and the app says "The old draft is larger than 1 MiB. It is not kept."

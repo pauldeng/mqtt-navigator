@@ -230,10 +230,10 @@ impl Navigator {
         if window.has_active_dialog(cx) {
             return;
         }
-        let entries = palette::available(&self.facts(cx));
+        let facts = self.facts(cx);
+        let entries = palette::available(&facts);
         let target = Rc::new(self.palette_target(cx));
         let cmds: Rc<Vec<Cmd>> = Rc::new(entries.iter().map(|e| e.cmd).collect());
-        let facts = self.facts(cx);
         let rows: Rc<Vec<PaletteRow>> = Rc::new(
             entries
                 .iter()
