@@ -97,20 +97,20 @@ The window has one place for each job. A control shows when it can act. Rare act
   - The composer is **closed** by default. Then the bottom of the centre pane shows one text button, **New message** (`Ctrl/Cmd+Shift+N`). This is the only New message button.
   - Closing keeps the editors and the draft. Opening restores them. Closing does not move the draft into History.
   - Edit and publish, Reply, Publish to this topic and a History recall open the composer too. The palette entry "Publish" opens a closed composer first. It does not send a draft that you cannot see.
-  - The open composer has the topic, the message, and one row: message mode `Text | Hex | JSON` (always visible, because it changes the bytes that are sent), QoS `0 | 1`, Retain, a `⋯` menu and **Publish** (`Ctrl/Cmd+Enter`). JSON sends the text as is. It checks the text in the background: valid JSON gets tree-sitter highlighting ([ADR 0007](adr/0007-json-highlighting.md)), invalid JSON a warning line in the warning colour. The warning does not block Publish.
+  - The open composer has the topic, the payload, and one row: payload mode `Text | Hex | JSON` (always visible, because it changes the bytes that are sent), QoS `0 | 1`, Retain, a `⋯` menu and **Publish** (`Ctrl/Cmd+Enter`). JSON sends the text as is. It checks the text in the background: valid JSON gets tree-sitter highlighting ([ADR 0007](adr/0007-json-highlighting.md)), invalid JSON a warning line in the warning colour. The warning does not block Publish.
   - The `⋯` menu holds: Beautify JSON, Minify JSON, Convert to Base64, Convert to Base64URL, History… and Properties (MQTT 5). A visible ✕ button at the end of the topic row closes the composer (also `Esc`). A menu item that is a state uses a checked item.
   - **One close operation** serves the Close item, `Esc` and the palette. It moves the focus to the message list, so the focus never stays on a removed control.
-  - The composer stays open after Publish. The last result shows under the message ("Acknowledged", "Rejected: …"). Show long results on a maximum of three lines.
+  - The composer stays open after Publish. The last result shows under the payload ("Acknowledged", "Rejected: …"). Show long results on a maximum of three lines.
   - A "Properties (N)" tag shows next to the topic when any property is present. The count includes present-but-empty properties ("Send empty"). A click on the tag opens the section.
   - **Properties** (MQTT 5) shows only the fields that are present, and an "Add property ▾" menu for the others: payload format (UTF-8), content type, response topic, correlation data, message expiry and user property. A field that you add stays visible while it is empty, because "present" is a state separate from the text. A History recall or a Reply opens Properties when it fills a field.
-  - The maximum height of the composer is 55% of the window height. If that is less than 17.5 rem, the maximum is 17.5 rem, so that the fixed rows keep their room at a large zoom. At the end, the composer takes at most 80% of the window. The Properties fields scroll as one block inside it. The topic, the message and the action row (mode, QoS, Retain, Publish) always stay in view, and the message list keeps the rest of the height. A centre pane narrower than 560 design pixels puts the label of a property above its field.
-  - Message mode is **Text**, **Hex** or **JSON**. A Hex message is sent as raw bytes. JSON sends the text as is, with a validity check and highlighting. Beautify and Minify work in Text and JSON mode.
+  - The maximum height of the composer is 55% of the window height. If that is less than 17.5 rem, the maximum is 17.5 rem, so that the fixed rows keep their room at a large zoom. At the end, the composer takes at most 80% of the window. The Properties fields scroll as one block inside it. The topic, the payload and the action row (mode, QoS, Retain, Publish) always stay in view, and the message list keeps the rest of the height. A centre pane narrower than 560 design pixels puts the label of a property above its field.
+  - Payload mode is **Text**, **Hex** or **JSON**. A Hex payload is sent as raw bytes. JSON sends the text as is, with a validity check and highlighting. Beautify and Minify work in Text and JSON mode.
   - The **History** menu has two groups: **Drafts** (the last 5 replaced drafts) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. Nothing is saved to disk.
   - **Every** replacement of the composer content first saves the current draft to Drafts, if it has content and was not sent. This includes History recall, Edit and publish, Reply, and Publish to this topic.
   - The topic and the property texts are single-line inputs. A text with a line break shows escaped (`\n`) with the note "This topic has line breaks; they are kept.". The composer keeps the exact text until you edit that field.
   - Content type, correlation data and each user property have **Send empty**: a property that is present but empty stays present in Edit and publish and in the sent message.
-  - **Beautify JSON** and **Minify JSON** work up to 1 MiB of message and 2 MiB of result, and it saves the old draft first. The Text/Hex switch saves the old draft, too.
-  - **Convert to Base64** and **Convert to Base64URL** (in the `⋯` menu and the command palette) encode the bytes that Publish would send now. They put the text in the message box, switch to Text mode and move the focus to the message box. They are off when the message has no bytes or the Hex text is not valid. They work up to 256 KiB. Base64 has padding. Base64URL has none. The old draft is saved first.
+  - **Beautify JSON** and **Minify JSON** work up to 1 MiB of payload and 2 MiB of result, and it saves the old draft first. The Text/Hex switch saves the old draft, too.
+  - **Convert to Base64** and **Convert to Base64URL** (in the `⋯` menu and the command palette) encode the bytes that Publish would send now. They put the text in the payload box, switch to Text mode and move the focus to the payload box. They are off when the payload has no bytes or the Hex text is not valid. They work up to 256 KiB. Base64 has padding. Base64URL has none. The old draft is saved first.
   - While disconnected, Publish is disabled and the composer shows "Connect to a broker first." when it has no result to show. The result of the last publish stays on screen.
 - **Right pane, details of the selected message or topic:**
   - **Wide window (1 100 px or more):** the pane opens when you select a message or a topic, with the mouse or the keyboard. Its close button closes it. It stays closed until the next selection, or until you open it from the command palette ("Details: Open").
@@ -120,7 +120,7 @@ The window has one place for each job. A control shows when it can act. Rare act
   - Tabs: **Message** and **History**.
   - The Message tab shows the payload (pretty JSON, wrap on) and one muted line under it: QoS · retained · size · arrival time. MQTT 5 properties show in a "Properties" section under that line. It is collapsed by default.
   - **History:** choosing a row shows that message in the Message tab and moves the focus to the Message tab. The Message tab then shows "Earlier message from 12:03:58" and a **Show latest** button. The button returns to the selected message or to the latest value of the topic.
-  - **Edit and publish** is the one visible action button. It fills the composer. **No action sends.** The old composer content goes to Drafts, so you can get it back. After the action, focus moves to the composer message. In a narrow window, the details sheet closes first.
+  - **Edit and publish** is the one visible action button. It fills the composer. **No action sends.** The old composer content goes to Drafts, so you can get it back. After the action, focus moves to the composer payload. In a narrow window, the details sheet closes first.
     - **Edit and publish** fills topic, payload bytes, QoS, retain and properties from the message.
       - A payload that is not valid UTF-8 opens in Hex mode with the exact bytes.
       - The action is disabled when the full payload is not stored (truncated or evicted). The reason shows next to it: "The full payload is not stored."
@@ -197,7 +197,7 @@ This table lists what the app uses now.
 | Topic tree | Our own flat rows on `uniform_list` (chevron icons from `IconName`). gpui-kit `Tree` rebuilds all entries on each change, which is too slow for 100k topics. |
 | Message list | Our own rows on `uniform_list`: one fixed row height for 1-line or 2-line rows, so the scroll anchor stays exact. |
 | Detail tabs (Message, History) | `TabBar::underline()`. We switch the content ourselves. History rows are `ListItem`s. The header has a `⋯` `dropdown_menu`. |
-| Publish composer | `v_flex` at the bottom of the centre pane. closed: one text `Button` (New message). Open: `Input` (topic), `Editor` (message), `TabBar::segmented()` (Text / Hex), `ToggleGroup` (QoS), `Switch` (Retain), `Button` with `dropdown_menu` (the `⋯` menu), `Tag` (Properties (N)), `Button::primary()` (Send). |
+| Publish composer | `v_flex` at the bottom of the centre pane. closed: one text `Button` (New message). Open: `Input` (topic), `Editor` (payload), `TabBar::segmented()` (Text / Hex), `ToggleGroup` (QoS), `Switch` (Retain), `Button` with `dropdown_menu` (the `⋯` menu), `Tag` (Properties (N)), `Button::primary()` (Send). |
 | Narrow window details | `open_sheet_at(Placement::Right, ..)` below 1 100 px |
 | Decoder choice | `Select` |
 | Payload view and Publish editor | `Editor`. Without the `tree-sitter` feature, the editor shows plain text. |
@@ -283,8 +283,8 @@ Key bindings are scoped to each area (`KeyBinding` with a context). There is no 
 
 Other rules:
 
-- `Tab` always moves focus, also in the message editor. To indent JSON, use **Beautify JSON** in the composer.
-- `Ctrl/Cmd+F` always focuses the app filter. The message editor has no separate find.
+- `Tab` always moves focus, also in the payload editor. To indent JSON, use **Beautify JSON** in the composer.
+- `Ctrl/Cmd+F` always focuses the app filter. The payload editor has no separate find.
 
 | Keys | Action |
 |---|---|
