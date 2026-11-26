@@ -314,6 +314,24 @@ pub static COMMANDS: &[Entry] = &[
         value,
     ),
     e(
+        "decoder-base64-url",
+        "Decoder: Base64URL",
+        Cmd::Decoder(DecoderPick::Base64Url),
+        value,
+    ),
+    e(
+        "decoder-base64-to-hex",
+        "Decoder: Base64 → Hex",
+        Cmd::Decoder(DecoderPick::Base64ToHex),
+        value,
+    ),
+    e(
+        "decoder-base64-url-to-hex",
+        "Decoder: Base64URL → Hex",
+        Cmd::Decoder(DecoderPick::Base64UrlToHex),
+        value,
+    ),
+    e(
         "decoder-number",
         "Decoder: Number",
         Cmd::Decoder(DecoderPick::Number),

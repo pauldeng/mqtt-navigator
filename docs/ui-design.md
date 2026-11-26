@@ -123,7 +123,7 @@ The window has one place for each job. A control shows when it can act. Rare act
     - **Edit and publish** fills topic, payload bytes, QoS, retain and properties from the message.
       - A payload that is not valid UTF-8 opens in Hex mode with the exact bytes.
       - The action is disabled when the full payload is not stored (truncated or evicted). The reason shows next to it: "The full payload is not stored."
-      - The composer never takes a formatted view (pretty JSON, Hex dump, Base64) as the payload text.
+      - The composer never takes a formatted view (pretty JSON, Hex, Base64) as the payload text.
   - The `⋯` menu holds: Copy topic, Copy payload, Publish to this topic, Reply (only with a Response Topic), Decoder, Wrap, Expand and Clear retained… (last, after a separator, with confirmation).
     - **Publish to this topic** sets the topic only and keeps the payload. It is available for a topic and for a message. It does not need a stored payload: a branch of the tree and a topic with an evicted value work too.
     - **Reply** sets the topic to the response topic and copies the correlation data. The payload is empty, Retain is off, and the other properties are empty.

@@ -6,7 +6,14 @@ use std::fmt::{Display, Write as _};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use base64::Engine as _;
+use base64::engine::GeneralPurpose;
+use base64::engine::general_purpose::{
+    STANDARD, STANDARD_NO_PAD_INDIFFERENT, URL_SAFE_NO_PAD, URL_SAFE_NO_PAD_INDIFFERENT,
+};
+
 use crate::model::MsgProps;
+use crate::publish::to_hex;
 use crate::text::{escape, is_bidi_control};
 
 /// Default input limit of the UI: it renders the first 256 KiB. "Show all" passes the length of
@@ -57,10 +64,16 @@ pub enum Decoder {
     Text,
     /// JSON, pretty printed. Keys keep their order.
     Json,
-    /// Offset, 16 bytes and an ASCII column on each line (like `hexdump -C`).
+    /// The bytes as hex pairs ("00 ff 10"), on one line. The composer reads this format.
     Hex,
     /// Standard Base64 with padding, on one line.
     Base64,
+    /// Base64URL (RFC 4648 section 5): URL-safe alphabet, no padding, on one line.
+    Base64Url,
+    /// The payload is Base64 text (with or without padding). Shows the bytes as hex.
+    Base64ToHex,
+    /// The payload is Base64URL text (with or without padding). Shows the bytes as hex.
+    Base64UrlToHex,
     /// A list of numbers, one for each line.
     Number(NumberKind, Endian),
 }
@@ -164,7 +177,14 @@ pub fn render(decoder: Decoder, payload: &[u8], limit: usize, cancel: &AtomicBoo
         }
         Decoder::Json => json(head, true, cancel),
         Decoder::Hex => hex(head, cut, cancel),
-        Decoder::Base64 => base64(head, cut, cancel),
+        Decoder::Base64 => base64(&STANDARD, head, cut, cancel),
+        Decoder::Base64Url => base64(&URL_SAFE_NO_PAD, head, cut, cancel),
+        Decoder::Base64ToHex => {
+            base64_to_hex(&STANDARD_NO_PAD_INDIFFERENT, "Base64", head, cut, cancel)
+        }
+        Decoder::Base64UrlToHex => {
+            base64_to_hex(&URL_SAFE_NO_PAD_INDIFFERENT, "Base64URL", head, cut, cancel)
+        }
         Decoder::Number(kind, endian) => number(kind, endian, head, cut, cancel),
     }
 }
@@ -268,33 +288,49 @@ pub fn json(head: &[u8], pretty: bool, cancel: &AtomicBool) -> Rendered {
     }
 }
 
-fn hex(head: &[u8], cut: bool, cancel: &AtomicBool) -> Rendered {
-    let mut out = String::with_capacity(head.len() / 16 * 77 + 80);
-    for (row, chunk) in head.chunks(16).enumerate() {
+/// Bytes per step of the hex and Base64 loops: the cancel flag is read between steps. A multiple
+/// of 3, so each Base64 step but the last ends on a group.
+const STEP: usize = 3 * 4096;
+
+/// `bytes` as hex pairs. `Err` has the number of bytes done when `cancel` was set.
+fn hex_text(bytes: &[u8], cancel: &AtomicBool) -> Result<String, (String, usize)> {
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (i, c) in bytes.chunks(STEP).enumerate() {
         if is_cancelled(cancel) {
-            return Rendered::cancelled(out, row * 16);
+            return Err((out, i * STEP));
         }
-        let _ = write!(out, "{:08x} ", row * 16);
-        for i in 0..16 {
-            if i == 8 {
-                out.push(' ');
-            }
-            match chunk.get(i) {
-                Some(b) => {
-                    let _ = write!(out, " {b:02x}");
-                }
-                None => out.push_str("   "),
-            }
+        if i > 0 {
+            out.push(' ');
         }
-        out.push_str("  |");
-        out.extend(chunk.iter().map(|&b| {
-            if (0x20..0x7f).contains(&b) {
-                b as char
-            } else {
-                '.'
-            }
-        }));
-        out.push_str("|\n");
+        out.push_str(&to_hex(c));
+    }
+    Ok(out)
+}
+
+fn hex(head: &[u8], cut: bool, cancel: &AtomicBool) -> Rendered {
+    match hex_text(head, cancel) {
+        Ok(text) => Rendered {
+            text,
+            truncated_at: cut.then_some(head.len()),
+            error: None,
+        },
+        Err((text, used)) => Rendered::cancelled(text, used),
+    }
+}
+
+fn base64(engine: &GeneralPurpose, head: &[u8], cut: bool, cancel: &AtomicBool) -> Rendered {
+    // A cut at a multiple of 3 bytes keeps the text a prefix of the full encoding.
+    let head = if cut {
+        &head[..head.len() / 3 * 3]
+    } else {
+        head
+    };
+    let mut out = String::with_capacity(head.len().div_ceil(3) * 4);
+    for (i, c) in head.chunks(STEP).enumerate() {
+        if is_cancelled(cancel) {
+            return Rendered::cancelled(out, i * STEP);
+        }
+        engine.encode_string(c, &mut out);
     }
     Rendered {
         text: out,
@@ -303,32 +339,47 @@ fn hex(head: &[u8], cut: bool, cancel: &AtomicBool) -> Rendered {
     }
 }
 
-fn base64(head: &[u8], cut: bool, cancel: &AtomicBool) -> Rendered {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    // A cut at a multiple of 3 bytes keeps the text a prefix of the full encoding.
-    let head = if cut {
-        &head[..head.len() / 3 * 3]
-    } else {
-        head
-    };
-    let mut out = String::with_capacity(head.len().div_ceil(3) * 4);
-    for (i, c) in head.chunks(3).enumerate() {
-        if i % 4096 == 0 && is_cancelled(cancel) {
-            return Rendered::cancelled(out, i * 3);
-        }
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(c.get(1).copied().unwrap_or(0)) << 8)
-            | u32::from(c.get(2).copied().unwrap_or(0));
-        let sextet = |shift: u32| ALPHABET[(n >> shift) as usize & 63] as char;
-        out.push(sextet(18));
-        out.push(sextet(12));
-        out.push(if c.len() > 1 { sextet(6) } else { '=' });
-        out.push(if c.len() > 2 { sextet(0) } else { '=' });
+/// Decodes Base64 text (the engine accepts padding or none) and shows the bytes as hex. White
+/// space, also inside the text, is ignored. A cut input ends at a whole group of 4 characters.
+fn base64_to_hex(
+    engine: &GeneralPurpose,
+    name: &str,
+    head: &[u8],
+    cut: bool,
+    cancel: &AtomicBool,
+) -> Rendered {
+    let mut clean: Vec<u8> = head
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let mut used = head.len();
+    if cut {
+        // Drop the last partial group. `used` is the input position after the last kept character.
+        clean.truncate(clean.len() / 4 * 4);
+        used = if clean.is_empty() {
+            0
+        } else {
+            let mut n = 0;
+            head.iter()
+                .position(|b| {
+                    n += usize::from(!b.is_ascii_whitespace());
+                    n == clean.len()
+                })
+                .map_or(0, |i| i + 1)
+        };
     }
-    Rendered {
-        text: out,
-        truncated_at: cut.then_some(head.len()),
-        error: None,
+    let bytes = match engine.decode(&clean) {
+        Ok(b) => b,
+        Err(e) => return Rendered::err(format!("The payload is not valid {name}: {e}.")),
+    };
+    match hex_text(&bytes, cancel) {
+        Ok(text) => Rendered {
+            text,
+            truncated_at: cut.then_some(used),
+            error: None,
+        },
+        Err((text, _)) => Rendered::cancelled(text, 0),
     }
 }
 
@@ -507,7 +558,15 @@ mod tests {
 
     fn all_decoders() -> Vec<Decoder> {
         use NumberKind::*;
-        let mut v = vec![Decoder::Text, Decoder::Json, Decoder::Hex, Decoder::Base64];
+        let mut v = vec![
+            Decoder::Text,
+            Decoder::Json,
+            Decoder::Hex,
+            Decoder::Base64,
+            Decoder::Base64Url,
+            Decoder::Base64ToHex,
+            Decoder::Base64UrlToHex,
+        ];
         for k in [I8, U8, I16, U16, I32, U32, I64, U64, F32, F64] {
             v.push(Decoder::Number(k, Endian::Little));
             v.push(Decoder::Number(k, Endian::Big));
@@ -629,22 +688,14 @@ mod tests {
     }
 
     #[test]
-    fn hex_dump_format() {
-        let p: Vec<u8> = (0u8..20)
-            .map(|b| if b < 17 { b'A' + b } else { b })
-            .collect();
-        let t = ok(Decoder::Hex, &p);
-        let mut lines = t.lines();
-        assert_eq!(
-            lines.next(),
-            Some("00000000  41 42 43 44 45 46 47 48  49 4a 4b 4c 4d 4e 4f 50  |ABCDEFGHIJKLMNOP|")
-        );
-        assert_eq!(
-            lines.next(),
-            Some("00000010  51 11 12 13                                       |Q...|")
-        );
-        assert_eq!(lines.next(), None);
+    fn hex_format() {
+        // Spaced pairs only: no offset and no ASCII column. The composer reads it back.
+        assert_eq!(ok(Decoder::Hex, &[0, 255, 16]), "00 ff 10");
+        assert_eq!(ok(Decoder::Hex, b"AB"), "41 42");
         assert_eq!(ok(Decoder::Hex, b""), "");
+        let big = vec![0xabu8; STEP + 1];
+        let t = ok(Decoder::Hex, &big);
+        assert_eq!(t, vec!["ab"; STEP + 1].join(" "));
     }
 
     #[test]
@@ -667,6 +718,68 @@ mod tests {
         let r = render(Decoder::Base64, b"foobar", 4, &NO);
         assert_eq!((r.text.as_str(), r.truncated_at), ("Zm9v", Some(3)));
         assert!(full.starts_with(&r.text));
+    }
+
+    #[test]
+    fn base64url_vectors() {
+        // RFC 4648 section 10 (no padding), and the URL-safe alphabet.
+        for (i, o) in [
+            ("", ""),
+            ("f", "Zg"),
+            ("fo", "Zm8"),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg"),
+            ("fooba", "Zm9vYmE"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(ok(Decoder::Base64Url, i.as_bytes()), o);
+        }
+        assert_eq!(ok(Decoder::Base64Url, &[0xfb, 0xff, 0xfe]), "-__-");
+        let r = render(Decoder::Base64Url, b"foobar", 4, &NO);
+        assert_eq!((r.text.as_str(), r.truncated_at), ("Zm9v", Some(3)));
+    }
+
+    #[test]
+    fn base64_to_hex_accepts_padding_or_none_and_white_space() {
+        for d in [Decoder::Base64ToHex, Decoder::Base64UrlToHex] {
+            for (i, o) in [
+                ("", ""),
+                ("Zg==", "66"),
+                ("Zg", "66"),
+                ("Zm8=", "66 6f"),
+                ("Zm8", "66 6f"),
+                ("Zm9vYmFy", "66 6f 6f 62 61 72"),
+                (" Zm9v\r\nYmE=\n", "66 6f 6f 62 61"),
+            ] {
+                assert_eq!(ok(d, i.as_bytes()), o, "{d:?} {i:?}");
+            }
+        }
+        // Each alphabet takes only its own symbols.
+        assert_eq!(ok(Decoder::Base64ToHex, b"+//+"), "fb ff fe");
+        assert_eq!(ok(Decoder::Base64UrlToHex, b"-__-"), "fb ff fe");
+        assert!(run(Decoder::Base64ToHex, b"-__-").error.is_some());
+        assert!(run(Decoder::Base64UrlToHex, b"+//+").error.is_some());
+    }
+
+    #[test]
+    fn base64_to_hex_reports_bad_input() {
+        let e = run(Decoder::Base64ToHex, b"Zm9v!mFy").error.expect("error");
+        assert!(e.starts_with("The payload is not valid Base64: "), "{e}");
+        assert!(e.ends_with('.'), "{e}");
+        let e = run(Decoder::Base64UrlToHex, b"Z").error.expect("error");
+        assert!(e.starts_with("The payload is not valid Base64URL: "), "{e}");
+    }
+
+    #[test]
+    fn base64_to_hex_cut_ends_at_a_whole_group() {
+        // The limit falls inside the second group: only the first group is decoded.
+        let r = render(Decoder::Base64ToHex, b"Zm9v YmFy", 6, &NO);
+        assert_eq!(r.error, None);
+        assert_eq!((r.text.as_str(), r.truncated_at), ("66 6f 6f", Some(4)));
+        let r = render(Decoder::Base64UrlToHex, b"Zm9vYmFy", 2, &NO);
+        assert_eq!((r.text.as_str(), r.truncated_at), ("", Some(0)));
+        let r = render(Decoder::Base64ToHex, b"Zm9vYmFy", 8, &NO);
+        assert_eq!(r.truncated_at, None);
     }
 
     #[test]
@@ -703,7 +816,7 @@ mod tests {
         );
         let r = render(Decoder::Hex, &[0u8; 40], 20, &NO);
         assert_eq!(r.truncated_at, Some(20));
-        assert_eq!(r.text.lines().count(), 2);
+        assert_eq!(r.text, vec!["00"; 20].join(" "));
         let r = render(Decoder::Text, b"abcdef", 4, &NO);
         assert_eq!((r.text.as_str(), r.truncated_at), ("abcd", Some(4)));
         let r = render(Decoder::Text, b"abcdef", 6, &NO);

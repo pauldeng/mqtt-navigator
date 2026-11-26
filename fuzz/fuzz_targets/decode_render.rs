@@ -25,12 +25,15 @@ fuzz_target!(|data: &[u8]| {
     };
     let cancel = AtomicBool::new(false);
     let endian = if sel & 0x80 == 0 { Endian::Little } else { Endian::Big };
-    let decoder = match sel % 14 {
+    let decoder = match sel % 17 {
         0 => Decoder::Text,
         1 => Decoder::Json,
         2 => Decoder::Hex,
         3 => Decoder::Base64,
-        n => Decoder::Number(KINDS[usize::from(n - 4)], endian),
+        4 => Decoder::Base64Url,
+        5 => Decoder::Base64ToHex,
+        6 => Decoder::Base64UrlToHex,
+        n => Decoder::Number(KINDS[usize::from(n - 7)], endian),
     };
     let limit = if sel & 0x40 == 0 { usize::MAX } else { payload.len() / 2 };
     let r = render(decoder, payload, limit, &cancel);

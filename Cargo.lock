@@ -4769,6 +4769,7 @@ dependencies = [
 name = "navigator-core"
 version = "0.2.7"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
  "log",
  "ntex",

@@ -17,16 +17,22 @@ pub enum DecoderPick {
     Json,
     Hex,
     Base64,
+    Base64Url,
+    Base64ToHex,
+    Base64UrlToHex,
     Number,
 }
 
 impl DecoderPick {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
         Self::Auto,
         Self::Text,
         Self::Json,
         Self::Hex,
         Self::Base64,
+        Self::Base64Url,
+        Self::Base64ToHex,
+        Self::Base64UrlToHex,
         Self::Number,
     ];
 
@@ -37,6 +43,9 @@ impl DecoderPick {
             Self::Json => "JSON",
             Self::Hex => "Hex",
             Self::Base64 => "Base64",
+            Self::Base64Url => "Base64URL",
+            Self::Base64ToHex => "Base64 → Hex",
+            Self::Base64UrlToHex => "Base64URL → Hex",
             Self::Number => "Number",
         }
     }
@@ -83,6 +92,9 @@ impl DecoderChoice {
             DecoderPick::Json => Decoder::Json,
             DecoderPick::Hex => Decoder::Hex,
             DecoderPick::Base64 => Decoder::Base64,
+            DecoderPick::Base64Url => Decoder::Base64Url,
+            DecoderPick::Base64ToHex => Decoder::Base64ToHex,
+            DecoderPick::Base64UrlToHex => Decoder::Base64UrlToHex,
             DecoderPick::Number => Decoder::Number(self.kind, self.endian),
         }
     }
