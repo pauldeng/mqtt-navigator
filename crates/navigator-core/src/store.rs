@@ -375,12 +375,29 @@ fn node_cost(name_len: usize, topic_len: usize) -> usize {
 
 /// Bytes that a latest value costs. The node struct already holds the fixed part.
 fn msg_cost(msg: &Msg) -> usize {
-    msg.payload.len() + msg.props.heap_bytes()
+    msg.payload.len() + msg.props.heap_bytes() + props_block(&msg.props)
 }
+
+/// The `Arc` block of props with content. The latest value is the only copy that has no
+/// `PROPS_OVERHEAD` in a fixed charge. Props with only a flag or an expiry cost 0 here: an empty
+/// payload with such props must stay out of the eviction queue (ponytail: one block for each
+/// such topic is not charged).
+fn props_block(props: &MsgProps) -> usize {
+    if props.heap_bytes() == 0 {
+        0
+    } else {
+        PROPS_OVERHEAD
+    }
+}
+
+/// What the inline `MsgProps` cost before `Msg.props` was an `Arc`. Each copy of a message still
+/// pays it, so the budget stays an upper bound for the shared `Arc` block (and the RSS at the
+/// budget stays where it was).
+const PROPS_OVERHEAD: usize = size_of::<MsgProps>() + ARC_OVERHEAD;
 
 /// Fixed part of the charge of a history entry. The `VecDeque` can have spare room, so the
 /// struct counts twice. The extra bytes are the entry in `hist_order`.
-const HIST_OVERHEAD: usize = 2 * size_of::<HistEntry>() + 48;
+const HIST_OVERHEAD: usize = 2 * size_of::<HistEntry>() + 48 + 2 * PROPS_OVERHEAD;
 
 /// Most retained publishes that wait for their end (see `TopicStore::pending_retained`).
 const MAX_PENDING_RETAINED: usize = 64;
@@ -431,7 +448,7 @@ struct PendingRetained {
 }
 
 /// Fixed part of the charge of a list row. The extra bytes are the entry in the filter index.
-const ROW_OVERHEAD: usize = size_of::<Row>() + 16;
+const ROW_OVERHEAD: usize = size_of::<Row>() + 16 + PROPS_OVERHEAD;
 
 /// Extra charge of a sent row: the entry in the `op_id` map and the room for the status text.
 const SENT_EXTRA: usize = 48 + STATUS_MAX;
@@ -912,7 +929,7 @@ impl TopicStore {
         let stored_len = original_size.min(self.limits.latest_payload_max);
         let props_cost = props.heap_bytes();
         let expiry = props.message_expiry;
-        let latest_cost = stored_len + props_cost;
+        let latest_cost = stored_len + props_cost + props_block(&props);
         let hist_len = stored_len.min(self.limits.history_payload_max);
         let hist_cost = HIST_OVERHEAD + hist_len + props_cost;
         let row_cost = ROW_OVERHEAD + stored_len + props_cost;
@@ -1022,7 +1039,7 @@ impl TopicStore {
             original_size,
             qos,
             retain,
-            props: Arc::new(props),
+            props: self.props_arc(props),
             received_at,
             protocol,
         };
@@ -1165,7 +1182,7 @@ impl TopicStore {
                     original_size,
                     qos,
                     retain,
-                    props: Arc::new(props),
+                    props: self.props_arc(props),
                     received_at: at,
                     protocol,
                 },
@@ -2149,6 +2166,15 @@ impl TopicStore {
         }
     }
 
+    /// Empty props share one `Arc`, so a message without properties holds no extra block.
+    fn props_arc(&self, props: MsgProps) -> Arc<MsgProps> {
+        if props == MsgProps::default() {
+            Arc::clone(&self.empty_props)
+        } else {
+            Arc::new(props)
+        }
+    }
+
     /// Empties the oldest non-empty latest value. Returns false if there is nothing to evict.
     fn evict_latest(&mut self) -> bool {
         let Some((_, id)) = self.order.pop_first() else {
@@ -2482,6 +2508,22 @@ mod tests {
 
     fn msg(topic: &str, payload: &[u8]) -> Incoming {
         incoming(topic, Bytes::copy_from_slice(payload), MsgProps::default())
+    }
+
+    #[test]
+    fn empty_props_share_one_arc() {
+        let mut s = TopicStore::new(big());
+        let a = stored(s.insert(msg("a", b"x")));
+        let b = stored(s.insert(msg("b", b"x")));
+        let props = |n: &str| MsgProps {
+            content_type: Some(n.into()),
+            ..MsgProps::default()
+        };
+        let c = stored(s.insert(incoming("c", Bytes::from_static(b"x"), props("t"))));
+        let p = |id| Arc::clone(&s.node(id).latest.as_ref().expect("latest").props);
+        assert!(Arc::ptr_eq(&p(a), &p(b)));
+        assert!(Arc::ptr_eq(&p(a), &s.empty_props));
+        assert!(!Arc::ptr_eq(&p(c), &s.empty_props));
     }
 
     fn big() -> Limits {
