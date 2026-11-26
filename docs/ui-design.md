@@ -275,7 +275,7 @@ Every view designs these states: empty, loading, error with a recovery action, d
 Rules, in this order:
 
 1. An open layer (menu, popover, dialog, sheet, palette) gets `Esc` first, and `Esc` closes it.
-2. The focused control keeps `Esc` when it has a use: the filter clears its text, and the payload editor keeps its keys.
+2. The focused control keeps `Esc` when it has a use: the filter clears its text, and the message editor keeps its keys.
 3. Else `Esc` closes the area that has the focus: the composer (the draft stays) or the details pane. The focus moves to the message list.
 4. App shortcuts always use a modifier key, so they do not take text input.
 
@@ -284,7 +284,7 @@ Key bindings are scoped to each area (`KeyBinding` with a context). There is no 
 Other rules:
 
 - `Tab` always moves focus, also in the message editor. To indent JSON, use **Format** in the composer.
-- `Ctrl/Cmd+F` always focuses the app filter. The payload editor has no separate find.
+- `Ctrl/Cmd+F` always focuses the app filter. The message editor has no separate find.
 
 | Keys | Action |
 |---|---|
