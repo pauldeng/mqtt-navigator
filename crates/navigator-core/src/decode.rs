@@ -244,7 +244,7 @@ impl io::Write for Capped<'_> {
 pub fn json_valid(text: &[u8]) -> Result<(), String> {
     serde_json::from_slice::<serde::de::IgnoredAny>(text)
         .map(|_| ())
-        .map_err(|e| format!("The payload is not valid JSON: {e}."))
+        .map_err(|e| format!("The message is not valid JSON: {e}."))
 }
 
 /// The payload as JSON text: `pretty` (beautify, two-space indent) or compact (minify). The key
@@ -256,7 +256,7 @@ pub fn json(head: &[u8], pretty: bool, cancel: &AtomicBool) -> Rendered {
         Err(e) if e.to_string().contains("recursion limit") => {
             return Rendered::err("The JSON is nested too deeply (the limit is 127 levels).");
         }
-        Err(e) => return Rendered::err(format!("The payload is not valid JSON: {e}.")),
+        Err(e) => return Rendered::err(format!("The message is not valid JSON: {e}.")),
     };
     if is_cancelled(cancel) {
         return Rendered::cancelled(String::new(), 0);

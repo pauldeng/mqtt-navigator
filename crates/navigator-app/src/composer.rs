@@ -98,7 +98,7 @@ impl Draft {
     pub fn payload_bytes(&self) -> Result<Vec<u8>, String> {
         match self.mode {
             PayloadMode::Text | PayloadMode::Json => Ok(self.payload.clone().into_bytes()),
-            PayloadMode::Hex => parse_hex(&self.payload).map_err(|e| format!("Payload: {e}")),
+            PayloadMode::Hex => parse_hex(&self.payload).map_err(|e| format!("Message: {e}")),
         }
     }
 
@@ -113,7 +113,7 @@ impl Draft {
         match to {
             PayloadMode::Hex => self.payload = to_hex(self.payload.as_bytes()),
             PayloadMode::Text | PayloadMode::Json => {
-                let bytes = parse_hex(&self.payload).map_err(|e| format!("Payload: {e}"))?;
+                let bytes = parse_hex(&self.payload).map_err(|e| format!("Message: {e}"))?;
                 self.payload = String::from_utf8(bytes)
                     .map_err(|_| "These bytes are not valid text. Keep Hex mode.".to_string())?;
             }

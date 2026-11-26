@@ -313,7 +313,7 @@ impl ComposerPane {
                 .folding(false)
                 .searchable(false)
                 .soft_wrap(true)
-                .placeholder("Payload")
+                .placeholder("Message")
         });
         let mut subs: Vec<Subscription> = [
             &topic,
@@ -752,9 +752,9 @@ impl ComposerPane {
     fn set_payload_hint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.check_json(cx);
         let hint = match self.mode {
-            PayloadMode::Text => "Payload",
-            PayloadMode::Hex => "Payload as hex bytes, for example 01 ff 7a",
-            PayloadMode::Json => "Payload as JSON",
+            PayloadMode::Text => "Message",
+            PayloadMode::Hex => "Message as hex bytes, for example 01 ff 7a",
+            PayloadMode::Json => "Message as JSON",
         };
         self.payload
             .update(cx, |e, cx| e.set_placeholder(hint, window, cx));
@@ -1045,7 +1045,7 @@ impl ComposerPane {
         let size = self.payload.read(cx).text().len();
         if size > FORMAT_MAX_IN {
             self.error = Some(format!(
-                "Format works up to {}. This payload has {}.",
+                "Format works up to {}. This message has {}.",
                 size_text(FORMAT_MAX_IN),
                 size_text(size)
             ));
