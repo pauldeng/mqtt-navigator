@@ -109,6 +109,8 @@ pub struct Facts {
     pub can_show_all: bool,
     pub can_show_more: bool,
     pub payload_mode: PayloadMode,
+    /// The composer message has bytes to convert to Base64 (not empty, valid Hex).
+    pub can_convert: bool,
     pub theme: Option<ThemeMode>,
     /// The id of the colour theme preset now.
     pub preset: &'static str,
@@ -483,15 +485,15 @@ pub static COMMANDS: &[Entry] = &[
     ),
     e(
         "convert-base64",
-        "Convert the message to Base64",
+        "Convert to Base64",
         Cmd::ConvertBase64(false),
-        always,
+        |f| f.can_convert,
     ),
     e(
         "convert-base64url",
-        "Convert the message to Base64URL",
+        "Convert to Base64URL",
         Cmd::ConvertBase64(true),
-        always,
+        |f| f.can_convert,
     ),
     e("new-message", "New message", Cmd::NewMessage, always),
     e(
