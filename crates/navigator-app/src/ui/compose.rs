@@ -96,6 +96,8 @@ fn composer_max_height(window: Pixels, rem: Pixels) -> Pixels {
 /// Format refuses a payload above this size, and a result above [`FORMAT_MAX_OUT`]: setting a
 /// large text into the editor runs on the UI thread (see docs/ui-design.md, 3.3).
 const FORMAT_MAX_IN: usize = 1024 * 1024;
+/// Convert to Base64 runs on the UI thread, so its input is smaller.
+const CONVERT_MAX_IN: usize = 256 * 1024;
 const FORMAT_MAX_OUT: usize = 2 * 1024 * 1024;
 
 /// A single-line input and the exact string that it stands for (see [`LineKeep`]).
@@ -1107,10 +1109,10 @@ impl ComposerPane {
         cx: &mut Context<Self>,
     ) {
         let size = self.payload.read(cx).text().len();
-        if size > FORMAT_MAX_IN {
+        if size > CONVERT_MAX_IN {
             self.error = Some(format!(
                 "Convert works up to {}. This message has {}.",
-                size_text(FORMAT_MAX_IN),
+                size_text(CONVERT_MAX_IN),
                 size_text(size)
             ));
             cx.notify();
@@ -1144,7 +1146,7 @@ impl ComposerPane {
     /// text is valid.
     pub(super) fn can_convert(&self, cx: &App) -> bool {
         // The length comes from the editor without a copy of the text.
-        if self.payload.read(cx).text().len() > FORMAT_MAX_IN {
+        if self.payload.read(cx).text().len() > CONVERT_MAX_IN {
             return false;
         }
         let text = self.payload.read(cx).value();
