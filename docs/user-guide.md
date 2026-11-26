@@ -272,7 +272,7 @@ The composer is closed by default. The bottom of the centre pane then shows one 
 
 1. Select **New message**.
 2. Type the topic.
-3. Type the payload.
+3. Type the message.
 4. Set QoS 0 or 1, and **Retain** if you need it.
 5. Press **Publish** or `Ctrl/Cmd+Enter`.
 
@@ -287,7 +287,7 @@ The result shows below the message and, if it is not routine, in the list row. A
 - **Convert to Base64** and **Convert to Base64URL** (in the composer **⋯** menu) encode the bytes that Publish would send now. For example, Hex `48 65 6c 6c 6f` becomes `SGVsbG8=` (Base64) or `SGVsbG8` (Base64URL, no padding). The text goes in the message box, and the mode changes to Text. The focus returns to the message box. The old draft goes to Drafts. The two items are off when the message has no bytes, or when the Hex text is not valid. To go back, open the old draft in **History…**. The items work up to 1 MiB.
 - **Properties** (MQTT 5): a **Properties (N)** tag shows next to the topic when a property is present. Select it to open the section. The section shows only the properties that are present. Use **Add property** to add: **Payload format: UTF-8**, content type, response topic, correlation data (hex), message expiry or user property. **Send empty** keeps an empty property in the message. A property that you add stays visible while it is empty.
 - **History** menu: **Drafts** (the last 5 drafts that you replaced) and **Sent** (the last 20 publishes of this session). Choose one to fill the composer. A draft leaves **Drafts** when you choose it. The app does not save History to disk. It clears History when you change the connection.
-- The composer saves the old content as a draft before something replaces it. These actions replace it: a choice in History, Edit and publish, Reply, Publish to this topic, Beautify JSON, Minify JSON, Convert to Base64, Convert to Base64URL and the Text/Hex switch. The app saves the old content only if it is unsent, it is not empty (a topic alone is empty) and it is at most 1 MiB. A larger draft is dropped, and the app says "The old draft is larger than 1 MiB. It is not kept."
+- The composer saves the old content as a draft before something replaces it. These actions replace it: a choice in History, Edit and publish, Reply, Publish to this topic, Beautify JSON, Minify JSON and the Text/Hex switch. Convert to Base64 and Convert to Base64URL also save it, but they stop and keep the text if the draft is too large. The app saves the old content only if it is unsent, it is not empty (a topic alone is empty) and it is at most 1 MiB. A larger draft is dropped, and the app says "The old draft is larger than 1 MiB. It is not kept."
 - Drafts and Sent share a budget of 1 MiB. The app removes the oldest entries first.
 - The command palette entry **Publish** opens the composer first when it is closed. It does not send a draft that you cannot see.
 
